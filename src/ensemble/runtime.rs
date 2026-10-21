@@ -1099,9 +1099,43 @@ async fn restore_member_transports(repo: &RepoId, entry: &RepositoryRuntime) -> 
         .runtime
         .identity_runtime()
         .context("identity authority missing")?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let (bootstrap, timed_out) = authority
+        .wait_identity_bootstrap_terminal(Duration::from_secs(60))
+        .await;
+    if timed_out || !bootstrap.ready {
+        bail!("repository {repo} identity bootstrap failed (timed_out={timed_out}): {bootstrap:?}");
+    }
     for name in entry.grants.keys() {
         let identity = member_identity(repo, name)?;
-        let before = authority.status(&identity).await?;
+        let before = loop {
+            let before = authority.status(&identity).await?;
+            if before.agent_runtime_id.is_some() {
+                break before;
+            }
+            let bootstrap = authority.identity_bootstrap_status();
+            // A native continuity refresh may start after the first barrier.
+            // Wait only for actual in-flight hydration, never retry Broken or
+            // a supposedly ready identity that lacks its runtime alias.
+            if before.state == IdentityLifecycleState::Broken
+                || bootstrap.ready
+                || bootstrap.error.is_some()
+                || bootstrap.counts.broken > 0
+                || (bootstrap.complete && bootstrap.counts.warming == 0)
+            {
+                break before;
+            }
+            let (bootstrap, timed_out) = authority
+                .wait_identity_bootstrap_terminal(
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                )
+                .await;
+            if timed_out || !bootstrap.ready {
+                bail!(
+                    "repository {repo} identity bootstrap failed (timed_out={timed_out}): {bootstrap:?}"
+                );
+            }
+        };
         let alias = before
             .agent_runtime_id
             .as_ref()
