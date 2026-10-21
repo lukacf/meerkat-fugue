@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod discovery;
 pub mod formation_review;
+mod handoff;
 pub mod http;
 pub mod repository_tools;
 pub mod runtime;

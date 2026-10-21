@@ -26,7 +26,8 @@ const ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 3
 pub async fn router(runtime: Arc<EnsembleRuntime>) -> anyhow::Result<Router> {
     Ok(routes(runtime, false)
         .await?
-        .route("/", get(|| async { Redirect::temporary("/ensemble") })))
+        .route("/", get(|| async { Redirect::temporary("/ensemble") }))
+        .route("/api/v1/build", get(crate::build_identity::endpoint)))
 }
 
 /// Mount the same repository teams and native consoles in the regular Fugue app.
