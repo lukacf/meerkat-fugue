@@ -2701,7 +2701,7 @@ async fn api_issue_move(
         Err(error) => return linear_config_error_response(error),
     };
     match adapter
-        .move_issue(MoveIssueInput {
+        .move_issue_as_operator(MoveIssueInput {
             issue: issue_ref_for_identifier(&issue_identifier),
             state: LinearStateRef::Name {
                 name: tracker_state_for_canonical_lane(&app.config, state),
@@ -3690,10 +3690,10 @@ fn tracker_fetch_lanes(config: &ServiceConfig) -> Vec<String> {
 
 fn canonical_lane_for_state(config: &ServiceConfig, state: &str) -> String {
     let normalized = state.trim().to_ascii_lowercase();
-    if state.eq_ignore_ascii_case(&config.linear.lanes.parked)
-        || normalized == "backlog"
-        || normalized == "icebox"
-    {
+    if config.tracker.is_intake_state(state) {
+        return "Queue".to_string();
+    }
+    if config.is_parked_state(state) || normalized == "backlog" || normalized == "icebox" {
         return "Backlog".to_string();
     }
     if config.tracker.is_intake_state(state)
@@ -3719,7 +3719,10 @@ fn canonical_lane_for_state(config: &ServiceConfig, state: &str) -> String {
             "done" | "canceled" | "cancelled" | "duplicate"
         )
     {
-        return if normalized == "done" {
+        return if state.eq_ignore_ascii_case(&config.linear.lanes.success)
+            || (config.deploy.enabled && state.eq_ignore_ascii_case(&config.deploy.success_lane))
+            || normalized == "done"
+        {
             "Done"
         } else {
             "Canceled"
@@ -4429,6 +4432,34 @@ pub async fn execute_deploy_transaction(
             };
         }
     };
+    if plan.decision == crate::deploy_gate::DeployGateDecision::MergeOnly {
+        let outcome = merge_only_success_outcome(
+            issue_identifier.clone(),
+            &request,
+            merged_sha,
+            config.deploy.merge_method,
+        );
+        if let Err(error) = record_successful_deploy_projection(&config, &request, &outcome).await {
+            return DeployTransactionResult {
+                accepted: false,
+                issue_identifier,
+                message: error.to_string(),
+                failure_category: Some(DeployFailureCategory::Unknown),
+                plan: Some(plan),
+                outcome: Some(outcome),
+                ota: None,
+            };
+        }
+        return DeployTransactionResult {
+            accepted: true,
+            issue_identifier,
+            message: "PR merged; no deployment requested".to_string(),
+            failure_category: None,
+            plan: Some(plan),
+            outcome: Some(outcome),
+            ota: None,
+        };
+    }
     let Some(ota_config) = ota_update else {
         return DeployTransactionResult {
             accepted: false,
@@ -4620,14 +4651,28 @@ async fn record_deploy_projection(
         .map_err(|error| anyhow::anyhow!("invalid deploy outcome: {error:?}"))?;
     let adapter = IssueAdapter::from_config(&config.tracker)?;
     let evidence = serde_json::to_string_pretty(outcome)?;
+    let inspected = adapter
+        .inspect_issue(InspectIssueInput {
+            issue: request.issue.clone(),
+        })
+        .await?;
+    let deployment = format!(
+        "### Deployment\n\nIdempotency-Key: `{}`\n\n```json\n{evidence}\n```",
+        request.idempotency_key.0
+    );
+    let body_markdown = crate::orchestrator::upsert_markdown_section(
+        inspected
+            .workpad
+            .as_ref()
+            .map_or("", |workpad| workpad.body_markdown.as_str()),
+        "### Deployment",
+        &deployment,
+    );
     adapter
         .upsert_workpad(UpsertWorkpadInput {
             issue: request.issue.clone(),
             heading: "## Fugue Workpad".to_string(),
-            body_markdown: format!(
-                "### Deployment\n\nIdempotency-Key: `{}`\n\n```json\n{evidence}\n```",
-                request.idempotency_key.0
-            ),
+            body_markdown,
             create_if_missing: true,
             idempotency_key: IdempotencyKey(format!(
                 "deploy-workpad:{}:{}",
@@ -4685,7 +4730,12 @@ fn deploy_success_idempotency_recorded_in_workpad(
     };
     let json_body = json_after_fence[..fence_end].trim();
     match serde_json::from_str::<DeployOutcome>(json_body) {
-        Ok(outcome) => outcome.status == DeployOutcomeStatus::Succeeded,
+        Ok(outcome) => {
+            matches!(
+                outcome.status,
+                DeployOutcomeStatus::Succeeded | DeployOutcomeStatus::Merged
+            ) && outcome.validate().is_ok()
+        }
         Err(_) => false,
     }
 }
@@ -5021,6 +5071,36 @@ async fn api_ota_update(State(app): State<AppState>, headers: HeaderMap) -> impl
             })),
         )
             .into_response(),
+    }
+}
+
+fn merge_only_success_outcome(
+    issue_identifier: String,
+    request: &DeployStartRequest,
+    merged_sha: GitSha,
+    merge_method: crate::tools::MergeMethod,
+) -> DeployOutcome {
+    let now = Utc::now();
+    DeployOutcome {
+        schema_version: DEPLOY_OUTCOME_SCHEMA_VERSION.to_string(),
+        issue_identifier,
+        status: DeployOutcomeStatus::Merged,
+        failure_category: None,
+        pull_request: DeployPullRequestEvidence {
+            repo: request.pull_request.repo.clone(),
+            number: request.pull_request.number,
+            url: request.pull_request.url.clone(),
+            base_branch: request.pull_request.base_branch.clone(),
+            head_branch: request.pull_request.head_branch.clone(),
+            head_sha: request.pull_request.head_sha.clone(),
+        },
+        merge: Some(crate::deploy_gate::DeployMergeEvidence {
+            method: merge_method,
+            merged_sha,
+        }),
+        ota: None,
+        started_at: now,
+        completed_at: now,
     }
 }
 
@@ -6511,6 +6591,22 @@ mod tests {
     }
 
     #[test]
+    fn configured_tracker_statuses_preserve_intake_and_success_roles() {
+        let mut config = issue_board_config();
+        config.linear.lanes.parked = "Open".into();
+        config.linear.lanes.ready = "Open".into();
+        config.linear.lanes.success = "Resolved".into();
+        config.linear.lanes.canceled = "Resolved".into();
+        config.tracker.intake_states = vec!["Open".into()];
+        config.tracker.terminal_states = vec!["Resolved".into(), "Closed".into()];
+        config.deploy.enabled = true;
+        config.deploy.success_lane = "Closed".into();
+        assert_eq!(canonical_lane_for_state(&config, "Open"), "Queue");
+        assert_eq!(canonical_lane_for_state(&config, "Resolved"), "Done");
+        assert_eq!(canonical_lane_for_state(&config, "Closed"), "Done");
+    }
+
+    #[test]
     fn issue_board_lanes_project_to_eight_canonical_names() {
         let config = issue_board_config();
 
@@ -7063,6 +7159,19 @@ mod tests {
             completed_at: now,
         };
 
+        let adapter = IssueAdapter::from_config(&config.tracker).expect("adapter");
+        adapter
+            .upsert_workpad(UpsertWorkpadInput {
+                issue: request.issue.clone(),
+                heading: "## Fugue Workpad".into(),
+                body_markdown:
+                    "### Plan\nReviewed feature plan.\n\n### Validation\nExact-head tests passed."
+                        .into(),
+                create_if_missing: true,
+                idempotency_key: IdempotencyKey("before-deploy".into()),
+            })
+            .await
+            .expect("initial workpad");
         record_successful_deploy_projection(&config, &request, &outcome)
             .await
             .expect("deploy projection");
@@ -7077,12 +7186,25 @@ mod tests {
             .await
             .expect("issue");
         assert_eq!(inspected.issue.state.name, "Done");
+        let workpad = &inspected.workpad.as_ref().expect("workpad").body_markdown;
+        assert!(workpad.contains("Reviewed feature plan."));
+        assert!(workpad.contains("Exact-head tests passed."));
         assert!(
             inspected
                 .workpad
                 .as_ref()
                 .is_some_and(|workpad| workpad.body_markdown.contains("### Deployment"))
         );
+        adapter
+            .upsert_workpad(UpsertWorkpadInput {
+                issue: request.issue.clone(),
+                heading: "## Fugue Workpad".into(),
+                body_markdown: "### Validation\nLate reviewer update.".into(),
+                create_if_missing: true,
+                idempotency_key: IdempotencyKey("after-deploy".into()),
+            })
+            .await
+            .expect("late workpad update");
         assert!(
             deploy_idempotency_already_recorded(&config, &request.issue, &request.idempotency_key)
                 .await
@@ -7406,6 +7528,38 @@ mod tests {
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
         assert_eq!(ota_evidence.health_url, "command:meerkat-fugue --help");
+
+        let mut merged = merge_only_success_outcome(
+            "LUC-642".to_string(),
+            &request,
+            GitSha("merge456".to_string()),
+            crate::tools::MergeMethod::Squash,
+        );
+        merged.validate().expect("valid merge-only outcome");
+        assert_eq!(merged.status, DeployOutcomeStatus::Merged);
+        assert!(merged.ota.is_none());
+        let workpad = format!(
+            "Idempotency-Key: `{}`\n```json\n{}\n```",
+            request.idempotency_key.0,
+            serde_json::to_string(&merged).expect("outcome")
+        );
+        assert!(deploy_success_idempotency_recorded_in_workpad(
+            &workpad,
+            &request.idempotency_key
+        ));
+        merged.ota = Some(ota_evidence);
+        assert_eq!(
+            merged.validate(),
+            Err(crate::deploy_gate::DeployOutcomeError::MergeOnlyWithDeployment)
+        );
+        merged.ota = None;
+        merged.merge = None;
+        assert_eq!(
+            merged.validate(),
+            Err(crate::deploy_gate::DeployOutcomeError::MissingField(
+                "merge"
+            ))
+        );
     }
 
     #[tokio::test]

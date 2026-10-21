@@ -260,6 +260,44 @@ async fn workpad_update_finds_existing_comment_on_later_pages() {
 }
 
 #[tokio::test]
+async fn late_workpad_update_preserves_recorded_deployment() {
+    let evidence =
+        "### Deployment\n\nIdempotency-Key: `merge-1`\n\n```json\n{\"status\":\"merged\"}\n```";
+    let existing = format!("## Fugue Workpad\n\nOld plan\n\n{evidence}\n\n### Other\nOld note");
+    let mock = mock_jira(vec![
+        reply("GET", "/rest/api/3/issue/TEST-1", issue("Done")),
+        reply(
+            "GET",
+            "/rest/api/3/issue/TEST-1/comment",
+            json!({"comments":[{"id":"1","body":existing}],"total":1}),
+        ),
+        reply(
+            "PUT",
+            "/rest/api/3/issue/TEST-1/comment/1",
+            json!({"id":"1"}),
+        ),
+    ])
+    .await;
+    JiraClient::from_config(&tracker(&mock.endpoint))
+        .expect("client")
+        .upsert_workpad(UpsertWorkpadInput {
+            issue: reference(),
+            heading: "Fugue Workpad".into(),
+            body_markdown: "### Validation\nReviewed and tested.".into(),
+            create_if_missing: true,
+            idempotency_key: IdempotencyKey("late-update".into()),
+        })
+        .await
+        .expect("update");
+    let requests = mock.requests.lock().expect("requests");
+    let body: JiraBody = serde_json::from_value(requests[2].1["body"].clone()).expect("ADF");
+    assert_eq!(
+        body.markdown(),
+        format!("## Fugue Workpad\n\n### Validation\nReviewed and tested.\n\n{evidence}")
+    );
+}
+
+#[tokio::test]
 async fn workpad_retries_are_noops_and_duplicate_workpads_fail_closed() {
     for duplicate in [false, true] {
         let mut comments = vec![json!({"id":"1","body":"## Fugue Workpad\n\nSame plan"})];
@@ -321,6 +359,52 @@ async fn transitions_use_destination_status_and_verify_observed_result() {
         mock.requests.lock().expect("requests")[2].1,
         json!({"transition":{"id":"31"}})
     );
+}
+
+#[tokio::test]
+async fn terminal_reopen_requires_explicit_operator_authority() {
+    for operator in [false, true] {
+        let mut responses = vec![
+            reply("GET", "/rest/api/3/issue/TEST-1", issue("Done")),
+            reply(
+                "GET",
+                "/rest/api/3/issue/TEST-1/transitions",
+                json!({"transitions":[{"id":"4","name":"Request merge","to":{"id":"2","name":"Merge","statusCategory":{"key":"indeterminate"}}}]}),
+            ),
+        ];
+        if operator {
+            responses.extend([
+                reply("POST", "/rest/api/3/issue/TEST-1/transitions", json!({})),
+                reply("GET", "/rest/api/3/issue/TEST-1", issue("Merge")),
+            ]);
+        }
+        let mock = mock_jira(responses).await;
+        let adapter = crate::linear_adapter::IssueAdapter::from_config(&tracker(&mock.endpoint))
+            .expect("adapter");
+        let input = MoveIssueInput {
+            issue: reference(),
+            state: LinearStateRef::Name {
+                name: "Merge".into(),
+            },
+            expected_updated_at: None,
+            idempotency_key: IdempotencyKey("operator-merge".into()),
+        };
+        if operator {
+            let moved = adapter
+                .move_issue_as_operator(input)
+                .await
+                .expect("operator move");
+            assert_eq!(moved.issue.state.name, "Merge");
+            assert!(moved.changed);
+        } else {
+            let error = adapter
+                .move_issue(input)
+                .await
+                .expect_err("agent reopen refused");
+            assert!(error.to_string().contains("explicit operator restart"));
+        }
+        assert!(mock.responses.lock().expect("responses").is_empty());
+    }
 }
 
 #[tokio::test]

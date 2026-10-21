@@ -1392,6 +1392,13 @@ impl WorkflowConfigManager {
 }
 
 impl ServiceConfig {
+    /// A tracker with one shared unstarted status has no separate parked lane.
+    /// Explicit intake scope takes precedence so that status remains runnable.
+    pub fn is_parked_state(&self, state: &str) -> bool {
+        normalize_state(state) == normalize_state(&self.linear.lanes.parked)
+            && !self.tracker.is_intake_state(state)
+    }
+
     pub fn from_definition(path: PathBuf, definition: &WorkflowDefinition) -> Result<Self> {
         let workflow_dir = path
             .parent()
@@ -2864,6 +2871,9 @@ fn native_tracker_value<'a>(
     add_unique_state(&mut terminal_states, linear.lanes.success.clone());
     add_unique_state(&mut terminal_states, linear.lanes.canceled.clone());
     add_unique_state(&mut terminal_states, linear.lanes.duplicate.clone());
+    if let Some(deploy) = deploy.filter(|config| config.enabled) {
+        add_unique_state(&mut terminal_states, deploy.success_lane.clone());
+    }
     let mut tracker = Map::new();
     tracker.insert(
         "kind".to_string(),
@@ -2965,6 +2975,11 @@ fn required_linear_states<'a>(
     }
     if let Some(deploy) = deploy.filter(|config| config.enabled) {
         push_required_state(&mut required, deploy.lane.clone(), LinearStateType::Started);
+        push_required_state(
+            &mut required,
+            deploy.success_lane.clone(),
+            LinearStateType::Completed,
+        );
     }
     if let Some(blocked) = &linear.lanes.blocked {
         push_required_state(&mut required, blocked.clone(), LinearStateType::Started);

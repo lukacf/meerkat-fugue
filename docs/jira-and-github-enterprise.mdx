@@ -115,6 +115,25 @@ Use `gh repo clone git.example.com/example/app .` in a workspace creation hook
 when relying on `gh` authentication. Fugue does not change the machine-wide
 default GitHub host or copy tokens into repository files.
 
+## Merge without deployment
+
+For repositories that only need reviewed PRs merged, set
+`deploy.procedure: merge-only` and `deploy.require_ota_update: false`. Configure
+an existing Jira status as `deploy.action_lane`, an existing terminal status as
+`deploy.success_lane`, and the full enterprise repository identity in
+`deploy.allowed_repositories`. Moving an accepted issue to the action lane
+requests the guarded merge. The exact head, CI, base branch, repository, and
+WorkGraph checks still apply. The result records `status: merged` and the merge
+commit without claiming an application deployment.
+
+An operator can request this transition from Fugue's issue board even when the
+accepted development status is terminal. Agent tools continue to reject
+reopening terminal Jira issues and entering operator action lanes.
+
+If GitHub Actions is disabled on the enterprise instance, an external CI runner
+can publish commit statuses. Configure branch protection to require its check,
+and run the actual tests against the exact PR head before publishing success.
+
 ## Validate before starting a queue
 
 ```bash

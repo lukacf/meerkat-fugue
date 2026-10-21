@@ -95,7 +95,7 @@ pub type LinearLaneObservation = ImsStageObservation;
 pub type LinearLaneClassification = ImsStageClassification;
 
 pub fn classify_linear_lane(config: &ServiceConfig, lane: &str) -> LinearLaneClassification {
-    if same_lane(lane, &config.linear.lanes.parked) {
+    if config.is_parked_state(lane) {
         return LinearLaneClassification::Parked;
     }
     if config

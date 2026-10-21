@@ -631,7 +631,7 @@ fn agent_mcp_server_configs(
 }
 
 fn is_agent_mcp_server(name: &str) -> bool {
-    !matches!(name, "linear" | "github" | "fugue_host")
+    !matches!(name, "linear" | "jira" | "github" | "fugue_host")
 }
 
 fn mcp_server_config(name: &str, server: &NativeMcpServerConfig) -> Option<McpServerConfig> {
@@ -968,7 +968,7 @@ fn direct_tool_dispatcher(
     )));
     tools.push(Arc::new(ToolDef::new(
         "fugue_run_deploy",
-        "Run the guarded Fugue deploy lane action from a typed DeployStartRequest: verify deploy policy, merge the exact PR head, and run the configured OTA update. Use only as repo Kapellmeister authority after explicit Deploy lane/operator intent.",
+        "Run the configured guarded merge-only or merge-and-OTA action from a typed DeployStartRequest: verify policy and merge the exact PR head, then perform OTA only when configured. Use only as repo Kapellmeister authority after explicit action-lane/operator intent.",
         json!({
             "type": "object",
             "description": "Typed DeployStartRequest payload with issue, PR snapshot, recorded head, CI status, WorkGraph blocker count, and idempotency key.",
@@ -1281,6 +1281,17 @@ fn build_unified_runtime(
                 state_path.join("mob.sqlite3"),
             )
             .map_err(|error| format!("open durable Fugue mob: {error}"))?;
+        if let Some(previous) = mob_storage
+            .created_definition_snapshot()
+            .await
+            .map_err(|error| format!("read durable Fugue definition: {error}"))?
+            && let Some(migrated) = migrate_duplicate_jira_mcp(previous.definition(), &definition)
+        {
+            mob_storage
+                .update_definition(previous.epoch(), migrated)
+                .await
+                .map_err(|error| format!("remove duplicate Jira MCP registration: {error}"))?;
+        }
         let builder = UnifiedRuntime::builder()
             .definition(definition)
             .mob_storage(mob_storage, provenance)
@@ -1322,6 +1333,24 @@ fn build_unified_runtime(
         .map_err(|err| format!("create Meta task runtime: {err}"))?;
     let unified = runtime.block_on(build())?;
     Ok((unified, Some(runtime)))
+}
+
+/// Upgrade only the host-owned duplicate adapter registration. Unrelated
+/// configuration drift must still be rejected by the native composition gate.
+fn migrate_duplicate_jira_mcp(
+    previous: &MobDefinition,
+    desired: &MobDefinition,
+) -> Option<MobDefinition> {
+    let mut migrated = previous.clone();
+    for binding in migrated.profiles.values_mut() {
+        if let ProfileBinding::Inline(profile) = binding {
+            profile
+                .tools
+                .mcp_servers
+                .retain(|server| server.name != "jira");
+        }
+    }
+    (previous != desired && &migrated == desired).then_some(migrated)
 }
 
 #[derive(Deserialize)]
@@ -4305,15 +4334,53 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_jira_migration_preserves_unrelated_definition_policy() {
+        let registry =
+            MetaRuntimeRegistry::new(test_meerkat_config(PathBuf::from("/tmp/fugue-state")));
+        let desired = registry.mob_definition().expect("definition");
+        let mut previous = desired.clone();
+        for binding in previous.profiles.values_mut() {
+            if let ProfileBinding::Inline(profile) = binding {
+                profile.tools.mcp_servers.push(McpServerConfig::stdio(
+                    "jira",
+                    "fugue-jira-mcp",
+                    Vec::new(),
+                    Default::default(),
+                ));
+            }
+        }
+        assert_eq!(
+            migrate_duplicate_jira_mcp(&previous, &desired),
+            Some(desired.clone())
+        );
+        assert!(migrate_duplicate_jira_mcp(&desired, &desired).is_none());
+        let ProfileBinding::Inline(profile) =
+            previous.profiles.get_mut(KAPELLMEISTER).expect("profile")
+        else {
+            panic!("inline profile")
+        };
+        profile.model = "different-model".into();
+        assert!(migrate_duplicate_jira_mcp(&previous, &desired).is_none());
+    }
+
+    #[test]
     fn profiles_expose_configured_mcp_tools_to_meta() {
         let mcp_servers = BTreeMap::from([
             ("linear".to_string(), mcp_server(&["fugue-linear-mcp"], &[])),
+            ("jira".to_string(), mcp_server(&["fugue-jira-mcp"], &[])),
             ("github".to_string(), mcp_server(&["fugue-github-mcp"], &[])),
             ("docs".to_string(), mcp_server(&["docs-mcp"], &[])),
         ]);
         let control = control_profile("repo coordinator", &mcp_servers);
         let worker = agent_profile(
-            &native_agent_profile(&["mob", "shell", "mcp:linear", "mcp:github", "mcp:docs"]),
+            &native_agent_profile(&[
+                "mob",
+                "shell",
+                "mcp:linear",
+                "mcp:jira",
+                "mcp:github",
+                "mcp:docs",
+            ]),
             &mcp_servers,
         )
         .expect("valid profile");

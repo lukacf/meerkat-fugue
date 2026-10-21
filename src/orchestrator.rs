@@ -5951,7 +5951,7 @@ fn native_launch_refresh_action(
 }
 
 fn kapellmeister_start_issue_block_reason(config: &ServiceConfig, issue: &Issue) -> Option<String> {
-    if same_issue_lane(&issue.state, &config.linear.lanes.parked) {
+    if config.is_parked_state(&issue.state) {
         return Some(
             "issue is parked; Kapellmeister must choose a nonterminal control lane before starting a mob"
                 .to_string(),
@@ -6103,7 +6103,7 @@ fn native_deploy_lane_candidate(config: &ServiceConfig, issue: &Issue) -> bool {
 }
 
 fn is_native_parked_state(config: &ServiceConfig, state: &str) -> bool {
-    normalize_state(state) == normalize_state(&config.linear.lanes.parked)
+    config.is_parked_state(state)
 }
 
 fn native_pr_handoff_monitor_action(
@@ -6433,7 +6433,7 @@ fn native_pr_handoff_replan_reason(reason: NativePrHandoffReplanReason) -> &'sta
     }
 }
 
-fn upsert_markdown_section(body: &str, heading: &str, section: &str) -> String {
+pub(crate) fn upsert_markdown_section(body: &str, heading: &str, section: &str) -> String {
     let body = body.trim_end();
     let section = section.trim_end();
     let lines = body.lines().collect::<Vec<_>>();
@@ -11198,6 +11198,34 @@ mod tests {
             },
             metadata: ToolExecutionMetadata::default(),
         }
+    }
+
+    #[test]
+    fn shared_parked_and_intake_status_still_starts_native_work() {
+        let mut config = native_control_plane_config();
+        config.linear.lanes.parked = "Open".into();
+        config.linear.lanes.ready = "Open".into();
+        config.tracker.intake_states = vec!["Open".into()];
+        config.tracker.active_states.push("Open".into());
+        let issue = issue_in_lane("Open");
+        assert_eq!(
+            classify_issue_lane(&config, "Open"),
+            IssueLaneClassification::Intake
+        );
+        assert!(!is_native_parked_state(&config, "Open"));
+        assert!(kapellmeister_start_issue_block_reason(&config, &issue).is_none());
+        assert!(
+            !issue_lane_control_plane_signals(
+                &config,
+                &issue,
+                IssueLaneObservation::FirstSeen {
+                    identifier: issue.identifier.clone(),
+                    current: "Open".into(),
+                },
+                None,
+            )
+            .is_empty()
+        );
     }
 
     #[test]

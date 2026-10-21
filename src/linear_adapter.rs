@@ -681,6 +681,18 @@ impl IssueAdapter {
         }
     }
 
+    /// An authenticated board action is explicit operator restart intent.
+    /// Agent tool dispatch must continue using `move_issue`.
+    pub(crate) async fn move_issue_as_operator(
+        &self,
+        input: MoveIssueInput,
+    ) -> Result<MoveIssueOutput> {
+        match self {
+            Self::Jira(client) => client.move_issue_as_operator(input).await,
+            _ => self.move_issue(input).await,
+        }
+    }
+
     pub async fn upsert_workpad(&self, input: UpsertWorkpadInput) -> Result<UpsertWorkpadOutput> {
         match self {
             Self::Jira(client) => client.upsert_workpad(input).await,

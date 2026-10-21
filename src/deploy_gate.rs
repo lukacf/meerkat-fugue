@@ -1,6 +1,34 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// A late plan/validation update must not erase the host's merge receipt.
+/// An explicit replacement section is still accepted for a subsequent action.
+pub(crate) fn merge_preserved_deploy_evidence(rendered: &str, existing: &str) -> String {
+    fn section(body: &str) -> Option<&str> {
+        let mut offset = 0;
+        let mut start = None;
+        for line in body.split_inclusive('\n') {
+            let trimmed = line.trim();
+            if trimmed == "### Deployment" {
+                start = Some(offset);
+            } else if let Some(start) = start
+                && (trimmed.starts_with("## ") || trimmed.starts_with("### "))
+            {
+                return Some(body[start..offset].trim_end());
+            }
+            offset += line.len();
+        }
+        start.map(|start| body[start..].trim_end())
+    }
+    if section(rendered).is_none()
+        && let Some(evidence) = section(existing)
+    {
+        format!("{}\n\n{evidence}", rendered.trim_end())
+    } else {
+        rendered.to_string()
+    }
+}
+
 use crate::config::DeployLaneConfig;
 use crate::tools::{
     BranchName, CiStatus, GitHubPullRequestNumber, GitHubPullRequestRef, GitHubPullRequestSnapshot,
@@ -41,6 +69,8 @@ pub struct DeployStartRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeployOutcomeStatus {
+    /// The exact PR head was merged; no deployment was requested or performed.
+    Merged,
     Succeeded,
     Failed,
 }
@@ -116,6 +146,17 @@ impl DeployOutcome {
             return Err(DeployOutcomeError::MissingField("pull_request.head_sha"));
         }
         match self.status {
+            DeployOutcomeStatus::Merged => {
+                if self.failure_category.is_some() {
+                    return Err(DeployOutcomeError::SucceededWithFailureCategory);
+                }
+                if self.merge.is_none() {
+                    return Err(DeployOutcomeError::MissingField("merge"));
+                }
+                if self.ota.is_some() {
+                    return Err(DeployOutcomeError::MergeOnlyWithDeployment);
+                }
+            }
             DeployOutcomeStatus::Succeeded => {
                 if self.failure_category.is_some() {
                     return Err(DeployOutcomeError::SucceededWithFailureCategory);
@@ -159,6 +200,7 @@ pub enum DeployOutcomeError {
     MissingField(&'static str),
     SucceededWithFailureCategory,
     FailedWithoutFailureCategory,
+    MergeOnlyWithDeployment,
     SuccessfulDeployShaMismatch {
         merged_sha: GitSha,
         deployed_checkout_sha: GitSha,
@@ -193,13 +235,21 @@ pub struct DeployGatePlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DeployProcedureIdentity {
+    MergeOnly,
     MeerkatFugueMergeOta { path: String },
     Unsupported { path: String },
 }
 
 impl DeployProcedureIdentity {
-    fn from_config(path: &str, repo: &GitHubRepoRef) -> Result<Self, String> {
+    fn from_config(path: &str, repo: &GitHubRepoRef, require_ota: bool) -> Result<Self, String> {
         let trimmed = path.trim();
+        if trimmed == "merge-only" {
+            return if require_ota {
+                Err("merge-only requires deploy.require_ota_update=false".to_string())
+            } else {
+                Ok(Self::MergeOnly)
+            };
+        }
         if trimmed.is_empty() {
             return Err("deploy procedure is empty".to_string());
         }
@@ -223,6 +273,7 @@ impl DeployProcedureIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeployGateDecision {
+    MergeOnly,
     MergeAndDeploy,
     ReadyForReview,
     Rework,
@@ -310,25 +361,29 @@ pub fn plan_deploy_gate(input: DeployGateInput) -> DeployGatePlan {
             "OTA update is not enabled",
         );
     }
-    let procedure_identity =
-        match DeployProcedureIdentity::from_config(&config.procedure, &pull_request.repo) {
-            Ok(identity) => identity,
-            Err(reason) => {
-                return DeployGatePlan {
-                    decision: DeployGateDecision::Blocked,
-                    target_lane: config.blocked_lane,
-                    procedure: config.procedure.clone(),
-                    procedure_identity: Some(DeployProcedureIdentity::Unsupported {
-                        path: config.procedure,
-                    }),
-                    failure_category: Some(DeployFailureCategory::UnsafeDeploy),
-                    reasons: vec![reason],
-                    merge: None,
-                };
-            }
-        };
+    let procedure_identity = match DeployProcedureIdentity::from_config(
+        &config.procedure,
+        &pull_request.repo,
+        config.require_ota_update,
+    ) {
+        Ok(identity) => identity,
+        Err(reason) => {
+            return DeployGatePlan {
+                decision: DeployGateDecision::Blocked,
+                target_lane: config.blocked_lane,
+                procedure: config.procedure.clone(),
+                procedure_identity: Some(DeployProcedureIdentity::Unsupported {
+                    path: config.procedure,
+                }),
+                failure_category: Some(DeployFailureCategory::UnsafeDeploy),
+                reasons: vec![reason],
+                merge: None,
+            };
+        }
+    };
 
-    if !input.deploy_auth_available {
+    let merge_only = procedure_identity == DeployProcedureIdentity::MergeOnly;
+    if !merge_only && !input.deploy_auth_available {
         return deploy_failure_plan(
             DeployGateDecision::Blocked,
             config.blocked_lane,
@@ -338,7 +393,11 @@ pub fn plan_deploy_gate(input: DeployGateInput) -> DeployGatePlan {
     }
 
     DeployGatePlan {
-        decision: DeployGateDecision::MergeAndDeploy,
+        decision: if merge_only {
+            DeployGateDecision::MergeOnly
+        } else {
+            DeployGateDecision::MergeAndDeploy
+        },
         target_lane: config.success_lane,
         procedure: config.procedure,
         procedure_identity: Some(procedure_identity),
@@ -494,6 +553,47 @@ mod tests {
             outcome.validate(),
             Err(DeployOutcomeError::FailedWithoutFailureCategory)
         );
+    }
+
+    #[test]
+    fn merge_only_accepts_an_allowed_enterprise_repo_without_ota() {
+        let mut input = gate_input();
+        let mut repo = input.pull_request.as_ref().unwrap().repo.clone();
+        repo.host = Some(crate::tools::GitHubHost::try_from("git.example.com".to_owned()).unwrap());
+        repo.owner = GitHubOwner("developer".into());
+        repo.name = GitHubRepoName("sandbox".into());
+        input.pull_request.as_mut().unwrap().repo = repo.clone();
+        input.config.allowed_repositories = vec![repo];
+        input.config.procedure = "merge-only".into();
+        input.config.require_ota_update = false;
+        input.ota_update_enabled = false;
+        input.deploy_auth_available = false;
+        let plan = plan_deploy_gate(input);
+        assert!(plan.merge.is_some(), "{plan:?}");
+        assert_eq!(serde_json::to_value(plan.decision).unwrap(), "merge_only");
+    }
+
+    #[test]
+    fn merge_only_retains_ci_and_head_guards() {
+        for (head, ci, expected) in [
+            ("stale", CiStatus::Success, DeployFailureCategory::StaleHead),
+            (
+                "abc123",
+                CiStatus::Failure,
+                DeployFailureCategory::CiNotGreen,
+            ),
+        ] {
+            let mut input = gate_input();
+            input.config.procedure = "merge-only".into();
+            input.config.require_ota_update = false;
+            input.ota_update_enabled = false;
+            input.deploy_auth_available = false;
+            input.recorded_head_sha = Some(GitSha(head.into()));
+            input.ci_status = Some(ci);
+            let plan = plan_deploy_gate(input);
+            assert!(plan.merge.is_none());
+            assert_eq!(plan.failure_category, Some(expected));
+        }
     }
 
     #[test]

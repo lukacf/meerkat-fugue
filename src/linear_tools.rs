@@ -297,6 +297,8 @@ impl<'a> LinearToolExecutor<'a> {
                 &rendered_body,
                 Some(&comment.body),
             );
+            let full_body =
+                crate::deploy_gate::merge_preserved_deploy_evidence(&full_body, &comment.body);
             if comment.body == full_body {
                 return Ok(UpsertWorkpadOutput {
                     comment_id: LinearCommentId(comment.id.clone()),

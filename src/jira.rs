@@ -89,6 +89,12 @@ pub struct JiraClient {
     attachment_limits: crate::tracker::AttachmentDownloadLimits,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MoveAuthority {
+    Automation,
+    Operator,
+}
+
 fn invalid(message: impl Into<String>) -> FugueError {
     FugueError::InvalidConfig(message.into())
 }
@@ -578,6 +584,7 @@ impl JiraClient {
             let previous = comment.body.markdown();
             let body =
                 crate::review_findings::merge_preserved_review_findings(&rendered, Some(&previous));
+            let body = crate::deploy_gate::merge_preserved_deploy_evidence(&body, &previous);
             let changed = body != previous;
             if changed {
                 let payload = CommentBody {
@@ -656,6 +663,23 @@ impl JiraClient {
     }
 
     pub async fn move_issue(&self, input: MoveIssueInput) -> Result<MoveIssueOutput> {
+        self.move_issue_with_authority(input, MoveAuthority::Automation)
+            .await
+    }
+
+    pub(crate) async fn move_issue_as_operator(
+        &self,
+        input: MoveIssueInput,
+    ) -> Result<MoveIssueOutput> {
+        self.move_issue_with_authority(input, MoveAuthority::Operator)
+            .await
+    }
+
+    async fn move_issue_with_authority(
+        &self,
+        input: MoveIssueInput,
+        authority: MoveAuthority,
+    ) -> Result<MoveIssueOutput> {
         let issue = self.fetch_issue(&input.issue).await?;
         if input
             .expected_updated_at
@@ -688,7 +712,8 @@ impl JiraClient {
                 "Jira has multiple available transitions to the requested status; an unambiguous workflow is required",
             ));
         }
-        if current.state.state_type == LinearStateType::Completed
+        if authority == MoveAuthority::Automation
+            && current.state.state_type == LinearStateType::Completed
             && transition.to.snapshot(&self.terminal_states).state_type
                 != LinearStateType::Completed
         {
