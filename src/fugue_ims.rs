@@ -212,6 +212,8 @@ impl FugueImsStore {
         let issue = self.resolve_linear_issue_ref(&input.issue)?;
         let body = workpad_body(&input.heading, &input.body_markdown);
         if let Some(existing) = self.workpad_snapshot(&issue.identifier, &input.heading)? {
+            let body =
+                crate::deploy_gate::merge_preserved_deploy_evidence(&body, &existing.body_markdown);
             self.update_comment(&ImsCommentId(existing.comment_id.0.clone()), &body)?;
             return Ok(UpsertWorkpadOutput {
                 comment_id: existing.comment_id,
@@ -1055,6 +1057,7 @@ fn sqlite_error(error: rusqlite::Error) -> FugueError {
 
 pub fn fugue_ims_tracker_config(path: &Path) -> TrackerConfig {
     TrackerConfig {
+        jira: None,
         kind: "fugue-ims".to_string(),
         endpoint: path.display().to_string(),
         api_key: None,

@@ -408,6 +408,31 @@ repo-configured deploy procedure file. The existing `meerkat-fugue` guarded
 merge + OTA behavior remains the default deploy procedure when `require_ota_update`
 and `ota_update` are configured.
 
+For a repository that needs PR merging without an application deployment, use
+the explicit `merge-only` procedure:
+
+```yaml
+deploy:
+  enabled: true
+  action_lane: Merge
+  procedure: merge-only
+  require_ota_update: false
+  ready_lane: Accepted
+  rework_lane: Working
+  blocked_lane: Blocked
+  success_lane: Closed
+  allowed_repositories:
+    - host: git.example.com
+      owner: developer
+      name: sandbox
+```
+
+Use status names already available in the configured tracker workflow. The
+repository allowlist, base branch, exact PR head, CI, and WorkGraph gates still
+apply. A successful merge-only action records `status: merged`, the reviewed
+head and merge commit, and no OTA evidence. The configured success lane is
+terminal for queue intake. Replaying the same completed action is idempotent.
+
 ## `server`
 
 ```yaml
@@ -451,6 +476,6 @@ staging, and only then runs the deployment replacement command from staging. The
 live checkout is not reset before build/health pass. The deploy command executes
 as the Fugue process user, so keep it atomic and operator reviewed. Production
 deploy commands should install the service binary and the helper MCP binaries
-(`fugue-linear-mcp`, `fugue-github-mcp`, and `fugue-host-mcp`) from the same
+(`fugue-linear-mcp`, `fugue-jira-mcp`, `fugue-github-mcp`, and `fugue-host-mcp`) from the same
 staging build before restart so member Workpad/GitHub tool behavior matches the
 service contract.

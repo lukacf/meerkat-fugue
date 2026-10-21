@@ -29,15 +29,15 @@ container, or OS sandbox for worker commands.
       modify.
 - [ ] Install and smoke-test Meerkat/Meta native execution tooling on the
       service host.
-- [ ] Deploy `meerkat-fugue`, `fugue-linear-mcp`, `fugue-github-mcp`,
+- [ ] Deploy `meerkat-fugue`, `fugue-linear-mcp`, `fugue-jira-mcp`, `fugue-github-mcp`,
       and `fugue-host-mcp` together so the service and companion MCP tool
       contracts stay in sync.
-      Install or restart all four binaries atomically; issue mob members use
+      Install or restart all five binaries atomically; issue mob members use
       the helper MCP binaries for Linear Workpad updates and GitHub PR/check/
       merge evidence, so deploying only the service can leave stale member tool
       behavior behind.
 - [ ] Record binary hash evidence for every Fugue binary in the issue-mob path:
-      `meerkat-fugue`, `fugue-linear-mcp`, `fugue-github-mcp`, and
+      `meerkat-fugue`, `fugue-linear-mcp`, `fugue-jira-mcp`, `fugue-github-mcp`, and
       `fugue-host-mcp`.
 - [ ] Prepare the remote host once:
 

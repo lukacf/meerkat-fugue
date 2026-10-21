@@ -54,6 +54,10 @@ struct Cli {
     #[arg(long)]
     ota_update: bool,
 
+    /// Validate configuration and tracker/repository access without starting agents.
+    #[arg(long, conflicts_with = "ota_update")]
+    check: bool,
+
     /// Backend profile to use when the positional argument is a repository directory.
     #[arg(long)]
     backend: Option<String>,
@@ -243,6 +247,9 @@ async fn run() -> anyhow::Result<()> {
 
     let workflow_path = cli.workflow.unwrap_or_else(|| PathBuf::from("fugue.yaml"));
     if workflow_path.is_dir() {
+        if cli.check {
+            anyhow::bail!("--check requires a workflow file");
+        }
         if cli.ensemble_config.is_some() {
             anyhow::bail!("--ensemble-config requires a workflow file, not repository onboarding");
         }
@@ -287,6 +294,53 @@ async fn run() -> anyhow::Result<()> {
     }
 
     manager.validate_dispatch()?;
+
+    if cli.check {
+        let config = manager.effective();
+        let adapter = meerkat_fugue::linear_adapter::IssueAdapter::from_config(&config.tracker)?;
+        let mut runtime = config.linear.clone();
+        runtime.provisioning.mode = meerkat_fugue::config::NativeLinearProvisioningMode::Validate;
+        adapter
+            .ensure_projection_lanes(&config.tracker, &runtime)
+            .await?;
+        let issues = adapter.fetch_candidate_issues().await?;
+        let github = meerkat_fugue::github_tools::GitHubToolHost::new();
+        let mut repositories = Vec::new();
+        for repo in &config
+            .kapellmeister
+            .shadow_mode
+            .authority
+            .safe_selectors
+            .repositories
+        {
+            match github.inspect_repo(meerkat_fugue::tools::InspectRepoInput { repo: repo.clone() })
+            {
+                meerkat_fugue::tools::FugueToolResult::Ok {
+                    output: meerkat_fugue::tools::FugueToolOutput::GitHubInspectRepo(output),
+                    ..
+                } => repositories.push(output.repo),
+                meerkat_fugue::tools::FugueToolResult::Err { error, .. } => {
+                    anyhow::bail!("repository preflight failed: {}", error.message)
+                }
+                _ => anyhow::bail!("repository preflight returned an unexpected result"),
+            }
+        }
+        #[derive(serde::Serialize)]
+        struct CheckReport<'a> {
+            tracker: &'a str,
+            candidate_issues: usize,
+            repositories: Vec<meerkat_fugue::tools::GitHubRepoSnapshot>,
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&CheckReport {
+                tracker: &config.tracker.kind,
+                candidate_issues: issues.len(),
+                repositories
+            })?
+        );
+        return Ok(());
+    }
 
     let (refresh_tx, refresh_rx) = mpsc::channel(8);
     let mut orchestrator = Orchestrator::new(manager, refresh_rx);

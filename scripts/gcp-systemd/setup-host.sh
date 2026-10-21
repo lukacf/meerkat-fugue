@@ -9,7 +9,7 @@ Usage:
 Prepares a trusted GCP/Linux host for Fugue queues. It creates the reusable
 directory layout, a shared secrets.env placeholder, and a prepare-auth.sh hook.
 If --bin-source is provided, it installs meerkat-fugue, fugue-linear-mcp,
-fugue-github-mcp, and fugue-host-mcp into $fugue_root/bin.
+fugue-jira-mcp, fugue-github-mcp, and fugue-host-mcp into $fugue_root/bin.
 USAGE
 }
 
@@ -96,6 +96,7 @@ fi
 if [[ -n "$bin_source" ]]; then
   install -m 0755 ${owner_args[@]+"${owner_args[@]}"} "$bin_source/meerkat-fugue" "$fugue_root/bin/meerkat-fugue"
   install -m 0755 ${owner_args[@]+"${owner_args[@]}"} "$bin_source/fugue-linear-mcp" "$fugue_root/bin/fugue-linear-mcp"
+  install -m 0755 ${owner_args[@]+"${owner_args[@]}"} "$bin_source/fugue-jira-mcp" "$fugue_root/bin/fugue-jira-mcp"
   install -m 0755 ${owner_args[@]+"${owner_args[@]}"} "$bin_source/fugue-github-mcp" "$fugue_root/bin/fugue-github-mcp"
   install -m 0755 ${owner_args[@]+"${owner_args[@]}"} "$bin_source/fugue-host-mcp" "$fugue_root/bin/fugue-host-mcp"
 fi

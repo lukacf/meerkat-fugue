@@ -438,7 +438,13 @@ impl EnsembleRuntime {
                 .require_incremental_session_persistence(true)
                 .roster_provider(Arc::new(MutableRosterProvider::new(roster)))
                 .topology_provider(Arc::new(TeamTopology(edges)))
-                .identity_bootstrap_mode(IdentityBootstrapMode::EagerMaterialize)
+                // Fresh members share the native memory store. Serialize its
+                // first opens so schema admission cannot observe another
+                // member's partially initialized domain. The native readiness
+                // barrier below still admits the whole team before serving.
+                .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
+                    concurrency: 1,
+                })
                 .session_hook(Arc::new(RepositorySessionHook {
                     root: repository.path.clone(),
                     state_root: self.config.state_root.clone(),
@@ -1100,6 +1106,9 @@ async fn restore_member_transports(repo: &RepoId, entry: &RepositoryRuntime) -> 
         .identity_runtime()
         .context("identity authority missing")?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    // Native bootstrap and continuity repair can still be publishing the roster
+    // when the builder returns. Read aliases only after the native barrier;
+    // Broken is terminal and must surface as a startup error, not a missing alias.
     let (bootstrap, timed_out) = authority
         .wait_identity_bootstrap_terminal(Duration::from_secs(60))
         .await;

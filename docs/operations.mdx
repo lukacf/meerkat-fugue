@@ -26,10 +26,10 @@ sandbox.
       `linear.provisioning.mode: create_missing` with an explicit team.
 - [ ] Confirm workers have GitHub credentials for target repositories.
 - [ ] Install and smoke-test Meerkat/Meta native execution tooling.
-- [ ] Deploy `meerkat-fugue`, `fugue-linear-mcp`, `fugue-github-mcp`,
+- [ ] Deploy `meerkat-fugue`, `fugue-linear-mcp`, `fugue-jira-mcp`, `fugue-github-mcp`,
       and `fugue-host-mcp` together so the service and companion MCP tool
       contracts stay in sync.
-      Install or restart all four binaries atomically; issue mob members use
+      Install or restart all five binaries atomically; issue mob members use
       the helper MCP binaries for Linear Workpad updates and GitHub PR/check/
       merge evidence, so deploying only the service can leave stale member tool
       behavior behind.
@@ -37,7 +37,7 @@ sandbox.
       `scripts/gcp-systemd/ota-update.sh` for one-command pull/build/replace/
       restart updates from the host.
 - [ ] Record binary hash evidence for every Fugue binary in the issue-mob path:
-      `meerkat-fugue`, `fugue-linear-mcp`, `fugue-github-mcp`, and
+      `meerkat-fugue`, `fugue-linear-mcp`, `fugue-jira-mcp`, `fugue-github-mcp`, and
       `fugue-host-mcp`.
 - [ ] Run `scripts/gcp-systemd/setup-host.sh` once on the remote host to create
       the Fugue root, binary directory, shared secrets file, queue/workspace/log/

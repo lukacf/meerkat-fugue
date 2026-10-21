@@ -79,7 +79,7 @@ impl AttachmentDownloadBudget {
             .saturating_sub(self.downloaded_bytes)
     }
 
-    fn reserve_file(&self, url: &str) -> Result<()> {
+    pub(crate) fn reserve_file(&self, url: &str) -> Result<()> {
         if self.downloaded_files >= self.limits.max_files {
             return Err(FugueError::ResponseError(format!(
                 "attachment download blocked for {url}: max attachment count {} exceeded",
@@ -89,7 +89,11 @@ impl AttachmentDownloadBudget {
         Ok(())
     }
 
-    fn check_content_length(&self, url: &str, content_length: Option<u64>) -> Result<()> {
+    pub(crate) fn check_content_length(
+        &self,
+        url: &str,
+        content_length: Option<u64>,
+    ) -> Result<()> {
         if let Some(content_length) = content_length {
             if content_length > self.limits.max_file_bytes {
                 return Err(FugueError::ResponseError(format!(
@@ -107,7 +111,7 @@ impl AttachmentDownloadBudget {
         Ok(())
     }
 
-    fn check_streamed_len(&self, url: &str, byte_len: u64) -> Result<()> {
+    pub(crate) fn check_streamed_len(&self, url: &str, byte_len: u64) -> Result<()> {
         if byte_len > self.limits.max_file_bytes {
             return Err(FugueError::ResponseError(format!(
                 "attachment download blocked for {url}: streamed bytes {byte_len} exceed per-file limit {}",
@@ -123,7 +127,7 @@ impl AttachmentDownloadBudget {
         Ok(())
     }
 
-    fn record_success(&mut self, byte_len: u64) {
+    pub(crate) fn record_success(&mut self, byte_len: u64) {
         self.downloaded_files += 1;
         self.downloaded_bytes = self.downloaded_bytes.saturating_add(byte_len);
     }
@@ -1149,6 +1153,7 @@ mod tests {
         max_attachment_total_bytes: u64,
     ) -> TrackerConfig {
         TrackerConfig {
+            jira: None,
             kind: "linear".to_string(),
             endpoint: "https://api.linear.app/graphql".to_string(),
             api_key: Some("token".to_string()),

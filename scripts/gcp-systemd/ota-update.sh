@@ -83,7 +83,7 @@ replace_stray_processes=false
 dry_run=false
 runtime_stage_dir=
 runtime_backup_dir=
-runtime_binaries=(meerkat-fugue fugue-linear-mcp fugue-github-mcp fugue-host-mcp)
+runtime_binaries=(meerkat-fugue fugue-linear-mcp fugue-jira-mcp fugue-github-mcp fugue-host-mcp)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -273,6 +273,7 @@ export CARGO_PROFILE_RELEASE_DEBUG="${CARGO_PROFILE_RELEASE_DEBUG:-false}"
 run cargo build --release \
   --bin meerkat-fugue \
   --bin fugue-linear-mcp \
+  --bin fugue-jira-mcp \
   --bin fugue-github-mcp \
   --bin fugue-host-mcp
 

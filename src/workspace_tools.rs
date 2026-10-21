@@ -343,6 +343,7 @@ mod tests {
     fn create_input(workspace_key: &str, reuse_existing: bool) -> CreateWorkspaceInput {
         CreateWorkspaceInput {
             repo: GitHubRepoRef {
+                host: None,
                 owner: GitHubOwner("lukacf".to_string()),
                 name: GitHubRepoName("meerkat-fugue".to_string()),
             },
@@ -441,6 +442,7 @@ mod tests {
             .await;
         let mut conflicting = create_input("LUC-137", true);
         conflicting.repo = GitHubRepoRef {
+            host: None,
             owner: GitHubOwner("other".to_string()),
             name: GitHubRepoName("repo".to_string()),
         };

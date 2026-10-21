@@ -716,6 +716,7 @@ mod tests {
 
     fn repo() -> GitHubRepoRef {
         GitHubRepoRef {
+            host: None,
             owner: GitHubOwner("lukacf".to_string()),
             name: GitHubRepoName("meerkat-fugue".to_string()),
         }

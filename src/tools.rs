@@ -380,8 +380,67 @@ pub enum LinearUserRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubRepoRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<GitHubHost>,
     pub owner: GitHubOwner,
     pub name: GitHubRepoName,
+}
+
+/// Validated GitHub Enterprise hostname, optionally including a port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct GitHubHost(String);
+
+impl TryFrom<String> for GitHubHost {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let url = reqwest::Url::parse(&format!("https://{value}"))
+            .map_err(|_| "GitHub host must be a hostname, optionally with a port".to_string())?;
+        if value.is_empty()
+            || value
+                .bytes()
+                .any(|byte| !byte.is_ascii_alphanumeric() && !b".-:[]".contains(&byte))
+            || value.contains(['/', '?', '#', '@', '\\'])
+            || value.chars().any(char::is_whitespace)
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err("GitHub host must not contain a URL, path, or credentials".to_string());
+        }
+        Ok(Self(value.to_ascii_lowercase()))
+    }
+}
+
+impl From<GitHubHost> for String {
+    fn from(host: GitHubHost) -> Self {
+        host.0
+    }
+}
+
+impl fmt::Display for GitHubHost {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl GitHubRepoRef {
+    pub fn hostname(&self) -> &str {
+        self.host
+            .as_ref()
+            .map(|host| host.0.as_str())
+            .unwrap_or("github.com")
+    }
+}
+
+impl fmt::Display for GitHubRepoRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(host) = &self.host {
+            write!(formatter, "{host}/")?;
+        }
+        write!(formatter, "{}/{}", self.owner.0, self.name.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1206,6 +1265,30 @@ pub enum RetryAdvice {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn repository_hosts_reject_urls_credentials_and_paths() {
+        for host in [
+            "",
+            "https://git.example.com",
+            "user@git.example.com",
+            "git.example.com/other",
+            "git.example.com?query",
+            "git.example.com#fragment",
+            "git.example.com\\other",
+            "git example.com",
+        ] {
+            assert!(
+                GitHubHost::try_from(host.to_string()).is_err(),
+                "accepted {host:?}"
+            );
+        }
+        let repo: GitHubRepoRef = serde_json::from_value(
+            json!({"host":"GIT.EXAMPLE.COM:8443","owner":"acme","name":"app"}),
+        )
+        .expect("repo");
+        assert_eq!(repo.to_string(), "git.example.com:8443/acme/app");
+    }
 
     #[test]
     fn operation_names_round_trip_as_catalog_strings() {

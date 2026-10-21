@@ -10,9 +10,8 @@ Powered by [Meerkat](https://github.com/lukacf/meerkat) and
 teams of repository specialists that study the codebase, remember what they
 learn, and coordinate across repositories.
 
-Use the built-in issue store, **Fugue IMS**, or connect **Linear**. Issue-driven
-workflows are central to Fugue; Linear is an optional integration, not a
-requirement.
+Use the built-in issue store, **Fugue IMS**, or connect **Linear** or **Jira**.
+GitHub and GitHub Enterprise repositories use the authenticated `gh` CLI.
 
 ## Install
 
@@ -26,9 +25,9 @@ cd meerkat-fugue
 cargo install --locked --path .
 ```
 
-This installs `meerkat-fugue`, `fugue-linear-mcp`, `fugue-github-mcp`, and
-`fugue-host-mcp`. Upgrade these together; the
-[operations guide](docs/operations.mdx) covers atomically replacing the four binaries.
+This installs `meerkat-fugue`, `fugue-linear-mcp`, `fugue-jira-mcp`,
+`fugue-github-mcp`, and `fugue-host-mcp`. Upgrade these together; the
+[operations guide](docs/operations.mdx) covers atomically replacing the five binaries.
 
 Fugue currently uses
 Meerkat/Meta 0.9.3, with an exact upstream Meta backport for persisted-session
@@ -42,12 +41,15 @@ and tracks review and delivery evidence. Choose your issue source:
 
 - **Fugue IMS:** the built-in local issue store, with no Linear account or API key.
 - **Linear:** an optional integration with your existing project and workflow.
+- **Jira:** an optional integration with existing Cloud or Server/Data Center workflows.
 
 Start with [fugue.example.yaml](fugue.example.yaml) and the
 [configuration reference](docs/configuration.mdx). The example is configured for
 Linear; to use Fugue IMS, set `kind: fugue-ims` and a SQLite `endpoint` in the
 existing `linear` configuration section, and omit the Linear API key and external
-Linear MCP server. The section retains its historical name for both issue sources.
+Linear MCP server. The section also accepts the name `tracker` for all issue sources.
+For Jira, start with [fugue.jira.example.yaml](fugue.jira.example.yaml) and the
+[Jira and GitHub Enterprise guide](docs/jira-and-github-enterprise.mdx).
 Configure repository hooks and agent tools for your environment before starting
 the queue. For Linear, follow the [Linear workflow setup guide](docs/getting-started.mdx).
 
@@ -129,6 +131,7 @@ transcripts. See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 - [Ensemble](docs/ensemble.mdx): formation, specialists, peering, and memory.
 - [Linear workflow setup](docs/getting-started.mdx): optional Linear integration and onboarding.
+- [Jira and GitHub Enterprise](docs/jira-and-github-enterprise.mdx): private configuration, authentication, workflow mapping, and validation.
 - [Configuration](docs/configuration.mdx): queue, agents, tools, and server settings.
 - [Native mobs](docs/native-mobs.mdx): orchestration, review, and delivery contracts.
 - [Architecture](docs/architecture.mdx): runtime boundaries and recovery.

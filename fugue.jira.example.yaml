@@ -1,0 +1,95 @@
+version: 1
+
+tracker:
+  kind: jira
+  endpoint: $JIRA_BASE_URL
+  api_key: $JIRA_API_TOKEN
+  project_slug: EXAMPLE
+  jira:
+    email: $JIRA_EMAIL
+    api_version: "3"
+    auth: basic
+    jql: 'labels = "fugue"'
+    issue_type: Task
+  provisioning:
+    mode: validate
+  lanes:
+    parked: To Do
+    ready: To Do
+    active: In Progress
+    success: Done
+    canceled: Done
+    duplicate: Done
+
+linear_projections:
+  implementation:
+    node_lanes:
+      planner: In Progress
+      coder: In Progress
+      reviewer: In Progress
+    aggregate:
+      precedence: [In Progress]
+      fallback: In Progress
+    terminal_lanes:
+      succeeded: Done
+      failed: In Progress
+      cancelled: Done
+
+selection:
+  default_template: implementation
+
+mcp_servers:
+  jira:
+    command: [fugue-jira-mcp]
+    env:
+      JIRA_API_TOKEN: $JIRA_API_TOKEN
+  github:
+    command: [fugue-github-mcp]
+    env:
+      FUGUE_GITHUB_HOST: git.example.com
+      FUGUE_GITHUB_OWNER: example
+      FUGUE_GITHUB_REPO: app
+
+agents:
+  planner:
+    model: gpt-5.5
+    tools: [mob, workgraph, mcp:jira, mcp:github]
+    system_prompt: Plan the issue in its Fugue Workpad and record blocking obligations.
+  coder:
+    model: gpt-5.5
+    tools: [mob, shell, git, workgraph, mcp:jira, mcp:github]
+    system_prompt: Implement the Workpad plan in the supplied worktree and verify the change.
+  reviewer:
+    model: gpt-5.5
+    tools: [mob, shell, git, workgraph, mcp:jira, mcp:github]
+    system_prompt: Review the diff and evidence, then close verified WorkGraph obligations.
+
+mob_templates:
+  implementation:
+    linear_projection: implementation
+    max_review_cycles: 3
+    members: [planner, coder, reviewer]
+
+worker:
+  prompt_template: >-
+    Work on {{ issue.identifier }}: {{ issue.title }}. Follow repository instructions,
+    preserve unrelated work, keep one Fugue Workpad, and verify changes before handoff.
+
+workspace:
+  root: ./fugue_workspaces
+
+hooks:
+  timeout_ms: 60000
+  after_create: |
+    gh repo clone git.example.com/example/app .
+  before_run: |
+    git fetch --all --prune
+
+kapellmeister:
+  shadow_mode:
+    enabled: false
+  safe_selectors:
+    repositories:
+      - host: git.example.com
+        owner: example
+        name: app

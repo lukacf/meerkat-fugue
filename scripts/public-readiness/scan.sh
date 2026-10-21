@@ -37,7 +37,7 @@ esac
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-token_pattern='(BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9_]{36,}|github_pat_[A-Za-z0-9_]+|xox[baprs]-[A-Za-z0-9-]+|sk-[A-Za-z0-9]{20,})'
+token_pattern='(BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9_]{36,}|github_pat_[A-Za-z0-9_]+|xox[baprs]-[A-Za-z0-9-]+|sk-[A-Za-z0-9]{20,}|ATATT[A-Za-z0-9_=-]{20,})'
 # Keep deployment inventory out of tracked source. Supply known private values
 # from the operator environment when auditing a repository for publication.
 live_infra_pattern="${FUGUE_PRIVATE_INFRA_PATTERN:-}"

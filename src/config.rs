@@ -60,6 +60,7 @@ pub struct TrackerConfig {
     pub endpoint: String,
     #[serde(skip_serializing)]
     pub api_key: Option<String>,
+    pub jira: Option<crate::jira::JiraConfig>,
     pub project_slug: Option<String>,
     pub intake_states: Vec<String>,
     pub in_flight_states: Vec<String>,
@@ -416,6 +417,54 @@ fn default_independent_review_findings_comment_marker() -> String {
 }
 
 impl TrackerConfig {
+    pub fn from_mcp_env(default_kind: &str) -> Result<Self> {
+        let kind = env::var("FUGUE_TRACKER_KIND").unwrap_or_else(|_| default_kind.to_string());
+        let mut raw = Map::new();
+        raw.insert("kind".to_string(), json!(kind));
+        let (endpoint_key, project_key) = match kind.as_str() {
+            "jira" => ("JIRA_BASE_URL", "JIRA_PROJECT_KEY"),
+            "fugue-ims" => ("FUGUE_IMS_ENDPOINT", "FUGUE_IMS_PROJECT"),
+            _ => ("LINEAR_ENDPOINT", "LINEAR_PROJECT_SLUG"),
+        };
+        for (field, variable) in [("endpoint", endpoint_key), ("project_slug", project_key)] {
+            if let Ok(value) = env::var(variable) {
+                raw.insert(field.to_string(), json!(value));
+            }
+        }
+        for (field, variable) in [
+            ("intake_states", "FUGUE_LINEAR_INTAKE_STATES"),
+            ("in_flight_states", "FUGUE_LINEAR_IN_FLIGHT_STATES"),
+            ("active_states", "FUGUE_LINEAR_ACTIVE_STATES"),
+            ("terminal_states", "FUGUE_LINEAR_TERMINAL_STATES"),
+        ] {
+            let states: Vec<_> = env::var(variable)
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect();
+            raw.insert(field.to_string(), json!(states));
+        }
+        if kind == "jira" {
+            let mut jira = Map::new();
+            for (field, variable) in [
+                ("auth", "JIRA_AUTH_MODE"),
+                ("api_version", "JIRA_API_VERSION"),
+                ("jql", "JIRA_JQL"),
+                ("issue_type", "JIRA_ISSUE_TYPE"),
+                ("create_fields_file", "JIRA_CREATE_FIELDS_FILE"),
+                ("transition_fields_file", "JIRA_TRANSITION_FIELDS_FILE"),
+            ] {
+                if let Ok(value) = env::var(variable) {
+                    jira.insert(field.to_string(), json!(value));
+                }
+            }
+            raw.insert("jira".to_string(), Value::Object(jira));
+        }
+        Self::from_raw(Some(&raw))
+    }
+
     pub fn is_intake_state(&self, state: &str) -> bool {
         let normalized = normalize_state(state);
         self.intake_states
@@ -883,6 +932,7 @@ pub struct NativeFugueConfig {
     pub mob: Option<NativeMobExecutionSection>,
     #[serde(default)]
     pub tracker_lanes: Option<TrackerLaneRoles>,
+    #[serde(alias = "tracker")]
     pub linear: NativeLinearConfig,
     pub selection: NativeSelectionConfig,
     #[serde(default)]
@@ -927,6 +977,8 @@ pub struct NativeLinearConfig {
     pub endpoint: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub jira: Option<crate::jira::JiraConfig>,
     #[serde(default)]
     pub project_slug: Option<String>,
     #[serde(default)]
@@ -1340,6 +1392,13 @@ impl WorkflowConfigManager {
 }
 
 impl ServiceConfig {
+    /// A tracker with one shared unstarted status has no separate parked lane.
+    /// Explicit intake scope takes precedence so that status remains runnable.
+    pub fn is_parked_state(&self, state: &str) -> bool {
+        normalize_state(state) == normalize_state(&self.linear.lanes.parked)
+            && !self.tracker.is_intake_state(state)
+    }
+
     pub fn from_definition(path: PathBuf, definition: &WorkflowDefinition) -> Result<Self> {
         let workflow_dir = path
             .parent()
@@ -1450,7 +1509,7 @@ impl ServiceConfig {
     }
 
     pub fn validate_dispatch(&self) -> Result<()> {
-        if self.tracker.kind != "linear" && self.tracker.kind != "fugue-ims" {
+        if !matches!(self.tracker.kind.as_str(), "linear" | "fugue-ims" | "jira") {
             return Err(FugueError::UnsupportedTrackerKind(
                 self.tracker.kind.clone(),
             ));
@@ -1463,6 +1522,9 @@ impl ServiceConfig {
             }
             self.mob.validate_before_dispatch()?;
             return Ok(());
+        }
+        if self.tracker.kind == "jira" {
+            crate::jira::JiraClient::from_config(&self.tracker)?;
         }
         if self.tracker.api_key.as_deref().is_none_or(str::is_empty) {
             return Err(FugueError::MissingTrackerApiKey);
@@ -1621,6 +1683,8 @@ impl TrackerConfig {
         let endpoint = opt_string(raw, "endpoint")?.unwrap_or_else(|| {
             if kind == "fugue-ims" {
                 "fugue-ims.sqlite".to_string()
+            } else if kind == "jira" {
+                env::var("JIRA_BASE_URL").unwrap_or_default()
             } else {
                 "https://api.linear.app/graphql".to_string()
             }
@@ -1628,9 +1692,13 @@ impl TrackerConfig {
         let configured_api_key = opt_string(raw, "api_key")?;
         let api_key = match configured_api_key {
             Some(value) => resolve_env_string(&value),
-            None => env::var("LINEAR_API_KEY")
-                .ok()
-                .filter(|value| !value.is_empty()),
+            None => env::var(if kind == "jira" {
+                "JIRA_API_TOKEN"
+            } else {
+                "LINEAR_API_KEY"
+            })
+            .ok()
+            .filter(|value| !value.is_empty()),
         };
         let active_states = opt_string_list(raw, "active_states")?
             .unwrap_or_else(|| vec!["Todo".to_string(), "Active".to_string()]);
@@ -1649,6 +1717,10 @@ impl TrackerConfig {
             kind,
             endpoint,
             api_key,
+            jira: opt_value(raw, "jira")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()
+                .map_err(|err| FugueError::InvalidConfig(format!("tracker.jira: {err}")))?,
             project_slug: opt_string(raw, "project_slug")?,
             intake_states,
             in_flight_states,
@@ -1766,7 +1838,8 @@ impl DeployLaneConfig {
 
     pub fn allows_repository(&self, repo: &GitHubRepoRef) -> bool {
         self.allowed_repositories.iter().any(|allowed| {
-            allowed.owner.0.eq_ignore_ascii_case(&repo.owner.0)
+            allowed.hostname() == repo.hostname()
+                && allowed.owner.0.eq_ignore_ascii_case(&repo.owner.0)
                 && allowed.name.0.eq_ignore_ascii_case(&repo.name.0)
         })
     }
@@ -2155,6 +2228,10 @@ fn repo_ref_from_value(value: &Value, key: &str) -> Result<GitHubRepoRef> {
     let name = opt_string(Some(object), "name")?
         .ok_or_else(|| FugueError::InvalidConfig(format!("{key}.name is required")))?;
     Ok(GitHubRepoRef {
+        host: opt_string(Some(object), "host")?
+            .map(crate::tools::GitHubHost::try_from)
+            .transpose()
+            .map_err(FugueError::InvalidConfig)?,
         owner: GitHubOwner(owner),
         name: GitHubRepoName(name),
     })
@@ -2794,6 +2871,9 @@ fn native_tracker_value<'a>(
     add_unique_state(&mut terminal_states, linear.lanes.success.clone());
     add_unique_state(&mut terminal_states, linear.lanes.canceled.clone());
     add_unique_state(&mut terminal_states, linear.lanes.duplicate.clone());
+    if let Some(deploy) = deploy.filter(|config| config.enabled) {
+        add_unique_state(&mut terminal_states, deploy.success_lane.clone());
+    }
     let mut tracker = Map::new();
     tracker.insert(
         "kind".to_string(),
@@ -2804,6 +2884,9 @@ fn native_tracker_value<'a>(
     }
     if let Some(api_key) = &linear.api_key {
         tracker.insert("api_key".to_string(), Value::String(api_key.clone()));
+    }
+    if let Some(jira) = &linear.jira {
+        tracker.insert("jira".to_string(), json!(jira));
     }
     if let Some(project_slug) = &linear.project_slug {
         tracker.insert(
@@ -2892,6 +2975,11 @@ fn required_linear_states<'a>(
     }
     if let Some(deploy) = deploy.filter(|config| config.enabled) {
         push_required_state(&mut required, deploy.lane.clone(), LinearStateType::Started);
+        push_required_state(
+            &mut required,
+            deploy.success_lane.clone(),
+            LinearStateType::Completed,
+        );
     }
     if let Some(blocked) = &linear.lanes.blocked {
         push_required_state(&mut required, blocked.clone(), LinearStateType::Started);
@@ -3033,6 +3121,63 @@ fn native_mcp_servers_with_linear_scope(
                 server
                     .env
                     .insert("LINEAR_PROJECT_SLUG".to_string(), project_slug.to_string());
+                if linear.kind.as_deref() == Some("jira") {
+                    if let Some(api_key) = &linear.api_key {
+                        server
+                            .env
+                            .insert("JIRA_API_TOKEN".to_string(), api_key.clone());
+                    }
+                    server
+                        .env
+                        .insert("FUGUE_TRACKER_KIND".to_string(), "jira".to_string());
+                    server
+                        .env
+                        .insert("JIRA_PROJECT_KEY".to_string(), project_slug.to_string());
+                    if let Some(endpoint) = &linear.endpoint {
+                        server
+                            .env
+                            .insert("JIRA_BASE_URL".to_string(), endpoint.clone());
+                    }
+                    if let Some(jira) = &linear.jira {
+                        if let Some(email) = &jira.email {
+                            server.env.insert("JIRA_EMAIL".to_string(), email.clone());
+                        }
+                        if let Some(jql) = &jira.jql {
+                            server.env.insert("JIRA_JQL".to_string(), jql.clone());
+                        }
+                        if let Some(path) = &jira.transition_fields_file {
+                            server
+                                .env
+                                .insert("JIRA_TRANSITION_FIELDS_FILE".to_string(), path.clone());
+                        }
+                        if let Some(path) = &jira.create_fields_file {
+                            server
+                                .env
+                                .insert("JIRA_CREATE_FIELDS_FILE".to_string(), path.clone());
+                        }
+                        if let Some(issue_type) = &jira.issue_type {
+                            server
+                                .env
+                                .insert("JIRA_ISSUE_TYPE".to_string(), issue_type.clone());
+                        }
+                        server.env.insert(
+                            "JIRA_AUTH_MODE".to_string(),
+                            match jira.auth {
+                                crate::jira::JiraAuth::Basic => "basic",
+                                crate::jira::JiraAuth::Bearer => "bearer",
+                            }
+                            .to_string(),
+                        );
+                        server.env.insert(
+                            "JIRA_API_VERSION".to_string(),
+                            match jira.api_version {
+                                crate::jira::JiraApiVersion::V2 => "2",
+                                crate::jira::JiraApiVersion::V3 => "3",
+                            }
+                            .to_string(),
+                        );
+                    }
+                }
             }
         }
     }
@@ -3040,7 +3185,11 @@ fn native_mcp_servers_with_linear_scope(
 }
 
 pub(crate) fn is_native_linear_mcp_server(name: &str, server: &NativeMcpServerConfig) -> bool {
-    name == "linear" || native_mcp_command_basename(server) == Some("fugue-linear-mcp")
+    matches!(name, "linear" | "jira")
+        || matches!(
+            native_mcp_command_basename(server),
+            Some("fugue-linear-mcp" | "fugue-jira-mcp")
+        )
 }
 
 fn native_mcp_command_basename(server: &NativeMcpServerConfig) -> Option<&str> {
@@ -3242,6 +3391,39 @@ fn projection_terminal_lanes(
 }
 
 fn validate_linear_config(linear: &NativeLinearConfig) -> Result<()> {
+    if linear.kind.as_deref() == Some("jira") {
+        // Existing Jira workflows may use one intake/backlog status and one
+        // terminal status for several semantic outcomes. Runtime outcomes remain typed.
+        let lanes = &linear.lanes;
+        let mut seen = BTreeMap::new();
+        validate_linear_lane_anchor(&mut seen, "ready", &lanes.ready)?;
+        if normalize_state(&lanes.parked) != normalize_state(&lanes.ready) {
+            validate_linear_lane_anchor(&mut seen, "parked", &lanes.parked)?;
+        }
+        let mut terminal_names = BTreeSet::new();
+        for (role, value) in [
+            ("success", &lanes.success),
+            ("canceled", &lanes.canceled),
+            ("duplicate", &lanes.duplicate),
+        ] {
+            if terminal_names.insert(normalize_state(value)) {
+                validate_linear_lane_anchor(&mut seen, role, value)?;
+            }
+        }
+        for (role, value) in [
+            ("active", &lanes.active),
+            ("review_ready", &lanes.review_ready),
+            ("rework", &lanes.rework),
+            ("do_review", &lanes.do_review),
+            ("deploy", &lanes.deploy),
+            ("blocked", &lanes.blocked),
+        ] {
+            if let Some(value) = value {
+                validate_linear_lane_anchor(&mut seen, role, value)?;
+            }
+        }
+        return Ok(());
+    }
     validate_linear_lane_anchors(&linear.lanes)
 }
 
@@ -3420,7 +3602,7 @@ fn validate_agent_profiles(
             }
         }
         for tool in &agent.tools {
-            if matches!(tool.as_str(), "linear" | "github") {
+            if matches!(tool.as_str(), "linear" | "jira" | "github") {
                 return Err(FugueError::InvalidConfig(format!(
                     "agents.{name}.tools uses {tool:?}, but repo tools must be packaged as MCP servers and referenced as mcp:{tool}"
                 )));
@@ -3920,6 +4102,66 @@ mod tests {
     use crate::domain::{Issue, IssueAttachment};
 
     #[test]
+    fn jira_example_materializes_scope_authentication_and_existing_statuses() {
+        let source = include_str!("../fugue.jira.example.yaml")
+            .replace("$JIRA_BASE_URL", "https://jira.example.com")
+            .replace("$JIRA_API_TOKEN", "fixture-token")
+            .replace("$JIRA_EMAIL", "fixture@example.com");
+        let path = PathBuf::from("/tmp/fugue.yaml");
+        let definition = parse_native_workflow(&path, &source).expect("Jira example");
+        let config = ServiceConfig::from_definition(path, &definition).expect("service config");
+        config
+            .validate_dispatch()
+            .expect("Jira dispatch configuration");
+        assert_eq!(config.tracker.kind, "jira");
+        assert_eq!(
+            config
+                .tracker
+                .jira
+                .as_ref()
+                .expect("Jira config")
+                .jql
+                .as_deref(),
+            Some("labels = \"fugue\"")
+        );
+        assert_eq!(
+            config.mob.mcp_servers["jira"].env["JIRA_PROJECT_KEY"],
+            "EXAMPLE"
+        );
+        assert_eq!(
+            config.mob.mcp_servers["jira"].env["FUGUE_TRACKER_KIND"],
+            "jira"
+        );
+        assert_eq!(config.linear.lanes.active.as_deref(), Some("In Progress"));
+        assert!(
+            crate::linear_lane_state::legacy_linear_lane_repair(&config, "In Progress").is_none()
+        );
+        let repo = &config
+            .kapellmeister
+            .shadow_mode
+            .authority
+            .safe_selectors
+            .repositories[0];
+        assert_eq!(repo.hostname(), "git.example.com");
+    }
+
+    #[test]
+    fn repository_allowlists_distinguish_github_hosts() {
+        let enterprise: GitHubRepoRef = serde_json::from_value(
+            json!({"host":"git.example.com","owner":"example","name":"app"}),
+        )
+        .expect("enterprise repo");
+        let public: GitHubRepoRef =
+            serde_json::from_value(json!({"owner":"example","name":"app"})).expect("public repo");
+        let config = DeployLaneConfig {
+            allowed_repositories: vec![enterprise.clone()],
+            ..Default::default()
+        };
+        assert!(config.allows_repository(&enterprise));
+        assert!(!config.allows_repository(&public));
+    }
+
+    #[test]
     fn native_config_defaults_apply() {
         let definition = WorkflowDefinition {
             config: json!({
@@ -4045,10 +4287,12 @@ mod tests {
         assert!(config.deploy.require_no_blocking_workgraph);
         assert!(config.deploy.require_ota_update);
         assert!(config.deploy.allows_repository(&GitHubRepoRef {
+            host: None,
             owner: GitHubOwner("LUKACF".to_string()),
             name: GitHubRepoName("meerkat-fugue".to_string()),
         }));
         assert!(!config.deploy.allows_repository(&GitHubRepoRef {
+            host: None,
             owner: GitHubOwner("lukacf".to_string()),
             name: GitHubRepoName("other".to_string()),
         }));
