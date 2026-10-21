@@ -1,0 +1,85 @@
+# Troubleshooting
+
+Use this guide when Fugue is not dispatching work, a native run stalls, or
+handoff evidence is inconsistent.
+
+## No issues are picked up
+
+Check:
+
+1. `linear.project_slug` matches the target project.
+2. The issue is in `linear.lanes.ready` for fresh native dispatch.
+3. Required labels match `linear.labels` and `selection.by_label` rules.
+4. The issue is not blocked, terminal, already running, claimed by another run,
+   or waiting for retry backoff.
+5. The status API `last_errors` does not show Linear authentication or GraphQL
+   errors.
+
+After fixing configuration or lanes, call `POST /api/v1/refresh`.
+
+## Hook fails before worker launch
+
+Hook failures are usually repository, credentials, or host setup problems.
+
+1. Open the issue workspace under `workspace.root`.
+2. Re-run the failing script manually from that directory.
+3. Fix clone URLs, credentials, branch names, or shell assumptions.
+4. Retry with the status refresh endpoint or wait for the next poll.
+
+## Native run appears stalled
+
+Inspect the issue row in `GET /api/v1/{issue_identifier}`:
+
+- If recent events include `native_mob_status_heartbeat`, Meta still reports
+  the run as pending, running, or waiting for input.
+- If the row enters retry backoff, inspect `last_errors` for the cancellation or
+  timeout reason.
+- If the Workpad shows progress but status does not, check Meta event
+  delivery and durable run id recovery.
+
+## `native_recovery.review_required` is set
+
+Do not force completion. Compare:
+
+- Meta run id;
+- Workpad run id;
+- workspace branch and head SHA;
+- PR number and head SHA;
+- Linear PR mentions;
+- GitHub PR state and checks.
+
+Leave the issue in the reviewer node's projected lane, record the finding in
+the Workpad, and resolve the mismatch manually or return to the planner node's
+projected lane for focused rework.
+
+## Duplicate PRs
+
+Choose the intended PR, update the Workpad to mention only the correct handoff,
+close or mark duplicate PRs as superseded if appropriate, and keep the issue in
+the reviewer node's projected lane until status evidence is coherent.
+
+## Missing MCP tools
+
+Symptoms can include empty tool catalogs, `Unexpected response type`, missing
+Workpad updates, or member tooling notes about attempted lifecycle lane
+mutations. Planner/coder/reviewer members should report lifecycle facts to the
+issue lead; the issue lead owns per-issue `linear_move_issue` movement while
+Fugue observes Linear for external lane drift.
+
+Check that:
+
+- `mcp_servers` defines the named server;
+- agent profiles use `mcp:linear` and `mcp:github` where needed;
+- MCP `tools/list` returns `inputSchema` descriptors;
+- the Meta console shows the expected native members and their issue launch context.
+
+## Need to stop native execution quickly
+
+Pause the systemd service, inspect `/api/v1/state`, and reconcile or park active
+native runs through Kapellmeister/Linear projection. Do not switch production
+queues to another execution backend as a lifecycle workaround.
+
+## Related docs
+
+- [Operations](./operations.mdx)
+- [Status Api](./status-api.mdx)

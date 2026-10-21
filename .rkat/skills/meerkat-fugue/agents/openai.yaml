@@ -1,0 +1,4 @@
+interface:
+  display_name: "Meerkat Fugue"
+  short_description: "Operate Fugue Linear queues and GCP deployment"
+  default_prompt: "Use $meerkat-fugue to set up, operate, deploy, or troubleshoot a Meerkat Fugue Linear queue."

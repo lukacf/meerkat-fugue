@@ -1,0 +1,4 @@
+# Match Meerkat's debug test stack budget. Generated native transition frames
+# exceed Rust's 2 MiB default at opt-level 0. Production sizes its own runtime.
+[env]
+RUST_MIN_STACK = "8388608"

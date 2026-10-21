@@ -1,0 +1,82 @@
+# Overview
+
+Meerkat Fugue is a small Rust service that turns a Linear project into a safe,
+observable coding-agent queue. It polls eligible Linear issues, prepares an
+isolated workspace for each issue, launches the configured native Meerkat mob,
+and keeps humans informed through a durable Linear Workpad, GitHub pull
+requests, and an optional local status API.
+
+## When to use Fugue
+
+Use Fugue when you want a trusted automation host to process a Linear queue with
+clear handoff evidence:
+
+- Linear remains the intake and human coordination surface.
+- Each issue receives an isolated workspace under `workspace.root`.
+- Native Meerkat/Meta mobs perform planning, implementation, and review.
+- Operators can inspect status and recovery evidence without reading process
+  memory.
+
+Do not use Fugue as a sandbox boundary. Hooks, worker commands, repository
+code, Meerkat tools, and credentials run with the permissions available on the
+host.
+
+## Core concepts
+
+### Linear issue lifecycle
+
+Native configs project the selected mob's state into coarse tracker lanes. The
+canonical planner/coder/reviewer projection looks like this:
+
+```text
+Queue -> Active -> Done
+          ^
+          +-- planner/coder/reviewer phases live in labels, Workpad,
+              WorkGraph, and Meta runtime state
+```
+
+`Queue` is the default ready queue. `Active` means Fugue is working the issue;
+`fugue:phase:planning`, `fugue:phase:implementing`, and
+`fugue:phase:reviewing` carry detailed execution phase without additional
+tracker statuses. `Review` and `Deploy` are operator action lanes, and `Done` is
+terminal completion after required handoff evidence is coherent.
+
+### Workpad
+
+Workers maintain exactly one persistent Linear comment headed
+`## Fugue Workpad`. The Workpad records the plan, acceptance criteria, progress,
+validation, and pull request or handoff evidence. It is the human-readable
+projection of the run, not the only source of truth.
+
+### Native execution mobs
+
+A native `fugue.yaml` with no backend override launches native Meerkat/Meta
+mobs. Mob templates define member profiles and flow shape, such as solo work or
+a bounded planner/coder/reviewer loop.
+
+### Recovery evidence
+
+Fugue reconciles Meta structural events, workspace state, Linear Workpad
+content, and GitHub PR state. A restarted process uses durable evidence to
+recover active work. Missing or contradictory facts set review requirements
+instead of silently completing an issue.
+
+## Documentation map
+
+- [Getting started](./getting-started.mdx) for installation, first config, safe
+  validation, and first run.
+- [Configuration](./configuration.mdx) for typed `fugue.yaml` fields and
+  examples.
+- [Native mobs](./native-mobs.mdx) for projection profiles, member roles,
+  Workpad handoff, and typed transitions.
+- [Operations](./operations.mdx) for production setup, monitoring, incidents,
+  and rollback.
+- [Architecture](./architecture.mdx) for components, lifecycle, recovery, and
+  trust boundaries.
+- [Development](./development.mdx) for local checks, coding rules, and the real
+  E2E suite.
+
+## Related docs
+
+- [Getting Started](./getting-started.mdx)
+- [Architecture](./architecture.mdx)

@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Ensemble · Fugue</title>
+  <style>
+    :root { color-scheme:light; --bg:#ECEAE4; --panel:#F6F4EE; --line:#D6D2C8; --text:#1C1A17; --muted:#6B6760; --mint:#D95A1E; --gold:#A56A18; --red:#A43F32; font:13px/1.45 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--text); background:var(--bg); }
+    * { box-sizing:border-box; } body { margin:0; } button,input,select,textarea { font:inherit; } button { cursor:pointer; } button:disabled { opacity:.5; cursor:wait; } a { color:inherit; }
+    :focus-visible { outline:2px solid var(--mint); outline-offset:3px; } [hidden] { display:none!important; }
+    .shell { max-width:1600px; margin:auto; padding:0 28px 28px; } header { display:flex; justify-content:space-between; align-items:center; gap:16px; padding:17px 0; border-bottom:1px solid var(--line); }
+    .brand,.eyebrow,.label,.badge,.section-heading h2 { font:10px/1.4 "JetBrains Mono",ui-monospace,monospace; letter-spacing:.1em; text-transform:uppercase; }
+    .brand { font-size:11px; } .status { display:flex; align-items:center; gap:8px; color:var(--muted); font:11px ui-monospace,monospace; } .dot { width:6px; height:6px; background:var(--gold); } .dot.live { background:#3E6B4F; }
+    .hero { padding:30px 0; display:flex; align-items:end; justify-content:space-between; gap:30px; } .eyebrow { color:var(--mint); } h1 { font-size:36px; line-height:1.1; font-weight:500; letter-spacing:-1px; margin:9px 0 13px; } .intro { margin:0; max-width:660px; color:var(--muted); } .stats { display:flex; gap:30px; flex-shrink:0; } .count { font-size:30px; font-variant-numeric:tabular-nums; line-height:1.1; } .stats small { color:var(--muted); font:10px ui-monospace,monospace; text-transform:uppercase; letter-spacing:.08em; }
+    .workspace { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:24px; align-items:start; } .section-heading { display:flex; justify-content:space-between; align-items:center; border-top:1px solid var(--text); padding:15px 0; gap:10px; } .section-heading h2 { margin:0; } .label { color:var(--muted); } .team-search { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:end; margin:0 0 14px; } .team-search label { margin:0; grid-column:1 / -1; } .team-search input { grid-column:1; width:100%; border:1px solid var(--line); background:var(--panel); color:var(--text); padding:10px; border-radius:2px; } .clear-search { grid-column:2; grid-row:2; min-height:38px; border:1px solid var(--line); background:var(--panel); color:var(--mint); padding:0 12px; border-radius:2px; } .match-summary { margin:0 0 12px; color:var(--muted); font-size:12px; } .no-results { padding:20px; border:1px dashed var(--line); color:var(--muted); background:var(--panel); } .match-chip { display:inline-block; margin:0 0 10px; color:var(--mint); font:9px/1.5 "JetBrains Mono",ui-monospace,monospace; letter-spacing:.08em; text-transform:uppercase; } #repos { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }
+    .repo { border:1px solid var(--line); background:var(--panel); padding:20px; min-width:0; } .repo.selected { border-color:var(--mint); } .repo-top { display:flex; justify-content:space-between; align-items:center; gap:12px; } .repo-icon { color:var(--mint); font:20px ui-monospace,monospace; } .badge { color:#3E6B4F; border:1px solid #abb9a8; padding:3px 7px; letter-spacing:.04em; } h3 { font-size:20px; font-weight:550; margin:12px 0 4px; letter-spacing:-.5px; overflow-wrap:anywhere; } .path { font:10px/1.5 ui-monospace,monospace; color:var(--muted); overflow-wrap:anywhere; } .description { color:var(--muted); font-size:12px; margin:14px 0; } .roles { display:grid; margin:16px 0; } .specialist { border-top:1px solid var(--line); padding:10px 0; } .specialist summary { cursor:pointer; list-style:none; } .specialist summary::-webkit-details-marker { display:none; } .specialist summary:hover { color:var(--mint); } .role { display:flex; justify-content:space-between; align-items:center; gap:8px; font-size:12px; } .role-name { display:flex; align-items:center; gap:7px; } .role-glyph { color:var(--mint); } .role-state { color:var(--muted); font:10px ui-monospace,monospace; white-space:nowrap; } .specialist-focus { font-size:12px; color:var(--muted); margin:10px 0; } .specialist-paths { font:10px/1.6 ui-monospace,monospace; overflow-wrap:anywhere; margin:8px 0; } .specialist .label { font-size:9px; line-height:1.7; }
+    .actions { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; border-top:1px solid var(--line); padding-top:14px; } .small-button { border:0; padding:0; background:transparent; color:var(--mint); font-size:12px; } .console-link { font-size:12px; text-underline-offset:3px; }
+    aside { position:sticky; top:60px; border:1px solid var(--text); background:#FAF8F2; padding:22px; } aside h2 { font-size:23px; font-weight:500; line-height:1.2; margin:10px 0; letter-spacing:-.5px; } aside p { font-size:12px; color:var(--muted); margin:0 0 18px; } label { display:block; font-size:11px; margin:15px 0 7px; } select,textarea { width:100%; border:1px solid var(--line); background:var(--panel); color:var(--text); padding:10px; border-radius:2px; } textarea { resize:vertical; min-height:160px; font-size:12px; line-height:1.5; } .submit { width:100%; border:1px solid var(--mint); border-radius:2px; padding:11px; margin-top:12px; color:white; background:var(--mint); } .hint { display:block; color:var(--muted); font-size:10px; margin-top:8px; } .study { width:100%; border:0; background:transparent; color:var(--muted); font-size:11px; margin-top:14px; } .notice { margin-top:16px; font-size:12px; color:#3E6B4F; overflow-wrap:anywhere; } .notice.error { color:var(--red); }
+    .peering { margin-top:25px; } .peer-intro { margin:0 0 12px; color:var(--muted); font-size:12px; } .peer { display:flex; align-items:center; gap:12px; padding:12px; border:1px solid var(--line); background:var(--panel); font-size:12px; margin-top:8px; } .peer-name { overflow-wrap:anywhere; } .peer-line { flex:1; border-top:1px solid var(--line); text-align:center; height:1px; } .peer-line span { position:relative; top:-10px; background:var(--panel); padding:0 8px; color:var(--mint); } .empty { padding:20px; border:1px dashed var(--line); color:var(--muted); } footer { display:flex; flex-wrap:wrap; justify-content:space-between; gap:10px; padding-top:18px; margin-top:28px; border-top:1px solid var(--line); color:var(--muted); font-size:10px; } .error-banner { padding:12px; border:1px solid var(--red); color:var(--red); margin-bottom:16px; }
+    @media(max-width:1150px) { #repos { grid-template-columns:1fr; } }
+    @media(max-width:760px) { .shell { padding:0 14px 20px; } .hero { display:block; padding:24px 0; } .stats { margin-top:20px; } h1 { font-size:30px; } .workspace { grid-template-columns:1fr; } .team-search { grid-template-columns:1fr; } .clear-search { grid-column:1; grid-row:auto; justify-self:start; } aside { position:static; grid-row:1; } header { flex-wrap:wrap; } .status { font-size:10px; } }
+  </style>
+</head>
+<body>
+<div class="shell">
+  <header>
+    <div class="brand">Ensemble / repository teams</div>
+    <div class="status"><span class="dot" id="health-dot"></span><span id="health" role="status">Connecting to native runtimes</span></div>
+  </header>
+  <section class="hero">
+    <div><div class="eyebrow" id="ensemble-name">Your development ensemble</div><h1>Your repository teams.</h1><p class="intro">Persistent specialists shaped by each codebase. Give a representative an objective, follow the work in Console, and let the teams collaborate across repositories.</p></div>
+    <div class="stats"><div><div class="count" id="repo-count">—</div><small>repositories</small></div><div><div class="count" id="agent-count">—</div><small>persistent agents</small></div></div>
+  </section>
+  <div class="error-banner" id="error-banner" role="alert" hidden></div>
+  <main class="workspace">
+    <div>
+      <div class="section-heading"><h2>Your repository teams</h2><span class="label">Persistent native mobs</span></div>
+      <div class="team-search" role="search"><label for="teamSearch">Search repository teams</label><input id="teamSearch" type="search" autocomplete="off" placeholder="Search repository, path, specialist, focus, or owned path" aria-describedby="matchSummary"><button class="clear-search" id="clearSearch" type="button" hidden>Clear</button></div>
+      <p class="match-summary" id="matchSummary" aria-live="polite">Loading repositories…</p>
+      <div id="repos"><div class="empty">Loading the native roster…</div></div>
+      <section class="peering">
+        <div class="section-heading"><h2>Across the ensemble</h2><span class="label">Configured representative links</span></div>
+        <p class="peer-intro">These routes are established at startup. Representatives carry context between teams; open a native console to inspect live peers and conversations.</p>
+        <div id="peers"></div>
+      </section>
+    </div>
+    <aside>
+      <div class="eyebrow">Begin a collaboration</div><h2>Set the direction.</h2><p>Send an objective to a repository's representative. Follow delegation, replies, and results in its native console.</p>
+      <form id="objective-form">
+        <label for="target">Repository</label><select id="target" required aria-label="Target repository"><option value="">Waiting for roster…</option></select>
+        <label for="objective">What should the team accomplish?</label><textarea id="objective" required maxlength="60000" placeholder="Map the API contract with the frontend team, propose a plan, then implement and review the change."></textarea>
+        <button class="submit" id="submit" type="submit" disabled>Send to representative ↗</button><span class="hint">⌘ / Ctrl + Enter to send · starts model usage</span>
+      </form>
+      <button class="study" id="study" type="button" disabled>Or start with a repository study →</button>
+      <div class="notice" id="notice" role="status" aria-live="polite"></div>
+    </aside>
+  </main>
+  <footer><span>Fugue Ensemble · Meerkat + Meta 0.9.3</span><span>Native identity. Durable conversations. Real peer communication.</span></footer>
+</div>
+<template id="repo-template"><article class="repo"><div class="repo-top"><div class="repo-icon" aria-hidden="true">⌘</div><span class="badge">Native mob</span></div><h3></h3><div class="path"></div><p class="description"></p><div class="roles"></div><div class="actions"><button class="small-button" type="button">Give an objective →</button><a class="console-link">Open console ↗</a></div></article></template>
+<script>
+  "use strict";
+  const $ = id => document.getElementById(id);
+  let snapshot = null, sending = false;
+  const expandedMembers = new Set();
+
+  function node(tag, className, text) { const element = document.createElement(tag); element.className = className; element.textContent = text; return element; }
+  function normalized(value) { return String(value ?? "").toLocaleLowerCase(); }
+  function includesNeedle(values, needle) { return values.some(value => normalized(value).includes(needle)); }
+  function searchNeedle() { return normalized($("teamSearch")?.value || "").trim(); }
+  function selectRepo(id) { $("target").value = id; highlight(); $("objective").focus(); }
+  function highlight() { document.querySelectorAll(".repo").forEach(card => card.classList.toggle("selected", card.dataset.repo === $("target").value)); }
+  function memberMatches(member, needle) {
+    if (!needle) return true;
+    return includesNeedle([member.member_id, member.label, member.focus, ...(member.ownership_paths || [])], needle);
+  }
+  function repoMatches(repo, config, needle) {
+    if (!needle) return true;
+    return includesNeedle([repo.repo, config.path], needle);
+  }
+  function visibleMembers(repo, config, needle) {
+    const members = repo.members || [];
+    const wholeTeam = repoMatches(repo, config, needle);
+    return { wholeTeam, members: wholeTeam ? members : members.filter(member => memberMatches(member, needle)) };
+  }
+  function render(data) {
+    snapshot = data;
+    $("ensemble-name").textContent = data.name;
+    const repos = data.runtime.repositories || [];
+    $("repo-count").textContent = repos.length;
+    $("agent-count").textContent = repos.reduce((total, repo) => total + repo.members.length, 0);
+    const selected = $("target").value;
+    const needle = searchNeedle();
+    $("repos").replaceChildren(); $("target").replaceChildren();
+    const visible = [];
+    for (const repo of repos) {
+      const id = repo.repo, config = data.repositories[id] || {};
+      const filtered = visibleMembers(repo, config, needle);
+      if (needle && !filtered.wholeTeam && !filtered.members.length) continue;
+      visible.push({repo, config, members: filtered.members, wholeTeam: filtered.wholeTeam});
+    }
+    for (const repo of repos) {
+      const option = document.createElement("option"); option.value = repo.repo; option.textContent = repo.repo; $("target").append(option);
+    }
+    if (repos.some(repo => repo.repo === selected)) $("target").value = selected;
+    for (const entry of visible) {
+      const repo = entry.repo, id = repo.repo, config = entry.config;
+      const card = $("repo-template").content.firstElementChild.cloneNode(true);
+      card.dataset.repo = id;
+      card.querySelector(".badge").textContent = repo.preparation === "ready" ? "Prepared team" : "Preparing";
+      card.querySelector("h3").textContent = id;
+      card.querySelector(".path").textContent = config.path || "";
+      const brief = repo.brief || {};
+      card.querySelector(".description").textContent = config.description || brief.summary || "A persistent team with repository-specific context and native peer communication.";
+      if (needle) {
+        const chip = node("div", "match-chip", entry.wholeTeam ? "Repository match · showing whole team" : `${entry.members.length} matching specialist${entry.members.length === 1 ? "" : "s"}`);
+        card.querySelector(".description").before(chip);
+      }
+      if (brief.languages && brief.languages.length) {
+        const languages = node("div", "label", brief.languages.join(" · "));
+        card.querySelector(".description").after(languages);
+      }
+      for (const member of entry.members) {
+        const row = node("div", "role", "");
+        const label = node("span", "role-name", "");
+        label.append(node("span", "role-glyph", member.member_id === "representative" ? "◇" : "◈"), document.createTextNode(member.label));
+        row.append(label, node("span", "role-state", `${member.state} ▾`));
+        const details = node("details", "specialist", "");
+        details.dataset.memberKey = JSON.stringify([id, member.member_id]);
+        details.open = expandedMembers.has(details.dataset.memberKey);
+        details.addEventListener("toggle", () => { if (details.open) expandedMembers.add(details.dataset.memberKey); else expandedMembers.delete(details.dataset.memberKey); });
+        const summary = node("summary", "", ""); summary.append(row); details.append(summary);
+        details.append(node("p", "specialist-focus", member.focus));
+        if (member.ownership_paths && member.ownership_paths.length) details.append(node("div", "specialist-paths", member.ownership_paths.join(" · ")));
+        details.append(node("div", "label", member.capability === "code" ? "Repository code & verification tools" : "Read-only repository tools"));
+        if (member.memory_enabled) details.append(node("div", "label", "Persistent memory enabled"));
+        if (member.study_state === "completed") details.append(node("div", "label", "Initial domain study completed"));
+        card.querySelector(".roles").append(details);
+      }
+      card.querySelector("button").addEventListener("click", () => selectRepo(id));
+      card.querySelector("a").href = `/repos/${encodeURIComponent(id)}/console`;
+
+      card.querySelector("a").rel = "noopener";
+      $("repos").append(card);
+    }
+    const visibleSpecialists = visible.reduce((total, entry) => total + entry.members.length, 0);
+    const totalSpecialists = repos.reduce((total, repo) => total + repo.members.length, 0);
+    const clearSearch = $("clearSearch");
+    clearSearch.hidden = !needle;
+    if (needle) {
+      $("matchSummary").textContent = visible.length ? `Showing ${visible.length} of ${repos.length} repositories and ${visibleSpecialists} of ${totalSpecialists} specialists for “${$("teamSearch").value.trim()}”.` : `No repository teams match “${$("teamSearch").value.trim()}”.`;
+    } else {
+      $("matchSummary").textContent = `Showing all ${repos.length} repositories and ${totalSpecialists} specialists.`;
+    }
+    if (!visible.length) {
+      const empty = node("div", "no-results", "No repository teams match your search. Clear search to show every repository team.");
+      $("repos").append(empty);
+    }
+    highlight();
+    $("peers").replaceChildren();
+    const peers = data.runtime.peers || [];
+    for (const peer of peers) {
+      const row = node("div","peer","");
+      const line = node("div","peer-line",""); line.append(node("span","","↔"));
+      row.append(node("span","peer-name",peer.from),line,node("span","peer-name",peer.to));
+      $("peers").append(row);
+    }
+    if (!peers.length) $("peers").append(node("div","empty","No repository peers configured. Add a pair to ensemble.yaml and restart to connect their representatives."));
+    $("submit").disabled = !repos.length || sending; $("study").disabled = !repos.length || sending;
+  }
+  async function refresh() {
+    try {
+      const response = await fetch("/api/ensemble", {cache:"no-store"});
+      if (!response.ok) throw new Error(`Runtime status unavailable (${response.status})`);
+      render(await response.json()); $("error-banner").hidden = true;
+      $("health-dot").classList.add("live"); $("health").textContent = `Native roster · ${new Date().toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"})}`;
+    } catch (error) {
+      $("health-dot").classList.remove("live"); $("health").textContent = "Connection interrupted";
+      $("error-banner").textContent = `${error.message}. Displayed state may be stale; reconnecting…`; $("error-banner").hidden = false;
+      $("submit").disabled = true; $("study").disabled = true;
+    }
+  }
+  async function send(message) {
+    const repo = $("target").value; if (!repo || sending || !message.trim()) return;
+    sending = true; $("submit").disabled = true; $("study").disabled = true;
+    $("notice").className = "notice"; $("notice").textContent = "Submitting to the native runtime…";
+    try {
+      const response = await fetch(`/api/repos/${encodeURIComponent(repo)}/messages`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({message})});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `Request failed (${response.status})`);
+      $("notice").replaceChildren(document.createTextNode("Accepted by the representative. "));
+      const link = node("a","","Open console → select representative"); link.href = `/repos/${encodeURIComponent(repo)}/console`;  link.rel = "noopener"; $("notice").append(link);
+      $("objective").value = "";
+    } catch (error) { $("notice").className = "notice error"; $("notice").textContent = error.message; }
+    finally { sending = false; await refresh(); }
+  }
+  $("target").addEventListener("change", highlight);
+  $("teamSearch").addEventListener("input", () => { if (snapshot) render(snapshot); });
+  $("clearSearch").addEventListener("click", () => { $("teamSearch").value = ""; if (snapshot) render(snapshot); $("teamSearch").focus(); });
+  $("objective-form").addEventListener("submit", event => { event.preventDefault(); send($("objective").value); });
+  $("objective").addEventListener("keydown", event => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") { event.preventDefault(); if (!$("submit").disabled) send($("objective").value); } });
+  $("study").addEventListener("click", () => send("Refresh this repository study with your domain specialists. Ask each specialist through native comms to inspect their assigned ownership paths and domain, then combine their findings about architecture, interfaces, implementation, verification and risks. Read the repository guidelines and actual relevant files. Return a concise evidenced repository briefing, collaboration opportunities with any connected repositories, and useful next steps. Do not modify files during this study."));
+  refresh(); setInterval(refresh, 5000);
+</script>
+</body>
+</html>

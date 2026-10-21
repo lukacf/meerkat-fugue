@@ -1,0 +1,8 @@
+interface:
+  display_name: "Fugue Dev"
+  short_description: "Develop Fugue without repeating old mistakes"
+  brand_color: "#B55345"
+  default_prompt: "Use $fugue-dev to implement a Meerkat Fugue change with the correct Meta, Linear, and Kapellmeister architecture."
+
+policy:
+  allow_implicit_invocation: true

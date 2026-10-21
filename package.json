@@ -1,0 +1,12 @@
+{
+  "name": "meerkat-fugue-luc654-ui-validation",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:luc654-ui": "playwright test tests/luc654-ui-validation.spec.mjs --project=chromium",
+    "test:ensemble-search": "playwright test tests/ensemble-dashboard-search.spec.mjs --project=chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.60.0"
+  }
+}

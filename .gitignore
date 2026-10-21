@@ -1,0 +1,35 @@
+/target
+.fugue/
+.playwright-cli/
+.playwright-mcp/
+fugue-console-*.png
+fugue-console-*.yml
+fugue-luc*-console.png
+fugue-luc*-loading.png
+fugue-luc*-console-errors.log
+fugue-pr*-console*.png
+fugue-pr*-console*.yml
+.rkat/*
+!.rkat/skills/
+!.rkat/skills/**
+
+# Local credentials and generated operator configuration.
+.env
+.env.*
+!.env.example
+secrets.env
+/fugue.yaml
+/ensemble.yaml
+
+# Browser tooling and local runtime artifacts.
+/node_modules/
+/output/
+/playwright-report/
+/test-results/
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+.DS_Store

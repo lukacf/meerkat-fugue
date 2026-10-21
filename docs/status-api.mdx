@@ -1,0 +1,155 @@
+# Status API
+
+Fugue can expose a loopback dashboard and JSON API for operational visibility.
+Enable it with CLI `--port` or `server.port` in `fugue.yaml`.
+
+## Starting with a status server
+
+```bash
+cargo run -- ./fugue.yaml --port 0
+```
+
+`--port 0` binds an available port. The default bind address is `127.0.0.1`.
+Use `--host` only when you have separate access controls. For raw public-IP
+access, configure `server.meta_console.basic_auth` and protect the transport
+with HTTPS, an SSH/IAP tunnel, or a source-IP firewall rule.
+
+## Endpoints
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/` | `GET` | Minimal HTML dashboard. |
+| `/console` | `GET` | Authenticated stock Meta console served by the Meta console router. |
+| `/console/rpc` | `POST` | Authenticated Meta console JSON-RPC through the Meta console router. |
+| `/api/v1/state` | `GET` | Full orchestrator snapshot. |
+| `/api/v1/{issue_identifier}` | `GET` | Issue-scoped running/recovery view. |
+| `/api/v1/refresh` | `POST` | Request an immediate poll. |
+| `/api/v1/meta/rpc` | `POST` | Forward a typed JSON body to `FUGUE_META_RPC_TCP_ADDR` as a Meta JSON-RPC request. Requires `Authorization: Bearer $TOKEN` from `FUGUE_META_RPC_BEARER_TOKEN`. |
+| `/api/v1/ota-update` | `POST` | Trigger configured authorized OTA fetch/staging-build/deploy flow. |
+
+## Meta console
+
+Open `/console` from the Fugue status server to load the configured stock Meta
+console bundle. Fugue may wrap the route with browser auth and serve static
+assets, but console timeline, roster, session history, identity routing, and send
+acknowledgement behavior come from Meta. Fugue does not expose
+host-projected browser data or RPC facades for those surfaces.
+
+The browser console posts to `/console/rpc` with this shape:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "operator-1",
+  "method": "meta/status",
+  "params": {}
+}
+```
+
+`jsonrpc` and `id` are optional for browser convenience. The console route is
+owned by Meta; Fugue does not implement its own console RPC facade.
+
+Use `server.meta_console` to enable or disable the browser route, tune the
+timeout used by related operator RPC, or add browser authentication:
+
+```yaml
+server:
+  port: 0
+  meta_console:
+    enabled: true
+    rpc_timeout_ms: 30000
+    basic_auth:
+      username_env: FUGUE_CONSOLE_USERNAME
+      password_env: FUGUE_CONSOLE_PASSWORD
+      realm: Meerkat Fugue
+```
+
+`basic_auth` uses standard HTTP Basic Auth and works with a raw IP address; it
+does not require an OAuth callback domain. It protects the dashboard,
+`/console`, read-only status APIs, refresh, and console RPC when configured.
+Use HTTPS, an SSH/IAP tunnel, or a source-IP firewall rule for
+untrusted networks because Basic Auth credentials are only safe in transit when
+the transport is protected.
+
+Scripted clients that need the persistent TCP bridge can still use
+`/api/v1/meta/rpc`. Before forwarding any method to
+`FUGUE_META_RPC_TCP_ADDR`, that endpoint requires
+`Authorization: Bearer $TOKEN` with `$TOKEN` supplied by
+`FUGUE_META_RPC_BEARER_TOKEN`; if the token env var is missing/empty it returns
+`meta_rpc_http_auth_not_configured`, and if the header is missing/wrong it
+returns `meta_rpc_http_auth_failed`.
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:PORT/api/v1/meta/rpc \
+  -H "Authorization: Bearer $FUGUE_META_RPC_BEARER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"mob/list_runs","params":{"limit":20}}'
+```
+
+## Important fields
+
+### `running[]`
+
+Current work. Production native rows report `backend: native_mob`.
+
+Look for:
+
+- issue identifier and Linear state;
+- workspace path;
+- selected template and policy owner;
+- last event and recent events;
+- native recovery evidence.
+
+### `retrying[]`
+
+Attempts waiting for retry backoff. Use this to distinguish a quiet queue from a
+queue that is intentionally waiting before retrying failures.
+
+### `last_errors`
+
+Recent hook, worker, timeout, recovery, or reconciliation errors.
+
+### `native_recovery`
+
+Native recovery facts used after restarts and during completion checks:
+
+- Meta run id and status evidence;
+- workspace branch and head SHA;
+- dirty workspace flag;
+- Linear Workpad run id and PR mentions;
+- GitHub PR URL, state, and head SHA;
+- `review_required` reason when evidence is not safe to accept.
+
+## Refreshing immediately
+
+Use refresh after fixing credentials, hooks, or Linear lanes:
+
+```bash
+curl -X POST http://127.0.0.1:PORT/api/v1/refresh
+```
+
+Replace `PORT` with the port printed by the running process.
+
+## Security notes
+
+The status API is intended for local operators. It can reveal issue identifiers,
+workspace paths, PR URLs, error text, and operational state. Do not expose it on
+an untrusted network without authentication. The built-in
+`server.meta_console.basic_auth` gate is intentionally provider-neutral and
+works on a raw IP address, but use HTTPS, an SSH/IAP tunnel, or source-IP
+firewalling so credentials are not sent over cleartext HTTP.
+
+The canonical Meta console RPC can invoke methods through the configured
+Meerkat command and is treated as an operator control surface. Keep it
+loopback-only or behind explicit access controls. The `POST /api/v1/meta/rpc` TCP bridge requires `Authorization: Bearer $TOKEN`
+from `FUGUE_META_RPC_BEARER_TOKEN`. If `ota_update` is configured,
+`POST /api/v1/ota-update` also requires `Authorization: Bearer $TOKEN` from
+`ota_update.trigger_token_env` and executes the operator-owned deployment command
+as the Fugue process user.
+
+## Related docs
+
+- [Operations](./operations.mdx)
+- [Troubleshooting](./troubleshooting.mdx)

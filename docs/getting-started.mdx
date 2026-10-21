@@ -1,0 +1,118 @@
+# Quick start
+
+This guide gets a new Fugue instance from a checkout to a native execution
+configuration that can be validated safely.
+
+## 1. Install prerequisites
+
+You need:
+
+- Rust stable with edition 2024 support.
+- A Linear API key that can read and update the target project.
+- Git and repository credentials for the repositories workers will modify.
+- Meerkat/Meta native execution tooling installed on the host.
+- Optional GitHub credentials if workers create pull requests or inspect CI.
+
+Fugue does not sandbox worker commands. Run it only on hosts where those tools
+and credentials are allowed.
+
+## 2. Create a native config
+
+```bash
+meerkat-fugue configure backend gcp-systemd \
+  --name live-gcp \
+  --gcp-project example-gcp-project \
+  --zone europe-west1-b \
+  --instance example-fugue-host \
+  --remote-user fugue \
+  --fugue-root /srv/fugue \
+  --bin-dir /srv/fugue/bin \
+  --flow-team implementation_mob=LUC \
+  --default
+
+meerkat-fugue /path/to/repo
+```
+
+The backend profile records how Fugue deploys queues to the remote host. Passing
+a repository directory then infers `remote.origin.url`, creates or reuses the
+Linear project for the selected mob flow, generates native config and prompts,
+deploys them to the backend, installs/updates systemd, and starts the queue.
+
+For local-only config generation, use `meerkat-fugue stage`.
+
+Review:
+
+- `linear.project_slug`, `linear.team`, `linear.lanes`, and
+  `linear_projections` for your Linear workflow.
+- `selection.default_template` and any label-to-template routing.
+- `agents` and `mob_templates` for the mob shape you want.
+- `mcp_servers` for scoped Linear and GitHub access.
+- `workspace.root` for durable issue workspaces.
+- `hooks.after_create` and `hooks.before_run` to clone and sync the target
+  repository.
+
+Keep secrets in environment variables:
+
+```yaml
+linear:
+  api_key: $LINEAR_API_KEY
+```
+
+## 3. Use native defaults
+
+For `fugue.yaml`, omitting `backend` means native execution. Most new configs
+should not set either top-level `backend` or `mob.backend`.
+
+Use this only for migration or incident rollback:
+
+```yaml
+```
+
+Do not disable native runtime while keeping native execution selected; Fugue
+rejects ambiguous backend mixtures before dispatch.
+
+## 4. Validate safely
+
+Run the non-destructive validation set:
+
+```bash
+cargo fmt --check
+cargo test
+cargo run -- --help
+```
+
+These commands are safe for routine development. They do not create live Linear
+issues, GitHub pull requests, or Meta sessions.
+
+## 5. Start Fugue
+
+```bash
+export LINEAR_API_KEY=lin_api_...
+RUST_LOG=meerkat_fugue=info cargo run -- ./fugue.yaml --port 0
+```
+
+Notes:
+
+- Fugue starts queues from `./fugue.yaml` by default.
+- `--port 0` enables the loopback status server on a free port.
+- The default status bind address is `127.0.0.1`.
+
+## 6. Confirm the first run
+
+After a native issue starts:
+
+1. Open `GET /api/v1/state` on the status server.
+2. Confirm the running row reports `backend: native_mob`.
+3. Confirm `native_recovery` is populated with Meta run, workspace, branch,
+   and handoff evidence as it becomes available.
+4. In Linear, confirm there is one `## Fugue Workpad` comment.
+5. If the issue requires code changes, confirm there is one PR for the issue
+   branch/head.
+
+If evidence is missing or inconsistent, leave the issue in a review lane and
+follow [Troubleshooting](./troubleshooting.mdx).
+
+## Related docs
+
+- [Configuration](./configuration.mdx)
+- [Operations](./operations.mdx)

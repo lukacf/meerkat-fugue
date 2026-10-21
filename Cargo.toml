@@ -1,0 +1,76 @@
+[package]
+name = "meerkat-fugue"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+default-run = "meerkat-fugue"
+license = "MIT OR Apache-2.0"
+description = "Meerkat-powered issue automation and persistent repository teams."
+repository = "https://github.com/lukacf/meerkat-fugue"
+readme = "README.md"
+keywords = ["agents", "automation", "meerkat", "linear"]
+categories = ["development-tools"]
+
+[dependencies]
+anyhow = "1.0"
+async-stream = "0.3"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["multipart"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+clap = { version = "4.5", features = ["derive"] }
+futures = "0.3"
+indexmap = { version = "2", features = ["serde"] }
+meerkat-core = "=0.9.3"
+meerkat-mob = "=0.9.3"
+meerkat-meta = "=0.9.3"
+meerkat-tools = "=0.9.3"
+meerkat = { version = "=0.9.3", features = ["workgraph"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["raw_value"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+minijinja = { version = "2.12", features = ["json"] }
+thiserror = "2.0"
+tokio = { version = "1.48", features = ["full"] }
+tokio-util = "0.7"
+toml = "0.9.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+meerkat-llm-core = "=0.9.3"
+tempfile = "3.23"
+
+# Published 0.9.3 omits continuity owner restoration before library recovery.
+# Pin the minimal upstream backport until a released crate includes the fix.
+# Upstream: https://github.com/lukacf/meerkat-meta/pull/674
+[patch.crates-io]
+meerkat-meta = { version = "=0.9.3", git = "https://github.com/lukacf/meerkat-meta.git", rev = "a206916aeb8495368b7b1e286c8b6cf65bc33d83" }
+
+# Keep the large generated platform crates inexpensive to link in the offline suite.
+[profile.test]
+debug = 0
+
+# Meta's release profile is not inherited by downstream applications. These
+# cold-path crates contain very large generated functions; optimizing them in
+# LLVM can exhaust memory without improving this I/O-bound service.
+[profile.release]
+opt-level = 1
+
+[profile.release.package.meerkat-machine-schema]
+opt-level = 0
+
+[profile.release.package.meerkat-core]
+opt-level = 0
+
+[profile.release.package.meerkat-runtime]
+opt-level = 0
+
+[profile.release.package.meerkat-mob]
+opt-level = 0
+
+[profile.release.package.meerkat-live]
+opt-level = 0

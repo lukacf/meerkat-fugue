@@ -1,0 +1,209 @@
+# Native execution mobs
+
+Native execution is Fugue's normal runtime for `fugue.yaml`. A native run
+launches a Meerkat/Meta mob for an issue, observes structural events, and
+reconciles evidence from Meta, the workspace, Linear, and GitHub.
+
+## Linear projection model
+
+Linear lanes are the issue lead's per-issue projection of the selected mob's
+state. Fugue keeps a host-side lane memory, observes Linear for external drift,
+and reports mismatches to Kapellmeister and the issue mob. The canonical
+planner/coder/reviewer projection uses coarse operator lanes:
+
+| Lane | Owner | Meaning |
+| --- | --- | --- |
+| `Queue` | Fugue host | Intake queue. A fresh native mob may be launched. |
+| `Active` | Issue mob | Planner/coder/reviewer execution is active; phase details are labels, Workpad, WorkGraph, and Meta. |
+| `Review` | Kapellmeister/operator | Action lane requesting an extra configured review procedure. |
+| `Deploy` | Kapellmeister/operator | Action lane requesting the configured deploy procedure. |
+| `Done` | Reviewer/operator | The requested work and required handoff are complete. |
+
+For native configs, `linear.lanes.ready` is the fresh dispatch queue and
+`linear_projections.*.node_lanes` are mob-owned in-flight lanes, normally all
+`Active` for planner/coder/reviewer. The host starts fresh mobs only from the
+ready lane. If external automation moves an issue into a legacy phase lane,
+Fugue reports or repairs it back to `Active` with labels such as
+`fugue:phase:planning`.
+
+`Backlog`, `Queue`, `Active`, `Review`, `Deploy`, `Blocked`, `Done`, and
+`Canceled` are semantic defaults, not hardcoded state ids.
+
+## Template selection
+
+Fugue chooses a template from `selection.by_label` or
+`selection.default_template`:
+
+```yaml
+selection:
+  default_template: planner_coder_reviewer
+  by_label:
+    docs: planner_coder_reviewer
+    risky-change: planner_coder_reviewer
+
+mob_templates:
+  planner_coder_reviewer:
+    linear_projection: planner_coder_reviewer
+    max_review_cycles: 3
+    members: [planner, coder, reviewer]
+```
+
+```yaml
+linear_projections:
+  planner_coder_reviewer:
+    node_lanes:
+      planner: Active
+      coder: Active
+      reviewer: Active
+    node_phase_labels:
+      planner: fugue:phase:planning
+      coder: fugue:phase:implementing
+      reviewer: fugue:phase:reviewing
+    aggregate:
+      precedence: [Active]
+      fallback: Active
+    terminal_lanes:
+      succeeded: Done
+      failed: Active
+      cancelled: Canceled
+```
+
+Native Meta issue mobs are prompt-driven by default: Fugue launches the issue
+lead plus worker members, and the issue lead coordinates planner, coder, and
+reviewer through comms. Use labels to route work to configured
+planner/coder/reviewer templates with appropriate prompts and review-cycle
+limits. `flow:` selects Fugue's role and review contract; the embedded host
+coordinates native members through Meta. Fugue does not launch a second
+`rkat-rpc` process or call a separate `mob/flow_run` endpoint.
+
+## Required member tools
+
+Planner, coder, and reviewer profiles normally need:
+
+- `mob` for Meerkat mob and flow tools.
+- `mcp:linear` to inspect the issue and update the Workpad.
+- `mcp:github` to create or inspect pull requests and checks.
+- `shell` and `git` for code-changing members.
+
+Native issue mob members receive issue- and repository-scoped defaults from the
+Linear and GitHub MCP companion servers. With `mcp:linear` and `mcp:github` in
+their profiles, workers can update the current issue Workpad, create the issue
+branch PR, and inspect checks without repeating issue or repo identifiers on
+every call. Lifecycle lane movement remains a Kapellmeister decision.
+`fugue-github-mcp` does not expose `github_merge_pr` unless that MCP server is
+started with `FUGUE_GITHUB_ALLOW_MERGE=true`; use that only for an explicit
+repo-level merge authority, not ordinary issue-mob review.
+
+The MCP boundary must expose protocol-compatible `tools/list` descriptors with
+`inputSchema`, not provider-style `input_schema`.
+
+## Workpad handoff contract
+
+Workers maintain exactly one persistent Linear comment headed
+`## Fugue Workpad`. For issue-scoped production smokes, an issue-specific
+heading such as `## LUC-123 Workpad` is preferred so operators can prove there is
+exactly one Workpad for that issue and no duplicate generic Fugue Workpad. It
+should contain Markdown task lists for:
+
+- Plan
+- Acceptance criteria
+- Progress
+- Validation
+- Pull request or Handoff
+
+Good Workpad updates are concrete. Avoid opaque evidence such as `text:"ok"`.
+Record commands, test names, PR URLs, branch-scoped CI evidence or check
+conclusions, and reviewer findings. Branch-scoped CI evidence means checking the
+current issue branch or PR head rather than relying on a stale SHA-only check
+result from an earlier handoff attempt. Keep Meta mechanism telemetry out of the Workpad:
+tool catalogs, readiness gate details, flow ids, and launch diagnostics belong
+in trace logs or recent events unless they are part of a human-facing blocker.
+Fugue may use a minimal pending-planner placeholder, but the
+planner/coder/reviewer/repo agent own the actual checkbox content.
+
+Post-merge Meta retake smokes should also prove the upstream Meta console
+path. For an autonomous kickoff smoke, create the issue while the browser
+console is already open and verify Fugue picks it up from `Queue` without manual
+intervention. The pre-existing console session must show the real repo
+`fugue/kapellmeister` member plus active issue planner, coder, and reviewer
+members with real session ids without relying on a manual browser refresh. The
+planner, coder, and reviewer rows must show active peering wired to
+`fugue/kapellmeister`, not a mock, stale, issue-mob container, or issue-local
+replacement Kapellmeister entry. During execution, Playwright must observe live
+transcript/event updates from Meta for each member.
+
+Linear lane movement remains Fugue/Kapellmeister projection from Meta state
+rather than member-owned `linear_move_issue` calls, and PR handoff is valid only
+after a green reviewer gate.
+
+After a Fugue service restart, reopen the Meta console from the same
+pre-existing Playwright browser context and verify Meta, not Fugue, replays
+each member's transcript/tool history for the session ids observed before
+restart. The restart smoke is green only when durable session snapshots re-admit
+those member sessions: the console must not show `runtime_restore=failed`, and
+service logs must not mention `missing durable session snapshot` for those ids.
+Treat missing member transcript/tool history or stale active rows after the mob
+reaches its terminal lane as smoke failures to investigate rather than accepted
+completion evidence.
+
+During restart recovery, an issue-specific heading such as `## LUC-123 Workpad`
+is also canonical. If both the generic and issue-specific headings are present,
+keep the most evidence-rich comment: issue-specific checkbox
+plan, role checkoffs, exact validation commands, PR URL, CI/check conclusions,
+merge SHA, and completion handoff. Placeholder progress from a restarted host
+must not overwrite PR, check, or merge evidence that agents already recorded.
+
+## Projected Lane Ownership
+
+Lane movement is owned by the issue lead for the issue. Planner, coder, and
+reviewer members write Workpad, validation, review, and handoff evidence and
+report lifecycle facts to the issue lead. Kapellmeister keeps the repo-wide
+view and starts or resumes issue mobs; Fugue host code only observes and
+records internal lane changes made through Fugue tools.
+
+For the default planner/coder/reviewer profile, the issue lead projects active
+planner, coder, and reviewer work to `Active`; the detailed role/phase is
+recorded as labels, WorkGraph/Workpad evidence, and Meta runtime state.
+Accepted completion projects to `Done`. If Linear drifts from the host's
+remembered lane, Fugue reports the external observation to Kapellmeister and the
+issue mob.
+
+## Review loops
+
+In `planner-coder-reviewer`, red review, CI failures, or PR feedback are
+recorded for focused replanning while Linear remains on the configured active
+lane. Legacy or noncanonical intake/rework signals are repaired or reported into
+`Queue`/`Active` semantics instead of becoming steady lifecycle projections.
+`Human Review`, `Merging`, and `In Review` are not special Fugue lifecycle
+states; merge and PR monitoring belong to the repo-level handoff policy or
+explicit mob nodes.
+
+Keep review cycles bounded with `max_review_cycles` so a bad loop escalates
+instead of running forever.
+
+## Recovery evidence
+
+Native status rows include recovery facts such as:
+
+- Meta run id and recent structural events.
+- Workspace path, branch, head SHA, and dirty flag.
+- Linear Workpad run evidence and PR mentions.
+- GitHub PR URL, state, and head SHA when available.
+- `review_required` if facts are missing or contradictory.
+
+A restarted Fugue process uses durable evidence to recover active work instead
+of trusting stale in-memory state.
+
+Treat a restart-time terminal Meta `Cancelled` event as a recovery signal, not
+as an automatic Linear cancellation decision. Fugue should reconcile cancellation
+with Workpad, workspace, branch, PR, checks, and merge facts before choosing
+retry, focused rework, handoff completion, or an operator-confirmed canceled
+lane. Post-recovery smoke tests should use a fresh issue and should leave
+Workpad evidence for the PR, check, merge, and final handoff that made the
+outcome safe.
+
+## Related docs
+
+- [Configuration](./configuration.mdx)
+- [Operations](./operations.mdx)
+- [Status Api](./status-api.mdx)

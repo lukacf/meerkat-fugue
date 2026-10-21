@@ -1,0 +1,647 @@
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::config::IndependentReviewConfig;
+use crate::tools::{
+    GitHubPullRequestSnapshot, GitSha, IdempotencyKey, LinearIssueRef, SpawnOrResumeExecutionInput,
+};
+
+pub const INDEPENDENT_REVIEW_SCHEMA_VERSION: &str = "fugue.review.v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndependentReviewVerdict {
+    pub schema_version: String,
+    pub reviewer_id: String,
+    pub focus: String,
+    pub verdict: IndependentReviewVerdictStatus,
+    pub summary: String,
+    #[serde(default)]
+    pub findings: Vec<IndependentReviewFinding>,
+    pub evidence: IndependentReviewEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndependentReviewStartRequest {
+    pub issue: LinearIssueRef,
+    pub spawn_input: SpawnOrResumeExecutionInput,
+    pub pull_request: GitHubPullRequestSnapshot,
+    pub orchestrator_profile: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndependentReviewCompletionRequest {
+    pub issue: LinearIssueRef,
+    pub pull_request: GitHubPullRequestSnapshot,
+    pub head_sha: GitSha,
+    pub workgraph_scope: IndependentReviewWorkGraphScope,
+    #[serde(default)]
+    pub verdicts: Vec<IndependentReviewVerdict>,
+    #[serde(default)]
+    pub timed_out: bool,
+    pub idempotency_key: IdempotencyKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndependentReviewWorkGraphScope {
+    pub realm_id: String,
+    pub namespace: String,
+}
+
+impl IndependentReviewWorkGraphScope {
+    pub fn validate(&self) -> Result<(), IndependentReviewVerdictError> {
+        if self.realm_id.trim().is_empty() {
+            return Err(IndependentReviewVerdictError::MissingField(
+                "workgraph_scope.realm_id",
+            ));
+        }
+        if self.namespace.trim().is_empty() {
+            return Err(IndependentReviewVerdictError::MissingField(
+                "workgraph_scope.namespace",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndependentReviewVerdictStatus {
+    Green,
+    Red,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndependentReviewFinding {
+    pub severity: IndependentReviewFindingSeverity,
+    pub title: String,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndependentReviewFindingSeverity {
+    Blocker,
+    Major,
+    Minor,
+    Note,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndependentReviewEvidence {
+    pub base: String,
+    pub head_sha: GitSha,
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default)]
+    pub checked_paths: Vec<String>,
+}
+
+impl IndependentReviewVerdict {
+    pub fn validate(&self) -> Result<(), IndependentReviewVerdictError> {
+        if self.schema_version != INDEPENDENT_REVIEW_SCHEMA_VERSION {
+            return Err(IndependentReviewVerdictError::UnsupportedSchema {
+                schema_version: self.schema_version.clone(),
+            });
+        }
+        if self.reviewer_id.trim().is_empty() {
+            return Err(IndependentReviewVerdictError::MissingField("reviewer_id"));
+        }
+        if self.focus.trim().is_empty() {
+            return Err(IndependentReviewVerdictError::MissingField("focus"));
+        }
+        if self.summary.trim().is_empty() {
+            return Err(IndependentReviewVerdictError::MissingField("summary"));
+        }
+        if self.evidence.base.trim().is_empty() {
+            return Err(IndependentReviewVerdictError::MissingField("evidence.base"));
+        }
+        if self.evidence.head_sha.0.trim().is_empty() {
+            return Err(IndependentReviewVerdictError::MissingField(
+                "evidence.head_sha",
+            ));
+        }
+        if self.verdict == IndependentReviewVerdictStatus::Green && !self.findings.is_empty() {
+            return Err(IndependentReviewVerdictError::GreenWithFindings);
+        }
+        if self.verdict == IndependentReviewVerdictStatus::Red && self.findings.is_empty() {
+            return Err(IndependentReviewVerdictError::RedWithoutFindings);
+        }
+        for finding in &self.findings {
+            if finding.title.trim().is_empty() {
+                return Err(IndependentReviewVerdictError::MissingField("finding.title"));
+            }
+            if finding.detail.trim().is_empty() {
+                return Err(IndependentReviewVerdictError::MissingField(
+                    "finding.detail",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndependentReviewVerdictError {
+    UnsupportedSchema { schema_version: String },
+    MissingField(&'static str),
+    GreenWithFindings,
+    RedWithoutFindings,
+}
+
+impl std::fmt::Display for IndependentReviewVerdictError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedSchema { schema_version } => write!(
+                formatter,
+                "unsupported schema_version {schema_version:?}; expected {INDEPENDENT_REVIEW_SCHEMA_VERSION:?}"
+            ),
+            Self::MissingField(field) => write!(formatter, "missing required field {field}"),
+            Self::GreenWithFindings => {
+                formatter.write_str("green verdict must not include findings")
+            }
+            Self::RedWithoutFindings => formatter.write_str("red verdict must include findings"),
+        }
+    }
+}
+
+impl std::error::Error for IndependentReviewVerdictError {}
+
+pub fn independent_review_completion_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": format!(
+            "Typed IndependentReviewCompletionRequest. Every verdict.schema_version must be exactly {:?}.",
+            INDEPENDENT_REVIEW_SCHEMA_VERSION
+        ),
+        "properties": {
+            "issue": {
+                "type": "object",
+                "description": "Linear issue reference, for example {\"kind\":\"identifier\",\"identifier\":\"LUC-631\"}."
+            },
+            "pull_request": {
+                "type": "object",
+                "description": "GitHubPullRequestSnapshot for the reviewed PR."
+            },
+            "head_sha": {
+                "type": "string",
+                "description": "Exact reviewed PR head SHA."
+            },
+            "workgraph_scope": {
+                "type": "object",
+                "description": "The exact WorkGraph scope used by the independent review mob. Copy realm_id and namespace from the reviewer obligation items you created; Fugue will create red-review blockers in this same scope.",
+                "properties": {
+                    "realm_id": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "namespace": {
+                        "type": "string",
+                        "minLength": 1
+                    }
+                },
+                "required": ["realm_id", "namespace"],
+                "additionalProperties": false
+            },
+            "timed_out": {
+                "type": "boolean",
+                "default": false
+            },
+            "idempotency_key": {
+                "type": "string"
+            },
+            "verdicts": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "schema_version": {
+                            "type": "string",
+                            "const": INDEPENDENT_REVIEW_SCHEMA_VERSION
+                        },
+                        "reviewer_id": {"type": "string"},
+                        "focus": {"type": "string"},
+                        "verdict": {
+                            "type": "string",
+                            "enum": ["green", "red", "blocked"]
+                        },
+                        "summary": {"type": "string"},
+                        "findings": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "severity": {
+                                        "type": "string",
+                                        "enum": ["blocker", "major", "minor", "note"]
+                                    },
+                                    "title": {"type": "string"},
+                                    "detail": {"type": "string"},
+                                    "file": {"type": "string"},
+                                    "line": {"type": "integer", "minimum": 1}
+                                },
+                                "required": ["severity", "title", "detail"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "evidence": {
+                            "type": "object",
+                            "properties": {
+                                "base": {"type": "string"},
+                                "head_sha": {"type": "string"},
+                                "commands": {"type": "array", "items": {"type": "string"}},
+                                "checked_paths": {"type": "array", "items": {"type": "string"}}
+                            },
+                            "required": ["base", "head_sha"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": [
+                        "schema_version",
+                        "reviewer_id",
+                        "focus",
+                        "verdict",
+                        "summary",
+                        "evidence"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": [
+            "issue",
+            "pull_request",
+            "head_sha",
+            "workgraph_scope",
+            "verdicts",
+            "timed_out",
+            "idempotency_key"
+        ],
+        "additionalProperties": false
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndependentReviewAggregationInput {
+    pub config: IndependentReviewConfig,
+    pub issue_identifier: String,
+    pub head_sha: GitSha,
+    pub verdicts: Vec<IndependentReviewVerdict>,
+    pub timed_out: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IndependentReviewAggregationPlan {
+    pub decision: IndependentReviewDecision,
+    pub target_lane: Option<String>,
+    pub consolidated_comment: Option<String>,
+    pub workgraph_items: Vec<IndependentReviewWorkGraphItem>,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndependentReviewDecision {
+    Waiting,
+    Success,
+    Rework,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IndependentReviewWorkGraphItem {
+    pub title: String,
+    pub detail: String,
+    pub labels: Vec<String>,
+}
+
+pub fn aggregate_independent_review(
+    input: IndependentReviewAggregationInput,
+) -> IndependentReviewAggregationPlan {
+    let required = usize::from(input.config.reviewer_count);
+    let distinct_reviewer_ids = distinct_reviewer_ids(&input.verdicts);
+    if distinct_reviewer_ids.len() < input.verdicts.len() {
+        return IndependentReviewAggregationPlan {
+            decision: IndependentReviewDecision::Blocked,
+            target_lane: Some(input.config.blocked_lane),
+            consolidated_comment: None,
+            workgraph_items: Vec::new(),
+            reasons: vec!["duplicate reviewer verdict ids".to_string()],
+        };
+    }
+    if input.verdicts.len() < required && !input.timed_out {
+        return IndependentReviewAggregationPlan {
+            decision: IndependentReviewDecision::Waiting,
+            target_lane: None,
+            consolidated_comment: None,
+            workgraph_items: Vec::new(),
+            reasons: vec![format!(
+                "waiting for {}/{} independent review verdicts",
+                input.verdicts.len(),
+                required
+            )],
+        };
+    }
+    if input.verdicts.len() < required && input.timed_out {
+        return IndependentReviewAggregationPlan {
+            decision: IndependentReviewDecision::Blocked,
+            target_lane: Some(input.config.blocked_lane),
+            consolidated_comment: None,
+            workgraph_items: Vec::new(),
+            reasons: vec![format!(
+                "timed out with {}/{} independent review verdicts",
+                input.verdicts.len(),
+                required
+            )],
+        };
+    }
+    if let Some(blocked) = input
+        .verdicts
+        .iter()
+        .find(|verdict| verdict.verdict == IndependentReviewVerdictStatus::Blocked)
+    {
+        return IndependentReviewAggregationPlan {
+            decision: IndependentReviewDecision::Blocked,
+            target_lane: Some(input.config.blocked_lane),
+            consolidated_comment: None,
+            workgraph_items: Vec::new(),
+            reasons: vec![format!("reviewer {} was blocked", blocked.reviewer_id)],
+        };
+    }
+
+    let red_findings = input
+        .verdicts
+        .iter()
+        .filter(|verdict| verdict.verdict == IndependentReviewVerdictStatus::Red)
+        .flat_map(|verdict| {
+            verdict
+                .findings
+                .iter()
+                .map(move |finding| (verdict, finding))
+        })
+        .collect::<Vec<_>>();
+    if !red_findings.is_empty() {
+        let labels = vec![
+            "fugue".to_string(),
+            format!("issue:{}", input.issue_identifier),
+            "review".to_string(),
+            "blocking".to_string(),
+        ];
+        let workgraph_items = red_findings
+            .iter()
+            .map(|(verdict, finding)| IndependentReviewWorkGraphItem {
+                title: format!("{}: {}", verdict.reviewer_id, finding.title),
+                detail: finding.detail.clone(),
+                labels: labels.clone(),
+            })
+            .collect::<Vec<_>>();
+        return IndependentReviewAggregationPlan {
+            decision: IndependentReviewDecision::Rework,
+            target_lane: Some(input.config.rework_lane.clone()),
+            consolidated_comment: Some(independent_review_findings_comment(
+                &input.config.findings_comment_marker,
+                &input.issue_identifier,
+                &input.head_sha,
+                &red_findings,
+            )),
+            workgraph_items,
+            reasons: vec!["one or more independent reviewers requested changes".to_string()],
+        };
+    }
+
+    IndependentReviewAggregationPlan {
+        decision: IndependentReviewDecision::Success,
+        target_lane: Some(input.config.success_lane),
+        consolidated_comment: None,
+        workgraph_items: Vec::new(),
+        reasons: vec!["all independent reviewers are green".to_string()],
+    }
+}
+
+fn distinct_reviewer_ids(verdicts: &[IndependentReviewVerdict]) -> Vec<&str> {
+    let mut ids = Vec::new();
+    for verdict in verdicts {
+        if !ids.contains(&verdict.reviewer_id.as_str()) {
+            ids.push(verdict.reviewer_id.as_str());
+        }
+    }
+    ids
+}
+
+fn independent_review_findings_comment(
+    marker: &str,
+    issue_identifier: &str,
+    head_sha: &GitSha,
+    findings: &[(&IndependentReviewVerdict, &IndependentReviewFinding)],
+) -> String {
+    struct Findings<'a>(&'a [(&'a IndependentReviewVerdict, &'a IndependentReviewFinding)]);
+
+    impl std::fmt::Display for Findings<'_> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            for (index, (verdict, finding)) in self.0.iter().enumerate() {
+                if index > 0 {
+                    formatter.write_str("\n")?;
+                }
+                write!(
+                    formatter,
+                    "- [{}] {}: {} -- {}",
+                    verdict.reviewer_id,
+                    format!("{:?}", finding.severity).to_lowercase(),
+                    finding.title,
+                    finding.detail
+                )?;
+            }
+            Ok(())
+        }
+    }
+
+    format!(
+        "{marker}\n\nIssue: {issue_identifier}\nHead SHA: {}\n\n{}",
+        head_sha.0,
+        Findings(findings)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn green_verdict() -> IndependentReviewVerdict {
+        IndependentReviewVerdict {
+            schema_version: INDEPENDENT_REVIEW_SCHEMA_VERSION.to_string(),
+            reviewer_id: "runtime-boundary".to_string(),
+            focus: "Meta runtime boundary".to_string(),
+            verdict: IndependentReviewVerdictStatus::Green,
+            summary: "No blocking findings.".to_string(),
+            findings: Vec::new(),
+            evidence: IndependentReviewEvidence {
+                base: "main".to_string(),
+                head_sha: GitSha("abc123".to_string()),
+                commands: vec!["git diff origin/main...HEAD".to_string()],
+                checked_paths: vec!["src/meta_runtime.rs".to_string()],
+            },
+        }
+    }
+
+    fn red_verdict() -> IndependentReviewVerdict {
+        let mut verdict = green_verdict();
+        verdict.reviewer_id = "tests".to_string();
+        verdict.focus = "Test coverage".to_string();
+        verdict.verdict = IndependentReviewVerdictStatus::Red;
+        verdict.summary = "Missing regression coverage.".to_string();
+        verdict.findings = vec![IndependentReviewFinding {
+            severity: IndependentReviewFindingSeverity::Major,
+            title: "Missing regression test".to_string(),
+            detail: "The PR changes lane classification without a focused test.".to_string(),
+            file: Some("src/linear_lane_state.rs".to_string()),
+            line: Some(120),
+        }];
+        verdict
+    }
+
+    fn aggregation_config() -> IndependentReviewConfig {
+        IndependentReviewConfig {
+            enabled: true,
+            ..IndependentReviewConfig::default()
+        }
+    }
+
+    fn aggregation_input(
+        verdicts: Vec<IndependentReviewVerdict>,
+    ) -> IndependentReviewAggregationInput {
+        IndependentReviewAggregationInput {
+            config: aggregation_config(),
+            issue_identifier: "LUC-631".to_string(),
+            head_sha: GitSha("abc123".to_string()),
+            verdicts,
+            timed_out: false,
+        }
+    }
+
+    #[test]
+    fn independent_review_verdict_round_trips_with_typed_status() {
+        let verdict = green_verdict();
+
+        let encoded = serde_json::to_string(&verdict).unwrap();
+        let decoded: IndependentReviewVerdict = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded, verdict);
+        decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn independent_review_verdict_rejects_red_without_findings() {
+        let mut verdict = green_verdict();
+        verdict.verdict = IndependentReviewVerdictStatus::Red;
+
+        assert_eq!(
+            verdict.validate(),
+            Err(IndependentReviewVerdictError::RedWithoutFindings)
+        );
+    }
+
+    #[test]
+    fn independent_review_verdict_rejects_unknown_schema() {
+        let mut verdict = green_verdict();
+        verdict.schema_version = "fugue.review.v0".to_string();
+
+        assert_eq!(
+            verdict.validate(),
+            Err(IndependentReviewVerdictError::UnsupportedSchema {
+                schema_version: "fugue.review.v0".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn independent_review_completion_schema_exposes_exact_verdict_schema() {
+        let schema = independent_review_completion_input_schema();
+
+        assert_eq!(
+            schema
+                .pointer("/properties/verdicts/items/properties/schema_version/const")
+                .and_then(Value::as_str),
+            Some(INDEPENDENT_REVIEW_SCHEMA_VERSION)
+        );
+        assert!(
+            schema
+                .pointer("/description")
+                .and_then(Value::as_str)
+                .is_some_and(|description| description.contains(INDEPENDENT_REVIEW_SCHEMA_VERSION))
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/workgraph_scope/required/0")
+                .and_then(Value::as_str),
+            Some("realm_id")
+        );
+        assert!(
+            schema
+                .pointer("/required")
+                .and_then(Value::as_array)
+                .is_some_and(|required| required.iter().any(|value| value == "workgraph_scope"))
+        );
+    }
+
+    #[test]
+    fn independent_review_aggregation_waits_for_three_verdicts() {
+        let plan = aggregate_independent_review(aggregation_input(vec![green_verdict()]));
+
+        assert_eq!(plan.decision, IndependentReviewDecision::Waiting);
+        assert!(plan.target_lane.is_none());
+    }
+
+    #[test]
+    fn independent_review_aggregation_all_green_moves_to_success_lane() {
+        let mut second = green_verdict();
+        second.reviewer_id = "product".to_string();
+        let mut third = green_verdict();
+        third.reviewer_id = "ops".to_string();
+
+        let plan =
+            aggregate_independent_review(aggregation_input(vec![green_verdict(), second, third]));
+
+        assert_eq!(plan.decision, IndependentReviewDecision::Success);
+        assert_eq!(plan.target_lane.as_deref(), Some("Ready for review"));
+    }
+
+    #[test]
+    fn independent_review_aggregation_red_creates_comment_and_workgraph_items() {
+        let mut third = green_verdict();
+        third.reviewer_id = "ops".to_string();
+
+        let plan = aggregate_independent_review(aggregation_input(vec![
+            green_verdict(),
+            red_verdict(),
+            third,
+        ]));
+
+        assert_eq!(plan.decision, IndependentReviewDecision::Rework);
+        assert_eq!(plan.target_lane.as_deref(), Some("Rework"));
+        assert_eq!(plan.workgraph_items.len(), 1);
+        assert!(plan.consolidated_comment.unwrap().contains("LUC-631"));
+    }
+
+    #[test]
+    fn independent_review_aggregation_timeout_blocks() {
+        let mut input = aggregation_input(vec![green_verdict()]);
+        input.timed_out = true;
+
+        let plan = aggregate_independent_review(input);
+
+        assert_eq!(plan.decision, IndependentReviewDecision::Blocked);
+        assert_eq!(plan.target_lane.as_deref(), Some("Blocked"));
+    }
+}

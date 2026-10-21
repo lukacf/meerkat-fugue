@@ -1,0 +1,191 @@
+# Operator guide
+
+This guide is for people running Fugue against a real Linear queue. It focuses
+on safe setup, daily operation, monitoring, handoff evidence, incidents, and
+rollback.
+
+## Operating model
+
+On each poll Fugue:
+
+1. reads eligible Linear issues from configured project lanes;
+2. skips blocked, terminal, already running, claimed, or backing-off work;
+3. creates or reuses the issue workspace;
+4. runs configured setup/sync hooks;
+5. launches the selected native Meerkat mob template;
+6. reconciles Meta, workspace, Linear, and GitHub evidence.
+
+The service is intended for trusted automation hosts. It does not provide an OS
+sandbox.
+
+## Production setup checklist
+
+- [ ] Create a dedicated Linear API key.
+- [ ] Confirm the Linear workflow has every state required by `linear.lanes`
+      and the selected `linear_projections`, or set
+      `linear.provisioning.mode: create_missing` with an explicit team.
+- [ ] Confirm workers have GitHub credentials for target repositories.
+- [ ] Install and smoke-test Meerkat/Meta native execution tooling.
+- [ ] Deploy `meerkat-fugue`, `fugue-linear-mcp`, `fugue-github-mcp`,
+      and `fugue-host-mcp` together so the service and companion MCP tool
+      contracts stay in sync.
+      Install or restart all four binaries atomically; issue mob members use
+      the helper MCP binaries for Linear Workpad updates and GitHub PR/check/
+      merge evidence, so deploying only the service can leave stale member tool
+      behavior behind.
+- [ ] For GCP/systemd hosts with a persistent source checkout, use
+      `scripts/gcp-systemd/ota-update.sh` for one-command pull/build/replace/
+      restart updates from the host.
+- [ ] Record binary hash evidence for every Fugue binary in the issue-mob path:
+      `meerkat-fugue`, `fugue-linear-mcp`, `fugue-github-mcp`, and
+      `fugue-host-mcp`.
+- [ ] Run `scripts/gcp-systemd/setup-host.sh` once on the remote host to create
+      the Fugue root, binary directory, shared secrets file, queue/workspace/log/
+      state roots, and auth hook.
+- [ ] Run `meerkat-fugue configure backend gcp-systemd ...` once locally to
+      record the reusable GCP/systemd deploy profile and flow-to-team mappings.
+- [ ] Run `meerkat-fugue /path/to/repo` to create/reuse the Linear queue,
+      generate native config and prompts, deploy them to the backend, install or
+      update systemd, start the queue, and print tunnel/status details.
+- [ ] Keep secrets in environment variables, not committed YAML.
+- [ ] Set `workspace.root` to durable storage with enough disk space.
+- [ ] Make `hooks.after_create` clone the intended repository.
+- [ ] Make `hooks.before_run` safely sync the checkout.
+- [ ] Review `prompts/fugue-worker.md` and your Linear handoff policy.
+- [ ] Run safe validation: `cargo fmt --check`, `cargo test`, and
+      `cargo run -- --help`.
+
+## Starting Fugue
+
+```bash
+export LINEAR_API_KEY=lin_api_...
+RUST_LOG=meerkat_fugue=info cargo run -- ./fugue.yaml --port 0
+```
+
+Use `--port 0` or `server.port: 0` to bind the status server to a free loopback
+port. Expose the status surface beyond loopback only with access controls. For a
+simple raw-IP setup, configure `server.meta_console.basic_auth` and protect
+the transport with HTTPS, an SSH/IAP tunnel, or a source-IP firewall rule.
+
+## Monitoring
+
+Enable the status surface with `--port` or `server.port`.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /` | Human dashboard. |
+| `GET /console` | Authenticated Meta console served by the Meta console router and embedded under Meerkat Fugue app chrome. |
+| `POST /console/rpc` | Authenticated Meta console JSON-RPC through the Meta console router. |
+| `GET /api/v1/state` | Full orchestrator snapshot as JSON. |
+| `GET /api/v1/{issue_identifier}` | Issue-scoped running row, events, and errors. |
+| `POST /api/v1/refresh` | Request an immediate poll. |
+| `POST /api/v1/ota-update` | Trigger configured authorized OTA fetch/staging-build/deploy flow. |
+
+Inspect these fields first:
+
+- `running[]` for executing issues, backend, policy owner, and workspace.
+- `retrying[]` for attempts waiting on retry backoff.
+- `last_errors` for hook, worker, timeout, or reconciliation failures.
+- `kapellmeister_shadow` when shadow recommendations are enabled.
+- `native_recovery.review_required` for evidence mismatches.
+
+Use `/console` only behind configured browser auth. Fugue serves configured
+Meta console assets unchanged and forwards console JSON-RPC to the configured
+Meta console service; it does not provide host-projected timeline, session
+history, roster, or send acknowledgement semantics. Those surfaces belong in
+Meta.
+
+## Native Meta stall heartbeat
+
+Native rows use a Meta status heartbeat at the stall boundary. If no new
+structural event appears before `meerkat.stall_timeout_ms`, Fugue asks Meta
+for run status before canceling. `pending`, `running`, or `waiting_for_input`
+records a `native_mob_status_heartbeat` event instead of canceling the run.
+
+
+## Handoff evidence
+
+Treat a run as green only when the Workpad and status evidence show:
+
+- Exactly one issue-specific Workpad exists for the current issue, with no
+  duplicate generic Fugue Workpad comment created during recovery or handoff.
+- Exactly one PR exists for the issue branch; duplicate PRs must be closed or
+  explicitly ruled out before completion.
+- CI/check evidence is branch-scoped to the issue branch or PR head instead of
+  copied from a stale SHA-only check result.
+- Final evidence records the PR URL, check conclusion, merge SHA, and Linear
+  `Done` handoff.
+- MCP servers expose protocol-compatible `inputSchema` descriptors.
+- Planner, coder, and reviewer profiles have the required `mcp:linear` and
+  `mcp:github` tools.
+- The planner publishes a specific checkbox plan.
+- Planner, coder, and reviewer members report lifecycle facts to the issue
+  lead. The issue lead owns per-issue `linear_move_issue` movement; Fugue
+  observes Linear and reports external lane drift to Kapellmeister/issue mobs.
+- The coder checks off implementation and validation items with concrete
+  evidence.
+- The reviewer records green or red findings and PR/no-PR evidence.
+- Member-facing MCP tools provide Workpad, PR, check, and merge evidence after
+  the deploy; do not treat service health alone as a production smoke pass.
+- Logs and the Meta console include native member launch, wiring, and review evidence.
+- Logs do not show repeated transport errors, empty MCP catalogs, missing state
+  arguments, stale active rows, retry loops, or recovery mismatches.
+
+## Common incidents
+
+### Hook failure
+
+1. Inspect the issue workspace under `workspace.root`.
+2. Re-run the failing hook manually from that directory.
+3. Fix `fugue.yaml`, repository access, or host credentials.
+4. Trigger `POST /api/v1/refresh` or wait for the next poll.
+
+### Worker or Meta failure
+
+1. Open the Linear Workpad and PR if one exists.
+2. Inspect `GET /api/v1/{issue_identifier}`.
+3. If durable evidence disagrees, leave the issue in the reviewer node's
+   projected lane, record the operator finding, and resolve manually.
+4. If transient, allow retry backoff to retry.
+
+During restart, a terminal Meta `Cancelled` event is only a recovery signal.
+Do not move the Linear issue to a canceled lane until Workpad, workspace,
+branch, PR, check, and merge evidence prove the work was intentionally
+abandoned. If an issue-specific Workpad heading such as `## LUC-123 Workpad`
+contains richer handoff evidence than `## Fugue Workpad`, preserve the richer
+comment and continue retry, review, or completion from that evidence. Verify
+recovery changes with a fresh issue that records PR, check, merge, and final
+handoff evidence.
+
+### Duplicate or missing PR evidence
+
+Choose the correct PR, update the Workpad, close duplicates if appropriate, and
+return the issue to the planner node's projected lane for focused rework or
+keep it in the reviewer node's projected lane until evidence is coherent.
+
+## Pause Or Park
+
+For production incidents, pause the systemd service or move affected issues into
+the configured non-active operator lane, then inspect `/api/v1/state`,
+Kapellmeister history, and Meta member timelines. Do not route production
+queues through another execution backend.
+
+Restart the service only after the incident is understood and the queue is safe to resume.
+
+## Real E2E warning
+
+The ignored real E2E suite creates live Linear projects/issues, GitHub
+repositories/PRs, and real Meerkat sessions. Run it only in an
+operator-approved disposable environment:
+
+```bash
+MEERKAT_FUGUE_REAL_E2E=1 \
+MEERKAT_FUGUE_E2E_POLICY_MODE=native_only \
+MEERKAT_FUGUE_E2E_KEEP_RESOURCES=1 \
+cargo test --test real_e2e -- --ignored --nocapture
+```
+
+## Related docs
+
+- [Status Api](./status-api.mdx)
+- [Troubleshooting](./troubleshooting.mdx)

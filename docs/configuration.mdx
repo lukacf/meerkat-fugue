@@ -1,0 +1,467 @@
+# Configuration reference
+
+Fugue's native configuration file is `fugue.yaml` or `fugue.yml`. Native configs
+are parsed into typed Rust structs and fail fast on unknown fields or invalid
+backend combinations.
+
+New queues
+should use `fugue.yaml`.
+
+## Top-level shape
+
+```yaml
+version: 1
+backend: native-execution # optional; omitted is native-execution
+linear: { ... }
+linear_projections: { ... }
+selection: { ... }
+mcp_servers: { ... }
+agents: { ... }
+mob_templates: { ... }
+worker: { ... }
+polling: { ... }
+workspace: { ... }
+hooks: { ... }
+agent: { ... }
+meerkat: { ... }
+mob: { ... }
+kapellmeister: { ... }
+server: { ... }
+```
+
+## Native defaults and backend rules
+
+For native YAML configs:
+
+- omitted top-level `backend` resolves to `native-execution`;
+- omitted `mob.backend` inherits the top-level backend;
+- omitted `mob.native` resolves to native runtime enabled when native execution
+  is selected;
+
+Fugue rejects ambiguous mixtures, such as native execution with
+`mob.native.enabled: false`, before dispatching a worker.
+
+## Environment variables
+
+String values beginning with `$` reference environment variables:
+
+```yaml
+linear:
+  api_key: $LINEAR_API_KEY
+```
+
+If `linear.api_key` is omitted, Fugue also checks `LINEAR_API_KEY`.
+
+## `linear`
+
+Configures issue intake, universal lane anchors, and optional workflow-state
+provisioning. Linear is a projection surface owned per issue by the issue lead;
+Fugue observes Linear for external lane drift.
+
+Canonical tracker lanes are coarse operator states:
+
+```yaml
+tracker_lanes:
+  parked: Backlog
+  intake: Queue
+  active: Active
+  review_action: Review
+  deploy_action: Deploy
+  blocked: Blocked
+  success: Done
+  canceled: Canceled
+```
+
+Planning, implementing, reviewing, template identity, and deploy flavor belong
+in labels (`fugue:phase:*`, `fugue:template:*`), Workpad, WorkGraph, Meta
+runtime state, and config; they should not require separate tracker statuses.
+
+```yaml
+linear:
+  endpoint: https://api.linear.app/graphql
+  api_key: $LINEAR_API_KEY
+  project_slug: your-project-slug
+  team: LUC
+  provisioning:
+    mode: validate # or create_missing
+  lanes:
+    parked: Backlog
+    ready: Queue
+    active: Active
+    do_review: Review
+    deploy: Deploy
+    blocked: Blocked
+    success: Done
+    canceled: Canceled
+    duplicate: Duplicate
+  labels:
+    - fugue:template:meerkat-fugue
+```
+
+The lane anchors are semantic defaults used across templates:
+
+- `parked`: intentionally not eligible for work.
+- `ready`/`intake`: eligible for fresh dispatch.
+- `active`: Fugue is actively working the issue; phase details are labels,
+  Workpad, WorkGraph, and Meta state.
+- `do_review`/`review_action` and `deploy`/`deploy_action`: action lanes that
+  trigger configured review/deploy procedures.
+- `success`: terminal success.
+- `canceled` and `duplicate`: terminal canceled states.
+
+`linear.team` is required for projection preflight because Linear workflow
+states are team-scoped. When `provisioning.mode` is `validate`, Fugue fails
+preflight if required states are missing. When it is `create_missing`, Fugue
+creates missing team-scoped workflow states. Fugue never deletes or renames
+existing Linear states automatically.
+
+`linear.states` is no longer accepted. Configure operator lanes under
+`linear.lanes` and mob projection lanes under `linear_projections`.
+
+## `linear_projections`
+
+Maps mob flow node ids to Linear lanes. Member ids are used as a fallback only
+when Meta does not expose node ids.
+
+```yaml
+linear_projections:
+  planner_coder_reviewer:
+    node_lanes:
+      planner: Active
+      coder: Active
+      reviewer: Active
+    node_phase_labels:
+      planner: fugue:phase:planning
+      coder: fugue:phase:implementing
+      reviewer: fugue:phase:reviewing
+    aggregate:
+      precedence: [Active]
+      fallback: Active
+    terminal_lanes:
+      succeeded: Done
+      failed: Active
+      cancelled: Canceled
+```
+
+If multiple nodes are active in parallel, Fugue displays the first active lane
+from `aggregate.precedence`. Terminal Meta run status maps only through
+`terminal_lanes`; PR/check side effects should be represented by mob nodes or
+Workpad evidence, not hidden Fugue lifecycle states.
+
+Legacy lanes such as `Todo`, `Planning`, `Implementing`, `Reviewing`,
+`Do Review`, `Rework`, `Human Review`, and `In Progress` are repaired or
+reported explicitly into the canonical lanes.
+
+## `selection`
+
+Maps issues to mob templates.
+
+```yaml
+selection:
+  default_template: planner_coder_reviewer
+  by_label:
+    docs: planner_coder_reviewer
+    risky-change: planner_coder_reviewer
+```
+
+Label names are matched against Linear issue labels. Issues without a matching
+label use `default_template`.
+
+## `mcp_servers`
+
+Defines scoped MCP servers that agent profiles can request.
+
+```yaml
+mcp_servers:
+  linear:
+    command: [fugue-linear-mcp]
+  github:
+    command: [fugue-github-mcp]
+```
+
+Agent tools should reference these as `mcp:linear` and `mcp:github`. Bare
+`linear` or `github` tool names are rejected so a member cannot silently start
+without the intended MCP catalog. The configured helper binaries are part of the
+runtime contract for issue mob members: `fugue-linear-mcp` owns Linear Workpad
+updates, `fugue-github-mcp` owns GitHub PR/check handoff evidence, and
+`fugue-host-mcp` owns host-level Fugue control-plane actions. It hides
+`github_merge_pr` by default; expose merge only for an explicit repo-level merge
+authority by setting `FUGUE_GITHUB_ALLOW_MERGE=true` on that MCP server. Deploy
+or restart the helpers with `meerkat-fugue`, and include all four binary hashes
+in post-deploy evidence.
+
+Fugue provides Playwright MCP to native agents by default. The default server is:
+
+```yaml
+mcp_servers:
+  playwright:
+    command: [npx, -y, "@playwright/mcp@latest", --headless]
+```
+
+If a queue defines its own `mcp_servers.playwright`, Fugue preserves that
+override. Otherwise native configs materialize the default server above and add
+`mcp:playwright` to every materialized issue-agent profile. Production hosts
+therefore need Node.js, `npx`, the Playwright package, and browser dependencies
+available to the Fugue service user.
+
+## `agents`
+
+Defines reusable Meerkat member profiles.
+
+```yaml
+agents:
+  coder:
+    model: gpt-5.5
+    provider: openai
+    max_tokens: 8000
+    tools: [mob, shell, git, mcp:linear, mcp:github]
+    skills: []
+    system_prompt: Implement inside the assigned workspace only.
+    additional_instructions:
+      - Keep the Fugue Workpad current.
+```
+
+Supported fields include model/provider settings, token limits, provider
+params, structured-output options, tools, skills, system prompts, and additional
+instructions. The special `mob` tool maps to Meerkat mob tooling such as
+`delegate`, `mob_create`, and flow tools.
+
+## `mob_templates`
+
+Defines native execution mob shapes.
+
+```yaml
+mob_templates:
+  planner_coder_reviewer:
+    linear_projection: planner_coder_reviewer
+    max_review_cycles: 3
+    members:
+      - name: planner
+        profile: planner
+      - name: coder
+        profile: coder
+      - name: reviewer
+        profile: reviewer
+```
+
+Members may be plain profile names or objects with `name` and `profile`.
+By default, native Meta issue mobs are prompt-driven: Fugue launches the
+issue lead plus worker members and the issue lead coordinates planner, coder,
+and reviewer through comms. Keep reviewer loops bounded with
+`max_review_cycles`.
+
+Do not add `flow:` to operator-facing native execution templates unless the
+configured Meta runtime is meant to use `mob/flow_run`. The default is a
+prompt-driven Meta topology with explicit peers, not host-side step control.
+
+## `worker`
+
+Configures prompt templates handed to workers and native launch context.
+
+```yaml
+worker:
+  prompt_file: prompts/fugue-worker.md
+  native_launch_context_file: prompts/native-launch-context.md
+```
+
+Use either inline template text or a file path for each template, not both.
+Relative file paths are resolved relative to the config file. The worker prompt
+receives issue data and attempt metadata; the native launch context also
+receives workspace, backend, template, flow, and member data.
+
+## `polling`
+
+```yaml
+polling:
+  interval_ms: 30000
+```
+
+Controls regular Linear poll cadence. When the status server is enabled,
+`POST /api/v1/refresh` requests an immediate poll.
+
+## `workspace`
+
+```yaml
+workspace:
+  root: ./fugue_workspaces
+```
+
+Each issue gets a directory below this root. Workspace names are derived from
+issue identifiers by replacing characters outside `[A-Za-z0-9._-]` with `_`.
+
+## `hooks`
+
+```yaml
+hooks:
+  timeout_ms: 60000
+  after_create: |
+    git clone https://github.com/your-org/your-repo.git .
+  before_run: |
+    git fetch --all --prune
+  after_run: |
+    git status --short
+  before_remove: |
+    git clean -fdx
+```
+
+Hooks run as `sh -lc` scripts with the issue workspace as the current directory.
+`after_create` and `before_run` failures abort the attempt. `after_run` and
+`before_remove` failures are logged and ignored.
+
+## `agent`
+
+Runtime limits for Fugue orchestration.
+
+```yaml
+agent:
+  max_concurrent_agents: 3
+  max_turns: 20
+  max_retry_backoff_ms: 300000
+  max_concurrent_agents_by_state:
+    todo: 1
+```
+
+`max_concurrent_agents_by_state` keys are normalized Linear state names.
+
+## `meerkat`
+
+Low-level Meerkat and Meta settings.
+
+```yaml
+meerkat:
+  command: rkat-rpc
+  realm_backend: sqlite
+  model: gpt-5.5
+  max_sessions: 4096
+  enable_shell: true
+  enable_builtins: true
+  enable_mob: true
+  first_turn_activation_prompt: Begin.
+  turn_timeout_ms: 3600000
+  read_timeout_ms: 5000
+  stall_timeout_ms: 300000
+```
+
+`max_sessions` is the positive native session capacity, separate from issue concurrency.
+Use `auth_binding` for a structural Meerkat credential binding. The 0.9.3 runtime
+and configuration changes are described in [the upgrade guide](./upgrading-0.9.3.mdx).
+
+Additional fields cover realm paths, provider params, feature flags,
+keep-alive, preloaded skills, app context, shell environment, and flow tool
+overlays.
+
+## `mob`
+
+Advanced backend/runtime override. Most native configs should omit this section.
+
+```yaml
+mob:
+  backend: native-execution
+  native:
+    enabled: true
+    shadow: false
+```
+
+
+## `kapellmeister`
+
+Kapellmeister shadow mode records recommendations without production mutation.
+Guarded authority must be explicitly narrowed with safe selectors.
+
+```yaml
+kapellmeister:
+  shadow_mode:
+    enabled: false
+    state_path: .fugue/kapellmeister-shadow.json
+  authority_mode: guarded_labeled
+  safe_selectors:
+    linear_labels:
+      - kapellmeister-safe
+```
+
+Production Kapellmeister decisions either execute through guarded native host
+tools or stop.
+
+## `server`
+
+```yaml
+server:
+  port: 0
+  meta_console:
+    enabled: true
+    rpc_timeout_ms: 30000
+    basic_auth:
+      username_env: FUGUE_CONSOLE_USERNAME
+      password_env: FUGUE_CONSOLE_PASSWORD
+      realm: Meerkat Fugue
+```
+
+Enables the optional loopback status API. CLI `--port` overrides this value.
+The bind address defaults to `127.0.0.1` and can be changed with `--host`.
+Expose it on a public IP only with explicit browser authentication and a
+protected transport.
+
+`meta_console` controls the browser console route and related browser auth:
+
+- `GET /console` serves the Meta console through Meta's own router and
+  embeds the returned HTML under Meerkat Fugue app chrome. Non-HTML console
+  assets are passed through unchanged.
+- `POST /console/rpc` is handled by Meta's console router. Fugue does not
+  implement console timeline, roster, session-history, identity-routing, or
+  send-acknowledgement semantics.
+- `path`, when set, must be `/console`; older console paths are not served.
+
+Set `enabled: false` to keep the status dashboard/API but reject privileged
+operator console RPC. Configure `asset_dir` to serve the stock Meta console
+bundle; no asset path is defaulted to a machine-specific location.
+`rpc_timeout_ms` must be positive and defaults to `30000`.
+
+`basic_auth` is optional and generic. If configured, Fugue requires HTTP Basic
+Auth on the dashboard, `/console`, read-only status APIs, refresh, and console
+RPC. Credentials are read from environment variables so no deployment- or
+organization-specific secret is committed. `basic_auth: {}` uses
+`FUGUE_CONSOLE_USERNAME`, `FUGUE_CONSOLE_PASSWORD`, and realm `Meerkat Fugue`.
+
+## `ota_update`
+
+```yaml
+ota_update:
+  enabled: true
+  repo_path: /srv/meerkat-fugue/current
+  branch: main
+  remote: origin
+  build_command: cargo build --release
+  health_check_command: target/release/meerkat-fugue --help >/dev/null
+  deploy_command: >-
+    install -m 0755 target/release/meerkat-fugue /usr/local/bin/meerkat-fugue &&
+    install -m 0755 target/release/fugue-linear-mcp /usr/local/bin/fugue-linear-mcp &&
+    install -m 0755 target/release/fugue-github-mcp /usr/local/bin/fugue-github-mcp &&
+    install -m 0755 target/release/fugue-host-mcp /usr/local/bin/fugue-host-mcp &&
+    systemctl restart meerkat-fugue
+  lock_path: /var/lock/meerkat-fugue-ota.lock
+  trigger_token_env: FUGUE_OTA_TRIGGER_TOKEN
+  timeout_ms: 600000
+  require_clean: true
+```
+
+Configures a trusted over-the-air update path for the live Fugue server. It can
+be triggered with `meerkat-fugue --ota-update ./fugue.yaml` or by POSTing the
+status API at `/api/v1/ota-update` with `Authorization: Bearer $TOKEN` from
+`trigger_token_env`. Fugue serializes updates with a lock file, builds and
+optionally health-checks a staging git worktree at the resolved target SHA, and
+then runs the operator-owned deployment command that replaces/restarts the live
+service. Production deploy commands should install the service binary and the
+helper MCP binaries (`fugue-linear-mcp`, `fugue-github-mcp`, and
+`fugue-host-mcp`) from the same staging build before restart so member
+Workpad/GitHub tool behavior matches the service contract.
+
+For GCP/systemd hosts, `scripts/gcp-systemd/ota-update.sh` is the reusable host
+command for direct pull/build/atomic-replace/restart/health-check deployments
+from a trusted host checkout. Use it when the operator wants a single shell
+command to update the running system rather than triggering the in-process
+staging OTA endpoint.
+
+## Related docs
+
+- [Getting Started](./getting-started.mdx)
+- [Native Mobs](./native-mobs.mdx)

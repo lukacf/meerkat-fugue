@@ -1,0 +1,239 @@
+version: 1
+# Fugue uses native Meta execution only..
+
+linear:
+  api_key: $LINEAR_API_KEY
+  project_slug: your-project-slug
+  team: LUC
+  provisioning:
+    mode: validate
+  lanes:
+    parked: Backlog
+    ready: Queue
+    active: Active
+    do_review: Review
+    deploy: Deploy
+    blocked: Blocked
+    success: Done
+    canceled: Canceled
+    duplicate: Duplicate
+  labels:
+    - fugue:template:meerkat-fugue
+
+tracker_lanes:
+  parked: Backlog
+  intake: Queue
+  active: Active
+  review_action: Review
+  deploy_action: Deploy
+  blocked: Blocked
+  success: Done
+  canceled: Canceled
+
+linear_projections:
+  planner_coder_reviewer:
+    node_lanes:
+      planner: Active
+      coder: Active
+      reviewer: Active
+    node_phase_labels:
+      planner: fugue:phase:planning
+      coder: fugue:phase:implementing
+      reviewer: fugue:phase:reviewing
+    aggregate:
+      precedence: [Active]
+      fallback: Active
+    terminal_lanes:
+      succeeded: Done
+      failed: Active
+      cancelled: Canceled
+
+selection:
+  default_template: planner_coder_reviewer
+  by_label:
+    "fugue:template:meerkat-fugue": planner_coder_reviewer
+
+mcp_servers:
+  linear:
+    command: [fugue-linear-mcp]
+    env:
+      LINEAR_API_KEY: $LINEAR_API_KEY
+  github:
+    command: [fugue-github-mcp]
+    env:
+      GITHUB_TOKEN: $GITHUB_TOKEN
+
+agents:
+  planner:
+    model: gpt-5.5
+    # `mob` is Meerkat's native mob tool surface (delegate/mob_create/etc).
+    tools: [mob, workgraph, mcp:linear, mcp:github]
+    system_prompt: >-
+      Own the issue plan, Workpad, and issue WorkGraph intake. Convert reviewer,
+      PR, comment, and check feedback into blocking WorkGraph items before
+      implementation resumes.
+  coder:
+    model: gpt-5.5
+    tools: [mob, shell, git, workgraph, mcp:linear, mcp:github]
+    system_prompt: >-
+      Implement only the current Workpad plan and open WorkGraph obligations,
+      keep validation evidence current, and hand back to the reviewer when
+      local checks are ready.
+  reviewer:
+    model: gpt-5.5
+    tools: [mob, shell, git, workgraph, mcp:linear, mcp:github]
+    system_prompt: >-
+      Gate the local implementation and PR/check evidence. Inspect diff and
+      WorkGraph state yourself, close completed obligations only after review,
+      and create blocking WorkGraph items for red findings.
+
+mob_templates:
+  planner_coder_reviewer:
+    # Inherits the top-level native backend default (native-execution).
+    linear_projection: planner_coder_reviewer
+    max_review_cycles: 3
+    members:
+      - planner
+      - coder
+      - reviewer
+
+# Native execution is the only supported backend for fugue.yaml.
+
+worker:
+  prompt_file: prompts/fugue-worker.md
+  native_launch_context_file: prompts/native-launch-context.md
+
+polling:
+  interval_ms: 30000
+
+workspace:
+  root: ./fugue_workspaces
+
+hooks:
+  timeout_ms: 60000
+  after_create: |
+    git clone https://github.com/your-org/your-repo.git .
+  before_run: |
+    git fetch --all --prune
+
+agent:
+  max_concurrent_agents: 3
+  max_turns: 20
+  max_retry_backoff_ms: 300000
+  max_concurrent_agents_by_state:
+    queue: 1
+    active: 3
+    review: 1
+    deploy: 1
+
+meerkat:
+  enable_shell: true
+  enable_builtins: true
+  enable_mob: true
+  first_turn_activation_prompt: Begin.
+  turn_timeout_ms: 3600000
+  read_timeout_ms: 5000
+  stall_timeout_ms: 300000
+
+# Kapellmeister is disabled/shadow-only by default. Stage 4 guarded authority
+# must be explicitly narrowed, for example with authority_mode: guarded_labeled
+# plus safe_selectors.linear_labels: [kapellmeister-safe]. Roll back by setting
+# authority_mode: shadow_only, removing the guarded label, or enabling
+# removing the guarded label.
+kapellmeister:
+  shadow_mode:
+    enabled: false
+  # authority_mode: guarded_labeled
+  # safe_selectors:
+  #   linear_labels:
+  #     - kapellmeister-safe
+
+# Optional repo-level final PR review gate. Disabled by default; when enabled,
+# Kapellmeister owns final reviewer orchestration, typed verdict aggregation,
+# configured lane projection, and any explicitly authorized merge. Host/issue
+# mobs observe and hand off only.
+final_review:
+  enabled: false
+  mode: manual # manual | auto
+  lane: Review
+  rework_lane: Active
+  blocked_lane: Blocked
+  success_lane: Done
+  merge:
+    strategy: squash # squash | merge | rebase
+    delete_branch: true
+    require_ci_success: true
+    require_fresh_head: true
+  reviewers:
+    - id: architecture
+      profile: final_architecture_reviewer
+      required: true
+    - id: tests
+      profile: final_test_reviewer
+      required: true
+    - id: security
+      profile: final_security_reviewer
+      required: false
+
+# Optional independent PR Review action lane. When enabled, Kapellmeister starts a
+# review orchestrator mob for the configured action lane; the orchestrator chooses
+# exactly three independent reviewers, each reviewer inspects the diff itself,
+# and red findings become blocking WorkGraph obligations before focused
+# replanning in the canonical active lane.
+independent_review:
+  enabled: false
+  lane: Review
+  success_lane: Active
+  rework_lane: Queue
+  blocked_lane: Blocked
+  reviewer_count: 3
+  timeout_ms: 900000
+  findings_comment_marker: Fugue independent review findings
+
+# Optional repo-limited Deploy lane. Keep disabled unless this queue is the
+# live `lukacf/meerkat-fugue` production queue and ota_update is configured.
+deploy:
+  enabled: false
+  action_lane: Deploy
+  procedure: .fugue/deploy.md
+  ready_lane: Active
+  rework_lane: Queue
+  blocked_lane: Blocked
+  success_lane: Done
+  base_branch: main
+  merge_method: squash
+  allowed_repositories:
+    - owner: lukacf
+      name: meerkat-fugue
+  require_ci_success: true
+  require_fresh_head: true
+  require_no_blocking_workgraph: true
+  require_ota_update: true
+
+server:
+  port: 0
+
+# Optional Fugue-triggered over-the-air update path for the live Fugue server.
+# Invoke once with `meerkat-fugue --ota-update ./fugue.yaml`, or POST the local
+# status API at `/api/v1/ota-update`. The deploy command is operator-owned; it
+# should atomically replace/restart the live service, for example via systemd.
+#
+# ota_update:
+#   enabled: false
+#   repo_path: /srv/meerkat-fugue/current
+#   branch: main
+#   remote: origin
+#   build_command: cargo build --release
+#   health_check_command: target/release/meerkat-fugue --help >/dev/null
+#   # Install the service and helper MCP binaries from the same staging build;
+#   # issue mob members use the helpers for Workpad and GitHub evidence.
+#   deploy_command: >-
+#     install -m 0755 target/release/meerkat-fugue /usr/local/bin/meerkat-fugue &&
+#     install -m 0755 target/release/fugue-linear-mcp /usr/local/bin/fugue-linear-mcp &&
+#     install -m 0755 target/release/fugue-github-mcp /usr/local/bin/fugue-github-mcp &&
+#     install -m 0755 target/release/fugue-host-mcp /usr/local/bin/fugue-host-mcp &&
+#     systemctl restart meerkat-fugue
+#   lock_path: /var/lock/meerkat-fugue-ota.lock
+#   trigger_token_env: FUGUE_OTA_TRIGGER_TOKEN
+#   timeout_ms: 600000
+#   require_clean: true

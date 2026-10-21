@@ -1,0 +1,156 @@
+---
+title: "Upgrading to Meerkat and Meta 0.9.3"
+description: "Runtime ownership, configuration changes, and a controlled upgrade from Fugue's 0.6 integration."
+---
+
+Fugue now embeds **Meerkat 0.9.3 and Meerkat Meta 0.9.3**. Meta is the continuation
+of Meerkat MobKit. All Meerkat crates remain pinned to 0.9.3. Meta uses an
+immutable upstream Git backport of its 0.9.3 source: the published library
+omits continuity owner restoration before recovering an interrupted process.
+The backport registers those existing owners before native recovery, preserving
+their sessions. `Cargo.toml` and `Cargo.lock` pin the exact commit; builds do not
+depend on sibling checkouts. Remove the patch when upgrading to a release that
+includes [the upstream fix](https://github.com/lukacf/meerkat-meta/pull/674).
+Rust 1.94 is the minimum, and `rust-toolchain.toml` selects 1.97 with rustfmt and
+Clippy for development and CI. The release profile follows Meta’s downstream
+build guidance: generated runtime crates use optimization level zero to bound
+LLVM memory, while Fugue uses level one. Test debug information is disabled to
+keep the offline suite’s linking footprint manageable. Cargo also applies Meerkat's
+8 MiB debug test-thread stack budget. The service uses Meta's explicitly sized
+worker runtime and a 16 MiB root thread, including when launched directly by systemd.
+
+## Ownership
+
+Fugue owns Linear selection, workspaces, review/deploy policy, and the mapping
+between an issue and a run. Meerkat owns member identities, sessions, execution,
+communication, and the mob lifecycle. Meta composes the runtime, persistence,
+tool surfaces, and console. Fugue no longer has a second RPC execution host, reads native SQLite tables to
+infer completion, or moves runtime databases aside during recovery.
+
+The embedded runtime uses `UnifiedRuntime::builder()` with explicit persistent
+mob storage and its composition provenance. `persistent_state()` alone persists
+sessions but does not persist the native mob journal. Fugue supplies both and
+requires incremental session persistence. Changes to a persisted mob definition
+are validated by Meta before it resumes; a changed definition is not silently
+substituted into an old journal.
+
+Fugue records issue/run mappings in its own `fugue-runs.sqlite3`. These records
+are application metadata, not a substitute for the native mob journal. Recovery
+verifies the expected members against native state and refuses an incomplete
+launch instead of claiming that absent workers are running. Shutdown
+stops admission and quiesces Meta; it does not retire active persistent members.
+Explicit cancellation and cleanup wait for native member retirement before
+removing the application record.
+
+Native comms now validates every identity component. Issue members use an
+escaped identity such as `issue_LUC-900__issue_5Flead` instead of
+`LUC-900/issue_lead`; issue and role labels retain their normal readable values.
+Launch, wiring, retirement, and recovery all use the same encoding. External
+consumers should read native identities from the console or run data instead of
+constructing slash-delimited names.
+
+## Tools and profiles
+
+MCP connections are declared on each native profile through
+`ToolConfig.mcp_servers`. Meerkat builds and owns each session's MCP router;
+Fugue no longer starts a second shared router or duplicate Meta module process
+for the same server. A profile sees the servers selected by its `mcp:<name>`
+entries, plus the configured default Playwright server.
+
+Fugue's in-process Linear/GitHub/host tools are composed with Meta's existing
+external tools through `ComposedExternalTools`. The platform retains its
+per-turn dispatch context and lifecycle binding. Workspace file and shell tools
+remain rooted at the issue workspace.
+
+Provider names, provider parameters, and output schemas are validated against
+Meerkat's typed contracts. Unknown provider parameters fail configuration
+validation. A native member receives its configured provider, prompt, output
+schema, token limit, structured-output retry limit, additional instructions,
+and authentication binding. Permission to move an issue comes from the
+runtime's typed mob/member identity and role binding; quoting coordinator text in a prompt does not
+confer that permission. Repo start/deploy tools are restricted to Kapellmeister,
+and independent-review completion is restricted to the configured review
+orchestrator. PR creation is coordinator-only, and merges must pass through
+the typed deploy gate. In-process Linear/GitHub tools also follow profile declarations.
+
+## Configuration changes
+
+`meerkat.max_sessions` configures the native session admission capacity (default
+4096, must be positive). It is separate from issue concurrency.
+
+- Use `server.meta_console` in place of `server.mobkit_console`.
+- The optional external RPC proxy is `/api/v1/meta/rpc`. Its settings are
+  `FUGUE_META_RPC_TCP_ADDR` and `FUGUE_META_RPC_BEARER_TOKEN`.
+- Status JSON uses `meta_flow_run_id` in place of `mobkit_flow_run_id`.
+- `auth_binding` replaces `connection_ref` and uses Meerkat's structural binding
+  contract. It accepts a realm, binding, optional profile, and optional origin.
+
+Legacy `meerkat.connection_ref` and `server.mobkit_console` keys fail with a
+migration error instead of silently falling back to defaults.
+
+For example:
+
+```yaml
+meerkat:
+  auth_binding:
+    realm: production
+    binding: coding
+
+agents:
+  reviewer:
+    model: gpt-5.5
+    provider: openai
+    auth_binding:
+      realm: production
+      binding: review
+    tools: [mob, shell, git, mcp:github]
+    system_prompt: Review the implementation against the issue and repository policy.
+
+server:
+  port: 8080
+  meta_console:
+    enabled: true
+```
+
+The binding must be configured in the host's Meerkat credential environment.
+Omitting it lets the platform resolve its normal provider credentials; Fugue
+does not read or substitute provider API keys.
+
+## State and rollout
+
+The state root deliberately keeps the historical `mobkit-runtime` directory
+name. Renaming the product must not redirect a running installation to an empty
+state directory. Back up the whole directory, including SQLite WAL files, with
+the service stopped.
+
+For an upgrade from the old 0.6 integration:
+
+1. Stop new intake and let active work reach an operator-reviewed handoff. The
+   old in-memory mob journal cannot be recovered by upgrading the binary.
+2. Stop Fugue and back up its configuration, workspace root, and complete state
+   root. Preserve Workpads, branches, and pull requests.
+3. Update the configuration and RPC/status clients to the names above. Reconcile
+   historical WorkGraph obligations before resuming intake. New members use
+   Meerkat's canonical `mob.fugue` realm; do not invent issue-specific namespaces.
+4. Build and install all four Fugue binaries from the same locked source tree.
+5. Start with one controlled issue. Check the console, issue-to-run mapping,
+   WorkGraph blockers, and workspace. Exercise a stop/restart before widening
+   intake. Never delete a journal or composition manifest to bypass a refusal.
+
+For subsequent restarts on this release, keep `mob.sqlite3`, its composition
+manifest, the session/runtime databases, WorkGraph, and `fugue-runs.sqlite3`
+together. A subset is not a consistent recovery snapshot.
+
+## Validation
+
+```bash
+cargo fmt --check
+cargo check --all-targets --locked
+cargo test --all-targets --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo run --locked -- --help
+```
+
+The normal suite uses temporary stores and test clients. Live Linear/GitHub
+E2E remains explicitly opt-in; ordinary local validation does not authorize a
+production deployment or create live issues or pull requests.
