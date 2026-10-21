@@ -325,6 +325,13 @@ impl EnsembleRuntime {
                 let mut migrated = canonical.clone();
                 if is_legacy {
                     migrated.profiles = desired_definition.profiles.clone();
+                    // Retiring fixed workers also retires only their exact
+                    // host-generated flows; customized flow drift stays visible.
+                    for (flow_id, flow) in super::handoff::flows(legacy_profiles.into_iter()) {
+                        if migrated.flows.get(&flow_id) == Some(&flow) {
+                            migrated.flows.remove(&flow_id);
+                        }
+                    }
                 } else {
                     // Earlier Ensemble definitions omitted native memory. Only
                     // this host-owned capability changes for an existing team;

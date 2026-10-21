@@ -15600,8 +15600,12 @@ worker:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn kapellmeister_native_terminal_event_keeps_nonterminal_issue_running() {
-        let (mut orchestrator, native_host) =
-            native_orchestrator_for_definition(native_kapellmeister_workflow_definition());
+        let workspace = tempfile::tempdir().expect("isolated workspace");
+        let mut definition = native_kapellmeister_workflow_definition();
+        definition
+            .config
+            .insert("workspace".to_owned(), json!({"root": workspace.path()}));
+        let (mut orchestrator, native_host) = native_orchestrator_for_definition(definition);
         orchestrator.terminal_issue_refresh = false;
         let config = orchestrator.config.effective().clone();
         let mut issue = active_issue_with_labels(&["kapellmeister-safe"]);
@@ -15616,6 +15620,16 @@ worker:
                 config,
             )
             .await;
+
+        {
+            let state = orchestrator.shared_state();
+            let state = state.read().await;
+            assert!(
+                state.running.contains_key(&issue.id),
+                "native dispatch must succeed before terminal handling: {:?}",
+                state.last_error
+            );
+        }
 
         orchestrator
             .handle_native_run_finished(issue.id.clone(), issue.clone(), MobRunStatus::Succeeded)
@@ -15635,8 +15649,12 @@ worker:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn kapellmeister_native_terminal_event_keeps_review_ready_issue_running() {
-        let (mut orchestrator, native_host) =
-            native_orchestrator_for_definition(native_kapellmeister_workflow_definition());
+        let workspace = tempfile::tempdir().expect("isolated workspace");
+        let mut definition = native_kapellmeister_workflow_definition();
+        definition
+            .config
+            .insert("workspace".to_owned(), json!({"root": workspace.path()}));
+        let (mut orchestrator, native_host) = native_orchestrator_for_definition(definition);
         orchestrator.terminal_issue_refresh = false;
         let config = orchestrator.config.effective().clone();
         let mut issue = active_issue_with_labels(&["kapellmeister-safe"]);
@@ -15651,6 +15669,16 @@ worker:
                 config,
             )
             .await;
+
+        {
+            let state = orchestrator.shared_state();
+            let state = state.read().await;
+            assert!(
+                state.running.contains_key(&issue.id),
+                "native dispatch must succeed before terminal handling: {:?}",
+                state.last_error
+            );
+        }
 
         orchestrator
             .handle_native_run_finished(issue.id.clone(), issue.clone(), MobRunStatus::Succeeded)
@@ -15670,8 +15698,12 @@ worker:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn kapellmeister_native_terminal_event_retires_terminal_issue_members() {
-        let (mut orchestrator, native_host) =
-            native_orchestrator_for_definition(native_kapellmeister_workflow_definition());
+        let workspace = tempfile::tempdir().expect("isolated workspace");
+        let mut definition = native_kapellmeister_workflow_definition();
+        definition
+            .config
+            .insert("workspace".to_owned(), json!({"root": workspace.path()}));
+        let (mut orchestrator, native_host) = native_orchestrator_for_definition(definition);
         orchestrator.terminal_issue_refresh = false;
         let config = orchestrator.config.effective().clone();
         let mut issue = active_issue_with_labels(&["kapellmeister-safe"]);
@@ -15686,6 +15718,16 @@ worker:
                 config,
             )
             .await;
+
+        {
+            let state = orchestrator.shared_state();
+            let state = state.read().await;
+            assert!(
+                state.running.contains_key(&issue.id),
+                "native dispatch must succeed before terminal handling: {:?}",
+                state.last_error
+            );
+        }
 
         orchestrator
             .handle_native_run_finished(issue.id.clone(), issue.clone(), MobRunStatus::Succeeded)
