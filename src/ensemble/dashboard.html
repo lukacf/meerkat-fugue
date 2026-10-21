@@ -69,6 +69,13 @@
   function normalized(value) { return String(value ?? "").toLocaleLowerCase(); }
   function includesNeedle(values, needle) { return values.some(value => normalized(value).includes(needle)); }
   function searchNeedle() { return normalized($("teamSearch")?.value || "").trim(); }
+  function queryFromUrl() { return new URL(window.location.href).searchParams.get("q") || ""; }
+  function writeSearchToUrl(value) {
+    const url = new URL(window.location.href);
+    const query = value.trim();
+    if (query) url.searchParams.set("q", query); else url.searchParams.delete("q");
+    window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+  }
   function selectRepo(id) { $("target").value = id; highlight(); $("objective").focus(); }
   function highlight() { document.querySelectorAll(".repo").forEach(card => card.classList.toggle("selected", card.dataset.repo === $("target").value)); }
   function memberMatches(member, needle) {
@@ -196,8 +203,10 @@
     finally { sending = false; await refresh(); }
   }
   $("target").addEventListener("change", highlight);
-  $("teamSearch").addEventListener("input", () => { if (snapshot) render(snapshot); });
-  $("clearSearch").addEventListener("click", () => { $("teamSearch").value = ""; if (snapshot) render(snapshot); $("teamSearch").focus(); });
+  $("teamSearch").value = queryFromUrl();
+  $("teamSearch").addEventListener("input", () => { writeSearchToUrl($("teamSearch").value); if (snapshot) render(snapshot); });
+  $("clearSearch").addEventListener("click", () => { $("teamSearch").value = ""; writeSearchToUrl(""); if (snapshot) render(snapshot); $("teamSearch").focus(); });
+  window.addEventListener("popstate", () => { $("teamSearch").value = queryFromUrl(); if (snapshot) render(snapshot); });
   $("objective-form").addEventListener("submit", event => { event.preventDefault(); send($("objective").value); });
   $("objective").addEventListener("keydown", event => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") { event.preventDefault(); if (!$("submit").disabled) send($("objective").value); } });
   $("study").addEventListener("click", () => send("Refresh this repository study with your domain specialists. Ask each specialist through native comms to inspect their assigned ownership paths and domain, then combine their findings about architecture, interfaces, implementation, verification and risks. Read the repository guidelines and actual relevant files. Return a concise evidenced repository briefing, collaboration opportunities with any connected repositories, and useful next steps. Do not modify files during this study."));

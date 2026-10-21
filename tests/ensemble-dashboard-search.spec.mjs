@@ -35,22 +35,23 @@ let baseUrl;
 test.beforeAll(async () => {
   const dashboard = await readFile(DASHBOARD_PATH, 'utf8');
   server = http.createServer((request, response) => {
-    if (request.url === '/' || request.url === '/ensemble') {
+    const url = new URL(request.url, 'http://127.0.0.1');
+    if (url.pathname === '/' || url.pathname === '/ensemble') {
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
       response.end(dashboard);
       return;
     }
-    if (request.url === '/api/ensemble') {
+    if (url.pathname === '/api/ensemble') {
       response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
       response.end(JSON.stringify(fixture));
       return;
     }
-    if (request.url?.startsWith('/api/repos/') && request.url.endsWith('/messages')) {
+    if (url.pathname.startsWith('/api/repos/') && url.pathname.endsWith('/messages')) {
       response.writeHead(202, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ repo: 'api', identity: 'api:representative', session_id: 'session-1', interaction_id: 'interaction-1' }));
       return;
     }
-    if (request.url?.startsWith('/repos/') && request.url.endsWith('/console')) {
+    if (url.pathname.startsWith('/repos/') && url.pathname.endsWith('/console')) {
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       response.end('<!doctype html><title>console</title>');
       return;
@@ -126,6 +127,64 @@ test.describe('Ensemble dashboard team search behavior', () => {
     await expect(objective).toHaveValue('Draft objective that must survive filtering.');
     await expect(repoCard(page, 'web').locator('details.specialist').filter({ hasText: FRONTEND_MEMBER_LABEL })).toHaveJSProperty('open', true);
     await expect(page.locator('.repo')).toHaveCount(1);
+  });
+
+  test('restores q on initial load and updates q without history spam', async ({ page }) => {
+    await page.goto(`${baseUrl}/ensemble?view=teams&q=api&mode=full#roster`);
+    const search = page.getByLabel('Search repository teams');
+    await expect(search).toHaveValue('api');
+    await expect(page.locator('.repo')).toHaveCount(1);
+    await expect(repoCard(page, 'api')).toBeVisible();
+    expect(new URL(page.url()).searchParams.get('view')).toBe('teams');
+    expect(new URL(page.url()).hash).toBe('#roster');
+
+    const historyLength = await page.evaluate(() => history.length);
+    await search.fill('ą accessible search & <tag>');
+    let url = new URL(page.url());
+    expect(url.searchParams.get('q')).toBe('ą accessible search & <tag>');
+    expect(url.searchParams.get('view')).toBe('teams');
+    expect(url.searchParams.get('mode')).toBe('full');
+    expect(url.hash).toBe('#roster');
+    await expect(page.locator('.no-results')).toContainText('No repository teams match your search');
+    expect(await page.evaluate(() => history.length)).toBe(historyLength);
+
+    await search.fill('accessible search');
+    url = new URL(page.url());
+    expect(url.searchParams.get('q')).toBe('accessible search');
+    await expect(page.locator('.repo')).toHaveCount(1);
+    await expect(repoCard(page, 'web').locator('details.specialist')).toHaveCount(1);
+  });
+
+  test('empty filter removes q and browser back and forward restore bookmarkable query', async ({ page }) => {
+    await page.goto(`${baseUrl}/ensemble?view=teams&q=api#roster`);
+    const search = page.getByLabel('Search repository teams');
+    await expect(search).toHaveValue('api');
+    await expect(page.locator('.repo')).toHaveCount(1);
+
+    await page.evaluate(() => {
+      const url = new URL(window.location.href);
+      url.searchParams.set('q', 'accessible search');
+      history.pushState(null, '', `${url.pathname}${url.search}${url.hash}`);
+    });
+    await page.evaluate(() => dispatchEvent(new PopStateEvent('popstate')));
+    await expect(search).toHaveValue('accessible search');
+    await expect(repoCard(page, 'web').locator('details.specialist')).toHaveCount(1);
+
+    await page.goBack();
+    await expect(search).toHaveValue('api');
+    await expect(page.locator('.repo')).toHaveCount(1);
+
+    await page.goForward();
+    await expect(search).toHaveValue('accessible search');
+    await expect(repoCard(page, 'web').locator('details.specialist')).toHaveCount(1);
+
+    await page.getByRole('button', { name: 'Clear' }).click();
+    const url = new URL(page.url());
+    expect(url.searchParams.get('q')).toBeNull();
+    expect(url.searchParams.get('view')).toBe('teams');
+    expect(url.hash).toBe('#roster');
+    await expect(search).toHaveValue('');
+    await expect(page.locator('.repo')).toHaveCount(2);
   });
 
   test('clear and no-results states remain keyboard accessible', async ({ page }) => {
