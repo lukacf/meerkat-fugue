@@ -145,6 +145,7 @@ pub(crate) async fn router(
         internal_tx,
     };
     let app = Router::new()
+        .route("/api/v1/build", get(crate::build_identity::endpoint))
         .route("/", get(dashboard))
         .route("/overview", get(dashboard))
         .route("/issues", get(issues_board))

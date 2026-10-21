@@ -81,6 +81,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
+    /// Print the immutable build identity as JSON and exit.
+    BuildInfo,
     /// Run long-lived repository teams connected through their representatives.
     Ensemble(meerkat_fugue::ensemble::cli::EnsembleArgs),
     /// Configure Fugue operator backends.
@@ -218,6 +220,13 @@ async fn run() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Some(CliCommand::BuildInfo) => {
+            println!(
+                "{}",
+                serde_json::to_string(&meerkat_fugue::build_identity::current())?
+            );
+            return Ok(());
+        }
         Some(CliCommand::Ensemble(args)) => {
             return meerkat_fugue::ensemble::cli::run(args).await;
         }

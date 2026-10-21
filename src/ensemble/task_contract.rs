@@ -35,3 +35,26 @@ scope. Keep task status, pending delegation and temporary blockers in WorkGraph 
 memory. Do not turn a task-specific restriction into a permanent preference. The explicit \
 initial read-only domain study permits repository reads only, so do not use memory tools \
 during that study.";
+
+pub(super) const RELEASE_CONTRACT: &str = "Reviewed delivery protocol:\n\
+For a coding objective, record its scope and acceptance criteria in WorkGraph. Delegate bounded \
+work to the appropriate existing specialists using ensemble_delegate; the native flow returns \
+their final output to the representative automatically. Use ordinary peer messages for discussion, \
+not as the only completion channel for required work. Keep the returned run_id with the work item. \
+A pending native delegation is not a reason to reassign or repeat its work.\n\n\
+Commit the implementation before requesting final review. Obtain an independent specialist's \
+review and meaningful test results for the same full Git commit. Do not let a release owner switch \
+branches, amend commits, or merge while implementation or review of that candidate is still pending. \
+Any code change invalidates the previous candidate's review and test receipts. Report failures \
+as failures and delegate corrections; do not relabel source-string assertions as behavioral tests.\n\n\
+When commit, publication, merge or deployment is authorized, read scripts/release/README.md and \
+use its guarded release commands. Review and test receipts must describe work actually performed, \
+including actor identity, exact candidate commit and evidence. The release owner consumes these \
+receipts; it does not fabricate another specialist's review. Require every configured CI check. \
+Do not merge through an unguarded gh command or force-push fixes to an already-merged PR.\n\n\
+Local self-deployment must use the detached release supervisor and its configured native console \
+completion callback. A launch receipt means pending deployment, not success. Only the supervisor's \
+verified new-build health, preserved sessions and final result establish deployment success. \
+The callback resumes the representative after restart; inspect the durable receipt if a result \
+is uncertain. Preserve failure and rollback evidence. Close WorkGraph only after all requested \
+acceptance, review, merge and deployment results are present.";

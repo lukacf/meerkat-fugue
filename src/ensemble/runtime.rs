@@ -129,6 +129,8 @@ struct RepositoryRuntime {
     study_path: PathBuf,
     grants: BTreeMap<String, MemberGrant>,
     event_drain: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    handoff_notifications: tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
+    handoff_failure: std::sync::OnceLock<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -312,6 +314,7 @@ impl EnsembleRuntime {
                     state.join("mob.sqlite3"),
                 )?;
             let desired_definition = definition(id, &self.config.model, &grants);
+            let handoff_runtime: super::handoff::RuntimeSlot = Arc::new(std::sync::OnceLock::new());
             if let Some(previous) = storage.created_definition_snapshot().await? {
                 let canonical = previous.definition();
                 let legacy_profiles = ["coder", "planner", "representative", "reviewer"];
@@ -331,6 +334,14 @@ impl EnsembleRuntime {
                             profile.tools.memory = true;
                         }
                     }
+                }
+                // Add only our missing native handoff flows. Existing flow drift
+                // remains visible and fails definition validation.
+                for (flow_id, flow) in &desired_definition.flows {
+                    migrated
+                        .flows
+                        .entry(flow_id.clone())
+                        .or_insert_with(|| flow.clone());
                 }
                 if canonical != &desired_definition && migrated == desired_definition {
                     // The native epoch CAS preserves history and makes the new profile
@@ -426,6 +437,7 @@ impl EnsembleRuntime {
                     state_root: self.config.state_root.clone(),
                     auth_binding: self.config.auth_binding.clone(),
                     grants: grants.clone(),
+                    handoff_runtime: handoff_runtime.clone(),
                     studies: studies.clone(),
                     study_path: study_path.clone(),
                 }))
@@ -446,6 +458,9 @@ impl EnsembleRuntime {
                     .await
                     .with_context(|| format!("build repository team {id}"))?,
             );
+            handoff_runtime
+                .set(Arc::downgrade(&runtime))
+                .map_err(|_| anyhow::anyhow!("handoff runtime already initialized"))?;
             let event_drain = runtime.clone().spawn_event_drain_task();
             self.repositories.insert(
                 id.clone(),
@@ -457,6 +472,8 @@ impl EnsembleRuntime {
                     study_path,
                     grants,
                     event_drain: tokio::sync::Mutex::new(Some(event_drain)),
+                    handoff_notifications: tokio::sync::Mutex::new(None),
+                    handoff_failure: std::sync::OnceLock::new(),
                 },
             );
             let entry = self
@@ -680,6 +697,14 @@ impl EnsembleRuntime {
                 }
             }
         }
+        for (repo, entry) in &self.repositories {
+            let task = super::handoff::start_notifications(
+                &entry.runtime,
+                member_identity(repo, REPRESENTATIVE)?,
+            )
+            .await?;
+            *entry.handoff_notifications.lock().await = Some(task);
+        }
         Ok(())
     }
 
@@ -813,7 +838,30 @@ impl EnsembleRuntime {
         self.repositories.get(repo).map(|entry| &entry.runtime)
     }
 
+    async fn ensure_notification_health(&self) -> Result<()> {
+        for (repo, entry) in &self.repositories {
+            let mut watcher = entry.handoff_notifications.lock().await;
+            if watcher.as_ref().is_some_and(|task| task.is_finished()) {
+                if let Some(task) = watcher.take() {
+                    let detail = match task.await {
+                        Ok(Err(error)) => format!("{error:#}"),
+                        Err(error) => error.to_string(),
+                        Ok(Ok(())) => "notification subscription ended".to_owned(),
+                    };
+                    entry.handoff_failure.get_or_init(|| detail);
+                }
+            }
+            if let Some(detail) = entry.handoff_failure.get() {
+                bail!(
+                    "repository {repo} delegation notifications failed: {detail}; restart to recover durable outcomes before admitting more work"
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub async fn status(&self) -> Result<EnsembleStatus> {
+        self.ensure_notification_health().await?;
         let mut repositories = Vec::new();
         for (repo, entry) in &self.repositories {
             let authority = entry
@@ -887,6 +935,7 @@ impl EnsembleRuntime {
     }
 
     pub async fn ask(&self, repo: &RepoId, text: &str) -> Result<EnsembleAccepted> {
+        self.ensure_notification_health().await?;
         let stopping = self.lifecycle.read().await;
         if *stopping {
             bail!("Ensemble is shutting down");
@@ -929,6 +978,18 @@ impl EnsembleRuntime {
         *stopping = true;
         let mut errors = Vec::new();
         for (repo, entry) in &self.repositories {
+            if let Some(task) = entry.handoff_notifications.lock().await.take() {
+                task.abort();
+                match task.await {
+                    Ok(Err(error)) => {
+                        errors.push(format!("{repo} handoff notifications: {error:#}"))
+                    }
+                    Err(error) if !error.is_cancelled() => {
+                        errors.push(format!("{repo} handoff notifications: {error}"))
+                    }
+                    _ => {}
+                }
+            }
             let report = entry.runtime.shutdown().await;
             if let Some(task) = entry.event_drain.lock().await.take() {
                 task.abort();
@@ -951,7 +1012,12 @@ impl EnsembleRuntime {
 
 fn collaboration_instructions() -> String {
     let delivery = "Native collaboration delivery rules:\n\
-When work originates in a peer message or request, return the result and supporting evidence \
+For an [ENSEMBLE DELEGATED WORK] assignment, return your substantive result and supporting \
+evidence as final text. Its native flow persists your result and automatically delivers the \
+terminal outcome to the representative; do not send a duplicate completion reply. The \
+representative must use ensemble_delegate for bounded specialist assignments and retain its \
+run_id and correlation in WorkGraph. Peer messages are for FYI and cross-repository contact.\n\n\
+When other work originates in a peer message or request, return the result and supporting evidence \
 to that requesting peer through the matching native response tool before ending with final text. \
 Your final assistant text alone is not delivered to the requesting peer. For an ordinary peer \
 message in the current turn, use reply_to_peer with handling_mode=queue; if multiple deliveries \
@@ -961,7 +1027,7 @@ result required by that request's contract. If the original ordinary request is 
 turn and no longer has a reply capability, resolve that requesting peer with peers and send \
 the correlated result using send_message. Never send another peer's result to whichever peer \
 happened to trigger the latest turn.\n\n\
-When delegating, explicitly require the recipient to return its findings, executed commands, \
+For those ordinary peer requests, explicitly require the recipient to return its findings, executed commands, \
 verification results, or blocker evidence through the matching native reply path. Retain the \
 requesting peer and correlation while work is pending. Send substantive completion or failure \
 evidence; do not create acknowledgement loops or reply to a terminal result merely to acknowledge \
@@ -970,9 +1036,10 @@ Exception: during an explicit initial read-only domain study, only inspect repos
 return the Domain Brief as final text. That study is host-initiated, requires no peer reply, and \
 must not send messages or delegate.";
     format!(
-        "{delivery}\n\n{}\n\n{}",
+        "{delivery}\n\n{}\n\n{}\n\n{}",
         super::task_contract::TASK_CONTRACT,
-        super::task_contract::MEMORY_CONTRACT
+        super::task_contract::MEMORY_CONTRACT,
+        super::task_contract::RELEASE_CONTRACT
     )
 }
 
@@ -981,7 +1048,10 @@ fn representative_instructions(team: &TeamManifest) -> String {
 
     let mut instructions = String::from(
         "You are the repository representative. Coordinate this repository's durable domain \
-specialists through native peer messages. Delegate to the relevant specialist, seek independent \
+specialists through ensemble_delegate for assignments that require a result. Native flows return \
+final results and failures to you automatically; retain run_id and correlation in WorkGraph, and \
+use ensemble_delegation_status after a restart or failure. Use peer messages for FYI only. \
+Delegate to the relevant specialist, seek independent \
 review from another specialist, and return evidence-backed outcomes. Reach other repositories \
 only through their representatives. Avoid acknowledgement loops.\n\n\
 Current authoritative repository specialist roster:\n",
@@ -1007,7 +1077,7 @@ outside those blocks. Correct unambiguous transcription errors introduced during
 within the original authorization; send explicit replacement instructions to the same owner.\n\n\
 Native message acceptance confirms delivery admission, not task completion. Record delegated work \
 in WorkGraph as pending, including its owner and expected evidence. After delegation, finish this \
-turn and resume when native peer replies arrive. An absent reply within the current turn is not \
+turn and resume when a durable delegation outcome or native peer reply arrives. An absent result within the current turn is not \
 a failure and does not justify duplicate execution or reassignment. Assess each reply and report \
 completion only after receiving the requested evidence; otherwise report pending progress.",
     );
@@ -1027,7 +1097,19 @@ async fn restore_member_transports(repo: &RepoId, entry: &RepositoryRuntime) -> 
         let before = authority.status(&identity).await?;
         let alias = before
             .agent_runtime_id
-            .context("member runtime alias missing")?
+            .as_ref()
+            .with_context(|| {
+                let bootstrap = authority.identity_bootstrap_status();
+                format!(
+                    "member runtime alias missing for {identity}: state={:?}, session={:?}, bootstrap={:?}, continuity_unrecoverable={:?}, session_repair_required={:?}, customizer_tools_pending={:?}",
+                    before.state,
+                    before.session_id,
+                    bootstrap.identities.get(&identity),
+                    before.continuity_unrecoverable,
+                    before.session_repair_required,
+                    before.customizer_tools_pending,
+                )
+            })?
             .to_string();
         match entry.runtime.local_member_peer_info(&alias).await {
             Ok(_) => continue,
@@ -1091,7 +1173,7 @@ fn definition(repo: &RepoId, model: &str, grants: &BTreeMap<String, MemberGrant>
         wiring: Default::default(),
         skills: BTreeMap::new(),
         backend: Default::default(),
-        flows: BTreeMap::new(),
+        flows: super::handoff::flows(grants.keys().map(String::as_str)),
         topology: None,
         supervisor: None,
         limits: None,
@@ -1366,6 +1448,7 @@ impl meerkat_core::tool_execution_policy::ToolDispatchAdmission for StudyAdmissi
 }
 
 struct RepositorySessionHook {
+    handoff_runtime: super::handoff::RuntimeSlot,
     studies: Arc<tokio::sync::Mutex<StudyJournal>>,
     study_path: PathBuf,
     grants: BTreeMap<String, MemberGrant>,
@@ -1436,6 +1519,20 @@ impl SessionHook for RepositorySessionHook {
                 previous: build.tool_dispatch_admission.take(),
             }));
         }
+        let owned: Arc<dyn AgentToolDispatcher> = if build
+            .mob_member_binding
+            .as_ref()
+            .is_some_and(|binding| binding.role == REPRESENTATIVE)
+        {
+            meerkat_meta::tool_compose::ComposedExternalTools::over(
+                Arc::new(super::handoff::HandoffTools::new(
+                    self.handoff_runtime.clone(),
+                )),
+                Some(owned),
+            )
+        } else {
+            owned
+        };
         build.override_builtins = meerkat_core::ToolCategoryOverride::Disable;
         build.override_shell = meerkat_core::ToolCategoryOverride::Disable;
         // Reapply the declared capability even when the durable session was
@@ -2671,5 +2768,540 @@ mod tests {
             2
         );
         recovered.shutdown().await.expect("shutdown");
+    }
+    struct HandoffScript {
+        fail_worker: bool,
+        pause_worker: bool,
+        workers: AtomicUsize,
+        handoffs: AtomicUsize,
+        returned: Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for HandoffScript {
+        async fn health_check(&self) -> std::result::Result<(), LlmError> {
+            Ok(())
+        }
+        fn project_replay_messages(
+            &self,
+            messages: &[Message],
+        ) -> std::result::Result<Vec<Message>, LlmError> {
+            Ok(messages.to_vec())
+        }
+        fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
+            let latest_user = request
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    Message::User(user) => {
+                        Some(serde_json::to_string(&user.content).expect("user"))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let worker = latest_user.contains("[ENSEMBLE DELEGATED WORK]");
+            let handoff = latest_user.contains("[ENSEMBLE DURABLE HANDOFF]")
+                || latest_user.contains("[ENSEMBLE INTERRUPTED HANDOFF]");
+            if handoff && std::env::var_os("FUGUE_HANDOFF_CRASH_CONFIG").is_some() {
+                // The worker's result is already in the native flow store, but
+                // this return turn has not produced any output or side effect.
+                std::process::exit(0);
+            }
+            if worker {
+                self.workers.fetch_add(1, Ordering::SeqCst);
+            }
+            if worker && self.pause_worker {
+                return Box::pin(futures::stream::pending());
+            }
+            if worker && self.fail_worker {
+                return Box::pin(futures::stream::iter(vec![Err(LlmError::InvalidRequest {
+                    message: "intentional worker failure".into(),
+                })]));
+            }
+            let text = if worker {
+                "WORKER FINAL EVIDENCE"
+            } else if handoff {
+                self.handoffs.fetch_add(1, Ordering::SeqCst);
+                *self.returned.lock().expect("returned") = Some(latest_user);
+                "HANDOFF RECEIVED"
+            } else {
+                "Ready."
+            };
+            Box::pin(futures::stream::iter(vec![
+                Ok(LlmEvent::TextDelta {
+                    delta: text.into(),
+                    meta: None,
+                }),
+                Ok(LlmEvent::UsageUpdate {
+                    usage: TurnUsage::host_declared(
+                        Provider::OpenAI,
+                        &request.model,
+                        Usage::default(),
+                    ),
+                }),
+                Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Success {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                }),
+            ]))
+        }
+        fn provider(&self) -> Provider {
+            Provider::OpenAI
+        }
+    }
+
+    async fn assert_native_handoff(fail_worker: bool) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = fixture_config(temp.path());
+        let client = Arc::new(HandoffScript {
+            fail_worker,
+            pause_worker: false,
+            workers: AtomicUsize::new(0),
+            handoffs: AtomicUsize::new(0),
+            returned: Mutex::new(None),
+        });
+        let ensemble = EnsembleRuntime::build_with_client(config.clone(), client.clone())
+            .await
+            .expect("runtime");
+        let repo = RepoId::try_from("alpha".to_owned()).expect("repo");
+        let runtime = ensemble.repository(&repo).expect("repository");
+        let handle = runtime.mob_handle();
+        let slot = Arc::new(std::sync::OnceLock::new());
+        slot.set(Arc::downgrade(runtime)).expect("bind runtime");
+        let tools = super::super::handoff::HandoffTools::new(slot);
+        let input = serde_json::value::to_raw_value(&json!({
+            "member":"coder", "correlation":"work-42/review-1", "task":"Inspect the implementation"
+        }))
+        .expect("args");
+        let call = meerkat_core::ToolCallView {
+            id: "delegate-1",
+            name: "ensemble_delegate",
+            args: &input,
+        };
+        let accepted = tools.dispatch(call).await.expect("flow admitted");
+        #[derive(Deserialize)]
+        struct Receipt {
+            run_id: meerkat_mob::RunId,
+            reused: bool,
+        }
+        let receipt: Receipt =
+            serde_json::from_str(&accepted.result.text_content()).expect("receipt");
+        assert!(!receipt.reused);
+        let run_id = receipt.run_id;
+        let replay = tools.dispatch(call).await.expect("retry admission");
+        let replay: Receipt =
+            serde_json::from_str(&replay.result.text_content()).expect("replay receipt");
+        assert_eq!(replay.run_id, run_id);
+        assert!(replay.reused);
+        let changed = serde_json::value::to_raw_value(&json!({
+            "member":"coder", "correlation":"work-42/review-1", "task":"Different task"
+        }))
+        .expect("args");
+        assert!(
+            tools
+                .dispatch(meerkat_core::ToolCallView {
+                    args: &changed,
+                    ..call
+                })
+                .await
+                .is_err(),
+            "same key with changed task must fail"
+        );
+        let run = tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                let run = handle
+                    .flow_status(run_id.clone())
+                    .await
+                    .expect("status")
+                    .expect("run");
+                if matches!(
+                    run.status,
+                    meerkat_mob::MobRunStatus::Completed
+                        | meerkat_mob::MobRunStatus::Failed
+                        | meerkat_mob::MobRunStatus::Canceled
+                ) {
+                    break run;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("bounded native handoff");
+        assert_eq!(
+            run.status,
+            if fail_worker {
+                meerkat_mob::MobRunStatus::Failed
+            } else {
+                meerkat_mob::MobRunStatus::Completed
+            },
+            "native status is preserved: {run:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while client.handoffs.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("automatic terminal outcome arrives");
+        assert_eq!(
+            client.handoffs.load(Ordering::SeqCst),
+            1,
+            "exactly one native return without any peer send"
+        );
+        let text = client
+            .returned
+            .lock()
+            .expect("returned")
+            .clone()
+            .expect("return text");
+        assert!(text.contains("work-42/review-1"), "exact correlation");
+        assert_eq!(text.contains("WORKER FINAL EVIDENCE"), !fail_worker);
+        assert_eq!(
+            run.failure_ledger.is_empty(),
+            !fail_worker,
+            "worker failure remains durable, never laundered as task success"
+        );
+        ensemble.shutdown().await.expect("shutdown");
+        drop(handle);
+        drop(ensemble);
+        let restored = EnsembleRuntime::build_with_client(config, client.clone())
+            .await
+            .expect("restart");
+        let slot = Arc::new(std::sync::OnceLock::new());
+        slot.set(Arc::downgrade(
+            restored.repository(&repo).expect("restored repository"),
+        ))
+        .expect("rebind");
+        let tools = super::super::handoff::HandoffTools::new(slot);
+        let replay = tools.dispatch(call).await.expect("retry after restart");
+        let replay: Receipt =
+            serde_json::from_str(&replay.result.text_content()).expect("persisted receipt");
+        assert_eq!(replay.run_id, run_id);
+        assert!(replay.reused);
+        assert_eq!(
+            client.handoffs.load(Ordering::SeqCst),
+            1,
+            "restart never repeats completed handoff"
+        );
+        restored.shutdown().await.expect("final shutdown");
+    }
+
+    #[tokio::test]
+    async fn native_flow_delivers_worker_final_without_peer_reply() {
+        if !isolated("native_flow_delivers_worker_final_without_peer_reply") {
+            return;
+        }
+        assert_native_handoff(false).await;
+    }
+
+    #[tokio::test]
+    async fn native_flow_delivers_worker_failure_without_peer_reply() {
+        if !isolated("native_flow_delivers_worker_failure_without_peer_reply") {
+            return;
+        }
+        assert_native_handoff(true).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_handoff_recovers_worker_result_after_process_loss() {
+        let name = "native_handoff_recovers_worker_result_after_process_loss";
+        if let Ok(path) = std::env::var("FUGUE_HANDOFF_CRASH_CONFIG") {
+            let config: EnsembleConfig =
+                serde_json::from_slice(&std::fs::read(path).expect("config")).expect("shape");
+            let script = Arc::new(HandoffScript {
+                fail_worker: false,
+                pause_worker: false,
+                workers: AtomicUsize::new(0),
+                handoffs: AtomicUsize::new(0),
+                returned: Mutex::new(None),
+            });
+            let ensemble = EnsembleRuntime::build_with_client(config, script)
+                .await
+                .expect("child runtime");
+            let repo = RepoId::try_from("alpha".to_owned()).expect("repo");
+            let handle = ensemble.repository(&repo).expect("repository").mob_handle();
+            let flow_id = meerkat_mob::FlowId::from("ensemble-delegate-coder");
+            let run_id = meerkat_mob::RunId::for_work_execution(
+                handle.mob_id(),
+                &flow_id,
+                "crash-correlation",
+            );
+            let delivery = meerkat_mob::store::MobExternalDeliveryIdentity::new(
+                "crash-correlation",
+                run_id.to_string(),
+            )
+            .expect("delivery");
+            handle
+                .run_flow_with_external_identity(
+                    flow_id,
+                    json!({"correlation":"crash-correlation", "task":"Inspect the implementation"}),
+                    &delivery,
+                )
+                .await
+                .expect("launch");
+            tokio::time::sleep(Duration::from_secs(40)).await;
+            panic!("child never reached return turn");
+        }
+        if !isolated(name) {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp");
+        let config = fixture_config(temp.path());
+        let path = temp.path().join("crash.json");
+        std::fs::write(&path, serde_json::to_vec(&config).expect("config JSON"))
+            .expect("config file");
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                &format!("ensemble::runtime::tests::{name}"),
+                "--nocapture",
+            ])
+            .env("FUGUE_HANDOFF_CRASH_CONFIG", &path)
+            .env("RUST_MIN_STACK", "16777216")
+            .output()
+            .expect("child");
+        assert!(
+            child.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let script = Arc::new(HandoffScript {
+            fail_worker: false,
+            pause_worker: false,
+            workers: AtomicUsize::new(0),
+            handoffs: AtomicUsize::new(0),
+            returned: Mutex::new(None),
+        });
+        let ensemble = EnsembleRuntime::build_with_client(config.clone(), script.clone())
+            .await
+            .expect("restore");
+        let repo = RepoId::try_from("alpha".to_owned()).expect("repo");
+        let handle = ensemble.repository(&repo).expect("repository").mob_handle();
+        let run_id = meerkat_mob::RunId::for_work_execution(
+            handle.mob_id(),
+            &"ensemble-delegate-coder".into(),
+            "crash-correlation",
+        );
+        let run = tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                let run = handle
+                    .flow_status(run_id.clone())
+                    .await
+                    .expect("status")
+                    .expect("run");
+                if !matches!(
+                    run.status,
+                    meerkat_mob::MobRunStatus::Pending | meerkat_mob::MobRunStatus::Running
+                ) {
+                    break run;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("recovered handoff terminates");
+        assert_eq!(
+            run.status,
+            meerkat_mob::MobRunStatus::Completed,
+            "native worker completion survives process loss: {run:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while script.handoffs.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("recovery notification arrives");
+        assert_eq!(
+            script.handoffs.load(Ordering::SeqCst),
+            1,
+            "pending return wakes once without operator input"
+        );
+        assert!(
+            script
+                .returned
+                .lock()
+                .expect("return")
+                .as_ref()
+                .is_some_and(|text| text.contains("WORKER FINAL EVIDENCE"))
+        );
+        assert_eq!(
+            script.workers.load(Ordering::SeqCst),
+            0,
+            "recovery must never repeat worker side effects"
+        );
+        let authority = ensemble
+            .repository(&repo)
+            .expect("runtime")
+            .identity_runtime()
+            .expect("authority");
+        let identity = member_identity(&repo, REPRESENTATIVE).expect("identity");
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if authority
+                    .inspect(&identity)
+                    .await
+                    .expect("inspect")
+                    .output_preview
+                    .as_deref()
+                    == Some("HANDOFF RECEIVED")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("notification commits");
+        drop(authority);
+        ensemble.shutdown().await.expect("shutdown");
+        drop(handle);
+        drop(ensemble);
+        let restarted = EnsembleRuntime::build_with_client(config, script.clone())
+            .await
+            .expect("second restore");
+        let runtime = restarted.repository(&repo).expect("restarted runtime");
+        let tickets = super::super::handoff::notify_terminal_handoffs(runtime, &identity)
+            .await
+            .expect("deduplicated notification");
+        assert_eq!(tickets.len(), 1);
+        for ticket in tickets {
+            let outcome = runtime
+                .identity_runtime()
+                .expect("authority")
+                .wait_for_turn(&identity, ticket, Duration::from_secs(20))
+                .await;
+            assert!(
+                matches!(outcome, TurnOutcome::Completed { .. }),
+                "deduplicated exact admission settles: {outcome:?}"
+            );
+        }
+        assert_eq!(
+            script.handoffs.load(Ordering::SeqCst),
+            1,
+            "native inbox deduplicates recovery across restarts"
+        );
+        restarted.shutdown().await.expect("final shutdown");
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_handoff_notifies_live_cancellation() {
+        if !isolated("native_handoff_notifies_live_cancellation") {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp");
+        let config = fixture_config(temp.path());
+        let script = Arc::new(HandoffScript {
+            fail_worker: false,
+            pause_worker: true,
+            workers: AtomicUsize::new(0),
+            handoffs: AtomicUsize::new(0),
+            returned: Mutex::new(None),
+        });
+        let ensemble = EnsembleRuntime::build_with_client(config, script.clone())
+            .await
+            .expect("build");
+        let repo = RepoId::try_from("alpha".to_owned()).expect("repo");
+        let handle = ensemble
+            .repository(&repo)
+            .expect("repo runtime")
+            .mob_handle();
+        let run_id = handle
+            .run_flow(
+                "ensemble-delegate-coder".into(),
+                json!({
+                    "correlation":"cancel-correlation", "task":"Wait for cancellation"
+                }),
+            )
+            .await
+            .expect("flow");
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while script.workers.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("worker starts");
+        let slot = Arc::new(std::sync::OnceLock::new());
+        slot.set(Arc::downgrade(ensemble.repository(&repo).expect("runtime")))
+            .expect("slot");
+        let tools = super::super::handoff::HandoffTools::new(slot);
+        for (member, correlation) in [
+            ("coder", "overlap"),
+            ("representative", "self"),
+            ("unknown", "missing"),
+        ] {
+            let args = serde_json::value::to_raw_value(
+                &json!({"member":member, "correlation":correlation, "task":"Must not start"}),
+            )
+            .expect("args");
+            let outcome = tools
+                .dispatch(meerkat_core::ToolCallView {
+                    id: "invalid",
+                    name: "ensemble_delegate",
+                    args: &args,
+                })
+                .await;
+            assert!(
+                outcome.is_err(),
+                "busy, self and unknown targets fail before admission"
+            );
+        }
+        handle.cancel_flow(run_id.clone()).await.expect("cancel");
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while script.handoffs.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("live cancellation reaches representative");
+        assert_eq!(script.handoffs.load(Ordering::SeqCst), 1);
+        assert_eq!(script.workers.load(Ordering::SeqCst), 1);
+        let text = script
+            .returned
+            .lock()
+            .expect("returned")
+            .clone()
+            .expect("notice");
+        assert!(text.contains("cancel-correlation"));
+        assert!(text.contains(&run_id.to_string()));
+        assert!(text.contains("canceled"));
+        let entry = ensemble.repositories.get(&repo).expect("entry");
+        entry
+            .handoff_notifications
+            .lock()
+            .await
+            .as_ref()
+            .expect("watcher")
+            .abort();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if entry
+                    .handoff_notifications
+                    .lock()
+                    .await
+                    .as_ref()
+                    .expect("watcher")
+                    .is_finished()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watcher stops");
+        let health = ensemble.status().await;
+        assert!(
+            health.is_err(),
+            "lost outcome delivery fails readiness closed"
+        );
+        assert!(
+            ensemble
+                .ask(&repo, "Must not admit more work")
+                .await
+                .is_err()
+        );
+        ensemble.shutdown().await.expect("shutdown");
     }
 }

@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod backend;
+pub mod build_identity;
 pub mod config;
 pub mod control_plane;
 pub mod deploy_gate;

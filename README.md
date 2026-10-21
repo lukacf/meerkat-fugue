@@ -81,6 +81,18 @@ its specialist team, and has the specialists study their assigned domains. This
 uses model tokens and can take a few minutes. Team identities, conversations,
 completed studies, and native agent memory persist across restarts.
 
+Representatives use `ensemble_delegate` for assignments that require a result.
+Native flows capture the specialist's final output and return it to the
+representative without relying on a separate peer message. Repeating the same
+assignment key reuses its run; interrupted runs remain interrupted and report
+their saved evidence after restart so the representative can reconcile progress.
+
+For authorized delivery, the [release helper](scripts/release/README.md) checks
+review and test receipts against the exact PR commit and required CI checks.
+Its detached local supervisor verifies the running build and preserved agent
+sessions, rolls back failed deployments, and notifies the representative after
+restart. Configure the deployment target once before assigning delivery work.
+
 In another terminal, give the representative an objective:
 
 ```bash

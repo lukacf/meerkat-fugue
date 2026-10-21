@@ -18,6 +18,31 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  delivery:
+    name: Delivery
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Test release safeguards
+        run: |
+          command -v lsof
+          python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
+
+      - name: Install browser dependencies
+        run: npm ci && npx playwright install --with-deps chromium
+
+      - name: Test Ensemble browser behavior
+        run: npm run test:ensemble-search
+
   rust:
     name: Rust
     runs-on: ubuntu-latest
