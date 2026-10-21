@@ -848,15 +848,15 @@ impl EnsembleRuntime {
     async fn ensure_notification_health(&self) -> Result<()> {
         for (repo, entry) in &self.repositories {
             let mut watcher = entry.handoff_notifications.lock().await;
-            if watcher.as_ref().is_some_and(|task| task.is_finished()) {
-                if let Some(task) = watcher.take() {
-                    let detail = match task.await {
-                        Ok(Err(error)) => format!("{error:#}"),
-                        Err(error) => error.to_string(),
-                        Ok(Ok(())) => "notification subscription ended".to_owned(),
-                    };
-                    entry.handoff_failure.get_or_init(|| detail);
-                }
+            if watcher.as_ref().is_some_and(|task| task.is_finished())
+                && let Some(task) = watcher.take()
+            {
+                let detail = match task.await {
+                    Ok(Err(error)) => format!("{error:#}"),
+                    Err(error) => error.to_string(),
+                    Ok(Ok(())) => "notification subscription ended".to_owned(),
+                };
+                entry.handoff_failure.get_or_init(|| detail);
             }
             if let Some(detail) = entry.handoff_failure.get() {
                 bail!(
