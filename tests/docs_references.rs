@@ -49,6 +49,7 @@ fn ota_deployment_docs_and_script_install_complete_fugue_binary_set() {
     let required_binaries = [
         "meerkat-fugue",
         "fugue-linear-mcp",
+        "fugue-jira-mcp",
         "fugue-github-mcp",
         "fugue-host-mcp",
     ];
@@ -67,9 +68,9 @@ fn ota_deployment_docs_and_script_install_complete_fugue_binary_set() {
         }
     }
 
-    assert!(readme.contains("atomically replacing the four binaries"));
-    assert!(operations.contains("Install or restart all four binaries atomically"));
-    assert!(operator_guide.contains("Install or restart all four binaries atomically"));
+    assert!(readme.contains("atomically replacing the five binaries"));
+    assert!(operations.contains("Install or restart all five binaries atomically"));
+    assert!(operator_guide.contains("Install or restart all five binaries atomically"));
 }
 
 #[test]

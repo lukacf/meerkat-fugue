@@ -936,12 +936,12 @@ fn unsupported_tool_callback(name: &str) -> (bool, String) {
 }
 
 pub fn external_tools_for_tracker(config: &crate::config::TrackerConfig) -> Option<Vec<Value>> {
-    let linear_tool_surface_available =
-        config.kind == "fugue-ims" || (config.kind == "linear" && config.api_key.is_some());
+    let linear_tool_surface_available = config.kind == "fugue-ims"
+        || (matches!(config.kind.as_str(), "linear" | "jira") && config.api_key.is_some());
     if !linear_tool_surface_available {
         return None;
     }
-    Some(vec![
+    let mut tools = vec![
         json!({
             "name": FugueToolOperation::LinearInspectIssue.provider_callback_name(),
             "description": "Inspect a Linear issue through Fugue's typed Linear tool layer, including the current Fugue Workpad comment body when present.",
@@ -1124,7 +1124,34 @@ pub fn external_tools_for_tracker(config: &crate::config::TrackerConfig) -> Opti
                 "additionalProperties": false
             }
         }),
-    ])
+    ];
+    if config.kind == "jira" {
+        for tool in &mut tools {
+            if let Some(description) = tool.get_mut("description")
+                && let Some(text) = description.as_str()
+            {
+                *description = Value::String(text.replace("Linear", "Jira"));
+            }
+        }
+    }
+    if config.kind == "jira" {
+        for tool in &mut tools {
+            match tool.get("name").and_then(Value::as_str) {
+                Some("linear_ensure_workflow_states") => {
+                    tool["description"] = json!(
+                        "Validate that configured Jira statuses already exist. Shared Jira workflows must be provisioned by an administrator."
+                    );
+                }
+                Some("linear_list_recent_issue_changes") => {
+                    tool["description"] = json!(
+                        "Read a scoped Jira issue changelog through REST API v3. This reports field changes, not comment bodies."
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    Some(tools)
 }
 
 fn map_rpc_error(method: &str, error: &Value) -> FugueError {
@@ -1311,6 +1338,7 @@ mod tests {
     #[test]
     fn advertised_linear_tools_are_provider_safe() {
         let tools = external_tools_for_tracker(&TrackerConfig {
+            jira: None,
             kind: "linear".to_string(),
             endpoint: "https://api.linear.app/graphql".to_string(),
             api_key: Some("token".to_string()),
@@ -1338,6 +1366,7 @@ mod tests {
     #[test]
     fn linear_tools_are_typed_and_workpad_first_for_linear() {
         let tools = external_tools_for_tracker(&TrackerConfig {
+            jira: None,
             kind: "linear".to_string(),
             endpoint: "https://api.linear.app/graphql".to_string(),
             api_key: Some("token".to_string()),
@@ -1368,6 +1397,7 @@ mod tests {
     #[test]
     fn fugue_ims_exposes_linear_shaped_tool_surface_without_api_key() {
         let tools = external_tools_for_tracker(&TrackerConfig {
+            jira: None,
             kind: "fugue-ims".to_string(),
             endpoint: "/tmp/fugue-ims.sqlite".to_string(),
             api_key: None,
@@ -1394,6 +1424,7 @@ mod tests {
     #[test]
     fn advertised_source_signal_tools_include_github_pr_and_ci_callbacks() {
         let tools = external_tools_for_tracker(&TrackerConfig {
+            jira: None,
             kind: "linear".to_string(),
             endpoint: "https://api.linear.app/graphql".to_string(),
             api_key: Some("token".to_string()),

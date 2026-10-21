@@ -157,6 +157,9 @@ pub fn legacy_linear_lane_repair(
     config: &ServiceConfig,
     lane: &str,
 ) -> Option<LegacyLinearLaneRepair> {
+    if config.tracker.kind == "jira" {
+        return None;
+    }
     let (target_lane, labels, reason) = match normalize_state(lane).as_str() {
         "todo" => (
             config.linear.lanes.ready.clone(),

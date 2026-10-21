@@ -1749,7 +1749,10 @@ impl Orchestrator {
             .iter()
             .map(|signal| signal.id.0.clone())
             .collect::<Vec<_>>();
-        match repo_kapellmeister_signal_message(&signals) {
+        match repo_kapellmeister_signal_message_with_success_lane(
+            &signals,
+            &self.config.effective().linear.lanes.success,
+        ) {
             Ok(message) => {
                 let registry = self.meta_runtime_registry.clone();
                 tokio::spawn(async move {
@@ -7062,6 +7065,11 @@ fn native_mcp_servers_for_issue(
     }
     if let Some(github) = scoped.get_mut("github") {
         if let Some(repository) = repository {
+            if let Some(host) = &repository.host {
+                github
+                    .env
+                    .insert("FUGUE_GITHUB_HOST".to_string(), host.to_string());
+            }
             github
                 .env
                 .insert("FUGUE_GITHUB_OWNER".to_string(), repository.owner.0.clone());
@@ -7202,6 +7210,11 @@ fn native_repo_kapellmeister_mcp_servers(
     if let Some(github) = scoped.get_mut("github")
         && let Some(repository) = repository
     {
+        if let Some(host) = &repository.host {
+            github
+                .env
+                .insert("FUGUE_GITHUB_HOST".to_string(), host.to_string());
+        }
         github
             .env
             .insert("FUGUE_GITHUB_OWNER".to_string(), repository.owner.0.clone());
@@ -9142,8 +9155,16 @@ fn sort_retry_rows(rows: &mut [RetryRow]) {
     });
 }
 
+#[cfg(test)]
 fn repo_kapellmeister_signal_message(
     signals: &[KapellmeisterShadowSignal],
+) -> std::result::Result<String, serde_json::Error> {
+    repo_kapellmeister_signal_message_with_success_lane(signals, "Done")
+}
+
+fn repo_kapellmeister_signal_message_with_success_lane(
+    signals: &[KapellmeisterShadowSignal],
+    success: &str,
 ) -> std::result::Result<String, serde_json::Error> {
     let payload = serde_json::to_string_pretty(signals)?;
     Ok(format!(
@@ -9167,7 +9188,7 @@ fn repo_kapellmeister_signal_message(
          orchestrate merge/OTA yourself; Fugue host handles Deploy as a guarded mechanical \
          transaction after verifying durable PR evidence, CI, WorkGraph blockers, and deploy \
          policy. \
-         If a pr_handoff_monitor_changed signal reports ready_for_done, CI is green or no checks are configured and the PR handoff is acceptable; inspect reviewer/WorkGraph evidence and move the issue to Done when those obligations are satisfied. Done means accepted development work, not merged PR. Merge/OTA only happens through the Deploy action lane. \
+         If a pr_handoff_monitor_changed signal reports ready_for_done, CI is green or no checks are configured and the PR handoff is acceptable; inspect reviewer/WorkGraph evidence and move the issue to {success} when those obligations are satisfied. {success} means accepted development work, not merged PR. Merge/OTA only happens through the Deploy action lane. \
          Do not wait for an external flow-step feeder. If an active issue reports missing concrete handoff, stale worker_started signals, or offline issue peers, actively inspect/ask the issue mob for status or decide resume/replan through Kapellmeister-owned coordination. \
          A linear_issue_moved signal means Fugue observed external projection drift from the \
          issue lane map. It is not proof that lifecycle work completed, but it is an \
@@ -9203,6 +9224,14 @@ fn repo_kapellmeister_signal_message(
 #[cfg(test)]
 mod tests {
     #![allow(dead_code)]
+
+    #[test]
+    fn repo_signal_prompt_uses_configured_success_lane() {
+        let body = super::repo_kapellmeister_signal_message_with_success_lane(&[], "Accepted")
+            .expect("prompt");
+        assert!(body.contains("move the issue to Accepted"));
+        assert!(!body.contains("move the issue to Done"));
+    }
 
     use super::*;
     use crate::final_pr_gate::{FinalPrGateDecision, FinalReviewVerdictStatus};
@@ -9354,6 +9383,7 @@ mod tests {
             },
         );
         let repo = GitHubRepoRef {
+            host: None,
             owner: GitHubOwner("lukacf".to_string()),
             name: GitHubRepoName("meerkat-fugue".to_string()),
         };
@@ -9472,6 +9502,7 @@ mod tests {
             },
         );
         let repo = GitHubRepoRef {
+            host: None,
             owner: GitHubOwner("lukacf".to_string()),
             name: GitHubRepoName("meerkat-fugue".to_string()),
         };
@@ -9672,6 +9703,7 @@ mod tests {
             ),
             native_member_direct_tool_servers(
                 &TrackerConfig {
+                    jira: None,
                     kind: "linear".to_string(),
                     endpoint: String::new(),
                     api_key: None,
@@ -9773,6 +9805,7 @@ mod tests {
             },
         );
         let repo = GitHubRepoRef {
+            host: None,
             owner: GitHubOwner("lukacf".to_string()),
             name: GitHubRepoName("meerkat-fugue".to_string()),
         };
@@ -9843,6 +9876,7 @@ mod tests {
 
     fn repo_ref() -> GitHubRepoRef {
         GitHubRepoRef {
+            host: None,
             owner: GitHubOwner("lukacf".to_string()),
             name: GitHubRepoName("meerkat-fugue".to_string()),
         }

@@ -378,7 +378,10 @@ impl GhCli {
             "name,state,link,completedAt",
         ]) {
             Ok(output) => output,
-            Err(err) if err.message.contains("unknown flag: --json") => {
+            Err(err)
+                if err.message.contains("unknown flag: --json")
+                    || err.message.contains("no checks reported") =>
+            {
                 return self.check_ci_via_pr_view(input);
             }
             Err(err) => return Err(err),
@@ -492,6 +495,7 @@ struct ProcessCommandRunner;
 impl CommandRunner for ProcessCommandRunner {
     fn run(&self, args: &[&str]) -> GitHubToolResult<CommandOutput> {
         let output = std::process::Command::new("gh")
+            .env("GH_HOST", "github.com")
             .args(args)
             .output()
             .map_err(|err| {
@@ -503,11 +507,26 @@ impl CommandRunner for ProcessCommandRunner {
             })?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        if output.status.success() {
-            Ok(CommandOutput { stdout, stderr })
-        } else {
-            Err(classify_gh_failure(output.status.code(), stderr))
-        }
+        command_output(args, output.status.code(), stdout, stderr)
+    }
+}
+
+fn command_output(
+    args: &[&str],
+    status: Option<i32>,
+    stdout: String,
+    stderr: String,
+) -> GitHubToolResult<CommandOutput> {
+    // `gh pr checks` reports failed and pending checks using nonzero exits while
+    // still returning the requested JSON. Preserve that evidence for aggregation.
+    let check_evidence = args.starts_with(&["pr", "checks"])
+        && args.contains(&"--json")
+        && matches!(status, Some(1 | 8))
+        && serde_json::from_str::<Vec<CheckView>>(&stdout).is_ok();
+    if status == Some(0) || check_evidence {
+        Ok(CommandOutput { stdout, stderr })
+    } else {
+        Err(classify_gh_failure(status, stderr))
     }
 }
 
@@ -553,7 +572,7 @@ where
 }
 
 fn repo_slug(repo: &GitHubRepoRef) -> String {
-    format!("{}/{}", repo.owner.0, repo.name.0)
+    repo.to_string()
 }
 
 fn not_found(item: String) -> GitHubToolFailure {
@@ -773,6 +792,7 @@ mod tests {
 
     fn repo() -> GitHubRepoRef {
         GitHubRepoRef {
+            host: None,
             owner: GitHubOwner("lukacf".to_string()),
             name: GitHubRepoName("meerkat-fugue".to_string()),
         }
@@ -805,6 +825,50 @@ mod tests {
                 "nameWithOwner,defaultBranchRef,url,sshUrl".to_string(),
             ]]
         );
+    }
+
+    #[test]
+    fn enterprise_repo_and_pr_commands_use_explicit_host() {
+        let runner = FakeRunner::with_outputs(vec![
+            output(
+                r#"{"defaultBranchRef":{"name":"main"},"url":"https://git.example.com/acme/app","sshUrl":"git@git.example.com:acme/app.git"}"#,
+            ),
+            output(
+                r#"{"number":7,"title":"Fixture","url":"https://git.example.com/acme/app/pull/7","state":"OPEN","isDraft":false,"headRefName":"test","baseRefName":"main","headRefOid":"abc123"}"#,
+            ),
+            output(
+                r#"[{"name":"test","state":"SUCCESS","link":"https://ci.example.com/7","completedAt":null}]"#,
+            ),
+        ]);
+        let host = GitHubToolHost::with_runner(Box::new(runner.clone()));
+        let repo = GitHubRepoRef {
+            host: Some("git.example.com".to_string().try_into().expect("host")),
+            owner: crate::tools::GitHubOwner("acme".to_string()),
+            name: crate::tools::GitHubRepoName("app".to_string()),
+        };
+        assert!(matches!(
+            host.inspect_repo(InspectRepoInput { repo: repo.clone() }),
+            FugueToolResult::Ok { .. }
+        ));
+        assert!(matches!(
+            host.inspect_pr(InspectPrInput {
+                repo: repo.clone(),
+                pull_request: GitHubPullRequestRef::Number {
+                    number: GitHubPullRequestNumber(7)
+                }
+            }),
+            FugueToolResult::Ok { .. }
+        ));
+        assert!(matches!(
+            host.check_ci(CheckCiInput {
+                repo,
+                git_ref: crate::tools::GitRef("test".to_string())
+            }),
+            FugueToolResult::Ok { .. }
+        ));
+        for call in runner.calls() {
+            assert!(call.iter().any(|value| value == "git.example.com/acme/app"));
+        }
     }
 
     #[test]
@@ -981,6 +1045,75 @@ mod tests {
             runner.calls()[0][0..5],
             ["pr", "checks", "branch", "--repo", "lukacf/meerkat-fugue"]
         );
+    }
+
+    #[test]
+    fn check_exit_codes_preserve_failed_and_pending_evidence() {
+        for (exit, state, expected) in [
+            (1, "FAILURE", CiStatus::Failure),
+            (8, "PENDING", CiStatus::Pending),
+        ] {
+            let output = command_output(
+                &["pr", "checks", "1", "--json", "name,state,link,completedAt"],
+                Some(exit),
+                format!(r#"[{{"name":"test","state":"{state}","link":null,"completedAt":null}}]"#),
+                String::new(),
+            )
+            .expect("check evidence");
+            let host =
+                GitHubToolHost::with_runner(Box::new(FakeRunner::with_outputs(vec![output])));
+            let result = host.check_ci(CheckCiInput {
+                repo: repo(),
+                git_ref: crate::tools::GitRef("1".to_string()),
+            });
+            assert!(
+                matches!(result, FugueToolResult::Ok { output: FugueToolOutput::GitHubCheckCi(CheckCiOutput { status, .. }), .. } if status == expected)
+            );
+        }
+        assert!(
+            command_output(
+                &["pr", "checks", "1", "--json", "name"],
+                Some(1),
+                String::new(),
+                "authentication failed".to_string()
+            )
+            .is_err()
+        );
+        assert!(
+            command_output(
+                &["pr", "merge"],
+                Some(1),
+                "[]".to_string(),
+                "failed".to_string()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn missing_checks_are_confirmed_by_rollup_and_remain_pending() {
+        let runner = FakeRunner::with_results(vec![
+            Err(classify_gh_failure(
+                Some(1),
+                "no checks reported on the branch".to_string(),
+            )),
+            Ok(output(r#"{"statusCheckRollup":[]}"#)),
+        ]);
+        let host = GitHubToolHost::with_runner(Box::new(runner));
+        let result = host.check_ci(CheckCiInput {
+            repo: repo(),
+            git_ref: crate::tools::GitRef("1".to_string()),
+        });
+        assert!(matches!(
+            result,
+            FugueToolResult::Ok {
+                output: FugueToolOutput::GitHubCheckCi(CheckCiOutput {
+                    status: CiStatus::Pending,
+                    ..
+                }),
+                ..
+            }
+        ));
     }
 
     #[test]

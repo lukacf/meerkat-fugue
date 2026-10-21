@@ -381,6 +381,7 @@ fn issue_comment_observation_cursor(
 pub enum IssueAdapter {
     Linear(LinearClient),
     FugueIms(FugueImsStore),
+    Jira(Box<crate::jira::JiraClient>),
 }
 
 fn fugue_ims_issue_key_prefix(config: &TrackerConfig) -> String {
@@ -397,15 +398,19 @@ fn fugue_ims_issue_key_prefix(config: &TrackerConfig) -> String {
 
 impl IssueAdapter {
     pub fn from_config(config: &TrackerConfig) -> Result<Self> {
-        if config.kind == "fugue-ims" {
-            return FugueImsStore::from_config(config).map(Self::FugueIms);
+        match config.kind.as_str() {
+            "jira" => crate::jira::JiraClient::from_config(config)
+                .map(|client| Self::Jira(Box::new(client))),
+            "fugue-ims" => FugueImsStore::from_config(config).map(Self::FugueIms),
+            "linear" => LinearClient::from_config(config).map(Self::Linear),
+            kind => Err(FugueError::UnsupportedTrackerKind(kind.to_string())),
         }
-        LinearClient::from_config(config).map(Self::Linear)
     }
 
     pub async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>> {
         match self {
             Self::Linear(client) => client.fetch_candidate_issues().await,
+            Self::Jira(client) => client.fetch_candidate_issues().await,
             Self::FugueIms(store) => store.fetch_candidate_issues().await,
         }
     }
@@ -413,6 +418,7 @@ impl IssueAdapter {
     pub async fn fetch_open_project_issues(&self) -> Result<Vec<Issue>> {
         match self {
             Self::Linear(client) => client.fetch_open_project_issues().await,
+            Self::Jira(client) => client.fetch_open_project_issues().await,
             Self::FugueIms(store) => store.all_open_issues(),
         }
     }
@@ -420,6 +426,7 @@ impl IssueAdapter {
     pub async fn fetch_issues_by_states(&self, states: &[String]) -> Result<Vec<Issue>> {
         match self {
             Self::Linear(client) => client.fetch_issues_by_states(states).await,
+            Self::Jira(client) => client.fetch_issues_by_states(states).await,
             Self::FugueIms(store) => store.fetch_issues_by_states(states).await,
         }
     }
@@ -430,6 +437,7 @@ impl IssueAdapter {
     ) -> Result<Vec<Issue>> {
         match self {
             Self::Linear(client) => client.fetch_board_issues_by_states(states).await,
+            Self::Jira(client) => client.fetch_issues_by_states(states).await,
             Self::FugueIms(store) => store.fetch_issues_by_states(states).await,
         }
     }
@@ -437,6 +445,7 @@ impl IssueAdapter {
     pub async fn fetch_issue_states_by_ids(&self, issue_ids: &[String]) -> Result<Vec<Issue>> {
         match self {
             Self::Linear(client) => client.fetch_issue_states_by_ids(issue_ids).await,
+            Self::Jira(client) => client.fetch_issue_states_by_ids(issue_ids).await,
             Self::FugueIms(store) => store.fetch_issue_states_by_ids(issue_ids).await,
         }
     }
@@ -453,6 +462,11 @@ impl IssueAdapter {
                     .await
             }
             Self::FugueIms(_) => Ok(issue.clone()),
+            Self::Jira(client) => {
+                client
+                    .materialize_issue_attachments(issue, workspace_path)
+                    .await
+            }
         }
     }
 
@@ -464,6 +478,7 @@ impl IssueAdapter {
         lane: &str,
     ) -> Result<Issue> {
         match self {
+            Self::Jira(client) => client.create_issue(title, description, lane).await,
             Self::Linear(client) => {
                 client
                     .create_issue_in_project(title, description, lane)
@@ -503,6 +518,7 @@ impl IssueAdapter {
 
     pub async fn inspect_issue(&self, input: InspectIssueInput) -> Result<InspectIssueOutput> {
         match self {
+            Self::Jira(client) => client.inspect_issue(input).await,
             Self::Linear(client) => LinearToolExecutor::new(client)
                 .inspect_issue(input)
                 .await
@@ -519,6 +535,7 @@ impl IssueAdapter {
         heading: &str,
     ) -> Result<Option<String>> {
         match self {
+            Self::Jira(client) => client.workpad_body(issue, heading).await,
             Self::Linear(client) => LinearToolExecutor::new(client)
                 .workpad_body(issue, heading)
                 .await
@@ -539,6 +556,7 @@ impl IssueAdapter {
         issue: &LinearIssueRef,
     ) -> Result<Vec<LinearIssueCommentSnapshot>> {
         match self {
+            Self::Jira(client) => client.issue_comments(issue).await,
             Self::Linear(client) => LinearToolExecutor::new(client)
                 .issue_comments(issue)
                 .await
@@ -575,6 +593,16 @@ impl IssueAdapter {
         issue: &LinearIssueRef,
     ) -> Result<Vec<LinearCommentSnapshot>> {
         match self {
+            Self::Jira(client) => Ok(client
+                .issue_comments(issue)
+                .await?
+                .into_iter()
+                .map(|comment| LinearCommentSnapshot {
+                    id: comment.comment_id,
+                    body_mark: comment.body_markdown.clone(),
+                    body_markdown: comment.body_markdown,
+                })
+                .collect()),
             Self::Linear(client) => LinearToolExecutor::new(client)
                 .issue_comment_snapshots(issue)
                 .await
@@ -629,6 +657,7 @@ impl IssueAdapter {
 
     pub async fn add_comment(&self, input: AddCommentInput) -> Result<AddCommentOutput> {
         match self {
+            Self::Jira(client) => client.add_comment(input).await,
             Self::Linear(client) => LinearToolExecutor::new(client)
                 .add_comment(input)
                 .await
@@ -641,6 +670,7 @@ impl IssueAdapter {
 
     pub async fn move_issue(&self, input: MoveIssueInput) -> Result<MoveIssueOutput> {
         match self {
+            Self::Jira(client) => client.move_issue(input).await,
             Self::Linear(client) => LinearToolExecutor::new(client)
                 .move_issue(input)
                 .await
@@ -653,6 +683,7 @@ impl IssueAdapter {
 
     pub async fn upsert_workpad(&self, input: UpsertWorkpadInput) -> Result<UpsertWorkpadOutput> {
         match self {
+            Self::Jira(client) => client.upsert_workpad(input).await,
             Self::Linear(client) => LinearToolExecutor::new(client)
                 .upsert_workpad(input)
                 .await
@@ -671,6 +702,29 @@ impl IssueAdapter {
         if runtime.required_states.is_empty() {
             return Ok(());
         }
+        if let Self::Jira(client) = self {
+            if runtime.provisioning.mode == NativeLinearProvisioningMode::CreateMissing {
+                return Err(FugueError::InvalidConfig("Jira workflows must be provisioned by an administrator; use provisioning.mode=validate".to_string()));
+            }
+            let states = client.list_project_states().await?.states;
+            let missing: Vec<_> = runtime
+                .required_states
+                .iter()
+                .filter(|required| {
+                    !states
+                        .iter()
+                        .any(|state| state.name.eq_ignore_ascii_case(&required.name))
+                })
+                .map(|required| required.name.as_str())
+                .collect();
+            return if missing.is_empty() {
+                Ok(())
+            } else {
+                Err(FugueError::InvalidConfig(format!(
+                    "Jira projection preflight missing statuses: {missing:?}"
+                )))
+            };
+        }
         let Some(team_selector) = runtime.team.as_deref() else {
             if runtime.provisioning.mode == NativeLinearProvisioningMode::CreateMissing {
                 return Err(FugueError::InvalidConfig(
@@ -684,6 +738,7 @@ impl IssueAdapter {
         };
 
         let states = match self {
+            Self::Jira(client) => client.list_project_states().await?.states,
             Self::Linear(client) => {
                 let executor = LinearToolExecutor::new(client);
                 let team_id = executor.resolve_team_id(team_selector).await.map_err(|err| {

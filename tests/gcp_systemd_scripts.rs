@@ -46,7 +46,7 @@ set -euo pipefail
 printf '%s\n' "$*" > {}
 release_dir="$CARGO_TARGET_DIR/release"
 mkdir -p "$release_dir"
-for binary in meerkat-fugue fugue-linear-mcp fugue-github-mcp fugue-host-mcp; do
+for binary in meerkat-fugue fugue-linear-mcp fugue-jira-mcp fugue-github-mcp fugue-host-mcp; do
   printf 'built:%s\n' "$binary" > "$release_dir/$binary"
   chmod 0755 "$release_dir/$binary"
 done
@@ -67,7 +67,7 @@ release_dir="$CARGO_TARGET_DIR/release"
 mkdir -p "$release_dir"
 cp /bin/sleep "$release_dir/meerkat-fugue"
 chmod 0755 "$release_dir/meerkat-fugue"
-for binary in fugue-linear-mcp fugue-github-mcp fugue-host-mcp; do
+for binary in fugue-linear-mcp fugue-jira-mcp fugue-github-mcp fugue-host-mcp; do
   printf 'built:%s\n' "$binary" > "$release_dir/$binary"
   chmod 0755 "$release_dir/$binary"
 done
@@ -81,10 +81,11 @@ fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
-fn runtime_binaries() -> [&'static str; 4] {
+fn runtime_binaries() -> [&'static str; 5] {
     [
         "meerkat-fugue",
         "fugue-linear-mcp",
+        "fugue-jira-mcp",
         "fugue-github-mcp",
         "fugue-host-mcp",
     ]

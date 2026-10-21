@@ -121,6 +121,7 @@ pub fn workspace_key_for_issue(issue: &Issue) -> String {
 
 pub fn workspace_provenance_repo() -> GitHubRepoRef {
     GitHubRepoRef {
+        host: None,
         owner: GitHubOwner("local".to_string()),
         name: GitHubRepoName("hook-managed-workspace".to_string()),
     }

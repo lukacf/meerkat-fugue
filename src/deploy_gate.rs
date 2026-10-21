@@ -206,9 +206,12 @@ impl DeployProcedureIdentity {
         if trimmed != ".fugue/deploy.md" {
             return Err(format!("unsupported deploy procedure `{trimmed}`"));
         }
-        if repo.owner.0 != "lukacf" || repo.name.0 != "meerkat-fugue" {
+        if repo.hostname() != "github.com"
+            || repo.owner.0 != "lukacf"
+            || repo.name.0 != "meerkat-fugue"
+        {
             return Err(format!(
-                "deploy procedure `{trimmed}` is currently supported only for lukacf/meerkat-fugue"
+                "deploy procedure `{trimmed}` is currently supported only for github.com/lukacf/meerkat-fugue"
             ));
         }
         Ok(Self::MeerkatFugueMergeOta {
@@ -382,6 +385,7 @@ mod tests {
     fn pr_evidence() -> DeployPullRequestEvidence {
         DeployPullRequestEvidence {
             repo: GitHubRepoRef {
+                host: None,
                 owner: GitHubOwner("lukacf".to_string()),
                 name: GitHubRepoName("meerkat-fugue".to_string()),
             },
@@ -396,6 +400,7 @@ mod tests {
     fn pr_snapshot() -> GitHubPullRequestSnapshot {
         GitHubPullRequestSnapshot {
             repo: GitHubRepoRef {
+                host: None,
                 owner: GitHubOwner("lukacf".to_string()),
                 name: GitHubRepoName("meerkat-fugue".to_string()),
             },
@@ -414,6 +419,7 @@ mod tests {
         DeployLaneConfig {
             enabled: true,
             allowed_repositories: vec![GitHubRepoRef {
+                host: None,
                 owner: GitHubOwner("lukacf".to_string()),
                 name: GitHubRepoName("meerkat-fugue".to_string()),
             }],
@@ -534,6 +540,7 @@ mod tests {
     fn deploy_gate_requires_supported_repo_for_meerkat_procedure() {
         let mut input = gate_input();
         let repo = GitHubRepoRef {
+            host: None,
             owner: GitHubOwner("lukacf".to_string()),
             name: GitHubRepoName("future-repo".to_string()),
         };
@@ -547,7 +554,7 @@ mod tests {
             plan.failure_category,
             Some(DeployFailureCategory::UnsafeDeploy)
         );
-        assert!(plan.reasons[0].contains("supported only for lukacf/meerkat-fugue"));
+        assert!(plan.reasons[0].contains("supported only for github.com/lukacf/meerkat-fugue"));
         assert!(plan.merge.is_none());
     }
 

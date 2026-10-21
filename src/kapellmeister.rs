@@ -770,6 +770,7 @@ pub fn shadow_signals_from_tool_result(result: &FugueToolResult) -> Vec<Kapellme
         }
         FugueToolOutput::GitHubCheckCi(CheckCiOutput { status, checks }) => {
             let repo = GitHubRepoRef {
+                host: None,
                 owner: GitHubOwner("unknown".to_string()),
                 name: GitHubRepoName("unknown".to_string()),
             };
@@ -867,7 +868,7 @@ fn linear_cursor(
 }
 
 fn github_repo_partition(repo: &GitHubRepoRef) -> CursorPartition {
-    CursorPartition(format!("{}/{}", repo.owner.0, repo.name.0))
+    CursorPartition(repo.to_string())
 }
 
 fn github_pr_cursor(
@@ -2420,8 +2421,8 @@ fn kapellmeister_decision_prompt(request: &KapellmeisterDecisionRequest) -> Resu
          The guarded host executor will validate selectors, issue scope, allowed tools, and idempotency before applying your decision. \
          You have Meerkat mob tooling available for repo-level delegation semantics: delegate/mob_create on the agent side and mob_run_flow inside mobs. \
          Treat context.observations as Fugue host observations, not host-owned lifecycle decisions. \
-         For a newly observed Queue or legacy-intake/remediation issue, choose worker_start when the next canonical step should be to start or resume the configured issue mob; the issue mob planner owns the detailed Workpad plan after worker_start. Queue is intake and Active is the steady running issue-mob projection lane; once the mob accepts the signal, the issue lead should project running work to Active and record detailed phase as labels/evidence/runtime state. \
-         If an observation reports the configured Active lane, treat it as resumable active work and choose worker_start unless a terminal/pause/blocker observation makes that unsafe. \
+         For a newly observed configured intake or remediation issue, choose worker_start when the next canonical step should be to start or resume the configured issue mob; the issue mob planner owns the detailed Workpad plan after worker_start. Use the configured intake and running projection lanes; once the mob accepts the signal, the issue lead should project work to the configured running lane and record detailed phase as labels/evidence/runtime state. \
+         If an observation reports the configured running lane, treat it as resumable active work and choose worker_start unless a terminal/pause/blocker observation makes that unsafe. \
          Never choose noop merely because you are waiting for an external flow step; Kapellmeister owns the repo-level decision to start, resume, replan, pause, or ask for human help. \
          If an observation reports a human lane change, decide whether it means pause, cancel, replan, or resume before selecting a host command. \
          Use workpad_update only for repo-agent evidence such as PR, check, merge, deploy, or reviewer feedback handoff; do not perform planner/coder/reviewer issue work directly in the repo decision turn. \
@@ -3261,6 +3262,20 @@ fn read_only_tool_schema(operation: FugueToolOperation) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_cursors_include_enterprise_host_identity() {
+        let public: GitHubRepoRef =
+            serde_json::from_value(json!({"owner":"example","name":"app"})).expect("public repo");
+        let enterprise: GitHubRepoRef = serde_json::from_value(
+            json!({"host":"git.example.com","owner":"example","name":"app"}),
+        )
+        .expect("enterprise repo");
+        assert_ne!(
+            github_repo_partition(&public),
+            github_repo_partition(&enterprise)
+        );
+    }
     use crate::tools::{
         AddCommentOutput, BranchName, ClaimIssueInput, CreatePrOutput, GitHubOwner, GitHubRepoName,
         IdempotencyKey, LinearIssueId, LinearIssueIdentifier, LinearIssueSnapshot, LinearStateId,
@@ -3277,6 +3292,7 @@ mod tests {
 
     fn repo_ref() -> GitHubRepoRef {
         GitHubRepoRef {
+            host: None,
             owner: GitHubOwner("lukacf".to_string()),
             name: GitHubRepoName("meerkat-fugue".to_string()),
         }
@@ -3487,6 +3503,7 @@ for line in sys.stdin:
             mode: KapellmeisterAuthorityMode::GuardedLabeled,
             safe_selectors: KapellmeisterSafeSelectors {
                 repositories: vec![GitHubRepoRef {
+                    host: None,
                     owner: GitHubOwner("*".to_string()),
                     name: GitHubRepoName("meerkat-fugue".to_string()),
                 }],
@@ -3950,6 +3967,7 @@ for line in sys.stdin:
     #[test]
     fn inert_shadow_runtime_does_not_advertise_callback_tools_until_servicing_loop_exists() {
         let tracker = TrackerConfig {
+            jira: None,
             kind: "linear".to_string(),
             endpoint: "https://api.linear.app/graphql".to_string(),
             api_key: Some("token".to_string()),

@@ -750,6 +750,7 @@ mod tests {
 
     fn repo_ref() -> GitHubRepoRef {
         GitHubRepoRef {
+            host: None,
             owner: GitHubOwner("lukacf".to_string()),
             name: GitHubRepoName("meerkat-fugue".to_string()),
         }
@@ -848,6 +849,7 @@ mod tests {
         let non_matching = KapellmeisterDecisionContext {
             issue: Some(issue_ref("LUC-168")),
             repository: Some(GitHubRepoRef {
+                host: None,
                 owner: GitHubOwner("other".to_string()),
                 name: GitHubRepoName("repo".to_string()),
             }),

@@ -7016,6 +7016,7 @@ mod tests {
             },
             pull_request: GitHubPullRequestSnapshot {
                 repo: GitHubRepoRef {
+                    host: None,
                     owner: GitHubOwner("lukacf".to_string()),
                     name: GitHubRepoName("meerkat-fugue".to_string()),
                 },
@@ -7134,6 +7135,7 @@ mod tests {
             },
             pull_request: GitHubPullRequestSnapshot {
                 repo: GitHubRepoRef {
+                    host: None,
                     owner: GitHubOwner("lukacf".to_string()),
                     name: GitHubRepoName("meerkat-fugue".to_string()),
                 },
@@ -7210,6 +7212,7 @@ mod tests {
             },
             pull_request: GitHubPullRequestSnapshot {
                 repo: GitHubRepoRef {
+                    host: None,
                     owner: GitHubOwner("lukacf".to_string()),
                     name: GitHubRepoName("meerkat-fugue".to_string()),
                 },
@@ -7324,6 +7327,7 @@ mod tests {
             },
             pull_request: GitHubPullRequestSnapshot {
                 repo: GitHubRepoRef {
+                    host: None,
                     owner: GitHubOwner("lukacf".to_string()),
                     name: GitHubRepoName("meerkat-fugue".to_string()),
                 },
@@ -7455,6 +7459,7 @@ mod tests {
             },
             pull_request: GitHubPullRequestSnapshot {
                 repo: GitHubRepoRef {
+                    host: None,
                     owner: GitHubOwner("lukacf".to_string()),
                     name: GitHubRepoName("meerkat-fugue".to_string()),
                 },

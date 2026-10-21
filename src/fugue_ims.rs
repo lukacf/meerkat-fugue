@@ -1055,6 +1055,7 @@ fn sqlite_error(error: rusqlite::Error) -> FugueError {
 
 pub fn fugue_ims_tracker_config(path: &Path) -> TrackerConfig {
     TrackerConfig {
+        jira: None,
         kind: "fugue-ims".to_string(),
         endpoint: path.display().to_string(),
         api_key: None,

@@ -451,6 +451,6 @@ staging, and only then runs the deployment replacement command from staging. The
 live checkout is not reset before build/health pass. The deploy command executes
 as the Fugue process user, so keep it atomic and operator reviewed. Production
 deploy commands should install the service binary and the helper MCP binaries
-(`fugue-linear-mcp`, `fugue-github-mcp`, and `fugue-host-mcp`) from the same
+(`fugue-linear-mcp`, `fugue-jira-mcp`, `fugue-github-mcp`, and `fugue-host-mcp`) from the same
 staging build before restart so member Workpad/GitHub tool behavior matches the
 service contract.

@@ -34,7 +34,7 @@ use crate::agent::{
 use crate::config::{
     DEFAULT_AGENT_MODEL, FinalReviewReviewerConfig, IndependentReviewConfig,
     MaterializedMobTemplate, MeerkatConfig, MetaConsoleBasicAuthConfig, NativeAgentProfile,
-    NativeMcpServerConfig, NativeMobFlow, TrackerConfig,
+    NativeMcpServerConfig, NativeMobFlow, TrackerConfig, is_native_linear_mcp_server,
 };
 use crate::deploy_gate::DeployStartRequest;
 use crate::domain::normalize_state;
@@ -988,7 +988,9 @@ fn direct_tool_dispatcher(
         }
         declared_tools.is_none_or(|declared| {
             if is_linear_fugue_tool_name(&tool.name) {
-                declared.iter().any(|name| name == "mcp:linear")
+                declared.iter().any(|name| {
+                    name == "mcp:linear" || (tracker.kind == "jira" && name == "mcp:jira")
+                })
             } else if is_github_fugue_tool_name(&tool.name) {
                 declared.iter().any(|name| name == "mcp:github")
             } else {
@@ -1020,6 +1022,12 @@ fn apply_direct_github_repo_scope(arguments: Value, repository: Option<&GitHubRe
     object
         .entry("repo".to_string())
         .or_insert_with(|| json!(repository));
+    if let Some(host) = &repository.host
+        && let Some(repo) = object.get_mut("repo").and_then(Value::as_object_mut)
+    {
+        repo.entry("host".to_string())
+            .or_insert_with(|| json!(host));
+    }
     Value::Object(object)
 }
 
@@ -1059,7 +1067,9 @@ fn guard_direct_public_lane_move(
     if target.is_empty() {
         return Err("linear_move_issue target lane must not be empty".to_string());
     }
-    if let Some(replacement) = legacy_public_lane_replacement(target) {
+    if tracker.kind != "jira"
+        && let Some(replacement) = legacy_public_lane_replacement(target)
+    {
         return Err(format!(
             "{target:?} is a legacy Fugue/Linear phase lane and must not be written by agents; use {replacement:?} and record phase/detail as labels, WorkGraph, Workpad, or Meta evidence"
         ));
@@ -1180,6 +1190,7 @@ fn tool_def_from_value(value: Value) -> Option<ToolDef> {
 
 fn default_tracker_config() -> TrackerConfig {
     TrackerConfig {
+        jira: None,
         kind: "linear".to_string(),
         endpoint: "https://api.linear.app/graphql".to_string(),
         api_key: std::env::var("LINEAR_API_KEY")
@@ -1255,7 +1266,7 @@ fn build_unified_runtime(
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
 ) -> Result<(UnifiedRuntime, Option<tokio::runtime::Runtime>), String> {
     let build = move || async move {
-        let github_repo = github_repo_from_mcp_servers(&servers);
+        let github_repo = github_repo_from_mcp_servers(&servers)?;
         let review_handoff_states = review_handoff_states_from_mcp_servers(&servers);
         let action_states = action_states_from_mcp_servers(&servers);
         let workgraph_gate = WorkGraphTerminalGate::new(
@@ -2314,9 +2325,11 @@ impl MetaRuntimeNativeMobExecutionHost {
             &issue_lead,
             None,
             member_labels(&issue, ISSUE_LEAD),
-            Some(issue_lead_prompt(
+            Some(issue_lead_prompt_for_tracker(
                 &issue,
                 plan.input.instructions.as_deref(),
+                &self.registry.tracker,
+                plan.template.linear_projection.as_ref(),
             )),
             plan.input.worktree_path.as_deref(),
             plan.template
@@ -2343,10 +2356,14 @@ impl MetaRuntimeNativeMobExecutionHost {
                 &identity,
                 initial_message.as_deref(),
                 member_labels(&issue, &member.name),
-                Some(worker_prompt(
+                Some(worker_prompt_with_lane(
                     &issue,
                     &member.name,
                     plan.input.instructions.as_deref(),
+                    running_lane(
+                        &self.registry.tracker,
+                        plan.template.linear_projection.as_ref(),
+                    ),
                 )),
                 plan.input.worktree_path.as_deref(),
                 member
@@ -2990,12 +3007,25 @@ fn independent_review_orchestrator_profile(
 
 fn github_repo_from_mcp_servers(
     servers: &BTreeMap<String, NativeMcpServerConfig>,
-) -> Option<GitHubRepoRef> {
-    let github = servers.get("github")?;
-    Some(GitHubRepoRef {
-        owner: GitHubOwner(server_env_value(github, "FUGUE_GITHUB_OWNER")?),
-        name: GitHubRepoName(server_env_value(github, "FUGUE_GITHUB_REPO")?),
-    })
+) -> Result<Option<GitHubRepoRef>, String> {
+    let Some(github) = servers.get("github") else {
+        return Ok(None);
+    };
+    let host = server_env_value(github, "FUGUE_GITHUB_HOST")
+        .or_else(|| server_env_value(github, "GH_HOST"))
+        .map(crate::tools::GitHubHost::try_from)
+        .transpose()?;
+    let (Some(owner), Some(name)) = (
+        server_env_value(github, "FUGUE_GITHUB_OWNER"),
+        server_env_value(github, "FUGUE_GITHUB_REPO"),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(GitHubRepoRef {
+        host,
+        owner: GitHubOwner(owner),
+        name: GitHubRepoName(name),
+    }))
 }
 
 fn server_env_value(server: &NativeMcpServerConfig, key: &str) -> Option<String> {
@@ -3023,8 +3053,9 @@ fn states_from_linear_mcp_env(
     env_name: &str,
 ) -> Vec<String> {
     let Some(value) = servers
-        .get("linear")
-        .and_then(|server| server_env_value(server, env_name))
+        .iter()
+        .find(|(name, server)| is_native_linear_mcp_server(name, server))
+        .and_then(|(_, server)| server_env_value(server, env_name))
     else {
         return Vec::new();
     };
@@ -3166,6 +3197,32 @@ fn member_labels(issue: &str, role: &str) -> BTreeMap<String, String> {
     ])
 }
 
+fn running_lane<'a>(
+    tracker: &'a crate::config::TrackerConfig,
+    projection: Option<&'a crate::config::MaterializedLinearProjection>,
+) -> &'a str {
+    projection
+        .and_then(|projection| projection.aggregate.fallback.as_deref())
+        .or_else(|| tracker.in_flight_states.first().map(String::as_str))
+        .unwrap_or("the configured running lane")
+}
+
+fn issue_lead_prompt_for_tracker(
+    issue: &str,
+    instructions: Option<&str>,
+    tracker: &crate::config::TrackerConfig,
+    projection: Option<&crate::config::MaterializedLinearProjection>,
+) -> String {
+    if tracker.kind != "jira" {
+        return issue_lead_prompt(issue, instructions);
+    }
+    let active = running_lane(tracker, projection);
+    format!(
+        "You are the Fugue issue lead for {issue}. Coordinate visible worker peers through Meta comms. You own issue-level Jira lane projection: inspect the issue, update the Workpad, and use linear_move_issue with the configured Jira status names. Kapellmeister owns repo-level startup/resume/retire coordination. Once intake is accepted, project the issue to {active}. Record internal planner/coder/reviewer/remediation phases in labels, WorkGraph, Workpad, and Meta evidence. Follow the template's configured node and terminal projections; never invent tracker statuses or enter operator action lanes from inside the issue mob. Terminal success means accepted development work; merge is a separate action. Red review, failed checks, or actionable operator findings must create or update WorkGraph blockers and keep or return the issue to {active} for focused replanning. Use labels `fugue`, `issue:{issue}`, and `blocking`. Deleted comments do not clear obligations without explicit newer acceptance. Use the default WorkGraph scope: omit realm_id and namespace unless following an exact returned item reference; never invent a realm or namespace from the issue identifier. Planner/coder may claim, update, and add evidence, but only reviewer-role agents may close completed review obligations. Before terminal success, query WorkGraph yourself and verify every blocking `issue:{issue}` item is terminal. Execute actual transition calls before reporting lane movement complete.\n\n{}",
+        instructions.unwrap_or_default()
+    )
+}
+
 fn issue_lead_prompt(issue: &str, instructions: Option<&str>) -> String {
     format!(
         "You are the Fugue issue lead for {issue}. Coordinate the visible worker peers through Meta comms. You own issue-level IMS/Linear lane projection for this issue: inspect the issue, update the Workpad, and call linear_move_issue when the issue's coarse operator lane should change. Kapellmeister owns repo-level startup/resume/retire coordination; do not wait for Kapellmeister to approve ordinary issue-mob projection such as Queue, Active, Blocked, Done, or Canceled when your mob has the evidence to move. Queue is the intake lane, and Active is the single running issue-mob lane; once an intake or legacy remediation signal has been accepted by the mob, project the issue to Active and record detailed planner/coder/reviewer/remediation phase as labels, WorkGraph, Workpad, and Meta runtime evidence. Review, Deploy, and final-review lanes are action lanes: never move an issue there from inside the issue mob; they are operator or host-observed control inputs. Done means accepted development work, not merged PR; merge/OTA is a separate Deploy action. Red review, failed checks, operator review findings, or concrete blocking remediation should create/update WorkGraph blockers and keep or return the issue to Active for focused replanning; do not create separate tracker statuses for internal phases. If Kapellmeister reports an issue comment add/update/delete, operator_review_finding, PR finding, check failure, or concrete blocking remediation, convert the actionable finding into WorkGraph items with labels `fugue`, `issue:{issue}`, and `blocking` before replanning; deleted comments are not acceptance unless a newer operator comment explicitly clears the finding. For normal issue-mob WorkGraph queries, use the default WorkGraph scope: omit realm_id and namespace unless you are following an exact returned item reference; never invent a realm or namespace from the issue identifier. Planner/coder may claim, update, and add evidence to WorkGraph items, but reviewer-role agents are the only agents allowed to close completed review obligations. Before moving this issue to a non-Blocked terminal success/cancel/duplicate lane, query WorkGraph yourself and ensure every blocking `issue:{issue}` item is terminal; the linear_move_issue tool will reject terminal success while unresolved obligations remain. If your task names a sequence of issue lanes, execute the actual linear_move_issue calls for each lane in that sequence before you report the sequence complete; do not merely announce future lane movement.\n\n{}",
@@ -3173,10 +3230,20 @@ fn issue_lead_prompt(issue: &str, instructions: Option<&str>) -> String {
     )
 }
 
+#[cfg(test)]
 fn worker_prompt(issue: &str, member: &str, instructions: Option<&str>) -> String {
+    worker_prompt_with_lane(issue, member, instructions, "Active")
+}
+
+fn worker_prompt_with_lane(
+    issue: &str,
+    member: &str,
+    instructions: Option<&str>,
+    active: &str,
+) -> String {
     let role_contract = match member {
         "reviewer" => format!(
-            "Reviewer contract for {issue}: query WorkGraph items labeled `fugue`, `issue:{issue}`, and `blocking` before deciding green/red. Use the default WorkGraph scope: omit realm_id and namespace unless an exact item reference gives you a scope; never invent a realm or namespace from the issue identifier. For every review pass, use a fresh neutral review helper through the mob/delegate tooling when available; give it strict neutral instructions to inspect the diff against base with shell/GitHub tools and query WorkGraph itself. Do not hand it a precomputed diff, curated findings, or a WorkGraph dump. If review is green, close only the completed WorkGraph obligations with workgraph_close after verifying evidence; if red, create or update blocking WorkGraph items and ask the issue lead to keep or project the issue to Active for focused replanning/remediation with phase evidence."
+            "Reviewer contract for {issue}: query WorkGraph items labeled `fugue`, `issue:{issue}`, and `blocking` before deciding green/red. Use the default WorkGraph scope: omit realm_id and namespace unless an exact item reference gives you a scope; never invent a realm or namespace from the issue identifier. For every review pass, use a fresh neutral review helper through the mob/delegate tooling when available; give it strict neutral instructions to inspect the diff against base with shell/GitHub tools and query WorkGraph itself. Do not hand it a precomputed diff, curated findings, or a WorkGraph dump. If review is green, close only the completed WorkGraph obligations with workgraph_close after verifying evidence; if red, create or update blocking WorkGraph items and ask the issue lead to keep or project the issue to {active} for focused replanning/remediation with phase evidence."
         ),
         "planner" => format!(
             "Planner contract for {issue}: inspect WorkGraph items labeled `fugue`, `issue:{issue}`, and `blocking`, turn open obligations into concrete Workpad plan items, and add WorkGraph evidence as planning clarifies scope. Use the default WorkGraph scope: omit realm_id and namespace unless an exact item reference gives you a scope; never invent a realm or namespace from the issue identifier. Do not close WorkGraph review obligations."
@@ -3458,6 +3525,7 @@ mod tests {
 
     fn tracker_with_key() -> TrackerConfig {
         TrackerConfig {
+            jira: None,
             kind: "linear".to_string(),
             endpoint: "https://api.linear.app/graphql".to_string(),
             api_key: Some("test-linear-key".to_string()),
@@ -3647,6 +3715,21 @@ mod tests {
         assert!(prompt.contains("project the issue to Active"));
         assert!(prompt.contains("labels, WorkGraph, Workpad, and Meta runtime evidence"));
         assert!(!prompt.contains("ordinary issue-stage movement"));
+    }
+
+    #[test]
+    fn jira_prompts_follow_configured_running_lane() {
+        let mut tracker = tracker_with_key();
+        tracker.kind = "jira".to_string();
+        tracker.in_flight_states = vec!["Working".to_string()];
+        let lead = issue_lead_prompt_for_tracker("TEST-1", None, &tracker, None);
+        let reviewer =
+            worker_prompt_with_lane("TEST-1", "reviewer", None, running_lane(&tracker, None));
+        assert!(lead.contains("project the issue to Working"));
+        assert!(reviewer.contains("project the issue to Working"));
+        assert!(!lead.contains("Queue is the intake lane"));
+        assert!(!reviewer.contains("project the issue to Active"));
+        assert!(lead.contains("omit realm_id and namespace"));
     }
 
     #[test]
@@ -4122,7 +4205,7 @@ mod tests {
                 ],
             ),
         )]);
-        let repo = github_repo_from_mcp_servers(&servers);
+        let repo = github_repo_from_mcp_servers(&servers).expect("repo scope");
 
         let arguments = apply_direct_github_repo_scope(
             json!({
@@ -4196,6 +4279,7 @@ mod tests {
     #[test]
     fn direct_github_scope_preserves_explicit_repo() {
         let configured = GitHubRepoRef {
+            host: None,
             owner: GitHubOwner("lukacf".to_string()),
             name: GitHubRepoName("meerkat-fugue".to_string()),
         };

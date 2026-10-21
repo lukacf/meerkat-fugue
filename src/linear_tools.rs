@@ -889,6 +889,9 @@ pub async fn execute_linear_fugue_tool_with_review_handoff_states(
     if config.kind == "fugue-ims" {
         return execute_fugue_ims_linear_tool(config, operation, name, arguments).await;
     }
+    if config.kind == "jira" {
+        return crate::jira::execute_tool(config, operation, arguments).await;
+    }
     let client = match LinearClient::from_config(config) {
         Ok(client) => client,
         Err(err) => {
@@ -1578,7 +1581,7 @@ fn workpad_body(heading: &str, body_markdown: &str) -> String {
     }
 }
 
-fn normalize_workpad_heading(heading: &str, issue_identifier: &str) -> String {
+pub(crate) fn normalize_workpad_heading(heading: &str, issue_identifier: &str) -> String {
     let trimmed = heading.trim();
     if trimmed.is_empty() {
         return DEFAULT_WORKPAD_HEADING.to_string();
@@ -2314,6 +2317,7 @@ mod tests {
     #[tokio::test]
     async fn unsupported_provider_tool_names_return_structured_errors() {
         let config = TrackerConfig {
+            jira: None,
             kind: "linear".to_string(),
             endpoint: "https://api.linear.app/graphql".to_string(),
             api_key: Some("token".to_string()),

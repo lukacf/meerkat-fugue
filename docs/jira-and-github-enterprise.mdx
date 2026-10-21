@@ -1,0 +1,137 @@
+---
+title: "Jira and GitHub Enterprise"
+description: "Configure Jira issue workflows and GitHub Enterprise repositories with private local settings."
+---
+
+# Jira and GitHub Enterprise
+
+Fugue supports Jira Cloud through REST API v3, Jira Server/Data Center through
+REST API v2, and GitHub Enterprise Server through the authenticated `gh` CLI.
+Use [fugue.jira.example.yaml](../fugue.jira.example.yaml) as a complete starting
+configuration. Store organization-specific configuration outside your public
+checkout, for example under `~/.config/meerkat-fugue/`.
+
+## Authentication
+
+Export `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN` in the environment that
+launches Fugue. The adapter never sources a shell profile. It uses the active
+environment; it does not read commented-out or legacy tokens.
+
+```yaml
+tracker:
+  kind: jira
+  endpoint: $JIRA_BASE_URL
+  api_key: $JIRA_API_TOKEN
+  project_slug: EXAMPLE
+  jira:
+    email: $JIRA_EMAIL
+    api_version: "3"
+    auth: basic
+    jql: 'labels = "fugue"'
+    issue_type: Task
+```
+
+The `tracker` section is an alias for the historical `linear` section. Both
+accept the same configuration, but specify only one. `linear_projections` and
+the existing `linear_*` host tool names remain compatible across trackers;
+with `kind: jira`, these tools call Jira REST APIs. Configure agent profiles
+with `mcp:jira` and the `fugue-jira-mcp` companion binary.
+
+Cloud uses email plus API token. Server/Data Center can use `auth: bearer` and
+`api_version: "2"`, with its personal access token in `JIRA_API_TOKEN`. A site
+URL with a context path, such as `https://jira.example.com/jira`, is supported.
+GitHub Enterprise authentication stays in `gh`'s credential store:
+
+```bash
+gh auth login --hostname git.example.com
+gh auth status --hostname git.example.com
+```
+
+## Scope and workflow
+
+Every issue search is restricted to `project_slug`. Optional `jira.jql` adds a
+parenthesized filter inside that scope; omit `ORDER BY` from this extra filter.
+Direct issue reads and mutations also check the configured project.
+
+Map `tracker.lanes` and `linear_projections` to the project's existing Jira
+statuses. Jira transitions are resolved by their destination status, which
+can differ from the transition's name. Fugue requires an available, unambiguous
+transition and confirms the resulting status after the request.
+
+Use `provisioning.mode: validate`. Fugue does not create Jira statuses or edit
+shared workflows. A Jira workflow can map multiple terminal outcomes to one
+status, such as `Done`, and may use the same status for parked and ready work.
+Use a selective JQL filter when intake and backlog share a status. Runtime
+terminal outcomes remain distinct even when their displayed Jira status matches.
+
+Jira issue-link types whose inward direction blocks intake are configured with
+`jira.blocking_link_types`, defaulting to `[Blocks]`. Other links do not become
+dependencies. Cloud descriptions and comments use Atlassian Document Format.
+Workpad updates paginate all comments, preserve review findings, reuse the
+existing workpad, and fail if duplicate workpads require human resolution.
+
+Attachments are downloaded from the configured Jira origin with the queue's
+existing file count and byte limits. Redirected or cross-origin attachments
+fail explicitly. Local file uploads through comments are currently unsupported;
+publicly reachable attachment URLs can be included as links. Changelog tools
+require a scoped issue and REST API v3.
+
+## Required custom fields
+
+Keep site-specific required fields in private JSON files. Set
+`tracker.jira.create_fields_file` to a file containing an object such as
+`{"customfield_12345":{"id":"10001"},"labels":["fugue"]}`. Fugue passes these
+values through to Jira without interpreting them. Project, summary, description,
+and issue type remain controlled by the typed creation request.
+
+For transitions requiring fields such as resolution, set
+`tracker.jira.transition_fields_file` to a private JSON object keyed by destination
+status name or ID, for example `{"Done":{"resolution":{"name":"Done"}}}`.
+Both file settings accept `$ENV_VAR` references. Use absolute paths; the files
+are read at client construction and never included in the public example.
+
+## Repository identity
+
+Use an explicit host in repository selectors and MCP environment:
+
+```yaml
+mcp_servers:
+  github:
+    command: [fugue-github-mcp]
+    env:
+      FUGUE_GITHUB_HOST: git.example.com
+      FUGUE_GITHUB_OWNER: example
+      FUGUE_GITHUB_REPO: app
+```
+
+A typed tool repository reference is `{host: git.example.com, owner: example,
+name: app}`. Put the same host in guarded repository selectors and deploy
+allowlists. PR inspection, creation, checks, and merge commands pass
+`git.example.com/example/app` to `gh`, selecting that host's credentials.
+Repository cursors and authorization distinguish identical owner/repository
+names on different hosts. Omit `host` for the existing public GitHub behavior.
+
+Use `gh repo clone git.example.com/example/app .` in a workspace creation hook
+when relying on `gh` authentication. Fugue does not change the machine-wide
+default GitHub host or copy tokens into repository files.
+
+## Validate before starting a queue
+
+```bash
+meerkat-fugue ~/.config/meerkat-fugue/fugue.yaml --check
+```
+
+This validates configured statuses, reads candidate issues, and checks access
+to the repository selectors in `kapellmeister.safe_selectors`.
+It exits before starting agents or polling. It always validates workflow
+statuses without creating them. Review the reported tracker and repository
+URLs, then start the queue by removing `--check`.
+
+The standalone Jira MCP binary accepts `JIRA_BASE_URL`, `JIRA_PROJECT_KEY`,
+`JIRA_EMAIL`, `JIRA_API_TOKEN`, `JIRA_API_VERSION`, `JIRA_AUTH_MODE`, `JIRA_JQL`,
+`JIRA_ISSUE_TYPE`, `JIRA_CREATE_FIELDS_FILE`, and `JIRA_TRANSITION_FIELDS_FILE`. Native workflow configuration supplies the matching
+scope to the companion automatically.
+
+API contracts: [Jira issue search](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-search/),
+[Jira issues and transitions](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/),
+and [GitHub CLI host selection](https://cli.github.com/manual/gh_help_environment).

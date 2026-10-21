@@ -13,6 +13,7 @@ pub mod github_tools;
 pub mod http;
 pub mod ims;
 pub mod independent_review;
+pub mod jira;
 pub mod kapellmeister;
 pub mod kapellmeister_host;
 pub mod linear_adapter;

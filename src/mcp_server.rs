@@ -14,11 +14,19 @@ use crate::tools::{
 use crate::workgraph_gate::WorkGraphTerminalGate;
 
 pub async fn run_linear_mcp_server(config: TrackerConfig) -> anyhow::Result<()> {
+    if config.kind == "jira" {
+        crate::jira::JiraClient::from_config(&config)?;
+    }
     let authority = LinearMcpAuthority::from_env();
     let tools = linear_tools(&config, authority);
     let scope = LinearMcpScope::from_env();
     let memory = Arc::new(Mutex::new(LinearMcpCallMemory::default()));
-    run_stdio_mcp("fugue-linear-mcp", tools, move |name, arguments| {
+    let server_name = if config.kind == "jira" {
+        "fugue-jira-mcp"
+    } else {
+        "fugue-linear-mcp"
+    };
+    run_stdio_mcp(server_name, tools, move |name, arguments| {
         let config = config.clone();
         let scope = scope.clone();
         let authority = authority;
@@ -72,7 +80,7 @@ pub async fn run_linear_mcp_server(config: TrackerConfig) -> anyhow::Result<()> 
 }
 
 pub async fn run_github_mcp_server() -> anyhow::Result<()> {
-    let scope = GitHubMcpScope::from_env();
+    let scope = GitHubMcpScope::from_env()?;
     let tools = github_tools(scope.allow_merge);
     let memory = Arc::new(Mutex::new(GitHubMcpCallMemory::default()));
     run_stdio_mcp(
@@ -516,7 +524,7 @@ struct GitHubMcpCallMemory {
 }
 
 impl GitHubMcpScope {
-    fn from_env() -> Self {
+    fn from_env() -> anyhow::Result<Self> {
         let head_branch = env_string("FUGUE_GITHUB_HEAD_BRANCH").map(BranchName);
         let pull_request = env_string("FUGUE_GITHUB_PR_NUMBER")
             .and_then(|value| value.parse::<u64>().ok())
@@ -528,12 +536,12 @@ impl GitHubMcpScope {
                     .clone()
                     .map(|head_branch| GitHubPullRequestRef::Branch { head_branch })
             });
-        Self {
-            repo: github_repo_ref_from_env(),
+        Ok(Self {
+            repo: github_repo_ref_from_env()?,
             head_branch,
             pull_request,
             allow_merge: env_bool("FUGUE_GITHUB_ALLOW_MERGE"),
-        }
+        })
     }
 }
 
@@ -567,7 +575,7 @@ fn apply_linear_mcp_scope(
     if operation == FugueToolOperation::LinearClaimIssue && !object.contains_key("assignee") {
         object.insert("assignee".to_string(), json!(LinearUserRef::Me));
     }
-    if operation == FugueToolOperation::LinearMoveIssue {
+    if operation == FugueToolOperation::LinearMoveIssue && config.kind != "jira" {
         object.remove("expected_updated_at");
     }
     normalize_linear_state_argument(config, operation, &mut object, "state")?;
@@ -739,6 +747,12 @@ fn apply_github_mcp_scope(scope: &GitHubMcpScope, name: &str, arguments: Value) 
         | FugueToolOperation::GitHubCheckCi
         | FugueToolOperation::GitHubMergePr => {
             insert_default(&mut object, "repo", scope.repo.as_ref());
+            if let Some(host) = scope.repo.as_ref().and_then(|repo| repo.host.as_ref())
+                && let Some(repo) = object.get_mut("repo").and_then(Value::as_object_mut)
+            {
+                repo.entry("host".to_string())
+                    .or_insert_with(|| json!(host));
+            }
         }
         _ => {}
     }
@@ -970,11 +984,23 @@ fn linear_issue_ref_from_env() -> Option<LinearIssueRef> {
         })
 }
 
-fn github_repo_ref_from_env() -> Option<GitHubRepoRef> {
-    Some(GitHubRepoRef {
-        owner: GitHubOwner(env_string("FUGUE_GITHUB_OWNER")?),
-        name: GitHubRepoName(env_string("FUGUE_GITHUB_REPO")?),
-    })
+fn github_repo_ref_from_env() -> anyhow::Result<Option<GitHubRepoRef>> {
+    let host = env_string("FUGUE_GITHUB_HOST")
+        .or_else(|| env_string("GH_HOST"))
+        .map(crate::tools::GitHubHost::try_from)
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+    let (Some(owner), Some(name)) = (
+        env_string("FUGUE_GITHUB_OWNER"),
+        env_string("FUGUE_GITHUB_REPO"),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(GitHubRepoRef {
+        host,
+        owner: GitHubOwner(owner),
+        name: GitHubRepoName(name),
+    }))
 }
 
 fn env_string(key: &str) -> Option<String> {
@@ -1068,6 +1094,7 @@ fn linear_mcp_authority_allows(
 
 fn github_tools(allow_merge: bool) -> Vec<Value> {
     let config = TrackerConfig {
+        jira: None,
         kind: "linear".to_string(),
         endpoint: "https://api.linear.app/graphql".to_string(),
         api_key: Some("tool-catalog-only".to_string()),
@@ -1210,10 +1237,49 @@ fn protocol_tool_descriptor(tool: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn enterprise_scope_supplies_missing_host_and_preserves_explicit_host() {
+        let scope = GitHubMcpScope {
+            repo: Some(
+                serde_json::from_value(
+                    json!({"host":"git.example.com","owner":"example","name":"app"}),
+                )
+                .expect("repo"),
+            ),
+            ..Default::default()
+        };
+        let inherited = apply_github_mcp_scope(
+            &scope,
+            "github_inspect_repo",
+            json!({"repo":{"owner":"example","name":"app"}}),
+        );
+        assert_eq!(inherited["repo"]["host"], "git.example.com");
+        let explicit = apply_github_mcp_scope(
+            &scope,
+            "github_inspect_repo",
+            json!({"repo":{"host":"other.example.com","owner":"example","name":"app"}}),
+        );
+        assert_eq!(explicit["repo"]["host"], "other.example.com");
+    }
+
+    #[test]
+    fn jira_moves_retain_optimistic_concurrency_guard() {
+        let mut config = compact_tracker_config();
+        config.kind = "jira".to_string();
+        let args = apply_linear_mcp_scope(
+            &config,
+            &LinearMcpScope::default(),
+            "linear_move_issue",
+            json!({"issue":"TEST-1","state":"Planning","expected_updated_at":"2026-01-01T00:00:00Z"}),
+        )
+        .expect("scope");
+        assert_eq!(args["expected_updated_at"], "2026-01-01T00:00:00Z");
+    }
     use super::*;
 
     fn compact_tracker_config() -> TrackerConfig {
         TrackerConfig {
+            jira: None,
             kind: "linear".to_string(),
             endpoint: "https://api.linear.app/graphql".to_string(),
             api_key: Some("test-validation-key".to_string()),
@@ -1463,6 +1529,7 @@ mod tests {
             }),
         };
         let config = TrackerConfig {
+            jira: None,
             kind: "linear".to_string(),
             endpoint: "https://api.linear.app/graphql".to_string(),
             api_key: Some("token".to_string()),
@@ -1527,6 +1594,7 @@ mod tests {
     fn github_mcp_scope_supplies_repo_branch_and_pr_defaults() {
         let scope = GitHubMcpScope {
             repo: Some(GitHubRepoRef {
+                host: None,
                 owner: GitHubOwner("lukacf".to_string()),
                 name: GitHubRepoName("meerkat-fugue".to_string()),
             }),
@@ -1563,6 +1631,7 @@ mod tests {
     fn github_mcp_unscoped_pr_inspection_is_non_failing_boundary_response() {
         let scope = GitHubMcpScope {
             repo: Some(GitHubRepoRef {
+                host: None,
                 owner: GitHubOwner("lukacf".to_string()),
                 name: GitHubRepoName("meerkat-fugue".to_string()),
             }),
@@ -1630,6 +1699,7 @@ mod tests {
     fn github_mcp_scope_rewrites_sha_ci_ref_to_scoped_branch() {
         let scope = GitHubMcpScope {
             repo: Some(GitHubRepoRef {
+                host: None,
                 owner: GitHubOwner("lukacf".to_string()),
                 name: GitHubRepoName("meerkat-fugue".to_string()),
             }),
@@ -1656,6 +1726,7 @@ mod tests {
     fn github_mcp_scope_preserves_non_sha_ci_ref() {
         let scope = GitHubMcpScope {
             repo: Some(GitHubRepoRef {
+                host: None,
                 owner: GitHubOwner("lukacf".to_string()),
                 name: GitHubRepoName("meerkat-fugue".to_string()),
             }),
@@ -1681,6 +1752,7 @@ mod tests {
     #[test]
     fn linear_workpad_mcp_catalog_excludes_projection_mutations() {
         let config = TrackerConfig {
+            jira: None,
             kind: "linear".to_string(),
             endpoint: "https://api.linear.app/graphql".to_string(),
             api_key: Some("token".to_string()),
@@ -1785,6 +1857,7 @@ mod tests {
     #[test]
     fn linear_mcp_scope_synthesizes_idempotency_for_projection_moves() {
         let config = TrackerConfig {
+            jira: None,
             kind: "linear".to_string(),
             endpoint: "https://api.linear.app/graphql".to_string(),
             api_key: Some("token".to_string()),
@@ -1830,6 +1903,7 @@ mod tests {
     #[test]
     fn linear_mcp_catalog_makes_idempotency_key_optional_for_agents() {
         let config = TrackerConfig {
+            jira: None,
             kind: "linear".to_string(),
             endpoint: "https://api.linear.app/graphql".to_string(),
             api_key: Some("token".to_string()),
@@ -1861,6 +1935,7 @@ mod tests {
     #[test]
     fn linear_projection_mcp_catalog_exposes_projection_mutations() {
         let config = TrackerConfig {
+            jira: None,
             kind: "linear".to_string(),
             endpoint: "https://api.linear.app/graphql".to_string(),
             api_key: Some("token".to_string()),
@@ -1904,6 +1979,7 @@ mod tests {
     #[test]
     fn linear_mcp_tools_list_descriptors_use_protocol_input_schema() {
         let config = TrackerConfig {
+            jira: None,
             kind: "linear".to_string(),
             endpoint: "https://api.linear.app/graphql".to_string(),
             api_key: Some("token".to_string()),

@@ -52,6 +52,15 @@ pub enum FugueError {
     #[error("linear_missing_end_cursor")]
     LinearMissingEndCursor,
 
+    #[error("jira_api_status: {status}")]
+    JiraApiStatus { status: u16 },
+
+    #[error("jira_stale_issue: refresh issue state before retrying")]
+    JiraStaleIssue,
+
+    #[error("jira_request: {0}")]
+    JiraRequest(String),
+
     #[error("meerkat_rpc_not_found: {0}")]
     MeerkatRpcNotFound(String),
 
