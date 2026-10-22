@@ -46,6 +46,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
 meerkat-llm-core = "=0.9.3"
+meerkat-providers = { version = "=0.9.3", default-features = false }
 
 # Published 0.9.3 omits continuity owner restoration and aggregate peer projection.
 # Pin the upstream compatibility fixes until a released crate includes them.

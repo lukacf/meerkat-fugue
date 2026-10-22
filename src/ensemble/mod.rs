@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod discovery;
 pub mod formation_review;
+mod formation_session;
 mod handoff;
 pub mod http;
 pub mod notifications;

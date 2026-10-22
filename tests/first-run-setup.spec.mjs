@@ -101,6 +101,18 @@ test('one repository selection produces preparation and a same-origin handoff',a
   expect(writes.at(-1).connection).toBe('start');
 });
 
+test('failed runtime startup reports its setup error without the long startup timeout',async({page})=>{
+  await setup(page,connected);
+  await page.getByLabel('Repository URL',{exact:true}).fill('https://github.com/example/application');
+  await page.getByRole('button',{name:'Check and prepare repository'}).click();
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeEnabled();
+  await page.route('**/api/v1/build',route=>route.fulfill({status:404}));
+  await page.route('**/api/setup/preparation',route=>route.fulfill({json:{phase:'failed',error:'The repository runtime could not start. Check the host log, then prepare the saved settings and start again.'}}));
+  await page.getByRole('button',{name:'Start Fugue'}).click();
+  await expect(page.locator('#launchResult')).toContainText('The repository runtime could not start.');
+  await expect(page.getByRole('button',{name:'Check and prepare repository'})).toBeEnabled();
+});
+
 for(const width of [390,1024,1440])test(`first-run setup fits ${width}px`,async({page})=>{
   await page.setViewportSize({width,height:900});
   await setup(page);

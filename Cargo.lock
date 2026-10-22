@@ -2133,6 +2133,7 @@ dependencies = [
  "meerkat-meta",
  "meerkat-mob",
  "meerkat-models",
+ "meerkat-providers",
  "meerkat-tools",
  "minijinja",
  "reqwest 0.12.28",
