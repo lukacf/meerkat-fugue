@@ -33,7 +33,16 @@ pub fn router(root: &Path, restart: CancellationToken) -> Result<Router> {
                 "/settings",
                 get(move || {
                     let page = page.clone();
-                    async move { Html(crate::http::browser_document(&page)) }
+                    async move {
+                        Html(
+                            crate::http::inject_app_chrome(
+                                &page,
+                                crate::http::AppPage::Settings,
+                                true,
+                            )
+                            .unwrap_or(page),
+                        )
+                    }
                 }),
             )
             .route(

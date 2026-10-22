@@ -149,9 +149,13 @@ pub(crate) async fn router(
         .route("/api/v1/workspace", get(workspace_context))
         .route(
             "/",
-            get(|| async { axum::response::Redirect::temporary("/issues") }),
+            get(|| async { axum::response::Redirect::temporary("/overview") }),
         )
         .route("/overview", get(dashboard))
+        .route(
+            "/queues",
+            get(|| async { axum::response::Redirect::temporary("/issues") }),
+        )
         .route("/issues", get(issues_board))
         .route("/issues/{issue_identifier}", get(issue_detail_page))
         .route("/api/v1/state", get(api_state))
@@ -341,6 +345,8 @@ pub(crate) enum AppPage {
     Work,
     Console,
     Ensemble,
+    Settings,
+    Setup,
 }
 
 pub(crate) fn inject_app_chrome(
@@ -354,21 +360,11 @@ pub(crate) fn inject_app_chrome(
         include_str!("ui/app.css")
     );
     let mut nav = String::new();
-    let tabs = [
-        (AppPage::Work, "/issues", "Work queue"),
-        (AppPage::Home, "/overview", "Overview"),
-        (AppPage::Ensemble, "/ensemble", "Repository setup"),
-        (AppPage::Console, "/console", "Conversations"),
-    ];
-    for (page, href, label) in tabs {
-        if !queue_enabled && page == AppPage::Home {
-            continue;
-        }
-        let href = if page == AppPage::Work && !queue_enabled {
-            "/queues"
-        } else {
-            href
-        };
+    for (page, href, label) in [
+        (AppPage::Home, "/overview", "Home"),
+        (AppPage::Work, "/queues", "Board"),
+        (AppPage::Console, "/console", "Agents"),
+    ] {
         let selected = if page == active {
             " class=\"active\" aria-current=\"page\""
         } else {
@@ -376,26 +372,38 @@ pub(crate) fn inject_app_chrome(
         };
         nav.push_str(&format!(r#"<a href="{href}"{selected}>{label}</a>"#));
     }
-    if let Some(logout) = crate::browser_access::logout_url() {
-        nav.push_str(&format!(r#"<a href="{logout}">Sign out</a>"#));
-    }
-    let home = if queue_enabled { "/issues" } else { "/queues" };
-    let context = if active == AppPage::Console {
-        r#"<span class="fugue-console-meta">All repository mobs</span>"#
+    let account = crate::browser_access::logout_url()
+        .map(|logout| format!(r#"<a href="{logout}">Sign out of this browser</a>"#))
+        .unwrap_or_else(|| "<p>Access is managed by this Fugue host.</p>".to_owned());
+    let (area, title) = match active {
+        AppPage::Home => ("home", "Home"),
+        AppPage::Work => ("board", "Board"),
+        AppPage::Console => ("agents", "Agents"),
+        AppPage::Ensemble => ("repositories", "Repositories"),
+        AppPage::Settings => ("settings", "Repository settings"),
+        AppPage::Setup => ("setup", "Connect repository"),
+    };
+    let repositories_selected = if matches!(
+        active,
+        AppPage::Ensemble | AppPage::Settings | AppPage::Setup
+    ) {
+        " class=\"active\" aria-current=\"page\""
     } else {
-        "Development workspace"
+        ""
     };
     let chrome = format!(
-        r#"<div class="fugue-console-rail" data-fugue-console-chrome><a class="fugue-console-brand" href="{home}" aria-label="Fugue home"><span class="fugue-console-mark" aria-hidden="true">≋</span><span>Fugue</span></a><nav class="fugue-console-tabs" aria-label="Primary app navigation">{nav}</nav><div class="fugue-console-spacer"></div><div class="fugue-console-meta">{context}</div></div>"#
+        r#"<div class="fugue-console-rail" data-fugue-console-chrome data-area="{area}"><a class="fugue-console-brand" href="/overview" aria-label="Fugue home"><span class="fugue-console-mark" aria-hidden="true">≋</span><span>Fugue</span></a><div class="fugue-scope"><label for="fugueScope">Repository</label><select id="fugueScope" aria-label="Repository scope"><option value="">All repositories</option></select></div><nav class="fugue-console-tabs" aria-label="Primary app navigation">{nav}</nav><div class="fugue-console-spacer"></div><a id="fugueRepositories" href="/ensemble"{repositories_selected}>Repositories</a><details class="fugue-account"><summary>Session</summary><div class="fugue-account-menu"><strong>Browser session</strong><p>Signing out leaves your teams running. Repository and AI credentials are managed in Repositories.</p>{account}</div></details></div><div class="fugue-breadcrumb"><a id="fugueScopeCrumb" href="/overview">All repositories</a><span aria-hidden="true">/</span><span>{title}</span><a id="fugueRepoSettings" href="./settings" hidden>Repository settings</a></div>"#
     );
 
     if html.contains(MARKER) {
         return None;
     }
 
-    let mut patched = html.to_string();
-    let settings_script = r#"<script>fugueFetch('/api/workspaces',{cache:'no-store'}).then(r=>r.ok?r.json():null).then(data=>{if(!data?.hub)return;const nav=document.querySelector('.fugue-console-tabs');if(nav){const link=document.createElement('a');link.href=data.hub.replace(/\/$/,'')+'/ensemble';link.textContent='All repositories';nav.prepend(link);}}).catch(()=>{});fugueFetch('/api/setup/connections',{cache:'no-store'}).then(response=>{if(!response.ok)return;const nav=document.querySelector('.fugue-console-tabs');if(nav){const link=document.createElement('a');link.href=fugueUrl('/settings');link.textContent='Settings';nav.append(link);}}).catch(()=>{});</script>"#;
-    patched = patched.replace("</body>", &format!("{settings_script}</body>"));
+    // Scope page-owned links before adding the origin-wide primary navigation.
+    let mut patched =
+        browser_document(html).replace("__PORTFOLIO_JS__", include_str!("ui/portfolio.js"));
+    let context_script = format!("<script>{}</script>", include_str!("ui/navigation.js"));
+    patched = patched.replace("</body>", &format!("{context_script}</body>"));
     if active == AppPage::Work {
         let script = format!("<script>{}</script>", include_str!("ui/work-context.js"));
         patched = patched.replace("</body>", &format!("{script}</body>"));
@@ -437,7 +445,7 @@ pub(crate) fn inject_app_chrome(
     patched.replace_range(body_start..=body_tag_end, &replacement);
     let body_tag_end = body_start + replacement.len();
     patched.insert_str(body_tag_end, &chrome);
-    Some(browser_document(&patched))
+    Some(patched)
 }
 
 pub(crate) fn browser_document(html: &str) -> String {
@@ -446,16 +454,20 @@ pub(crate) fn browser_document(html: &str) -> String {
         .replace("href=\"/", "href=\"./")
 }
 
-fn render_dashboard_html() -> String {
-    inject_app_chrome(include_str!("ui/overview.html"), AppPage::Home, true)
-        .unwrap_or_else(|| include_str!("ui/overview.html").to_owned())
+pub(crate) fn render_home_html(queue_enabled: bool) -> String {
+    inject_app_chrome(
+        include_str!("ui/overview.html"),
+        AppPage::Home,
+        queue_enabled,
+    )
+    .unwrap_or_else(|| include_str!("ui/overview.html").to_owned())
 }
 
 async fn dashboard(State(app): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
-    Html(render_dashboard_html()).into_response()
+    Html(render_home_html(true)).into_response()
 }
 
 #[derive(Serialize)]
@@ -5641,19 +5653,22 @@ mod tests {
     #[test]
     fn home_and_work_share_navigation_and_real_data_sources() {
         for html in [
-            render_dashboard_html(),
+            render_home_html(true),
+            render_home_html(false),
             render_issues_board_html(&issue_board_config()),
         ] {
-            for destination in ["/overview", "/ensemble", "/issues", "/console"] {
-                assert!(html.contains(&format!("href=\".{destination}\"")));
+            for destination in ["/overview", "/queues", "/console"] {
+                assert!(html.contains(&format!("href=\"{destination}\"")));
             }
             assert!(html.contains("Primary app navigation"));
+            assert!(html.contains("Repository scope"));
         }
-        let html = render_dashboard_html();
+        let html = render_home_html(true);
         assert!(html.contains("/api/ensemble"));
-        assert!(html.contains("/api/v1/state"));
+        assert!(html.contains("/api/v1/issues/board"));
+        assert!(html.contains("/api/workspaces"));
         assert!(html.contains("/ensemble#add"));
-        assert!(!html.contains("actual Fugue mob topology"));
+        assert!(!html.contains("__PORTFOLIO_JS__"));
     }
 
     #[test]
@@ -5739,7 +5754,7 @@ mod tests {
         assert!(html.contains("--ensemble-config"));
         assert!(html.contains("No Ensemble is configured"));
         assert!(!html.contains("http://127.0.0.1"));
-        assert!(html.contains(r#"href="./ensemble" class="active" aria-current="page""#));
+        assert!(html.contains(r#"href="/ensemble" class="active" aria-current="page""#));
     }
 
     #[test]
@@ -6612,6 +6627,38 @@ mod tests {
     }
 
     #[test]
+    fn app_navigation_keeps_primary_links_stable_before_async_data_loads() {
+        let html = "<html><head></head><body></body></html>";
+        for queue_enabled in [false, true] {
+            for active in [
+                AppPage::Home,
+                AppPage::Work,
+                AppPage::Ensemble,
+                AppPage::Console,
+            ] {
+                let page = inject_app_chrome(html, active, queue_enabled).unwrap();
+                let primary = page
+                    .split("aria-label=\"Primary app navigation\">")
+                    .nth(1)
+                    .unwrap()
+                    .split("</nav>")
+                    .next()
+                    .unwrap();
+                assert_eq!(primary.matches("<a ").count(), 3);
+                let home = primary.find(">Home</a>").unwrap();
+                let board = primary.find(">Board</a>").unwrap();
+                let agents = primary.find(">Agents</a>").unwrap();
+                assert!(home < board && board < agents);
+                assert!(!primary.contains("Sign out"));
+                assert!(!primary.contains("Overview"));
+                assert!(!primary.contains("Settings"));
+                assert!(!page.contains("nav.prepend"));
+                assert!(!page.contains("nav.append"));
+            }
+        }
+    }
+
+    #[test]
     fn console_browser_compat_embeds_meta_in_fugue_shell_once() {
         let html = r#"<!doctype html><html><head><title>Meta</title></head><body class="meta"><main id="meta-root"></main></body></html>"#;
         let patched = inject_console_browser_compat_html(html, true);
@@ -6620,12 +6667,12 @@ mod tests {
         assert!(patched.contains("data-fugue-console-chrome"));
         assert!(patched.contains("class=\"fugue-console-embedded meta\""));
         assert!(patched.contains("Fugue home"));
-        assert!(patched.contains(r#"href="./overview""#));
-        assert!(patched.contains(r#"href="./issues""#));
-        assert!(patched.contains(r#"href="./console" class="active" aria-current="page""#));
-        assert!(patched.contains("Conversations"));
+        assert!(patched.contains(r#"href="/ensemble""#));
+        assert!(patched.contains(r#"href="/queues""#));
+        assert!(patched.contains(r#"href="/console" class="active" aria-current="page""#));
+        assert!(patched.contains(">Agents</a>"));
         assert!(patched.contains("meta-root"));
-        assert!(patched.contains("--bs-accent:#176b58"));
+        assert!(patched.contains("--bs-accent:#a34924"));
 
         let repatched = inject_console_browser_compat_html(&patched, true);
         assert_eq!(
@@ -6642,10 +6689,10 @@ mod tests {
     fn console_browser_compat_hub_links_only_to_shared_pages() {
         let html = "<html><head></head><body><main id=\"meta-root\"></main></body></html>";
         let patched = inject_console_browser_compat_html(html, false);
-        assert!(patched.contains(r#"href="./ensemble""#));
-        assert!(patched.contains(r#"href="./console" class="active""#));
-        assert!(patched.contains(r#"href="./queues""#));
-        assert!(patched.contains("Work queue"));
+        assert!(patched.contains(r#"href="/ensemble""#));
+        assert!(patched.contains(r#"href="/console" class="active""#));
+        assert!(patched.contains(r#"href="/queues""#));
+        assert!(patched.contains(">Board</a>"));
         assert!(!patched.contains(r#"href="./issues""#));
         assert!(!patched.contains(r#"href="./overview""#));
     }

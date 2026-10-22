@@ -350,13 +350,20 @@ pub fn router(setup: Arc<Setup>) -> Router {
         );
     Router::new()
         .route("/", get(|| async { Redirect::temporary("/setup") }))
+        .route("/overview", get(|| async { Redirect::temporary("/setup") }))
         .route("/issues", get(|| async { Redirect::temporary("/setup") }))
+        .route("/queues", get(|| async { Redirect::temporary("/setup") }))
         .route("/ensemble", get(|| async { Redirect::temporary("/setup") }))
         .route(
             "/setup",
             get(move || {
                 let page = page.clone();
-                async move { Html(crate::http::browser_document(&page)) }
+                async move {
+                    Html(
+                        crate::http::inject_app_chrome(&page, crate::http::AppPage::Setup, false)
+                            .unwrap_or(page),
+                    )
+                }
             }),
         )
         .route("/api/setup/connections", get(status).post(update))
@@ -462,6 +469,32 @@ mod tests {
         http::Request,
     };
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn managed_setup_composes_directory_routes_without_duplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let setup = Setup::open(directory.path(), 8789).unwrap();
+        let app = router(setup)
+            .merge(super::super::directory::hub_router("http://127.0.0.1:8788".into()).unwrap());
+        for (path, expected) in [
+            ("/setup", StatusCode::OK),
+            ("/queues", StatusCode::TEMPORARY_REDIRECT),
+            ("/overview", StatusCode::TEMPORARY_REDIRECT),
+            ("/api/workspaces", StatusCode::OK),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .header("Host", "127.0.0.1:8789")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
+    }
 
     #[tokio::test]
     async fn connection_api_never_returns_keys_and_rejects_cross_origin_writes() {

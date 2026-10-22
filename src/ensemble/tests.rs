@@ -476,11 +476,11 @@ server:
         );
         let html = response.text().await.unwrap();
         assert!(
-            html.contains("/overview"),
+            html.contains("href=\"/ensemble\""),
             "shared navigation missing from {path}"
         );
         assert!(
-            html.contains("/issues"),
+            html.contains("href=\"/queues\""),
             "IMS navigation missing from {path}"
         );
         assert!(

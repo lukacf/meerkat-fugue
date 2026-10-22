@@ -239,10 +239,10 @@ function repoCard(page, name) {
 }
 
 test('setup is separate from ticket-based operation', async ({ page }) => {
-  await expect(page.getByRole('heading', { name: 'Repository setup', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Repositories', exact: true })).toBeVisible();
   await expect(page.locator('#objective-form')).toHaveCount(0);
   await expect(page.locator('textarea')).toHaveCount(0);
-  await expect(page.getByRole('link', { name: /Open work queue/ }).first()).toHaveJSProperty('href', baseUrl + '/issues');
+  await expect(page.getByRole('link', { name: /Open board/ }).first()).toHaveJSProperty('href', baseUrl + '/issues');
   await expect(page.getByRole('button', { name: '+ Add repository', exact: true })).toBeVisible();
 });
 

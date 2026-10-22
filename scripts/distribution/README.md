@@ -3,7 +3,8 @@
 Each archive contains all five Fugue executables, the pinned native rkat CLI,
 licenses, and a file checksum manifest. Every Fugue executable reports the same
 clean commit and tree with `build-info`. No credentials or operator state are
-part of the archive.
+part of the archive. The executable set is `meerkat-fugue`, `fugue-linear-mcp`,
+`fugue-jira-mcp`, `fugue-github-mcp` and `fugue-host-mcp`.
 
 Build from a clean checkout on the target platform:
 
@@ -50,7 +51,7 @@ FUGUE_LOGOUT_PATH=/auth/sign-out
 ```
 
 Set the optional logout path to the proxy's same-origin sign-out endpoint. Fugue
-then shows a Sign out link in its shared navigation. The proxy owns session
+then shows Sign out inside the shared Session menu. The proxy owns session
 revocation and cookie removal.
 
 The file must be owner-readable only (`0600`) and contain a random token of at

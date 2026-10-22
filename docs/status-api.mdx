@@ -1,7 +1,30 @@
-# Status API
+---
+title: "Status and browser API"
+description: "Repository-scoped queue endpoints and the shared native console."
+---
 
-Fugue can expose a loopback dashboard and JSON API for operational visibility.
-Enable it with CLI `--port` or `server.port` in `fugue.yaml`.
+# Status and browser API
+
+Fugue exposes the browser application and operational APIs on its loopback
+listener. In managed multi-repository mode, directory routes are instance-wide
+and queue routes use the repository prefix `/repositories/<id>`.
+
+| Managed host route | Purpose |
+| --- | --- |
+| `/`, `/overview` | Home, with read-only projections from repository boards. |
+| `/queues` | All-repository board; each repository keeps its own workflow. |
+| `/ensemble` | Repository setup and preparation. |
+| `/api/workspaces` | Repository IDs, same-origin URLs and configured/running state. |
+| `/repositories/<id>/overview` | One repository's Home. |
+| `/repositories/<id>/issues` | One repository's interactive board. |
+| `/repositories/<id>/api/v1/issues/board` | Typed board lanes, actions, issues and runtime status. |
+| `/repositories/<id>/api/v1/state` | That repository's orchestrator state. |
+| `/console` | One shared native console for all registered teams. |
+| `/api/v1/build` | Running build identity. |
+
+The queue endpoints below are unprefixed when running a single workflow directly.
+In a managed host, prepend `/repositories/<id>` for that repository. Shared
+console and directory endpoints remain at the origin root.
 
 ## Starting with a status server
 
@@ -18,7 +41,9 @@ with HTTPS, an SSH/IAP tunnel, or a source-IP firewall rule.
 
 | Endpoint | Method | Purpose |
 | --- | --- | --- |
-| `/` | `GET` | Minimal HTML dashboard. |
+| `/` | `GET` | Redirect to Home. |
+| `/overview` | `GET` | Repository Home. |
+| `/api/v1/issues/board` | `GET` | Board snapshot with typed lane kinds and actions. |
 | `/console` | `GET` | Authenticated stock Meta console served by the Meta console router. |
 | `/console/rpc` | `POST` | Authenticated Meta console JSON-RPC through the Meta console router. |
 | `/api/v1/state` | `GET` | Full orchestrator snapshot. |

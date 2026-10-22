@@ -1,8 +1,8 @@
 :root {
   color-scheme:light;
-  --bs-paper:#f5f7f8; --bs-paper-soft:#fff; --bs-paper-raised:#fff;
-  --bs-ink:#192b30; --bs-muted:#65777d; --bs-subtle:#89989c; --bs-line:#dfe7e8;
-  --bs-accent:#176b58; --bs-accent-dark:#125342; --bs-ok:#176b58; --bs-warn:#9c681a; --bs-crit:#b94242;
+  --bs-paper:#f5f4f0; --bs-paper-soft:#fafaf7; --bs-paper-raised:#fff;
+  --bs-ink:#25251f; --bs-muted:#75756d; --bs-subtle:#93938b; --bs-line:#e1e1d9;
+  --bs-accent:#a34924; --bs-accent-dark:#823a1c; --bs-ok:#176b58; --bs-warn:#9c681a; --bs-crit:#b94242;
   --bs-font-sans:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   --bs-font-mono:ui-monospace,SFMono-Regular,Menlo,monospace;
   --bg:var(--bs-paper); --surface:#fff; --ink:var(--bs-ink); --text:var(--bs-ink);
@@ -148,3 +148,116 @@ body.fugue-console-embedded { margin:0; padding-top:64px; background:var(--bg); 
 
 .fugue-button { white-space:nowrap; }
 .fugue-heading > .fugue-actions { flex-shrink:0; }
+
+/* One frame for daily work, repository setup and the native console. */
+body.fugue-console-embedded { padding-top:104px; }
+.fugue-console-rail { height:64px; gap:24px; padding:0 28px; background:var(--bg); }
+.fugue-console-brand { flex-shrink:0; font-size:19px; letter-spacing:-.5px; }
+.fugue-console-mark { background:transparent; color:var(--accent); width:22px; }
+.fugue-scope { flex:0 0 230px; width:230px; min-width:0; border:1px solid var(--hair); border-radius:6px; background:var(--bs-paper-soft); padding:5px 10px; }
+.fugue-scope label { display:block; margin:0; font:10px/1.2 var(--bs-font-sans); text-transform:uppercase; letter-spacing:.06em; color:var(--muted); }
+.fugue-scope select { display:block; width:100%; margin:0; padding:0; border:0; background:transparent; color:var(--ink); font:500 13px/1.4 var(--bs-font-sans); text-overflow:ellipsis; }
+.fugue-console-tabs { width:auto; gap:8px; flex-shrink:0; }
+.fugue-console-tabs a { display:flex; align-items:center; height:100%; padding:0 12px; border-radius:0; border-bottom:2px solid transparent; font-weight:500; color:var(--ink); }
+.fugue-console-tabs a.active { background:transparent; border-bottom-color:var(--ink); color:var(--ink); font-weight:500; }
+.fugue-console-tabs a:hover { background:var(--bs-paper-soft); }
+#fugueRepositories { flex-shrink:0; font-size:13px; }
+#fugueRepositories.active { color:var(--ink); text-decoration:underline; text-underline-offset:6px; }
+.fugue-account { position:relative; flex-shrink:0; font:13px/1.5 var(--bs-font-sans); }
+.fugue-account summary { cursor:pointer; padding:8px; }
+.fugue-account-menu { position:absolute; right:0; top:40px; width:290px; padding:20px; border:1px solid var(--hair); border-radius:8px; background:var(--surface); box-shadow:0 8px 30px #0001; color:var(--ink); }
+.fugue-account-menu p { color:var(--muted); font-size:13px; }
+.fugue-account-menu a { color:var(--accent); }
+.fugue-breadcrumb { height:40px; position:fixed; top:64px; inset-inline:0; z-index:28; display:flex; align-items:center; gap:12px; padding:0 28px; background:var(--bg); border-bottom:1px solid var(--hair); font:12px/1.5 var(--bs-font-sans); color:var(--muted); }
+.fugue-breadcrumb a { color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#fugueScopeCrumb { max-width:50vw; }
+#fugueRepoSettings { margin-left:auto; }
+.fugue-console-scope-note { margin-left:auto; }
+.fugue-page { max-width:1440px; padding:30px 28px 64px; }
+.fugue-page h1 { font-size:30px; }
+.fugue-kicker { color:var(--muted); font-weight:500; }
+.fugue-button.primary { background:var(--ink); border-color:var(--ink); }
+.fugue-tag { background:#eeeee7; color:var(--muted); }
+.fugue-panel { background:var(--bs-paper-soft); border-radius:8px; }
+.fugue-console-embedded.ims-subsystem > .shell { height:calc(100vh - 104px); }
+.fugue-console-embedded.issue-subsystem .sheet { top:120px; }
+.fugue-console-embedded > .setup-header,
+.fugue-console-embedded > header { display:none; }
+:focus-visible { outline-color:var(--accent); }
+@media(max-width:1060px) { .fugue-console-rail { gap:14px; padding-inline:20px; } .fugue-scope { flex-basis:190px; width:190px; } }
+@media(max-width:940px) { .fugue-console-embedded.ims-subsystem .drawer { top:104px; } }
+@media(max-width:760px) {
+  body.fugue-console-embedded { padding-top:146px; }
+  .fugue-console-rail { height:106px; padding:8px 16px 0; display:grid; grid-template-columns:auto minmax(0,1fr) auto; grid-template-rows:48px 42px; gap:0 12px; }
+  .fugue-console-brand { font-size:17px; }
+  .fugue-scope { width:auto; grid-column:2; grid-row:1; }
+  .fugue-console-tabs { grid-column:1 / 3; grid-row:2; height:42px; width:100%; gap:0; }
+  .fugue-console-tabs a { padding-inline:10px; font-size:13px; }
+  .fugue-console-spacer { display:none; }
+  #fugueRepositories { grid-column:3; grid-row:2; }
+  .fugue-account { grid-column:3; grid-row:1; }
+  .fugue-account-menu { top:48px; }
+  .fugue-breadcrumb { top:106px; padding-inline:16px; gap:8px; }
+  .fugue-console-scope-note { font-size:10px; }
+  .fugue-page { padding:24px 16px 40px; }
+  .fugue-console-embedded.ims-subsystem > .shell { height:calc(100vh - 146px); }
+  .fugue-console-embedded.ims-subsystem .drawer { top:146px; }
+  .fugue-console-embedded.issue-subsystem .sheet { top:158px; }
+}
+.portfolio-toolbar { display:flex; justify-content:space-between; align-items:center; color:var(--muted); font-size:12px; margin:-10px 0 28px; }
+.portfolio-toolbar button { min-height:30px; padding:4px 12px; font-size:12px; }
+.portfolio-columns { display:grid; grid-template-columns:minmax(0,2fr) minmax(280px,1fr); gap:28px; align-items:start; }
+.portfolio-section-heading { margin:0 0 16px!important; font:500 11px/1.4 var(--bs-font-sans)!important; text-transform:uppercase; letter-spacing:.09em!important; color:var(--muted); }
+.portfolio-columns section + section { margin-top:32px; }
+.portfolio-repositories { display:grid; gap:20px; }
+.portfolio-repository { min-width:0; }
+.portfolio-repository .fugue-panel-head { padding:20px; }
+.portfolio-repository h2 { font-size:16px; overflow-wrap:anywhere; }
+.portfolio-repository-status { font-size:12px; margin:6px 0 0; }
+.portfolio-counts { display:flex; flex-wrap:wrap; gap:24px; padding:16px 20px; border-bottom:1px solid var(--hair); }
+.portfolio-counts span { display:block; color:var(--muted); font-size:11px; }
+.portfolio-counts strong { font:500 19px/1.5 var(--bs-font-sans); }
+.portfolio-issue { display:flex; align-items:center; gap:16px; padding:16px 20px; border-bottom:1px solid var(--hair); color:var(--ink); text-decoration:none; min-width:0; }
+.portfolio-issue:last-child { border-bottom:0; }
+.portfolio-issue:hover { background:#eeeee7; }
+.portfolio-issue-content { min-width:0; flex:1; }
+.portfolio-issue-title { display:flex; gap:8px; min-width:0; align-items:baseline; }
+.portfolio-identifier { color:var(--muted); font-size:12px; flex:none; }
+.portfolio-issue strong { font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.portfolio-issue small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); font-size:12px; margin-top:5px; }
+.portfolio-state { flex:0 0 90px; overflow-wrap:anywhere; color:var(--muted); font-size:12px; }
+.portfolio-state.attention { color:var(--accent); }
+.portfolio-open { font-size:12px; flex:none; }
+.portfolio-problem { padding:20px; border-bottom:1px solid var(--hair); overflow-wrap:anywhere; }
+.portfolio-problem:last-child { border:0; }
+.portfolio-problem p { font-size:13px; }
+.portfolio-problem .fugue-button { padding:0; min-height:28px; border:0; background:none; text-decoration:underline; font-size:13px; }
+#portfolioRecent .portfolio-issue { padding:14px 0; flex-wrap:wrap; gap:6px; }
+#portfolioRecent .portfolio-state { flex-basis:100%; }
+#portfolioRecent .portfolio-open { display:none; }
+#portfolioRecent .portfolio-issue-title { display:block; }
+#portfolioRecent .portfolio-identifier { margin-right:6px; }
+#portfolioRecent strong { white-space:normal; }
+.portfolio-freshness { font-size:11px; padding:12px 20px; margin:0; }
+.portfolio-lanes { display:flex; gap:12px; overflow-x:auto; padding:20px; align-items:flex-start; }
+.portfolio-lane { flex:1 0 240px; max-width:320px; min-width:0; border:1px solid var(--hair); background:#f1f1eb; border-radius:6px; }
+.portfolio-lane h3 { font-size:12px; margin:0; padding:12px; }
+.portfolio-lane .portfolio-issue { display:block; margin:0 8px 8px; padding:12px; background:var(--surface); border:1px solid var(--hair); border-radius:5px; }
+.portfolio-lane .portfolio-state,.portfolio-lane .portfolio-open { display:none; }
+.portfolio-lane .portfolio-issue-title { display:block; }
+.portfolio-lane strong { display:block; white-space:normal; overflow-wrap:anywhere; font-size:13px; margin-top:5px; }
+.portfolio-no-issues { font-size:12px; padding:0 12px; }
+@media(max-width:900px) { .portfolio-columns { grid-template-columns:1fr; } }
+@media(max-width:600px) {
+  .portfolio-issue { flex-wrap:wrap; gap:8px; padding:16px; }
+  .portfolio-state { flex-basis:100%; }
+  .portfolio-issue-title { display:block; }
+  .portfolio-issue strong { display:block; white-space:normal; overflow-wrap:anywhere; margin-top:4px; }
+  .portfolio-open { display:none; }
+  .portfolio-repository .fugue-panel-head { flex-wrap:wrap; }
+  .portfolio-counts { gap:16px; }
+}
+
+.fugue-session-alert { position:fixed; z-index:60; bottom:20px; right:20px; width:min(420px,calc(100vw - 40px)); padding:18px; border:1px solid var(--bs-warn); border-radius:8px; background:#fffaf0; box-shadow:0 4px 20px #0002; color:var(--ink); font:14px/1.5 var(--bs-font-sans); }
+.fugue-session-alert[hidden] { display:none; }
+.fugue-session-alert a { display:block; margin-top:10px; color:var(--accent); font-weight:600; }

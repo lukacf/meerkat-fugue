@@ -2,41 +2,82 @@ import {browserDocument} from './browser-document.mjs';
 import {test, expect} from '@playwright/test';
 import {readFile} from 'node:fs/promises';
 
-const html = (await readFile(new URL('../src/ui/queues.html', import.meta.url), 'utf8'))
-  .replace('</head>', `<style>${await readFile(new URL('../src/ui/app.css', import.meta.url), 'utf8')}</style></head>`);
-
-async function showQueues(page, workspaces, status = 200) {
+const css = await readFile(new URL('../src/ui/app.css', import.meta.url), 'utf8');
+const portfolio = await readFile(new URL('../src/ui/portfolio.js', import.meta.url), 'utf8');
+async function document(view) {
+  return browserDocument((await readFile(new URL(`../src/ui/${view === 'home' ? 'overview' : 'queues'}.html`, import.meta.url), 'utf8'))
+    .replace('__PORTFOLIO_JS__', portfolio).replace('<body>', '<body data-queue-enabled="false">')
+    .replace('</head>', `<style>${css}</style></head>`));
+}
+const workspaces = [
+  {id:'repository-service',repository:{host:'github.com',owner:'example',repository:'service'},running:true,configured:true},
+  {id:'repository-web',repository:{host:'git.example.com',owner:'example',repository:'web'},running:true,configured:true},
+  {id:'repository-draft',repository:{host:'github.com',owner:'example',repository:'draft'},running:true,configured:false},
+  {id:'repository-stopped',repository:{host:'github.com',owner:'example',repository:'stopped'},running:false,configured:true},
+];
+const board = (identifier, title) => ({generated_at:'2026-10-23T00:00:00Z', totals:{issues:1,running:0,retrying:0},lanes:[
+  {name:'Reopened',kind:'attention',action:'merge',issues:[{identifier,title,runtime:null,updated_at:'2026-10-22T00:00:00Z'}]},
+  {name:'Closed',kind:'terminal',action:null,issues:[]},
+]});
+async function show(page, {view='board', listing=workspaces, status=200, failedBoard=null}={}) {
+  const html = await document(view);
   await page.route('http://fugue.test/**', route => {
-    if (new URL(route.request().url()).pathname === '/api/workspaces') {
-      return route.fulfill({status, json:{hub:null, workspaces}});
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/api/workspaces') return route.fulfill({status,json:{hub:null,workspaces:listing}});
+    if (path.endsWith('/api/ensemble')) return route.fulfill({json:{setup:{phase:'ready'}}});
+    if (path.endsWith('/api/v1/issues/board')) {
+      if (path.includes(failedBoard || 'impossible')) return route.fulfill({status:503});
+      const web = path.includes('repository-web');
+      return route.fulfill({json:board(web ? 'WEB-1' : 'API-1', web ? 'Web change' : 'Service change')});
     }
-    return route.fulfill({contentType:'text/html', body:browserDocument(html)});
+    return route.fulfill({contentType:'text/html',body:html});
   });
-  await page.goto('http://fugue.test/queues');
+  await page.goto('http://fugue.test/' + (view === 'home' ? 'overview' : 'queues'));
 }
 
-test('repository queues retain their separate destinations and unavailable states', async ({page}) => {
-  await showQueues(page, [
-    {repository:{host:'github.com',owner:'example',repository:'service'},url:'http://127.0.0.1:9001/issues',running:true,configured:true},
-    {repository:{host:'git.example.com',owner:'example',repository:'web'},url:'http://127.0.0.1:9002/issues',running:true,configured:true},
-    {repository:{host:'github.com',owner:'example',repository:'draft'},url:'http://127.0.0.1:9003/setup',running:true,configured:false},
-    {repository:{host:'github.com',owner:'example',repository:'stopped'},url:'http://127.0.0.1:9004/issues',running:false,configured:true},
-  ]);
-  const card = name => page.getByRole('article').filter({has:page.getByRole('heading',{name,exact:true})});
-  await expect(card('example/service').getByRole('link')).toHaveAttribute('href','http://127.0.0.1:9001/issues');
-  await expect(card('example/web').getByRole('link')).toHaveAttribute('href','http://127.0.0.1:9002/issues');
-  await expect(card('example/draft').getByRole('link',{name:'Continue configuration'})).toHaveAttribute('href','http://127.0.0.1:9003/setup');
-  await expect(card('example/stopped').getByRole('link',{name:'Manage repository'})).toHaveAttribute('href','/ensemble#repositoryWorkspacesPanel');
+test('boards retain repository scope and Jira status names', async ({page}) => {
+  await show(page);
+  const service = page.getByRole('region',{name:'example/service',exact:true});
+  const web = page.getByRole('region',{name:'example/web',exact:true});
+  await expect(service.getByRole('link',{name:'Open board',exact:true})).toHaveAttribute('href','/repositories/repository-service/issues');
+  await expect(service.getByRole('link',{name:/API-1/})).toHaveAttribute('href','/repositories/repository-service/issues/API-1');
+  await expect(service).not.toContainText('WEB-1');
+  await expect(web.getByRole('link',{name:/WEB-1/})).toHaveAttribute('href','/repositories/repository-web/issues/WEB-1');
+  await expect(service.getByRole('heading',{name:'Reopened (1)',exact:true})).toBeVisible();
+  await expect(page.getByRole('region',{name:'example/draft',exact:true}).getByRole('link')).toHaveAttribute('href','/repositories/repository-draft/setup');
+  await expect(page.getByRole('region',{name:'example/stopped',exact:true}).getByRole('link')).toHaveAttribute('href','/ensemble#repositoryWorkspacesPanel');
 });
 
-test('empty directory offers onboarding instead of a dead board', async ({page}) => {
-  await showQueues(page, []);
-  await expect(page.getByRole('status')).toContainText('No repositories yet');
-  await expect(page.getByRole('link',{name:'Add repository'})).toHaveAttribute('href','./ensemble#add');
+test('empty directory offers repository onboarding', async ({page}) => {
+  await show(page,{listing:[]});
+  await expect(page.getByRole('link',{name:'Add your first repository'})).toHaveAttribute('href','/ensemble#add');
+  await expect(page.getByRole('status')).toContainText('0 repositories');
 });
 
-test('a failed directory read is visible', async ({page}) => {
-  await showQueues(page, [], 500);
-  await expect(page.getByRole('status')).toContainText('Could not load work queues');
-  await expect(page.getByRole('article')).toHaveCount(0);
+test('failed directory reads are not presented as an empty queue', async ({page}) => {
+  await show(page,{status:500});
+  await expect(page.getByRole('alert')).toContainText('HTTP 500');
+  await expect(page.getByRole('status')).toHaveText('Update failed');
+  await expect(page.locator('#portfolioRepositories')).toContainText('Repository boards are unavailable.');
+  await expect(page.locator('#portfolioRepositories')).not.toContainText('Loading');
+  await expect(page.getByRole('alert')).not.toContainText('Previously loaded');
+  await expect(page.getByRole('link',{name:'Add your first repository'})).toHaveCount(0);
+});
+
+test('one failed board does not hide another repository or claim no attention', async ({page}) => {
+  await show(page,{view:'home',failedBoard:'repository-service'});
+  await expect(page.getByRole('heading',{level:1})).toHaveText('1 issue needs attention.');
+  await expect(page.locator('#portfolioAttention').getByRole('link',{name:/WEB-1/})).toBeVisible();
+  await expect(page.getByRole('region',{name:'example/service',exact:true})).toContainText('HTTP 503');
+  await expect(page.locator('#portfolioProblems')).toContainText('HTTP 503');
+});
+
+test('mobile attention rows do not overlap or overflow their container', async ({page}) => {
+  await page.setViewportSize({width:390,height:844});
+  await show(page,{view:'home'});
+  const rows = page.locator('#portfolioAttention .portfolio-issue');
+  await expect(rows).toHaveCount(2);
+  const first = await rows.nth(0).boundingBox(), second = await rows.nth(1).boundingBox();
+  expect(second.y).toBeGreaterThanOrEqual(first.y + first.height - 1);
+  expect(first.x + first.width).toBeLessThanOrEqual(390);
 });

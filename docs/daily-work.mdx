@@ -1,0 +1,93 @@
+---
+title: "Daily work"
+description: "Find work that needs attention, inspect your teams, and deliver changes with evidence."
+---
+
+# Daily work
+
+Start at **Home**. Choose a repository to narrow the work context, or keep
+**All repositories** to see each team's board and preparation status together.
+The navigation stays in the same order: Home, Board, Agents, then Repositories
+and the browser Session menu.
+
+## Find what needs attention
+
+Home groups issues from configured attention lanes and issues awaiting retry.
+An attention lane is a request to inspect the issue, not proof that a merge is
+ready. Open the issue to read its workpad, comments and review evidence.
+
+Work in progress comes from each repository's board and native runtime status.
+Setup and access shows stopped repositories, incomplete configuration,
+preparation failures and unavailable boards. A failed read is shown as an error,
+not an empty queue. Refresh retries the read; previously loaded data may be stale
+when the update fails.
+
+Recently finished includes terminal tracker states. A terminal Jira status may
+represent either completed or canceled work. Use the runtime outcome and merged
+PR to distinguish them.
+
+## Work from the board
+
+All repositories shows a separate board for each repository. Choose **Open board**
+to create issues, filter work or use that repository's issue editor.
+
+Use a small, explicit acceptance contract in each issue. State the desired
+behavior, relevant tests and any permitted external effects. Comments let you
+answer the team's questions without rewriting the original request.
+
+Review and merge controls follow the configured lane actions. Read the action's
+label before saving a lane change: a configured action can start a review or
+merge procedure. Ordinary status changes and procedure triggers are distinct.
+
+Before requesting merge, check:
+
+- The PR targets the intended repository and branch.
+- Test and review evidence covers the current head, not an earlier revision.
+- Blockers are resolved and required review gates are complete.
+- CI is successful, or this repository has an explicitly authorized no-checks
+  policy. Pending and failed checks remain blockers.
+
+After the action, confirm the PR is merged and the tracker reflects the result.
+If merge fails, inspect its reason and refresh the evidence before trying again.
+
+## Inspect the team
+
+**Agents** is the native shared Meta console. Use its roster to select an
+addressable agent and read or send messages. The repository coordinator handles
+repository-wide work; an issue lead coordinates its ticket. Specialists own
+repository domains and can explain their context and subscriptions.
+
+Use **Topology** for membership and native peer links, **Logs** for events and
+**Health** for runtime availability. A roster count alone does not establish
+working communication between members.
+
+**Memory** and **Work Graph** are scoped to a native runtime. Select the team
+inside the panel. Switching teams clears the prior team's content while the new
+read is in progress. Memory exposes native records and their details; Work Graph
+exposes tasks, dependencies and evidence. Availability follows the runtime's
+capabilities and access policy.
+
+## Change a connection
+
+Open the repository, then **Repository settings**. Finish active work before
+stopping its runtime and reopening setup. Saved conversations and issues remain
+on disk. Save the changed connections, check the workspace and start it again.
+An empty repository/tracker token field preserves the existing credential only
+when the host and account still match.
+
+Browser access, tracker/repository access and model access are separate:
+
+| Symptom | Check |
+| --- | --- |
+| Sign-in page or rejected browser request | Renew the browser session at the host gateway. |
+| Board cannot read or update issues | Tracker credentials, project scope and transitions. |
+| Clone, fetch or PR operation fails | GHE/GitHub network reachability and repository credentials. |
+| Agent cannot contact its model | Native rkat account, binding and provider reachability. |
+| Live console stops updating | Service health and streaming connectivity; reconnect before assuming work stopped. |
+
+Signing out clears the browser's gateway session. Teams keep running. Changing
+an AI account affects agent access; it does not change who may sign in to Fugue.
+
+For service restarts, backup restoration or failed upgrades, use the
+[operations guide](./operations.mdx). Preserve the failed run's evidence before
+retrying or cleaning up its workspace.

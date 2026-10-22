@@ -1,19 +1,40 @@
+---
+title: "Troubleshooting"
+description: "Diagnose setup, access, queue and native runtime problems without losing evidence."
+---
+
 # Troubleshooting
 
 Use this guide when Fugue is not dispatching work, a native run stalls, or
 handoff evidence is inconsistent.
 
+## Start with the affected layer
+
+| Symptom | First check |
+| --- | --- |
+| Add repository fails before configuration opens | Service logs and the saved private draft. Fix startup before adding a duplicate. |
+| Setup cannot clone or read the project | Connectivity and saved credentials on the execution host. |
+| Jira status transition fails | Actual available transitions, required fields and configured project scope. |
+| Browser asks you to sign in again | Host gateway session, separate from repository and model credentials. |
+| Agents cannot call the model | Native rkat binding under the service user's persistent HOME. |
+| Memory or Work Graph is unavailable | Selected native runtime, its capabilities and the installed Meta bundle version. |
+| Board or console stops updating | Connection state and service health; preserve the last error before retrying. |
+
+For managed workspaces, open Repository settings to stop and reconfigure that
+repository. Use the host's private deployment guide for gateway, DNS and network
+problems. A working connection on a laptop does not prove access from the host.
+
 ## No issues are picked up
 
 Check:
 
-1. `linear.project_slug` matches the target project.
+1. `tracker.project_slug` (historically `linear.project_slug`) matches the target project.
 2. The issue is in `linear.lanes.ready` for fresh native dispatch.
 3. Required labels match `linear.labels` and `selection.by_label` rules.
 4. The issue is not blocked, terminal, already running, claimed by another run,
    or waiting for retry backoff.
-5. The status API `last_errors` does not show Linear authentication or GraphQL
-   errors.
+5. The status API errors do not show tracker authentication, workflow or query
+   failures. For Jira, also check the configured JQL restriction.
 
 After fixing configuration or lanes, call `POST /api/v1/refresh`.
 

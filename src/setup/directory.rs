@@ -10,7 +10,7 @@ use axum::{
     extract::{Path, Request, State, rejection::JsonRejection},
     http::StatusCode,
     middleware,
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{Html, IntoResponse, Response},
     routing::{any, get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -329,6 +329,10 @@ pub fn router(directory: Arc<Directory>) -> Router {
         .with_state(directory.clone());
     Router::new()
         .route(
+            "/overview",
+            get(|| async { Html(crate::http::render_home_html(false)) }),
+        )
+        .route(
             "/queues",
             get(|State(directory): State<Arc<Directory>>| async move {
                 match directory.list().await {
@@ -377,13 +381,7 @@ pub fn router(directory: Arc<Directory>) -> Router {
         ))
 }
 
-fn queue_directory(list: Listing) -> Response {
-    if let [workspace] = list.workspaces.as_slice()
-        && workspace.configured
-        && workspace.running
-    {
-        return Redirect::temporary(&workspace.url).into_response();
-    }
+fn queue_directory(_list: Listing) -> Response {
     let html = include_str!("../ui/queues.html");
     Html(
         crate::http::inject_app_chrome(html, crate::http::AppPage::Work, false)
@@ -401,24 +399,17 @@ pub fn hub_router(hub: String) -> Result<Router> {
     {
         bail!("Invalid Fugue workspace directory address");
     }
-    let queues = format!("{hub}/queues");
-    Ok(Router::new()
-        .route(
-            "/queues",
-            get(move || {
-                let queues = queues.clone();
-                async move { Redirect::temporary(&queues) }
-            }),
-        )
-        .route(
-            "/api/workspaces",
-            get(move || async {
-                Json(Listing {
-                    hub: Some("/".into()),
-                    workspaces: Vec::new(),
-                })
-            }),
-        ))
+    // Page routes belong to the workspace app or setup router. Registering a
+    // second /queues handler here makes Axum panic when composing either app.
+    Ok(Router::new().route(
+        "/api/workspaces",
+        get(move || async {
+            Json(Listing {
+                hub: Some("/".into()),
+                workspaces: Vec::new(),
+            })
+        }),
+    ))
 }
 
 #[cfg(test)]
@@ -500,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn one_ready_repository_opens_its_own_queue() {
+    fn one_ready_repository_does_not_change_the_global_board_scope() {
         let workspace = Workspace {
             id: "repository-one".into(),
             repository: RepositoryAddress::parse("https://github.com/example/service").unwrap(),
@@ -512,11 +503,8 @@ mod tests {
             hub: None,
             workspaces: vec![workspace],
         });
-        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
-        assert_eq!(
-            response.headers()["location"],
-            "http://127.0.0.1:9001/issues"
-        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key("location"));
     }
 
     #[tokio::test]
@@ -535,8 +523,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 128 * 1024).await.unwrap();
         let html = std::str::from_utf8(&body).unwrap();
-        assert!(html.contains(r#"href="./queues" class="active""#));
-        assert!(html.contains(r#"href="./console""#));
+        assert!(html.contains(r#"href="/queues" class="active""#));
+        assert!(html.contains(r#"href="/console""#));
         assert!(html.contains("/api/workspaces"));
     }
 

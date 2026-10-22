@@ -16,7 +16,10 @@ h2 { font-size:18px; font-weight:600; letter-spacing:-.4px; margin:0; }
 .team-search input { width:100%; background:white; border:1px solid var(--line,#dfe7e8); border-radius:7px; padding:11px 14px; font:14px var(--bs-font-sans,system-ui); }
 .clear-search { border:0; background:none; color:var(--accent); cursor:pointer; }
 .match-summary { color:var(--muted); font-size:12px; margin:10px 0 18px; }
-#repos { display:grid; gap:18px; }
+#repos, #repositoryWorkspaces { display:grid; gap:18px; }
+#repositoryWorkspacesPanel { margin-bottom:24px; }
+#repositoryWorkspaces .fugue-button { margin:12px 8px 0 0; }
+[hidden] { display:none!important; }
 .repo { background:white; border:1px solid var(--line,#dfe7e8); border-radius:12px; padding:24px; min-width:0; }
 .repo.selected { border-color:#92b9aa; box-shadow:0 0 0 1px #92b9aa; }
 .repo-top { display:flex; align-items:center; justify-content:space-between; gap:10px; }
@@ -65,23 +68,29 @@ dialog .fugue-actions { margin-top:24px; justify-content:flex-end; }
 .setup-steps { padding-left:22px; margin:24px 0; } .setup-steps li { padding-left:6px; margin:18px 0; color:var(--ink); } .setup-steps p { margin:6px 0; }
 </style></head><body>
 <div class="shell">
-<section class="hero"><div><div class="fugue-kicker" id="ensemble-name">YOUR WORKSPACE</div><h1>Repository setup</h1><p class="intro">Connect a GitHub repository, choose its issue tracker, and prepare its agents. Once setup is complete, manage day-to-day work through tickets.</p></div><button class="fugue-button primary" id="addRepo" type="button">+ Add repository</button></section>
-<div class="status"><span class="dot" id="health-dot"></span><span id="health" role="status">Connecting to your teams</span><span aria-hidden="true"> / </span><span><b id="repo-count">0</b> teams in this workspace</span><span aria-hidden="true"> / </span><span><b id="agent-count">0</b> team members</span></div>
+<section class="hero"><div><div class="fugue-kicker" id="ensemble-name">YOUR WORKSPACE</div><h1>Repositories</h1><p class="intro">Connect a GitHub repository, choose its issue tracker, and prepare its agents. Once setup is complete, manage day-to-day work through tickets.</p></div><button class="fugue-button primary" id="addRepo" type="button">+ Add repository</button></section>
+<div class="status" id="teamStatus"><span class="dot" id="health-dot"></span><span id="health" role="status">Connecting to your teams</span><span aria-hidden="true"> / </span><span><b id="repo-count">0</b> teams in this workspace</span><span aria-hidden="true"> / </span><span><b id="agent-count">0</b> team members</span></div>
 <div class="error-banner" id="error-banner" role="alert" hidden></div>
 <div class="fugue-message setup" id="setup" role="status" hidden><span id="setupText"></span> <button class="fugue-button" id="retrySetup" type="button" hidden>Retry setup</button></div>
 <main class="workspace"><section>
 <section id="repositoryWorkspacesPanel" hidden><div class="section-heading"><h2>Repository workspaces</h2></div><p class="peer-intro">Each workspace has its own repository, tracker, and work queue.</p><div id="repositoryWorkspaces"></div></section>
-<div class="team-search" role="search"><label for="teamSearch">Search repository teams</label><input id="teamSearch" type="search" autocomplete="off" placeholder="Find a repository or specialist..." aria-describedby="matchSummary"><button class="clear-search" id="clearSearch" type="button" hidden>Clear</button></div>
+<section id="localTeams"><div class="team-search" role="search"><label for="teamSearch">Search repository teams</label><input id="teamSearch" type="search" autocomplete="off" placeholder="Find a repository or specialist..." aria-describedby="matchSummary"><button class="clear-search" id="clearSearch" type="button" hidden>Clear</button></div>
 <p class="match-summary" id="matchSummary" aria-live="polite">Loading repositories...</p>
 <div id="repos"><div class="empty">Loading your teams...</div></div>
-<section class="peering"><div class="section-heading"><h2>Team connections</h2><span class="label">Representatives</span></div><p class="peer-intro">Connected teams can share context with each other through their representatives.</p><div id="peers"></div></section>
-</section><aside><div class="fugue-kicker">ONE-TIME SETUP</div><h2>Prepare the repository.</h2><ol class="setup-steps"><li><strong>Connect the repository</strong><p>Choose its GitHub URL, issue tracker, and access.</p></li><li><strong>Map the codebase</strong><p>Fugue discovers the structure, instructions, and areas of responsibility.</p></li><li><strong>Create its agents</strong><p>Specialists study their areas and keep their context for future work.</p></li></ol><div class="queue-context"><h2>Then work with tickets.</h2><p>Create an issue, follow it across the board, and review its result.</p><p id="queueDescription">The work queue uses your connected issue tracker.</p><a class="fugue-button primary" href="/issues">Open work queue &rarr;</a></div></aside></main></div>
+<section class="peering"><div class="section-heading"><h2>Team connections</h2><span class="label">Representatives</span></div><p class="peer-intro">Connected teams can share context with each other through their representatives.</p><div id="peers"></div></section></section>
+</section><aside><div class="fugue-kicker">ONE-TIME SETUP</div><h2>Prepare the repository.</h2><ol class="setup-steps"><li><strong>Connect the repository</strong><p>Choose its GitHub URL, issue tracker, and access.</p></li><li><strong>Map the codebase</strong><p>Fugue discovers the structure, instructions, and areas of responsibility.</p></li><li><strong>Create its agents</strong><p>Specialists study their areas and keep their context for future work.</p></li></ol><div class="queue-context"><h2>Then work with tickets.</h2><p>Create an issue, follow it across the board, and review its result.</p><p id="queueDescription">The work queue uses your connected issue tracker.</p><a class="fugue-button primary" href="/issues">Open board &rarr;</a></div></aside></main></div>
 <dialog id="addDialog" aria-labelledby="addTitle"><form id="addForm"><h2 id="addTitle">Add a repository</h2><p>Start with its GitHub.com or GitHub Enterprise URL. Next, configure its tracker, repository access, and rkat account.</p><label for="repoUrl">Repository URL</label><input id="repoUrl" required placeholder="https://github.com/owner/repository" autocomplete="off"><p>Each repository has its own work queue and team. Existing repositories keep running during setup.</p><div id="addError" class="notice error" role="alert"></div><div class="fugue-actions"><button type="button" class="fugue-button" id="cancelAdd">Cancel</button><button type="submit" class="fugue-button primary" id="confirmAdd">Configure repository</button></div></form></dialog>
-<template id="repo-template"><article class="repo"><div class="repo-top"><div class="repo-icon" aria-hidden="true">&lt;/&gt;</div><span class="badge">Preparing</span></div><h3></h3><div class="path"></div><p class="description"></p><div class="roles"></div><div class="actions"><a class="work-link fugue-button" href="/issues">Open work queue &rarr;</a><a class="console-link">Inspect team &rarr;</a></div></article></template>
+<template id="repo-template"><article class="repo"><div class="repo-top"><div class="repo-icon" aria-hidden="true">&lt;/&gt;</div><span class="badge">Preparing</span></div><h3></h3><div class="path"></div><p class="description"></p><div class="roles"></div><div class="actions"><a class="work-link fugue-button" href="/issues">Open board &rarr;</a><a class="console-link">Inspect team &rarr;</a></div></article></template>
 <script>
   "use strict";
   const $ = id => document.getElementById(id);
   let snapshot = null, enrolling = false;
+  let directoryCount = 0;
+  function teamVisibility() {
+    const hasLocalTeams = Object.keys(snapshot?.repositories || {}).length > 0;
+    $("localTeams").hidden = directoryCount > 0 && !hasLocalTeams;
+    $("teamStatus").hidden = directoryCount > 0 && !hasLocalTeams;
+  }
   const expandedMembers = new Set();
 
   function node(tag, className, text) { const element = document.createElement(tag); element.className = className; element.textContent = text; return element; }
@@ -111,6 +120,7 @@ dialog .fugue-actions { margin-top:24px; justify-content:flex-end; }
   }
   function render(data) {
     snapshot = data;
+    teamVisibility();
     $("ensemble-name").textContent = data.name;
     const available = data.runtime.repositories || [];
     const repos = Object.keys(data.repositories).map(id => available.find(repo => repo.repo === id) || {repo:id,members:[],preparation:"preparing"});
@@ -220,7 +230,7 @@ dialog .fugue-actions { margin-top:24px; justify-content:flex-end; }
   window.addEventListener("popstate", () => { $("teamSearch").value = queryFromUrl(); if (snapshot) render(snapshot); });
   const dialog = $("addDialog");
   let workspaceHub = null;
-  async function loadWorkspaces(){try{const response=await fugueFetch('/api/workspaces',{cache:'no-store'});if(!response.ok)return;const data=await response.json();workspaceHub=data.hub;const root=$('repositoryWorkspaces');$('repositoryWorkspacesPanel').hidden=data.workspaces.length===0;root.replaceChildren();for(const workspace of data.workspaces){const card=node('article','repo','');card.append(node('span','badge',workspace.running?(workspace.configured?'Configured':'Setup draft'):'Stopped'),node('h3','',workspace.repository.repository),node('p','path',`https://${workspace.repository.host}/${workspace.repository.owner}/${workspace.repository.repository}`));const link=node('a','fugue-button primary',workspace.configured?'Open work queue':'Continue configuration');link.href=workspace.url;if(workspace.running){card.append(link);if(workspace.configured){const settings=node('a','fugue-button','Configure');settings.href=new URL('settings',new URL(workspace.url,location.href)).href;card.append(settings);}}else{const resume=node('button','fugue-button','Resume workspace');resume.onclick=async()=>{resume.disabled=true;try{const response=await fugueFetch('/api/workspaces/'+encodeURIComponent(workspace.id)+'/resume',{method:'POST'});if(!response.ok){const error=await response.json();throw new Error(error.error);}await loadWorkspaces();}catch(error){resume.disabled=false;card.append(node('p','notice error',error.message));}};card.append(resume);}root.append(card);}if(workspaceHub&&location.hash==='#add')location.href=workspaceHub.replace(/\/$/,'')+'/ensemble#add';}catch(error){$('error-banner').hidden=false;$('error-banner').textContent='Could not load repository workspaces: '+error.message;}}
+  async function loadWorkspaces(){try{const response=await fugueFetch('/api/workspaces',{cache:'no-store'});if(!response.ok)return;const data=await response.json();workspaceHub=data.hub;directoryCount=data.workspaces.length;teamVisibility();const root=$('repositoryWorkspaces');$('repositoryWorkspacesPanel').hidden=data.workspaces.length===0;root.replaceChildren();for(const workspace of data.workspaces){const card=node('article','repo','');card.append(node('span','badge',workspace.running?(workspace.configured?'Connected':'Setup draft'):'Stopped'),node('h3','',workspace.repository.repository),node('p','path',`https://${workspace.repository.host}/${workspace.repository.owner}/${workspace.repository.repository}`));const link=node('a','fugue-button primary',workspace.configured?'Open repository':'Continue configuration');link.href=workspace.configured?new URL('ensemble',new URL(workspace.url,location.href)).href:workspace.url;if(workspace.running){card.append(link);if(workspace.configured){const board=node('a','fugue-button','Open board');board.href=workspace.url;card.append(board);const settings=node('a','fugue-button','Settings');settings.href=new URL('settings',new URL(workspace.url,location.href)).href;card.append(settings);}}else{const resume=node('button','fugue-button','Resume workspace');resume.onclick=async()=>{resume.disabled=true;try{const response=await fugueFetch('/api/workspaces/'+encodeURIComponent(workspace.id)+'/resume',{method:'POST'});if(!response.ok){const error=await response.json();throw new Error(error.error);}await loadWorkspaces();}catch(error){resume.disabled=false;card.append(node('p','notice error',error.message));}};card.append(resume);}root.append(card);}if(workspaceHub&&location.hash==='#add')location.href=workspaceHub.replace(/\/$/,'')+'/ensemble#add';}catch(error){$('error-banner').hidden=false;$('error-banner').textContent='Could not load repository workspaces: '+error.message;}}
   function openAdd() { if(workspaceHub){location.href=workspaceHub.replace(/\/$/,'')+'/ensemble#add';return;} $('addError').textContent='';if(!dialog.open)dialog.showModal();$('repoUrl').focus(); }
   $('addRepo').addEventListener('click',openAdd);
   $('cancelAdd').addEventListener('click',()=>dialog.close());

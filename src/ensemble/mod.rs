@@ -49,7 +49,7 @@ pub(crate) async fn serve_with_directory(
             )
             .route(
                 "/",
-                axum::routing::get(|| async { axum::response::Redirect::temporary("/ensemble") }),
+                axum::routing::get(|| async { axum::response::Redirect::temporary("/overview") }),
             ),
         Err(error) => {
             runtime

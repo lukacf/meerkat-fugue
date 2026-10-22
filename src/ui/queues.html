@@ -1,41 +1,8 @@
 <!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Work queues - Fugue</title></head>
-<body>
-<main class="fugue-page">
-  <header class="fugue-heading"><div><div class="fugue-kicker">REPOSITORIES</div><h1>Work queues</h1><p>Choose a repository to open its Kanban board.</p></div><a class="fugue-button" href="/ensemble#add">Add repository</a></header>
-  <div id="queueStatus" role="status">Loading repositories...</div>
-  <div id="queues" style="display:grid;gap:16px"></div>
-</main>
-<script>
-(async () => {
-  const status = document.getElementById('queueStatus');
-  const queues = document.getElementById('queues');
-  try {
-    const response = await fugueFetch('/api/workspaces', {cache:'no-store'});
-    if (!response.ok) throw new Error('Could not load work queues. Reload to try again.');
-    const {workspaces} = await response.json();
-    status.textContent = workspaces.length ? '' : 'No repositories yet. Add a repository to create its work queue.';
-    for (const workspace of workspaces) {
-      const card = document.createElement('article');
-      card.className = 'fugue-panel fugue-panel-head';
-      const info = document.createElement('div');
-      const name = document.createElement('h2');
-      name.textContent = `${workspace.repository.owner}/${workspace.repository.repository}`;
-      const detail = document.createElement('p');
-      detail.textContent = `${workspace.repository.host} / ${workspace.running ? (workspace.configured ? 'Ready' : 'Configuration needed') : 'Stopped'}`;
-      info.append(name, detail);
-      const link = document.createElement('a');
-      link.className = 'fugue-button primary';
-      link.href = workspace.running ? workspace.url : '/ensemble#repositoryWorkspacesPanel';
-      link.textContent = workspace.running ? (workspace.configured ? 'Open work queue' : 'Continue configuration') : 'Manage repository';
-      card.append(info, link);
-      queues.append(card);
-    }
-  } catch (error) {
-    status.textContent = error.message;
-  }
-})();
-</script>
-</body>
-</html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Board | Fugue</title></head><body>
+<main id="portfolio" class="fugue-page" data-view="board">
+  <header class="fugue-heading"><div><h1>Board</h1><p>Each repository keeps its own issue tracker, workflow and team.</p></div><a class="fugue-button" href="/ensemble#add">Add repository</a></header>
+  <div class="portfolio-toolbar"><span id="portfolioStatus" role="status">Loading repositories...</span><button class="fugue-button" id="portfolioRetry">Refresh</button></div>
+  <div id="portfolioError" class="fugue-message fugue-error" role="alert" hidden></div>
+  <div id="portfolioRepositories" class="portfolio-repositories"><div class="fugue-panel fugue-empty">Loading boards...</div></div>
+</main><script>__PORTFOLIO_JS__</script></body></html>
