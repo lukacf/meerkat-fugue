@@ -626,7 +626,15 @@ async fn workspace_enrollment_proof() {
         );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (stop_server, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
     let client = reqwest::Client::new();
     let initial: serde_json::Value = client
         .get(format!("{base}/api/ensemble"))
@@ -720,15 +728,28 @@ async fn workspace_enrollment_proof() {
             .any(|member| member["session_id"] == accepted.session_id)
     );
     workspace.shutdown().await.unwrap();
-    server.abort();
-    let _ = server.await;
+    // Axum connection tasks retain router state after aborting the accept
+    // loop. Drain them before reopening the same durable configuration.
+    stop_server.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap();
     drop(workspace);
     let restored = super::workspace::Workspace::open_with_client(path, llm);
     restored.start().await.unwrap();
     let app = super::http::workspace_router(Arc::clone(&restored), true).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (stop_server, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
     let status = wait_for_workspace(&client, &base).await;
     assert_eq!(
         status["runtime"]["repositories"].as_array().unwrap().len(),
@@ -742,8 +763,13 @@ async fn workspace_enrollment_proof() {
             .any(|member| member["session_id"] == accepted.session_id)
     );
     restored.shutdown().await.unwrap();
-    server.abort();
-    let _ = server.await;
+    // Axum connection tasks retain router state after aborting the accept
+    // loop. Drain them before reopening the same durable configuration.
+    stop_server.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 async fn wait_for_workspace(client: &reqwest::Client, base: &str) -> serde_json::Value {
