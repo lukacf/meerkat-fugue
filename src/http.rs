@@ -376,6 +376,9 @@ pub(crate) fn inject_app_chrome(
         };
         nav.push_str(&format!(r#"<a href="{href}"{selected}>{label}</a>"#));
     }
+    if let Some(logout) = crate::browser_access::logout_url() {
+        nav.push_str(&format!(r#"<a href="{logout}">Sign out</a>"#));
+    }
     let home = if queue_enabled { "/issues" } else { "/queues" };
     let context = if active == AppPage::Console {
         r#"<span class="fugue-console-meta">All repository mobs</span>"#

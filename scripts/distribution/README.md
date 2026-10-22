@@ -46,7 +46,12 @@ operator proxy in front of it and configure the service with both:
 ```sh
 FUGUE_PUBLIC_ORIGIN=https://fugue.example.com
 FUGUE_PROXY_TOKEN_FILE=/etc/fugue/proxy-token
+FUGUE_LOGOUT_PATH=/auth/sign-out
 ```
+
+Set the optional logout path to the proxy's same-origin sign-out endpoint. Fugue
+then shows a Sign out link in its shared navigation. The proxy owns session
+revocation and cookie removal.
 
 The file must be owner-readable only (`0600`) and contain a random token of at
 least 32 ASCII characters. The proxy must authenticate the user, apply an explicit

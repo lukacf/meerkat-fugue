@@ -14,6 +14,7 @@ struct ProxyAccess {
     origin: String,
     host: String,
     token_hash: [u8; 32],
+    logout_url: Option<String>,
 }
 
 impl ProxyAccess {
@@ -42,6 +43,7 @@ impl ProxyAccess {
             origin,
             host,
             token_hash: Sha256::digest(token.as_bytes()).into(),
+            logout_url: None,
         })
     }
 
@@ -89,7 +91,11 @@ pub fn configure_from_environment() -> Result<()> {
                 }
             }
             let token = std::fs::read_to_string(path).context("Read trusted proxy token file")?;
-            Some(ProxyAccess::new(&origin, token.trim())?)
+            let mut proxy = ProxyAccess::new(&origin, token.trim())?;
+            if let Ok(path) = std::env::var("FUGUE_LOGOUT_PATH") {
+                proxy.logout_url = Some(operator_logout_url(&proxy.origin, &path)?);
+            }
+            Some(proxy)
         }
         _ => bail!(
             "Set both FUGUE_PUBLIC_ORIGIN and FUGUE_PROXY_TOKEN_FILE for authenticated proxy access"
@@ -98,6 +104,23 @@ pub fn configure_from_environment() -> Result<()> {
     PROXY
         .set(proxy)
         .map_err(|_| anyhow::anyhow!("Browser access was already configured"))
+}
+
+fn operator_logout_url(origin: &str, path: &str) -> Result<String> {
+    if !path.starts_with('/')
+        || path.starts_with("//")
+        || path.contains("..")
+        || !path
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte))
+    {
+        bail!("FUGUE_LOGOUT_PATH must be a same-origin absolute path without a query or fragment");
+    }
+    Ok(format!("{origin}{path}"))
+}
+
+pub(crate) fn logout_url() -> Option<&'static str> {
+    PROXY.get().and_then(Option::as_ref)?.logout_url.as_deref()
 }
 
 pub(crate) fn allows_proxy(method: &Method, headers: &HeaderMap) -> bool {
@@ -135,6 +158,23 @@ mod tests {
         headers.insert(header::ORIGIN, "https://fugue.example.com".parse().unwrap());
         headers.insert(header::AUTHORIZATION, "Bearer untrusted".parse().unwrap());
         assert!(!proxy.allows(&Method::POST, &headers));
+    }
+
+    #[test]
+    fn logout_target_stays_on_the_authenticated_public_origin() {
+        assert_eq!(
+            operator_logout_url("https://fugue.example.com", "/auth/sign-out").unwrap(),
+            "https://fugue.example.com/auth/sign-out"
+        );
+        for path in [
+            "//evil.example",
+            "https://evil.example",
+            "/../other",
+            "/auth?redirect=other",
+            "/auth\"onclick",
+        ] {
+            assert!(operator_logout_url("https://fugue.example.com", path).is_err());
+        }
     }
 
     #[test]
