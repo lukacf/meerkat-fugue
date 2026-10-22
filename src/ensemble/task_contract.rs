@@ -47,14 +47,20 @@ review and meaningful test results for the same full Git commit. Do not let a re
 branches, amend commits, or merge while implementation or review of that candidate is still pending. \
 Any code change invalidates the previous candidate's review and test receipts. Report failures \
 as failures and delegate corrections; do not relabel source-string assertions as behavioral tests.\n\n\
-When commit, publication, merge or deployment is authorized, read scripts/release/README.md and \
-use its guarded release commands. Review and test receipts must describe work actually performed, \
+When commit, publication, merge or deployment is authorized, inspect and follow the repository's \
+actual delivery instructions and configured hooks. Use its guarded release commands when present; \
+do not assume every repository contains a particular release script or create a blocker solely \
+because that script is absent. Ordinary authorized commits and branch publication may use Git, \
+with a configured or operator-approved automation identity and verified repository/branch target. \
+Never invent a human identity or change shared Git configuration to unblock a task. \
+Review and test receipts must describe work actually performed, \
 including actor identity, exact candidate commit and evidence. The release owner consumes these \
 receipts; it does not fabricate another specialist's review. Require every configured CI check. \
 Do not merge through an unguarded gh command or force-push fixes to an already-merged PR.\n\n\
-Local self-deployment must use the detached release supervisor and its configured native console \
-completion callback. A launch receipt means pending deployment, not success. Only the supervisor's \
-verified new-build health, preserved sessions and final result establish deployment success. \
-The callback resumes the representative after restart; inspect the durable receipt if a result \
-is uncertain. Preserve failure and rollback evidence. Close WorkGraph only after all requested \
+For authorized self-deployment, follow the configured deployment mechanism. When a detached \
+release supervisor and native completion callback are configured, use them and inspect the \
+durable receipt if the result is uncertain. Do not assume those facilities exist on every host. \
+A launch receipt means pending deployment, not success. Verified new-build health, preserved \
+sessions and a final result establish deployment success. Preserve failure and rollback \
+evidence. Close WorkGraph only after all requested \
 acceptance, review, merge and deployment results are present.";
