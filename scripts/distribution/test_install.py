@@ -63,6 +63,18 @@ class InstallTests(unittest.TestCase):
         for name in installer.BINARIES:
             self.assertTrue((self.prefix / 'bin' / name).is_file())
 
+    def test_service_account_can_traverse_release_after_private_staging(self):
+        first = bundle(self.root)
+        installer.install(*first, self.prefix)
+        release = (self.prefix / 'current').resolve()
+        self.assertEqual(release.stat().st_mode & 0o777, 0o755)
+        self.assertEqual((release / 'bin').stat().st_mode & 0o777, 0o755)
+        # Repair the same verified release after an older installer left its
+        # temporary directory mode in place.
+        release.chmod(0o700)
+        installer.install(*first, self.prefix)
+        self.assertEqual(release.stat().st_mode & 0o777, 0o755)
+
     def test_rejected_bundles_preserve_running_release_and_private_state(self):
         installer.install(*bundle(self.root), self.prefix)
         before = (self.prefix / 'current').readlink()

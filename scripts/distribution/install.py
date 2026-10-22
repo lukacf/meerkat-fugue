@@ -111,6 +111,11 @@ def install(archive, expected, prefix):
                         raise ValueError('Existing release files have changed; installation stopped.')
             else:
                 os.replace(stage, release)
+            # TemporaryDirectory is deliberately private during verification.
+            # Published files are public executables; a different service user
+            # must be able to traverse the verified release after root installs.
+            release.chmod(0o755)
+            (release / 'bin').chmod(0o755)
             old = os.readlink(current) if current.is_symlink() else None
             if old and old != f'versions/{name}':
                 if PurePosixPath(old).parent != PurePosixPath('versions'):
