@@ -181,6 +181,23 @@ impl Connections {
             .collect::<BTreeMap<_, _>>();
         if let Some(github) = &self.github {
             environment.insert("GH_HOST".into(), github.host.clone());
+            // A PAT environment variable authenticates gh, not Git itself.
+            // Scope the helper to this subprocess and host so later fetches and
+            // specialist shell commands work without changing a user's checkout
+            // or consulting unrelated global credential helpers.
+            environment.extend([
+                ("GIT_CONFIG_COUNT".into(), "2".into()),
+                ("GIT_CONFIG_KEY_0".into(), "credential.helper".into()),
+                ("GIT_CONFIG_VALUE_0".into(), String::new()),
+                (
+                    "GIT_CONFIG_KEY_1".into(),
+                    format!("credential.https://{}.helper", github.host),
+                ),
+                (
+                    "GIT_CONFIG_VALUE_1".into(),
+                    "!gh auth git-credential".into(),
+                ),
+            ]);
             if let GitHubCredential::Token { token } = &github.credential {
                 environment.insert(
                     github_token_environment(&github.host).into(),
@@ -684,6 +701,74 @@ mod tests {
             .unwrap();
         assert!(config.realm.contains_key(first_binding.realm.as_str()));
         assert!(!config.realm.contains_key(second_binding.realm.as_str()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_git_uses_saved_credentials_without_checkout_or_global_helpers() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let helper = bin.join("gh");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\n[ \"$1 $2 $3\" = 'auth git-credential get' ] || exit 1\nprintf 'username=repository-test\\npassword=%s\\n' \"${GH_ENTERPRISE_TOKEN:-cli-login-sentinel}\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let global = root.path().join("gitconfig");
+        std::fs::write(
+            &global,
+            "[credential]\nhelper = !printf 'username=unrelated\\npassword=unrelated-secret\\n'\n",
+        )
+        .unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        let path = std::env::join_paths(paths).unwrap();
+        let lookup = |connections: &Connections, host: &str| {
+            let mut child = Command::new("git")
+                .args(["credential", "fill"])
+                .current_dir(root.path())
+                .env("HOME", root.path())
+                .env("GIT_CONFIG_GLOBAL", &global)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("PATH", &path)
+                .envs(connections.github_environment())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            writeln!(child.stdin.take().unwrap(), "protocol=https\nhost={host}\n").unwrap();
+            child.wait_with_output().unwrap()
+        };
+
+        let connection = connections();
+        let saved = lookup(&connection, "git.example.com");
+        assert!(saved.status.success());
+        let saved = String::from_utf8(saved.stdout).unwrap();
+        assert!(saved.contains("password=github-secret-sentinel"), "{saved}");
+        assert!(!saved.contains("unrelated-secret"));
+        assert!(
+            !lookup(&connection, "unrelated.example.com")
+                .status
+                .success()
+        );
+
+        let mut cli = connection.clone();
+        cli.github.as_mut().unwrap().credential = GitHubCredential::GhCli;
+        let cli = lookup(&cli, "git.example.com");
+        assert!(cli.status.success());
+        assert!(
+            String::from_utf8(cli.stdout)
+                .unwrap()
+                .contains("password=cli-login-sentinel")
+        );
     }
 
     #[test]
