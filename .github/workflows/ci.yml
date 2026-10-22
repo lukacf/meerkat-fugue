@@ -73,5 +73,13 @@ jobs:
         timeout-minutes: 45
         run: cargo test --all-targets --locked
 
+      - name: Repeat native handoff and restart contracts
+        timeout-minutes: 15
+        run: |
+          for attempt in 1 2 3 4 5; do
+            echo "Native restart qualification $attempt/5"
+            cargo test --locked --lib native_flow_delivers_worker
+          done
+
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings

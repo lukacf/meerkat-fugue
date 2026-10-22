@@ -198,10 +198,19 @@ fn save_studies(path: &Path, journal: &StudyJournal) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+enum ShutdownState {
+    #[default]
+    Running,
+    Closing,
+    Complete,
+    Failed(String),
+}
+
 pub struct EnsembleRuntime {
     config: EnsembleConfig,
     repositories: BTreeMap<RepoId, RepositoryRuntime>,
-    lifecycle: tokio::sync::RwLock<bool>,
+    lifecycle: tokio::sync::RwLock<ShutdownState>,
     peer_coordinators: Vec<SameProcessTopologyCoordinator>,
     _state_guard: EnsembleStateGuard,
     queue: Option<crate::meta_runtime::MetaRuntimeRegistry>,
@@ -250,7 +259,7 @@ impl EnsembleRuntime {
         let mut this = Self {
             config,
             repositories: BTreeMap::new(),
-            lifecycle: tokio::sync::RwLock::new(false),
+            lifecycle: tokio::sync::RwLock::new(ShutdownState::Running),
             peer_coordinators: Vec::new(),
             _state_guard: state_guard,
             queue,
@@ -1130,7 +1139,7 @@ impl EnsembleRuntime {
     pub async fn ask(&self, repo: &RepoId, text: &str) -> Result<EnsembleAccepted> {
         self.ensure_notification_health().await?;
         let stopping = self.lifecycle.read().await;
-        if *stopping {
+        if !matches!(*stopping, ShutdownState::Running) {
             bail!("Ensemble is shutting down");
         }
         if text.trim().is_empty() || text.len() > 64 * 1024 {
@@ -1165,10 +1174,15 @@ impl EnsembleRuntime {
 
     pub async fn shutdown(&self) -> Result<()> {
         let mut stopping = self.lifecycle.write().await;
-        if *stopping {
-            return Ok(());
+        match &*stopping {
+            ShutdownState::Complete => return Ok(()),
+            ShutdownState::Failed(detail) => bail!("{detail}"),
+            ShutdownState::Closing => bail!(
+                "Ensemble shutdown was interrupted; restart the host process before reopening its repositories"
+            ),
+            ShutdownState::Running => {}
         }
-        *stopping = true;
+        *stopping = ShutdownState::Closing;
         let mut errors = Vec::new();
         for (repo, entry) in &self.repositories {
             if let Some(task) = entry.event_notifications.lock().await.take() {
@@ -1191,7 +1205,7 @@ impl EnsembleRuntime {
                     _ => {}
                 }
             }
-            let report = entry.runtime.shutdown().await;
+            let mut report = entry.runtime.shutdown().await;
             if let Some(task) = entry.event_drain.lock().await.take() {
                 task.abort();
                 if let Err(error) = task.await
@@ -1200,13 +1214,29 @@ impl EnsembleRuntime {
                     errors.push(format!("{repo} event drain: {error}"));
                 }
             }
-            if !report.cleanup_completed() && !report.cleanup_retained_until_process_exit() {
+            // A process-exit retention receipt does not permit this host to
+            // reopen the layout. After our drain owner has joined, ask the
+            // native child owner to settle its retained work once more.
+            if report.cleanup_retained_until_process_exit() {
+                tracing::warn!(repository = %repo, ?report, "retrying retained native child cleanup before repository replacement");
+                report.child_mob_stand_down = entry
+                    .runtime
+                    .mob_runtime()
+                    .stand_down_child_mobs(std::time::Instant::now() + Duration::from_secs(30))
+                    .await;
+            }
+            if !report.cleanup_completed() {
                 errors.push(format!("{repo}: {report:?}"));
             }
         }
         if !errors.is_empty() {
-            bail!("Ensemble shutdown failed: {errors:?}");
+            let detail = format!(
+                "Ensemble shutdown failed; restart the host process before reopening its repositories: {errors:?}"
+            );
+            *stopping = ShutdownState::Failed(detail.clone());
+            bail!("{detail}");
         }
+        *stopping = ShutdownState::Complete;
         Ok(())
     }
 }
