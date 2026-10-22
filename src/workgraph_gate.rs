@@ -9,12 +9,14 @@ use crate::tools::{LinearIssueRef, LinearStateRef, MoveIssueInput};
 
 pub const WORKGRAPH_STATE_PATH_ENV: &str = "FUGUE_WORKGRAPH_STATE_PATH";
 pub const WORKGRAPH_BLOCKED_STATES_ENV: &str = "FUGUE_WORKGRAPH_BLOCKED_STATES";
+pub const WORKGRAPH_MOB_ID_ENV: &str = "FUGUE_WORKGRAPH_MOB_ID";
 pub const FUGUE_WORKGRAPH_LABEL: &str = "fugue";
 pub const FUGUE_WORKGRAPH_BLOCKING_LABEL: &str = "blocking";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkGraphTerminalGate {
     pub state_path: PathBuf,
+    pub mob_id: String,
     pub terminal_states: Vec<String>,
     pub allowed_terminal_states: Vec<String>,
 }
@@ -27,9 +29,15 @@ impl WorkGraphTerminalGate {
     ) -> Self {
         Self {
             state_path: state_path.into(),
+            mob_id: crate::native_mob_contract::FUGUE_MOB_ID.to_owned(),
             terminal_states,
             allowed_terminal_states,
         }
+    }
+
+    pub fn for_mob(mut self, mob_id: impl Into<String>) -> Self {
+        self.mob_id = mob_id.into();
+        self
     }
 
     pub fn from_env(config: &TrackerConfig) -> Option<Self> {
@@ -37,11 +45,17 @@ impl WorkGraphTerminalGate {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())?;
-        Some(Self::new(
-            state_path,
-            config.terminal_states.clone(),
-            env_list(WORKGRAPH_BLOCKED_STATES_ENV),
-        ))
+        Some(
+            Self::new(
+                state_path,
+                config.terminal_states.clone(),
+                env_list(WORKGRAPH_BLOCKED_STATES_ENV),
+            )
+            .for_mob(
+                std::env::var(WORKGRAPH_MOB_ID_ENV)
+                    .unwrap_or_else(|_| crate::native_mob_contract::FUGUE_MOB_ID.to_owned()),
+            ),
+        )
     }
 
     pub async fn guard_terminal_move(&self, input: &MoveIssueInput) -> Result<(), String> {
@@ -77,7 +91,7 @@ impl WorkGraphTerminalGate {
     }
 
     pub async fn unresolved_blocking_items(&self, issue: &str) -> Result<Vec<WorkItem>, String> {
-        let service = workgraph_service(&self.state_path)?;
+        let service = workgraph_service_for_mob(&self.state_path, &self.mob_id)?;
         service
             .list(WorkItemFilter {
                 statuses: vec![
@@ -106,10 +120,10 @@ pub fn workgraph_blocked_states_env_value(states: &[String]) -> String {
     states.join(",")
 }
 
-fn workgraph_service(path: &Path) -> Result<WorkGraphService, String> {
+fn workgraph_service_for_mob(path: &Path, mob_id: &str) -> Result<WorkGraphService, String> {
     let store = SqliteWorkGraphStore::open(path)
         .map_err(|error| format!("open WorkGraph store at {}: {error}", path.display()))?;
-    let realm = meerkat_core::mob_realm_id(crate::native_mob_contract::FUGUE_MOB_ID)
+    let realm = meerkat_core::mob_realm_id(mob_id)
         .map_err(|error| format!("resolve Fugue WorkGraph realm: {error}"))?;
     Ok(WorkGraphService::with_scope(
         Arc::new(store),
@@ -167,6 +181,59 @@ mod tests {
 
     use super::*;
     use crate::tools::{IdempotencyKey, LinearIssueIdentifier};
+
+    #[tokio::test]
+    async fn repository_gate_reads_its_native_mob_scope_without_cross_repository_leakage() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workgraph.sqlite3");
+        let store = SqliteWorkGraphStore::open(&path).unwrap();
+        let realm = meerkat_core::mob_realm_id("ensemble-api").unwrap();
+        let service = WorkGraphService::with_scope(
+            Arc::new(store),
+            realm.as_str(),
+            meerkat::WorkNamespace::default(),
+        );
+        service
+            .create(CreateWorkItemRequest {
+                realm_id: None,
+                namespace: None,
+                title: "Specialist review is still required".into(),
+                description: None,
+                priority: WorkPriority::High,
+                completion_policy: WorkCompletionPolicy::SelfAttest,
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                labels: BTreeSet::from([
+                    FUGUE_WORKGRAPH_LABEL.into(),
+                    issue_workgraph_label("DEMO-1"),
+                    FUGUE_WORKGRAPH_BLOCKING_LABEL.into(),
+                ]),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: Some(WorkStatus::Open),
+            })
+            .await
+            .unwrap();
+        let gate = WorkGraphTerminalGate::new(&path, vec!["Done".into()], Vec::new())
+            .for_mob("ensemble-api");
+        assert_eq!(
+            gate.unresolved_blocking_items("DEMO-1")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            gate.for_mob("ensemble-web")
+                .unresolved_blocking_items("DEMO-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[tokio::test]
     async fn terminal_gate_blocks_success_with_open_fugue_issue_obligation() {

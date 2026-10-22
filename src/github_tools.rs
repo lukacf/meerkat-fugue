@@ -20,6 +20,14 @@ impl GitHubToolHost {
         Self { gh: GhCli::new() }
     }
 
+    pub fn with_connections(
+        connections: Option<std::sync::Arc<crate::setup::connections::Connections>>,
+    ) -> Self {
+        Self {
+            gh: GhCli::with_runner(Box::new(ProcessCommandRunner { connections })),
+        }
+    }
+
     #[cfg(test)]
     fn with_runner(runner: Box<dyn CommandRunner>) -> Self {
         Self {
@@ -210,7 +218,9 @@ impl GitHubToolFailure {
 }
 
 fn aggregate_ci_status(checks: &[GitHubCheckSnapshot]) -> CiStatus {
-    if checks.is_empty() || checks.iter().any(|check| check.status == CiStatus::Pending) {
+    if checks.is_empty() {
+        CiStatus::NoChecks
+    } else if checks.iter().any(|check| check.status == CiStatus::Pending) {
         CiStatus::Pending
     } else if checks
         .iter()
@@ -236,7 +246,7 @@ struct GhCli {
 
 impl GhCli {
     fn new() -> Self {
-        Self::with_runner(Box::new(ProcessCommandRunner))
+        Self::with_runner(Box::new(ProcessCommandRunner::default()))
     }
 
     fn with_runner(runner: Box<dyn CommandRunner>) -> Self {
@@ -489,12 +499,18 @@ pub struct CommandOutput {
     pub stderr: String,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ProcessCommandRunner;
+#[derive(Debug, Clone, Default)]
+struct ProcessCommandRunner {
+    connections: Option<std::sync::Arc<crate::setup::connections::Connections>>,
+}
 
 impl CommandRunner for ProcessCommandRunner {
     fn run(&self, args: &[&str]) -> GitHubToolResult<CommandOutput> {
-        let output = std::process::Command::new("gh")
+        let mut command = std::process::Command::new("gh");
+        if let Some(connections) = &self.connections {
+            command.envs(connections.github_environment());
+        }
+        let output = command
             .env("GH_HOST", "github.com")
             .args(args)
             .output()
@@ -1091,7 +1107,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_checks_are_confirmed_by_rollup_and_remain_pending() {
+    fn missing_checks_are_confirmed_by_rollup_without_claiming_success() {
         let runner = FakeRunner::with_results(vec![
             Err(classify_gh_failure(
                 Some(1),
@@ -1108,7 +1124,7 @@ mod tests {
             result,
             FugueToolResult::Ok {
                 output: FugueToolOutput::GitHubCheckCi(CheckCiOutput {
-                    status: CiStatus::Pending,
+                    status: CiStatus::NoChecks,
                     ..
                 }),
                 ..
@@ -1117,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn check_ci_treats_empty_check_list_as_pending_not_success() {
+    fn check_ci_reports_empty_check_list_without_claiming_success() {
         let runner = FakeRunner::with_outputs(vec![output("[]")]);
         let host = GitHubToolHost::with_runner(Box::new(runner));
 
@@ -1131,7 +1147,7 @@ mod tests {
                 output: FugueToolOutput::GitHubCheckCi(output),
                 ..
             } => {
-                assert_eq!(output.status, CiStatus::Pending);
+                assert_eq!(output.status, CiStatus::NoChecks);
                 assert!(output.checks.is_empty());
             }
             other => panic!("unexpected result: {other:?}"),

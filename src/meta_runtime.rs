@@ -29,12 +29,12 @@ use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::agent::{
-    execute_github_fugue_tool, external_tools_for_tracker, is_github_fugue_tool_name,
+    execute_github_fugue_tool_with_host, external_tools_for_tracker, is_github_fugue_tool_name,
 };
 use crate::config::{
-    DEFAULT_AGENT_MODEL, FinalReviewReviewerConfig, IndependentReviewConfig,
-    MaterializedMobTemplate, MeerkatConfig, MetaConsoleBasicAuthConfig, NativeAgentProfile,
-    NativeMcpServerConfig, NativeMobFlow, TrackerConfig, is_native_linear_mcp_server,
+    FinalReviewReviewerConfig, IndependentReviewConfig, MaterializedMobTemplate, MeerkatConfig,
+    MetaConsoleBasicAuthConfig, NativeAgentProfile, NativeMcpServerConfig, NativeMobFlow,
+    TrackerConfig, default_agent_model, is_native_linear_mcp_server,
 };
 use crate::deploy_gate::DeployStartRequest;
 use crate::domain::normalize_state;
@@ -95,7 +95,7 @@ impl FugueMobJob {
 }
 
 #[derive(Debug, Default)]
-struct FugueConsoleVisibilityPolicy;
+pub(crate) struct FugueConsoleVisibilityPolicy;
 
 impl ConsoleVisibilityPolicy for FugueConsoleVisibilityPolicy {
     fn include_implicit_delegate_members(&self) -> bool {
@@ -135,6 +135,14 @@ fn is_raw_comms_admission_prompt(prompt: &str) -> bool {
         || lower.starts_with("peer response from ")
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct RepositorySpecialist {
+    pub identity: String,
+    pub label: String,
+    pub focus: String,
+    pub paths: Vec<PathBuf>,
+}
+
 #[derive(Clone)]
 pub struct MetaRuntimeRegistry {
     meerkat: MeerkatConfig,
@@ -146,6 +154,8 @@ pub struct MetaRuntimeRegistry {
     final_review_reviewers: Vec<FinalReviewReviewerConfig>,
     independent_review: IndependentReviewConfig,
     runtime: Arc<tokio::sync::Mutex<Option<Arc<UnifiedRuntime>>>>,
+    specialists: Arc<OnceLock<Vec<RepositorySpecialist>>>,
+    console: Arc<OnceLock<Arc<crate::console::ConsoleHub>>>,
     meta_task_runtime: Arc<Mutex<Option<tokio::runtime::Runtime>>>,
     event_drain_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     kapellmeister_bootstrap: Arc<tokio::sync::Mutex<()>>,
@@ -156,6 +166,77 @@ pub struct MetaRuntimeRegistry {
 }
 
 impl MetaRuntimeRegistry {
+    pub(crate) fn connections(&self) -> Option<&Arc<crate::setup::connections::Connections>> {
+        self.meerkat.runtime_connections.as_ref()
+    }
+    pub(crate) fn auth_binding(&self) -> Option<meerkat_core::AuthBindingRef> {
+        self.meerkat.auth_binding.clone()
+    }
+    pub(crate) fn configure_model(&self, config: &mut meerkat::Config) -> anyhow::Result<()> {
+        if let Some(connections) = self.connections() {
+            connections.apply_model_config(config, &self.state_path())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn repository_binding(&self) -> Option<&crate::config::RepositoryRuntimeBinding> {
+        self.meerkat.repository_runtime.as_ref()
+    }
+
+    pub(crate) fn repository_definition(&self) -> Result<MobDefinition, String> {
+        self.mob_definition()
+    }
+
+    pub(crate) fn repository_session_hook(&self) -> Result<Arc<dyn SessionHook>, String> {
+        Ok(Arc::new(FugueDirectToolSessionHook {
+            connections: self.meerkat.runtime_connections.clone(),
+            mob_id: self.meerkat.mob_id().into_owned(),
+            agent_profiles: self
+                .templates
+                .values()
+                .flat_map(|template| template.members.iter())
+                .map(|member| (member.profile.clone(), member.agent.clone()))
+                .collect(),
+            default_auth_binding: self.meerkat.auth_binding.clone(),
+            review_orchestrator_profile: self.independent_review.orchestrator_profile.clone(),
+            independent_review_enabled: self.independent_review.enabled,
+            tracker: self.tracker.clone(),
+            host_api_url: self.host_api_url.clone(),
+            host_api_auth: self.host_api_auth.clone(),
+            github_repo: github_repo_from_mcp_servers(&self.repo_mcp_servers)?,
+            review_handoff_states: review_handoff_states_from_mcp_servers(&self.repo_mcp_servers),
+            action_states: action_states_from_mcp_servers(&self.repo_mcp_servers),
+            workgraph_gate: WorkGraphTerminalGate::new(
+                self.state_path().join("workgraph.sqlite3"),
+                self.tracker.terminal_states.clone(),
+                workgraph_blocked_states_from_mcp_servers(&self.repo_mcp_servers),
+            )
+            .for_mob(self.meerkat.mob_id().into_owned()),
+        }))
+    }
+
+    /// Borrow the repository's native owner. Never construct a second queue mob.
+    pub(crate) async fn attach_repository_runtime(
+        &self,
+        runtime: Arc<UnifiedRuntime>,
+        specialists: Vec<RepositorySpecialist>,
+    ) -> Result<(), String> {
+        let binding = self
+            .repository_binding()
+            .ok_or("queue has no repository binding")?;
+        if runtime.mob_handle().mob_id().as_str() != binding.mob_id() {
+            return Err("repository runtime does not match the queue binding".into());
+        }
+        let mut current = self.runtime.lock().await;
+        if current.is_some() {
+            return Err("repository runtime is already attached".into());
+        }
+        self.specialists
+            .set(specialists)
+            .map_err(|_| "repository specialists are already attached")?;
+        *current = Some(runtime);
+        Ok(())
+    }
     pub fn new(meerkat: MeerkatConfig) -> Self {
         Self::with_templates(meerkat, BTreeMap::new(), BTreeMap::new())
     }
@@ -193,6 +274,8 @@ impl MetaRuntimeRegistry {
             final_review_reviewers: Vec::new(),
             independent_review: IndependentReviewConfig::default(),
             runtime: Arc::new(tokio::sync::Mutex::new(None)),
+            specialists: Arc::new(OnceLock::new()),
+            console: Arc::new(OnceLock::new()),
             meta_task_runtime: Arc::new(Mutex::new(None)),
             event_drain_task: Arc::new(Mutex::new(None)),
             kapellmeister_bootstrap: Arc::new(tokio::sync::Mutex::new(())),
@@ -231,13 +314,83 @@ impl MetaRuntimeRegistry {
             KAPELLMEISTER,
             KAPELLMEISTER,
             Some("You are the repo-scoped Fugue Kapellmeister. Startup rule: do not inspect Linear, call tools, send peer messages, start issue mobs, mutate lifecycle lanes, or infer work from this initial autonomous wake. Reply briefly that you are idle and waiting for explicit Fugue host signals, issue-lead messages, or operator messages. When a Fugue host signal arrives, treat that signal payload as the task context and then coordinate through the provided tools one call at a time."),
-            BTreeMap::from([("role".to_string(), KAPELLMEISTER.to_string())]),
+            BTreeMap::from([
+                ("role".to_string(), KAPELLMEISTER.to_string()),
+                ("display_name".to_string(), "Queue coordinator".to_string()),
+            ]),
             None,
             None,
             self.meerkat.auth_binding.as_ref(),
         )
         .await?;
+        self.wire_repository_members(&runtime).await?;
         Ok(())
+    }
+
+    pub(crate) async fn wire_repository_members(
+        &self,
+        runtime: &UnifiedRuntime,
+    ) -> Result<(), String> {
+        let Some(binding) = self.repository_binding() else {
+            return Ok(());
+        };
+        let authority = runtime
+            .identity_runtime()
+            .ok_or("repository identity runtime is missing")?;
+        let identities = self
+            .specialists
+            .get()
+            .into_iter()
+            .flatten()
+            .map(|specialist| specialist.identity.clone())
+            .chain(std::iter::once(format!(
+                "{}:representative",
+                binding.repository
+            )));
+        for identity in identities {
+            let identity = meerkat_meta::identity_first::AgentIdentity::parse(&identity)
+                .map_err(|error| error.to_string())?;
+            let status = authority
+                .status(&identity)
+                .await
+                .map_err(|error| error.to_string())?;
+            if status.agent_runtime_id.is_none() {
+                return Err(format!("specialist {identity} is unavailable"));
+            }
+        }
+        // One repository is one communication group. Reconcile the native
+        // roster on bootstrap as well as admission so existing installations
+        // gain missing links without replacing members or their sessions.
+        let members = runtime.mob_handle().list_members().await;
+        for (index, member) in members.iter().enumerate() {
+            for peer in &members[index + 1..] {
+                wire_pair(
+                    runtime,
+                    member.agent_identity.as_str(),
+                    peer.agent_identity.as_str(),
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn repository_collaboration_prompt(&self, prompt: String) -> String {
+        if self.repository_binding().is_none() {
+            return prompt;
+        }
+        use std::fmt::Write;
+        let mut directory = String::new();
+        for specialist in self.specialists.get().into_iter().flatten() {
+            let _ = writeln!(
+                directory,
+                "- {}: {}. {}. Paths: {:?}",
+                specialist.identity, specialist.label, specialist.focus, specialist.paths
+            );
+        }
+        format!(
+            "{prompt}\n\nRepository specialist directory:\n{directory}\nYou share this repository mob with its persistent domain specialists and representative. Use native peers to discover them. Consult the relevant domain specialist before planning or implementing a change, and include its response as evidence in your handoff. Consult an independent specialist for review where its charter applies. These specialists retain repository knowledge between tickets. After changing their domain, send the affected specialists a change summary, changed paths, tests, and commit SHA. Share the ticket worktree path and commit SHA; specialists can use repository_read_revision to inspect that commit without changing the checkout. Include an uncommitted diff directly when no commit exists yet; do not ask them to mutate the main checkout. WorkGraph is the same shared ledger for this whole repository. If consultation fails, report the blocker rather than silently substituting a generic role."
+        )
     }
 
     pub async fn deliver_repo_kapellmeister_signal_batch(
@@ -264,6 +417,12 @@ impl MetaRuntimeRegistry {
         })
     }
 
+    pub fn use_console(&self, console: Arc<crate::console::ConsoleHub>) -> Result<(), String> {
+        self.console
+            .set(console)
+            .map_err(|_| "console is already attached".into())
+    }
+
     pub async fn reference_console_router<S>(
         &self,
         decision_state: RuntimeDecisionState,
@@ -271,6 +430,17 @@ impl MetaRuntimeRegistry {
     where
         S: Clone + Send + Sync + 'static,
     {
+        if let Some(console) = self.console.get() {
+            if self.repository_binding().is_none() {
+                use sha2::{Digest, Sha256};
+                let key = format!(
+                    "queue-{:x}",
+                    Sha256::digest(self.state_path().as_os_str().as_encoded_bytes())
+                );
+                console.register(key, self.runtime().await?);
+            }
+            return Ok(console.router(decision_state).with_state::<S>(()));
+        }
         let runtime = self.runtime().await?;
         Ok(runtime
             .build_reference_app_router_with_console_visibility_policy(
@@ -289,6 +459,9 @@ impl MetaRuntimeRegistry {
             return Ok(runtime.clone());
         }
 
+        if self.repository_binding().is_some() {
+            return Err("Repository formation has not attached its shared mob yet".into());
+        }
         let definition = self.mob_definition()?;
         let state_path = self.state_path();
         let (runtime, meta_task_runtime) = build_unified_runtime(
@@ -301,7 +474,7 @@ impl MetaRuntimeRegistry {
                 .collect(),
             self.meerkat.auth_binding.clone(),
             self.meerkat.max_sessions,
-            self.independent_review.orchestrator_profile.clone(),
+            self.independent_review.clone(),
             self.repo_mcp_servers.clone(),
             self.tracker.clone(),
             self.host_api_url.clone(),
@@ -341,6 +514,10 @@ impl MetaRuntimeRegistry {
         let Some(runtime) = guard.take() else {
             return Ok(());
         };
+        if self.repository_binding().is_some() {
+            // Ensemble owns shutdown. The queue only relinquishes its lease.
+            return Ok(());
+        }
         let report = runtime.shutdown().await;
         let drain_task = self
             .event_drain_task
@@ -358,7 +535,12 @@ impl MetaRuntimeRegistry {
     }
 
     fn mob_definition(&self) -> Result<MobDefinition, String> {
-        let mut definition = MobDefinition::explicit(MOB_ID);
+        let model = self
+            .meerkat
+            .model
+            .as_deref()
+            .unwrap_or(default_agent_model());
+        let mut definition = MobDefinition::explicit(self.meerkat.mob_id().as_ref());
         definition.limits = Some(LimitsSpec {
             max_orphaned_turns: Some(DEFAULT_NATIVE_MAX_ORPHANED_TURNS),
             ..LimitsSpec::default()
@@ -368,6 +550,7 @@ impl MetaRuntimeRegistry {
             ProfileBinding::Inline(Box::new(control_profile(
                 "Repo-level Fugue coordinator",
                 &self.repo_mcp_servers,
+                model,
             ))),
         );
         let issue_lead_profile = match self
@@ -377,7 +560,11 @@ impl MetaRuntimeRegistry {
             .find(|member| is_issue_lead_member(member))
         {
             Some(member) => agent_profile(&member.agent, &self.repo_mcp_servers)?,
-            None => control_profile("Issue-level Fugue coordinator", &self.repo_mcp_servers),
+            None => control_profile(
+                "Issue-level Fugue coordinator",
+                &self.repo_mcp_servers,
+                model,
+            ),
         };
         definition.profiles.insert(
             ProfileName::from(ISSUE_LEAD),
@@ -412,6 +599,7 @@ impl MetaRuntimeRegistry {
                     ProfileBinding::Inline(Box::new(final_reviewer_profile(
                         &reviewer.id,
                         &self.repo_mcp_servers,
+                        model,
                     )))
                 });
         }
@@ -424,6 +612,7 @@ impl MetaRuntimeRegistry {
                 .or_insert_with(|| {
                     ProfileBinding::Inline(Box::new(independent_review_orchestrator_profile(
                         &self.repo_mcp_servers,
+                        model,
                     )))
                 });
         }
@@ -502,6 +691,9 @@ impl MetaRuntimeRegistry {
 }
 
 pub fn meta_runtime_state_path(meerkat: &MeerkatConfig) -> PathBuf {
+    if let Some(binding) = &meerkat.repository_runtime {
+        return binding.state_path.clone();
+    }
     meerkat
         .state_root
         .clone()
@@ -515,9 +707,12 @@ pub struct MetaRuntimeNativeMobExecutionHost {
 }
 
 struct FugueDirectToolSessionHook {
+    connections: Option<Arc<crate::setup::connections::Connections>>,
+    mob_id: String,
     agent_profiles: BTreeMap<String, NativeAgentProfile>,
     default_auth_binding: Option<meerkat_core::AuthBindingRef>,
     review_orchestrator_profile: String,
+    independent_review_enabled: bool,
     tracker: TrackerConfig,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
@@ -530,11 +725,12 @@ struct FugueDirectToolSessionHook {
 #[async_trait]
 impl SessionHook for FugueDirectToolSessionHook {
     async fn before_create(&self, req: &mut CreateSessionRequest) -> Result<(), SessionError> {
-        let authority = HostToolAuthority::for_binding(
+        let authority = HostToolAuthority::for_mob_binding(
             req.build
                 .as_ref()
                 .and_then(|build| build.mob_member_binding.as_ref()),
             &self.review_orchestrator_profile,
+            &self.mob_id,
         );
         let workspace_root = fugue_worktree_path_from_request(req);
         let profile = req
@@ -580,6 +776,12 @@ impl SessionHook for FugueDirectToolSessionHook {
             build.auth_binding = self.default_auth_binding.clone();
         }
         build.keep_alive = true;
+        if let Some(connections) = &self.connections {
+            build
+                .shell_env
+                .get_or_insert_with(Default::default)
+                .extend(connections.github_environment());
+        }
         let direct_tools = direct_tool_dispatcher(
             &self.tracker,
             self.host_api_url.clone(),
@@ -590,6 +792,8 @@ impl SessionHook for FugueDirectToolSessionHook {
             self.review_handoff_states.clone(),
             self.action_states.clone(),
             self.workgraph_gate.clone(),
+            self.independent_review_enabled,
+            self.connections.clone(),
         );
         let existing_tools = build.external_tools.take();
         let fugue_tools = match workspace_root {
@@ -604,6 +808,7 @@ impl SessionHook for FugueDirectToolSessionHook {
                     direct_tools,
                     builtins,
                     shell,
+                    self.connections.as_deref(),
                 )?
             }
             None => direct_tools,
@@ -673,9 +878,16 @@ fn workspace_bounded_tool_dispatcher(
     external: Arc<dyn AgentToolDispatcher>,
     builtins: bool,
     shell: bool,
+    connections: Option<&crate::setup::connections::Connections>,
 ) -> Result<Arc<dyn AgentToolDispatcher>, SessionError> {
     let workspace_root = workspace_root.to_path_buf();
-    let shell_config = shell.then(|| ShellConfig::with_project_root(workspace_root.clone()));
+    let shell_config = shell.then(|| {
+        let mut config = ShellConfig::with_project_root(workspace_root.clone());
+        if let Some(connections) = connections {
+            config.env_vars.extend(connections.github_environment());
+        }
+        config
+    });
     let mut policy = ToolPolicyLayer::new().with_mode(if builtins {
         meerkat_tools::ToolMode::AllowAll
     } else {
@@ -718,8 +930,17 @@ enum HostToolAuthority {
 }
 
 impl HostToolAuthority {
+    #[cfg(test)]
     fn for_binding(binding: Option<&meerkat_core::MobMemberBinding>, review_profile: &str) -> Self {
-        let Some(binding) = binding.filter(|binding| binding.mob_id == MOB_ID) else {
+        Self::for_mob_binding(binding, review_profile, MOB_ID)
+    }
+
+    fn for_mob_binding(
+        binding: Option<&meerkat_core::MobMemberBinding>,
+        review_profile: &str,
+        mob_id: &str,
+    ) -> Self {
+        let Some(binding) = binding.filter(|binding| binding.mob_id == mob_id) else {
             return Self::Worker;
         };
         match (binding.role.as_str(), binding.member.as_str()) {
@@ -757,6 +978,7 @@ impl HostToolAuthority {
 }
 
 struct FugueDirectToolDispatcher {
+    github: crate::github_tools::GitHubToolHost,
     tracker: TrackerConfig,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
@@ -856,7 +1078,8 @@ impl AgentToolDispatcher for FugueDirectToolDispatcher {
         }
         if is_github_fugue_tool_name(call.name) {
             let arguments = apply_direct_github_repo_scope(arguments, self.github_repo.as_ref());
-            let (is_error, content, _signals) = execute_github_fugue_tool(call.name, &arguments);
+            let (is_error, content, _signals) =
+                execute_github_fugue_tool_with_host(call.name, &arguments, &self.github);
             return Ok(ToolResult::new(call.id.to_string(), content, is_error).into());
         }
         if call.name == "fugue_start_issue_mob" {
@@ -924,6 +1147,8 @@ fn direct_tool_dispatcher(
     review_handoff_states: Vec<String>,
     action_states: Vec<String>,
     workgraph_gate: WorkGraphTerminalGate,
+    independent_review_enabled: bool,
+    connections: Option<Arc<crate::setup::connections::Connections>>,
 ) -> Arc<dyn AgentToolDispatcher> {
     let allow_issue_mutation = authority.can_move_issue();
     let tracker = tracker.clone();
@@ -976,6 +1201,14 @@ fn direct_tool_dispatcher(
         }),
     )));
     tools.retain(|tool| {
+        if !independent_review_enabled
+            && matches!(
+                tool.name.as_str(),
+                "fugue_start_independent_review" | "fugue_complete_independent_review"
+            )
+        {
+            return false;
+        }
         // Merges must traverse the typed deploy gate, even for the coordinator.
         if tool.name == "github_merge_pr" {
             return false;
@@ -998,7 +1231,17 @@ fn direct_tool_dispatcher(
             }
         })
     });
+    // These tools are in-process host callbacks. Stable source identity lets
+    // native delegation preserve the parent's witnessed tool ceiling. Without
+    // it, Meerkat correctly refuses to inherit this catalog into a child.
+    for tool in &mut tools {
+        Arc::make_mut(tool).provenance = Some(meerkat_core::ToolProvenance::new(
+            meerkat_core::ToolSourceKind::Callback,
+            "fugue-direct-tools",
+        ));
+    }
     Arc::new(FugueDirectToolDispatcher {
+        github: crate::github_tools::GitHubToolHost::with_connections(connections),
         tracker,
         host_api_url,
         host_api_auth,
@@ -1259,7 +1502,7 @@ fn build_unified_runtime(
     agent_profiles: BTreeMap<String, NativeAgentProfile>,
     default_auth_binding: Option<meerkat_core::AuthBindingRef>,
     max_sessions: usize,
-    review_orchestrator_profile: String,
+    independent_review: IndependentReviewConfig,
     servers: BTreeMap<String, NativeMcpServerConfig>,
     tracker: TrackerConfig,
     host_api_url: Option<String>,
@@ -1298,9 +1541,12 @@ fn build_unified_runtime(
             .persistent_state(state_path)
             .require_incremental_session_persistence(true)
             .session_hook(Arc::new(FugueDirectToolSessionHook {
+                connections: None,
+                mob_id: MOB_ID.to_owned(),
                 agent_profiles,
                 default_auth_binding,
-                review_orchestrator_profile,
+                review_orchestrator_profile: independent_review.orchestrator_profile,
+                independent_review_enabled: independent_review.enabled,
                 tracker,
                 host_api_url,
                 host_api_auth,
@@ -2354,12 +2600,15 @@ impl MetaRuntimeNativeMobExecutionHost {
             &issue_lead,
             None,
             member_labels(&issue, ISSUE_LEAD),
-            Some(issue_lead_prompt_for_tracker(
-                &issue,
-                plan.input.instructions.as_deref(),
-                &self.registry.tracker,
-                plan.template.linear_projection.as_ref(),
-            )),
+            Some(
+                self.registry
+                    .repository_collaboration_prompt(issue_lead_prompt_for_tracker(
+                        &issue,
+                        plan.input.instructions.as_deref(),
+                        &self.registry.tracker,
+                        plan.template.linear_projection.as_ref(),
+                    )),
+            ),
             plan.input.worktree_path.as_deref(),
             plan.template
                 .members
@@ -2370,6 +2619,7 @@ impl MetaRuntimeNativeMobExecutionHost {
         )
         .await?;
         wire_pair(&runtime, KAPELLMEISTER, &issue_lead).await?;
+        self.registry.wire_repository_members(&runtime).await?;
 
         for member in plan
             .template
@@ -2385,15 +2635,18 @@ impl MetaRuntimeNativeMobExecutionHost {
                 &identity,
                 initial_message.as_deref(),
                 member_labels(&issue, &member.name),
-                Some(worker_prompt_with_lane(
-                    &issue,
-                    &member.name,
-                    plan.input.instructions.as_deref(),
-                    running_lane(
-                        &self.registry.tracker,
-                        plan.template.linear_projection.as_ref(),
-                    ),
-                )),
+                Some(
+                    self.registry
+                        .repository_collaboration_prompt(worker_prompt_with_lane(
+                            &issue,
+                            &member.name,
+                            plan.input.instructions.as_deref(),
+                            running_lane(
+                                &self.registry.tracker,
+                                plan.template.linear_projection.as_ref(),
+                            ),
+                        )),
+                ),
                 plan.input.worktree_path.as_deref(),
                 member
                     .agent
@@ -2403,6 +2656,7 @@ impl MetaRuntimeNativeMobExecutionHost {
             )
             .await?;
             wire_pair(&runtime, &issue_lead, &identity).await?;
+            self.registry.wire_repository_members(&runtime).await?;
         }
         wire_template_members(&runtime, &issue, &plan.template).await?;
         self.set_run_status(&run_id, MobRunStatus::Running)?;
@@ -2479,7 +2733,7 @@ impl MetaRuntimeNativeMobExecutionHost {
         let envelopes = tokio::time::timeout(
             META_EVENT_QUERY_TIMEOUT,
             runtime.query_mob_events(&EventQuery {
-                mob_id: Some(MOB_ID.to_string()),
+                mob_id: Some(self.registry.meerkat.mob_id().into_owned()),
                 after_seq,
                 limit: Some(usize::from(input.limit)),
                 ..EventQuery::default()
@@ -2857,6 +3111,7 @@ fn meta_runtime_run_status_is_active(status: MobRunStatus) -> bool {
 fn control_profile(
     description: &str,
     mcp_servers: &BTreeMap<String, NativeMcpServerConfig>,
+    model: &str,
 ) -> Profile {
     Profile {
         model_fallback: None,
@@ -2865,7 +3120,7 @@ fn control_profile(
         image_generation_provider: None,
         auto_compact_threshold: None,
         resume_overrides: Vec::new(),
-        model: DEFAULT_AGENT_MODEL.to_string(),
+        model: model.to_string(),
         skills: Vec::new(),
         tools: ToolConfig {
             builtins: false,
@@ -2906,7 +3161,7 @@ fn agent_profile(
         model: agent
             .model
             .clone()
-            .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string()),
+            .unwrap_or_else(|| default_agent_model().to_string()),
         skills: agent.skills.clone(),
         tools: ToolConfig {
             builtins: agent
@@ -2975,6 +3230,7 @@ fn agent_mcp_servers(
 fn final_reviewer_profile(
     reviewer_id: &str,
     mcp_servers: &BTreeMap<String, NativeMcpServerConfig>,
+    model: &str,
 ) -> Profile {
     Profile {
         model_fallback: None,
@@ -2983,7 +3239,7 @@ fn final_reviewer_profile(
         image_generation_provider: None,
         auto_compact_threshold: None,
         resume_overrides: Vec::new(),
-        model: DEFAULT_AGENT_MODEL.to_string(),
+        model: model.to_string(),
         skills: Vec::new(),
         tools: ToolConfig {
             builtins: true,
@@ -3005,6 +3261,7 @@ fn final_reviewer_profile(
 
 fn independent_review_orchestrator_profile(
     mcp_servers: &BTreeMap<String, NativeMcpServerConfig>,
+    model: &str,
 ) -> Profile {
     Profile {
         model_fallback: None,
@@ -3013,7 +3270,7 @@ fn independent_review_orchestrator_profile(
         image_generation_provider: None,
         auto_compact_threshold: None,
         resume_overrides: Vec::new(),
-        model: DEFAULT_AGENT_MODEL.to_string(),
+        model: model.to_string(),
         skills: Vec::new(),
         tools: ToolConfig {
             builtins: true,
@@ -3220,9 +3477,17 @@ fn issue_key(issue: &LinearIssueRef) -> String {
 }
 
 fn member_labels(issue: &str, role: &str) -> BTreeMap<String, String> {
+    let label = match role {
+        ISSUE_LEAD => "Issue lead",
+        "planner" => "Planner",
+        "coder" => "Coder",
+        "reviewer" => "Reviewer",
+        other => other,
+    };
     BTreeMap::from([
         ("issue".to_string(), issue.to_string()),
         ("role".to_string(), role.to_string()),
+        ("display_name".to_string(), format!("{issue} / {label}")),
     ])
 }
 
@@ -3246,8 +3511,11 @@ fn issue_lead_prompt_for_tracker(
         return issue_lead_prompt(issue, instructions);
     }
     let active = running_lane(tracker, projection);
+    let handoff = projection
+        .map(|projection| projection.terminal_lanes.succeeded.as_str())
+        .unwrap_or("the configured development handoff lane");
     format!(
-        "You are the Fugue issue lead for {issue}. Coordinate visible worker peers through Meta comms. You own issue-level Jira lane projection: inspect the issue, update the Workpad, and use linear_move_issue with the configured Jira status names. Kapellmeister owns repo-level startup/resume/retire coordination. Once intake is accepted, project the issue to {active}. Record internal planner/coder/reviewer/remediation phases in labels, WorkGraph, Workpad, and Meta evidence. Follow the template's configured node and terminal projections; never invent tracker statuses or enter operator action lanes from inside the issue mob. Terminal success means accepted development work; merge is a separate action. Red review, failed checks, or actionable operator findings must create or update WorkGraph blockers and keep or return the issue to {active} for focused replanning. Use labels `fugue`, `issue:{issue}`, and `blocking`. Deleted comments do not clear obligations without explicit newer acceptance. Use the default WorkGraph scope: omit realm_id and namespace unless following an exact returned item reference; never invent a realm or namespace from the issue identifier. Planner/coder may claim, update, and add evidence, but only reviewer-role agents may close completed review obligations. Before terminal success, query WorkGraph yourself and verify every blocking `issue:{issue}` item is terminal. Execute actual transition calls before reporting lane movement complete.\n\n{}",
+        "You are the Fugue issue lead for {issue}. Coordinate visible worker peers through Meta comms. You own issue-level Jira lane projection: inspect the issue, update the Workpad, and use linear_move_issue with the configured Jira status names. Kapellmeister owns repo-level startup/resume/retire coordination. Once intake is accepted, project the issue to {active}. Record internal planner/coder/reviewer/remediation phases in labels, WorkGraph, Workpad, and Meta evidence. Follow the template's configured node and terminal projections; never invent tracker statuses or enter operator action lanes from inside the issue mob. Successful development projects to {handoff} after review and WorkGraph obligations are satisfied. A configured review holding lane may be entered for this handoff; it is distinct from operator action lanes. Do not substitute the tracker completion lane for this projection. Merging requires a separate explicit action and verified merge completion follows its configured success projection. Red review, failed checks, or actionable operator findings must create or update WorkGraph blockers and keep or return the issue to {active} for focused replanning. Use labels `fugue`, `issue:{issue}`, and `blocking`. Deleted comments do not clear obligations without explicit newer acceptance. Use the default WorkGraph scope: omit realm_id and namespace unless following an exact returned item reference; never invent a realm or namespace from the issue identifier. Planner/coder may claim, update, and add evidence, but only reviewer-role agents may close completed review obligations. Before terminal success, query WorkGraph yourself and verify every blocking `issue:{issue}` item is terminal. Execute actual transition calls before reporting lane movement complete.\n\n{}",
         instructions.unwrap_or_default()
     )
 }
@@ -3272,7 +3540,7 @@ fn worker_prompt_with_lane(
 ) -> String {
     let role_contract = match member {
         "reviewer" => format!(
-            "Reviewer contract for {issue}: query WorkGraph items labeled `fugue`, `issue:{issue}`, and `blocking` before deciding green/red. Use the default WorkGraph scope: omit realm_id and namespace unless an exact item reference gives you a scope; never invent a realm or namespace from the issue identifier. For every review pass, use a fresh neutral review helper through the mob/delegate tooling when available; give it strict neutral instructions to inspect the diff against base with shell/GitHub tools and query WorkGraph itself. Do not hand it a precomputed diff, curated findings, or a WorkGraph dump. If review is green, close only the completed WorkGraph obligations with workgraph_close after verifying evidence; if red, create or update blocking WorkGraph items and ask the issue lead to keep or project the issue to {active} for focused replanning/remediation with phase evidence."
+            "Reviewer contract for {issue}: query WorkGraph items labeled `fugue`, `issue:{issue}`, and `blocking` before deciding green/red. Use the default WorkGraph scope: omit realm_id and namespace unless an exact item reference gives you a scope; never invent a realm or namespace from the issue identifier. For every review pass, use a fresh neutral review helper through native fork_off with message_count: 0. The empty transcript avoids inheriting earlier conclusions while the native fork preserves your issue workspace and WorkGraph scope. Plain delegate inherits tool visibility but does not preserve this issue workspace. Give the child strict neutral instructions to verify its working directory first, independently inspect the diff against base with shell/GitHub tools, and query WorkGraph itself; it must not delegate further, change code, close obligations, or move tracker lanes. Do not hand it a precomputed diff, curated findings, or a WorkGraph dump. Await its native result, record the evidence, and retire it. A workspace refusal blocks review; never work around it. If review is green, close only the completed WorkGraph obligations with workgraph_close after verifying evidence; if red, create or update blocking WorkGraph items and ask the issue lead to keep or project the issue to {active} for focused replanning/remediation with phase evidence."
         ),
         "planner" => format!(
             "Planner contract for {issue}: inspect WorkGraph items labeled `fugue`, `issue:{issue}`, and `blocking`, turn open obligations into concrete Workpad plan items, and add WorkGraph evidence as planning clarifies scope. Use the default WorkGraph scope: omit realm_id and namespace unless an exact item reference gives you a scope; never invent a realm or namespace from the issue identifier. Do not close WorkGraph review obligations."
@@ -3360,7 +3628,7 @@ fn block_on<T>(future: impl Future<Output = T>) -> Result<T, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use crate::config::{MaterializedMobMember, MobExecutionBackend};
@@ -3504,7 +3772,7 @@ mod tests {
         false
     }
 
-    fn test_meerkat_config(state_root: PathBuf) -> MeerkatConfig {
+    pub(crate) fn test_meerkat_config(state_root: PathBuf) -> MeerkatConfig {
         let realm_suffix = state_root
             .parent()
             .and_then(|path| path.file_name())
@@ -3513,6 +3781,8 @@ mod tests {
         let context_root = state_root.join("context");
         let user_config_root = state_root.join("user-config");
         MeerkatConfig {
+            runtime_connections: None,
+            repository_runtime: None,
             command: "rkat-rpc".to_string(),
             realm: Some(format!("fugue-test-{realm_suffix}")),
             instance: None,
@@ -3521,7 +3791,7 @@ mod tests {
             context_root: Some(context_root),
             user_config_root: Some(user_config_root),
             auth_binding: None,
-            model: Some(DEFAULT_AGENT_MODEL.to_string()),
+            model: Some(default_agent_model().to_string()),
             provider: None,
             max_tokens: None,
             system_prompt: None,
@@ -3661,7 +3931,38 @@ mod tests {
             Vec::new(),
             Vec::new(),
             WorkGraphTerminalGate::new("/unused/workgraph.sqlite3", Vec::new(), Vec::new()),
+            true,
+            None,
         )
+    }
+
+    #[tokio::test]
+    async fn disabled_independent_review_is_absent_from_host_tool_catalog() {
+        let tools = direct_tool_dispatcher(
+            &tracker_with_key(),
+            None,
+            None,
+            HostToolAuthority::Coordinator,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            WorkGraphTerminalGate::new("/unused/workgraph.sqlite3", Vec::new(), Vec::new()),
+            false,
+            None,
+        );
+        assert!(!tools.tools().iter().any(|tool| {
+            matches!(
+                tool.name.as_str(),
+                "fugue_start_independent_review" | "fugue_complete_independent_review"
+            )
+        }));
+        assert!(
+            tools
+                .tools()
+                .iter()
+                .any(|tool| tool.name == "fugue_run_deploy")
+        );
     }
 
     #[tokio::test]
@@ -3759,6 +4060,23 @@ mod tests {
         assert!(!lead.contains("Queue is the intake lane"));
         assert!(!reviewer.contains("project the issue to Active"));
         assert!(lead.contains("omit realm_id and namespace"));
+        assert!(!lead.contains("Terminal success means accepted development work"));
+        let projection = crate::config::MaterializedLinearProjection {
+            id: "development".into(),
+            node_lanes: BTreeMap::new(),
+            node_phase_labels: BTreeMap::new(),
+            aggregate: crate::config::NativeLinearProjectionAggregate {
+                precedence: vec!["Working".into()],
+                fallback: Some("Working".into()),
+            },
+            terminal_lanes: crate::config::NativeLinearProjectionTerminals {
+                succeeded: "Awaiting approval".into(),
+                failed: "Working".into(),
+                cancelled: "Closed".into(),
+            },
+        };
+        let lead = issue_lead_prompt_for_tracker("TEST-1", None, &tracker, Some(&projection));
+        assert!(lead.contains("Successful development projects to Awaiting approval"));
     }
 
     #[test]
@@ -3767,6 +4085,9 @@ mod tests {
 
         assert!(prompt.contains("project the issue to Active"));
         assert!(prompt.contains("focused replanning/remediation with phase evidence"));
+        assert!(prompt.contains("fork_off with message_count: 0"));
+        assert!(prompt.contains("verify its working directory first"));
+        assert!(prompt.contains("it must not delegate further"));
     }
 
     #[test]
@@ -3977,9 +4298,12 @@ mod tests {
         let worktree = temp.path().join("worktree");
         std::fs::create_dir_all(&worktree).expect("create worktree");
         let hook = FugueDirectToolSessionHook {
+            connections: None,
+            mob_id: MOB_ID.to_owned(),
             agent_profiles: BTreeMap::new(),
             default_auth_binding: None,
             review_orchestrator_profile: IndependentReviewConfig::default().orchestrator_profile,
+            independent_review_enabled: false,
             tracker: tracker_with_key(),
             host_api_url: None,
             host_api_auth: None,
@@ -3993,7 +4317,7 @@ mod tests {
             ),
         };
         let mut req = CreateSessionRequest {
-            model: DEFAULT_AGENT_MODEL.to_string(),
+            model: default_agent_model().to_string(),
             prompt: meerkat_core::types::ContentInput::Text(
                 "You are coder for Fugue issue LUC-900.".to_string(),
             ),
@@ -4042,6 +4366,25 @@ mod tests {
         assert!(tool_names.iter().any(|name| name == "shell"));
         assert!(tool_names.iter().any(|name| name == "apply_patch"));
         assert!(tool_names.iter().any(|name| name == "linear_inspect_issue"));
+        let tools = dispatcher.tools();
+        let filter = meerkat_core::tool_scope::ToolFilter::Allow(
+            tools
+                .iter()
+                .filter(|tool| {
+                    is_linear_fugue_tool_name(&tool.name) || is_github_fugue_tool_name(&tool.name)
+                })
+                .map(|tool| tool.name.clone())
+                .collect(),
+        );
+        let definitions = tools
+            .iter()
+            .map(|tool| tool.as_ref().clone())
+            .collect::<Vec<_>>();
+        let witnesses =
+            meerkat_core::tool_scope::filter_witnesses_for_tool_defs(&definitions, &filter);
+        meerkat_core::tool_scope::validate_witnessed_filter_authority(&filter, &witnesses)
+            .expect("native helper inheritance retains Fugue tool provenance");
+
         assert!(
             !tool_names.iter().any(|name| name == "linear_move_issue"),
             "worker sessions still must not get lane mutation tools"
@@ -4082,9 +4425,12 @@ mod tests {
     async fn session_hook_preserves_existing_external_tools() {
         let temp = tempfile::tempdir().expect("tempdir");
         let hook = FugueDirectToolSessionHook {
+            connections: None,
+            mob_id: MOB_ID.to_owned(),
             agent_profiles: BTreeMap::new(),
             default_auth_binding: None,
             review_orchestrator_profile: IndependentReviewConfig::default().orchestrator_profile,
+            independent_review_enabled: false,
             tracker: tracker_with_key(),
             host_api_url: None,
             host_api_auth: None,
@@ -4098,7 +4444,7 @@ mod tests {
             ),
         };
         let mut req = CreateSessionRequest {
-            model: DEFAULT_AGENT_MODEL.to_string(),
+            model: default_agent_model().to_string(),
             prompt: meerkat_core::types::ContentInput::Text(
                 "You are coder for Fugue issue LUC-900.".to_string(),
             ),
@@ -4150,7 +4496,7 @@ mod tests {
     #[test]
     fn quoted_coordinator_text_does_not_grant_mutation_authority() {
         let mut req = CreateSessionRequest {
-            model: DEFAULT_AGENT_MODEL.to_string(),
+            model: default_agent_model().to_string(),
             prompt: meerkat_core::types::ContentInput::Text(
                 "You have been spawned as 'FUG-607/issue_lead' (role: issue_lead) in mob 'fugue'."
                     .to_string(),
@@ -4371,7 +4717,7 @@ mod tests {
             ("github".to_string(), mcp_server(&["fugue-github-mcp"], &[])),
             ("docs".to_string(), mcp_server(&["docs-mcp"], &[])),
         ]);
-        let control = control_profile("repo coordinator", &mcp_servers);
+        let control = control_profile("repo coordinator", &mcp_servers, default_agent_model());
         let worker = agent_profile(
             &native_agent_profile(&[
                 "mob",
@@ -4450,8 +4796,9 @@ mod tests {
             ),
         ]);
 
-        let final_reviewer = final_reviewer_profile("tests", &mcp_servers);
-        let independent_orchestrator = independent_review_orchestrator_profile(&mcp_servers);
+        let final_reviewer = final_reviewer_profile("tests", &mcp_servers, default_agent_model());
+        let independent_orchestrator =
+            independent_review_orchestrator_profile(&mcp_servers, default_agent_model());
 
         assert_eq!(
             final_reviewer
@@ -4497,6 +4844,44 @@ mod tests {
         assert!(profile.tools.workgraph);
         assert!(profile.tools.mcp_servers.is_empty());
         assert_eq!(profile.runtime_mode, MobRuntimeMode::AutonomousHost);
+    }
+
+    #[test]
+    fn coordinator_and_review_profiles_honor_the_workspace_model() {
+        for model in [None, Some("gpt-5.5"), Some("custom-model")] {
+            let mut config = test_meerkat_config(PathBuf::from("/tmp/fugue-state"));
+            config.model = model.map(str::to_owned);
+            let registry =
+                MetaRuntimeRegistry::with_templates(config, BTreeMap::new(), BTreeMap::new())
+                    .with_final_review_reviewers(vec![FinalReviewReviewerConfig {
+                        id: "tests".into(),
+                        profile: "final_tests".into(),
+                        required: true,
+                    }])
+                    .with_independent_review_config(IndependentReviewConfig {
+                        enabled: true,
+                        orchestrator_profile: "review_orchestrator".into(),
+                        ..Default::default()
+                    });
+            let definition = registry.mob_definition().expect("valid definition");
+            for name in [
+                KAPELLMEISTER,
+                ISSUE_LEAD,
+                "final_tests",
+                "review_orchestrator",
+            ] {
+                let ProfileBinding::Inline(profile) =
+                    &definition.profiles[&ProfileName::from(name)]
+                else {
+                    panic!("generated profile must be inline")
+                };
+                assert_eq!(
+                    profile.model,
+                    model.unwrap_or_else(default_agent_model),
+                    "{name}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5017,6 +5402,7 @@ mod tests {
             Arc::new(StaticToolDispatcher::with_tool("linear_inspect_issue")),
             false,
             false,
+            None,
         )
         .expect("dispatcher");
         let names = tools.tools();

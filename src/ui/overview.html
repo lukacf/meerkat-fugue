@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Home | Fugue</title>
+<style>
+.home-metrics { display:grid; grid-template-columns:repeat(3,1fr); gap:18px; margin-bottom:28px; }
+.home-metric { padding:22px 24px; }
+.home-metric span { display:block; color:var(--muted); font-size:13px; }
+.home-metric strong { display:block; font-size:30px; letter-spacing:-1px; margin:8px 0 2px; font-weight:600; }
+.home-columns { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(280px,1fr); gap:24px; align-items:start; }
+.home-row { display:flex; align-items:center; gap:16px; padding:20px 24px; border-bottom:1px solid var(--hair); color:var(--ink); text-decoration:none; }
+.home-row:last-child { border:0; }
+a.home-row:hover { background:#f7faf9; }
+.home-row .repo-symbol { display:grid; place-items:center; width:42px; height:42px; border:1px solid var(--hair); border-radius:10px; color:var(--accent); font:20px var(--bs-font-mono); flex:none; }
+.home-row .row-content { flex:1; min-width:0; }
+.home-row strong { font-size:15px; font-weight:550; overflow-wrap:anywhere; }
+.home-row small { display:block; color:var(--muted); margin-top:4px; font-size:12px; overflow-wrap:anywhere; }
+.home-note { padding:24px; border-top:1px solid var(--hair); }
+.home-note p { margin:8px 0 16px; }
+.home-activity { margin-top:24px; }
+@media(max-width:760px) { .home-columns { grid-template-columns:1fr; } .home-metrics { gap:10px; } .home-metric { padding:16px; } .home-metric strong { font-size:26px; } .home-row { padding:18px; flex-wrap:wrap; } }
+</style></head><body>
+<main class="fugue-page">
+  <div class="fugue-heading"><div><div class="fugue-kicker">YOUR WORKSPACE</div><h1>Work at a glance.</h1><p>Create a ticket, follow its progress, and review the result.</p></div><div class="fugue-actions"><a class="fugue-button primary" href="/issues">Open work queue</a><a class="fugue-button" href="/ensemble#add">+ Add repository</a></div></div>
+  <div id="homeError" class="fugue-message fugue-error" role="alert" hidden></div>
+  <div id="homeSetup" class="fugue-message" role="status" hidden></div>
+  <div class="home-metrics"><div class="fugue-panel home-metric"><span>Repositories</span><strong id="repositoryCount">...</strong><span id="teamSummary">Loading your teams</span></div><div class="fugue-panel home-metric"><span>Running issues</span><strong id="runningCount">...</strong><span>From the live work queue</span></div><div class="fugue-panel home-metric"><span>Awaiting retry</span><strong id="retryCount">...</strong><span>Issues waiting to resume</span></div></div>
+  <div class="home-columns"><section class="fugue-panel"><div class="fugue-panel-head"><h2>Repositories</h2><a href="/ensemble">Manage repositories &rarr;</a></div><div id="homeRepos"><div class="fugue-empty">Loading repositories...</div></div></section>
+  <section class="fugue-panel"><div class="fugue-panel-head"><h2>Connected work queue</h2><span class="fugue-tag" id="trackerKind">Loading</span></div><div class="home-note" style="border:0"><strong id="queueProject">Loading configuration...</strong><p id="queueScope"></p><a class="fugue-button" href="/issues">View issues &rarr;</a></div><div class="home-note"><strong>Set up once. Work through tickets.</strong><p>Repository setup maps the code and creates its agents. The work queue is where you create, track, and review issues.</p><a class="fugue-button" href="/ensemble">Repository setup &rarr;</a></div></section></div>
+  <section class="fugue-panel home-activity"><div class="fugue-panel-head"><h2>Work in progress</h2><a href="/issues">All tracked work &rarr;</a></div><div id="homeWork"><div class="fugue-empty">Loading live work...</div></div></section>
+</main>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+const el=(tag, cls, text)=>{const n=document.createElement(tag);n.className=cls;n.textContent=text;return n;};
+async function json(url){const r=await fugueFetch(url,{cache:'no-store'});if(!r.ok)throw new Error(`${url.includes('ensemble')?'Repositories':'Work queue'} unavailable (${r.status})`);return r.json();}
+async function loadHome(){
+  const errors=[];
+  const results=await Promise.allSettled([json('/api/ensemble'),json('/api/v1/state'),json('/api/v1/workspace')]);
+  const [teams,state,context]=results.map(result=>{if(result.status==='fulfilled')return result.value;errors.push(result.reason.message);return null;});
+  if(teams){
+    const repos=Object.entries(teams.repositories),runtime=teams.runtime.repositories;
+    $('repositoryCount').textContent=repos.length;
+    $('teamSummary').textContent=`${runtime.filter(r=>r.preparation==='ready').length} teams ready`;
+    $('homeSetup').hidden=!['preparing','failed'].includes(teams.setup?.phase);
+    $('homeSetup').textContent=teams.setup?.phase==='failed'?`Team setup needs attention: ${teams.setup.error}. Open Repositories to retry.`:'Preparing repository teams. You can use the work queue while setup completes.';
+    $('homeRepos').replaceChildren();
+    for(const [id,config]of repos){const native=runtime.find(r=>r.repo===id);const a=el('a','home-row','');a.href=fugueUrl(`/ensemble?repo=${encodeURIComponent(id)}`);a.append(el('span','repo-symbol','</>'));const text=el('div','row-content','');text.append(el('strong','',id),el('small','',config.path));a.append(text,el('span','fugue-tag',native?.preparation==='ready'?`${native.members.length} team members`:teams.setup?.phase==='failed'?'Setup failed':'Preparing'));$('homeRepos').append(a);}
+    if(!repos.length){const empty=el('div','fugue-empty','');empty.append(el('strong','','Set up your first repository.'),document.createTextNode('Add a local checkout to map the codebase and prepare its agents.'));$('homeRepos').append(empty);}
+  }
+  if(state){
+    $('runningCount').textContent=state.running.length;$('retryCount').textContent=state.retrying.length;
+    $('homeWork').replaceChildren();
+    for(const issue of [...state.running,...state.retrying]){const a=el('a','home-row','');a.href=fugueUrl(`/issues/${encodeURIComponent(issue.issue_identifier)}`);const text=el('div','row-content','');text.append(el('strong','',`${issue.issue_identifier} ${issue.issue?.title||''}`),el('small','',issue.last_message||issue.last_event||issue.error||'Waiting for the next update'));a.append(text,el('span','fugue-tag',issue.state||'Awaiting retry'));$('homeWork').append(a);}
+    if(!state.running.length&&!state.retrying.length){const empty=el('div','fugue-empty','');empty.append(el('strong','','No issues running right now.'),document.createTextNode('Browse the work queue to create an issue or see what is ready to start.'));$('homeWork').append(empty);}
+    if(state.last_error)errors.push(state.last_error);
+  }
+  if(context){$('trackerKind').textContent={'fugue-ims':'Fugue tickets',linear:'Linear',jira:'Jira'}[context.tracker]||context.tracker;$('queueProject').textContent=context.project||'Configured project';$('queueScope').textContent=context.repositories.length?`Queue repositories: ${context.repositories.join(', ')}. Adding a team does not change the queue's scope.`:'This queue uses the selection in your Fugue configuration. Adding a repository team does not add issues to the queue.';}
+  $('homeError').hidden=!errors.length;$('homeError').textContent=errors.join('. ');
+}
+loadHome();setInterval(loadHome,5000);
+</script></body></html>

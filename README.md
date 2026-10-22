@@ -31,8 +31,56 @@ This installs `meerkat-fugue`, `fugue-linear-mcp`, `fugue-jira-mcp`,
 
 Fugue currently uses
 Meerkat/Meta 0.9.3, with an exact upstream Meta backport for persisted-session
-recovery. Cargo resolves that public Git dependency automatically; see the
+recovery and shared-console names and peer links. Cargo resolves that public Git
+dependency automatically; see the
 [upgrade guide](docs/upgrading-0.9.3.mdx).
+
+## First-run setup
+
+Start Fugue with a single browser address for every repository:
+
+```bash
+meerkat-fugue serve --port 8788
+```
+
+Open **[http://127.0.0.1:8788/ensemble](http://127.0.0.1:8788/ensemble)** and choose
+**Add repository**. Paste a
+GitHub.com or GitHub Enterprise repository URL and choose `gh` or a token for
+repository access. Select built-in tickets, Jira, or Linear and its project scope.
+Then select an rkat account or environment credentials for the agents.
+Each repository has its own tracker, queue, checkout, and team.
+
+For packaged installation, atomic binary upgrades, and authenticated remote
+hosting, see the [bundle guide](scripts/distribution/README.md).
+`meerkat-fugue setup` remains available for an individual managed workspace.
+
+Setup saves repository and tracker credentials under the user's application state directory,
+separately from generated workflow files. On Unix, credential files are readable
+only by their owner. `--state-dir /absolute/private/path` selects another location;
+setup refuses locations inside Git repositories. Do not commit this directory.
+The setup command resumes an existing workspace; use `--reconfigure` to reopen
+its setup form explicitly.
+
+AI credentials belong to rkat. The account picker reads its global bindings;
+API keys are passed to `rkat auth login --non-interactive` through stdin and
+Fugue saves only the resulting binding reference. This updates rkat's default
+API-key account for that provider. Browser sign-in runs `rkat auth login` on the
+execution host. For Copilot or a remote host, run that command in a terminal on
+the host and refresh the account list. Install rkat to create accounts through
+this screen; existing environment credentials remain supported.
+
+The setup page hands over to the work queue at the same address. **Settings**
+lets you stop the runtime and reopen configuration; existing conversations and
+tickets remain saved. Empty repository/tracker token fields keep the saved token
+for the same host and account. Running `meerkat-fugue` without a workflow from a directory
+without `fugue.yaml` resumes the default managed workspace, or opens setup if it
+has not been configured.
+
+Repository setup maps the codebase and creates its agents. Daily work belongs
+in the ticket queue: create work, follow its progress, review the result, and
+inspect agent conversations in context. The generated merge action is limited
+to the selected repository and its actual default branch. Moving a reviewed
+ticket to Deploy requests a checked PR merge; it does not deploy a service.
 
 ## Run issue-driven workflows
 
@@ -58,7 +106,7 @@ meerkat-fugue fugue.yaml --port 8788
 ```
 
 Open **[http://127.0.0.1:8788/](http://127.0.0.1:8788/)** to follow the queue and
-agent activity. Fugue IMS manages local issues in the same UI. With Linear,
+agent activity. The app opens on the ticket-based **Work queue**. **Overview** summarizes live work; **Repository setup** connects checkouts and prepares their agents. Fugue IMS manages local issues in the same UI. With Linear,
 Fugue maintains one durable workpad per issue; detailed agent activity remains
 in Meta and WorkGraph.
 
@@ -113,8 +161,41 @@ To serve the issue queue and persistent repository teams together in the regular
 meerkat-fugue fugue.yaml --ensemble-config ensemble.yaml --port 8788
 ```
 
-Overview, IMS, Ensemble, and repository consoles share one local server. See
-[operations](docs/operations.mdx) for deployment, upgrades, and recovery.
+On a loopback listener, **Repository setup > Add repository** takes a GitHub URL
+and opens configuration for an independent repository workspace. Each workspace
+has its own tracker, queue, credentials, and native mob. The directory hosts their
+services in one process with explicitly scoped credentials and one native console
+at `/console`. Repository URLs retain their own loopback ports for setup and work
+queues; their console links return to the shared console. Stopping the directory
+settles its repository services, and restarting restores them. Directory state
+lives under the user's application state directory, keyed by the UI port.
+
+Fugue clones the repository automatically. An existing checkout is an Advanced
+option and must have a matching origin. Setup maps the code, creates specialists,
+and completes their domain studies. Ticket leads, coders, reviewers, and the queue
+coordinator then join that same repository mob. Execution prompts name its actual
+specialists and require domain consultation and change handoffs through native
+peers. Setup generates `meerkat.repository_runtime`, binding the queue to the
+repository's Ensemble state directory. Older configurations that split these
+runtimes must be prepared again; their existing state files are preserved.
+
+After studying the repository, each specialist registers its own file and folder
+subscriptions using `repository_subscribe`. Fugue checks the remote default branch
+once per minute and delivers matching changes through native Meta admission.
+Folder subscriptions include descendants. Notifications include changed paths and
+commit IDs; `repository_read_revision` reads the notified version without moving
+the checkout. The durable cursor and delivery outbox survive restarts, with native
+idempotency preventing duplicate admission. Failed checks remain visible in
+repository setup and are retried. Specialists can revise their subscriptions as
+their domain changes. Configure the host check in `ensemble.yaml`:
+
+```yaml
+notifications:
+  enabled: true
+  poll_interval_secs: 60
+```
+
+See [operations](docs/operations.mdx) for deployment, upgrades, and recovery.
 
 ## Execution and credentials
 

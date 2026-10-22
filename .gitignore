@@ -36,3 +36,4 @@ secrets.env
 
 # Local release helper bytecode.
 scripts/release/__pycache__/
+scripts/distribution/__pycache__/

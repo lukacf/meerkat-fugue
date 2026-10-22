@@ -3322,6 +3322,8 @@ mod tests {
 
     fn meerkat_config_with_mutating_capabilities() -> MeerkatConfig {
         MeerkatConfig {
+            runtime_connections: None,
+            repository_runtime: None,
             command: "rkat-rpc".to_string(),
             realm: None,
             instance: None,

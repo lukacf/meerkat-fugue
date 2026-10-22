@@ -1,10 +1,9 @@
 //! A thin operator surface over native runtime state and console projections.
 use std::sync::Arc;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use axum::{
     Json, Router,
-    body::to_bytes,
     extract::{DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
@@ -20,8 +19,63 @@ use super::{
 };
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
-const CONSOLE_META_TAG: &str = "<meta name=\"meta-base-url\" content=\"\" />";
 const ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="16" fill="#b9efc4"/><path d="M8 11c6-5 10 5 16 0M8 16c6-5 10 5 16 0M8 21c6-5 10 5 16 0" fill="none" stroke="#193721" stroke-width="2"/></svg>"##;
+
+pub fn workspace_router(
+    workspace: Arc<super::workspace::Workspace>,
+    queue_enabled: bool,
+) -> anyhow::Result<Router> {
+    use super::workspace;
+    let page = crate::http::inject_app_chrome(
+        include_str!("dashboard.html"),
+        crate::http::AppPage::Ensemble,
+        queue_enabled,
+    )
+    .context("repository page has no app shell insertion point")?;
+    Ok(Router::new()
+        .route(
+            "/ensemble",
+            get(move || {
+                let page = page.clone();
+                async move { Html(page) }
+            }),
+        )
+        .route(
+            "/repositories",
+            get(|| async { Redirect::temporary("/ensemble") }),
+        )
+        .route("/api/ensemble", get(workspace::status))
+        .route("/api/repos", post(workspace::add))
+        .route("/api/ensemble/retry", post(workspace::retry))
+        .route(
+            "/repos/{repo}/console",
+            get(|| async { Redirect::temporary("/console") }),
+        )
+        .route("/api/repos/{repo}/messages", post(workspace::dispatch))
+        .route(
+            "/api/repos/{repo}/meta",
+            axum::routing::any(workspace::dispatch),
+        )
+        .route(
+            "/api/repos/{repo}/meta/{*rest}",
+            axum::routing::any(workspace::dispatch),
+        )
+        .route(
+            "/console/assets/console-app.js",
+            get(meerkat_meta::http_console::console_frontend_app_js_handler),
+        )
+        .route(
+            "/console/assets/console-app.css",
+            get(meerkat_meta::http_console::console_frontend_app_css_handler),
+        )
+        .route(
+            "/favicon.ico",
+            get(|| async { ([(header::CONTENT_TYPE, "image/svg+xml")], ICON) }),
+        )
+        .with_state(workspace)
+        .layer(DefaultBodyLimit::max(MAX_MESSAGE_BYTES + 1024))
+        .layer(middleware::from_fn(local_origin_guard)))
+}
 
 pub async fn router(runtime: Arc<EnsembleRuntime>) -> anyhow::Result<Router> {
     Ok(routes(runtime, false)
@@ -58,16 +112,6 @@ async fn routes(runtime: Arc<EnsembleRuntime>, queue_enabled: bool) -> anyhow::R
         .route("/api/repos/{repo}/messages", post(ask))
         .with_state(Arc::clone(&runtime));
 
-    // Use the packaged native console rather than a second conversation model.
-    // Its supported base-url tag scopes every API request to the selected mob.
-    let response = meerkat_meta::http_console::console_frontend_index_handler()
-        .await
-        .into_response();
-    let bytes = to_bytes(response.into_body(), 1024 * 1024).await?;
-    let template = String::from_utf8(bytes.to_vec()).context("native console HTML is not UTF-8")?;
-    if !template.contains(CONSOLE_META_TAG) {
-        bail!("native console no longer exposes its expected base-url configuration");
-    }
     app = app
         .route(
             "/console/assets/console-app.js",
@@ -82,18 +126,6 @@ async fn routes(runtime: Arc<EnsembleRuntime>, queue_enabled: bool) -> anyhow::R
             .repository(id)
             .context("configured repository has no native runtime")?;
         let prefix = format!("/api/repos/{id}/meta");
-        let html = template
-            .replace(
-                CONSOLE_META_TAG,
-                &format!("<meta name=\"meta-base-url\" content=\"{prefix}\" />"),
-            )
-            .replace(
-                "<title>Meta Console</title>",
-                &format!("<title>{id} · Ensemble console</title>"),
-            );
-        let html =
-            crate::http::inject_app_chrome(&html, crate::http::AppPage::Console, queue_enabled)
-                .context("native console has no app shell insertion point")?;
         app = app
             .nest(
                 &prefix,
@@ -107,10 +139,7 @@ async fn routes(runtime: Arc<EnsembleRuntime>, queue_enabled: bool) -> anyhow::R
             )
             .route(
                 &format!("/repos/{id}/console"),
-                get(move || {
-                    let html = html.clone();
-                    async move { Html(html) }
-                }),
+                get(|| async { Redirect::temporary("/console") }),
             );
         native.reconcile_interrupted_console_sends().await;
     }
@@ -185,11 +214,13 @@ fn api_error(status: StatusCode, error: String) -> Response {
 /// Loopback listeners still receive browser requests from public websites.
 /// Reject cross-origin requests and DNS-rebinding hosts, including on the
 /// embedded native console. CLI requests without Origin remain supported.
-async fn local_origin_guard(request: Request, next: Next) -> Response {
-    if !is_local_request(request.headers()) {
+pub(crate) async fn local_origin_guard(request: Request, next: Next) -> Response {
+    if !is_local_request(request.headers())
+        && !crate::browser_access::allows_proxy(request.method(), request.headers())
+    {
         return api_error(
             StatusCode::FORBIDDEN,
-            "local same-origin access required".into(),
+            "Authenticated same-origin operator access required".into(),
         );
     }
     let mut response = next.run(request).await;

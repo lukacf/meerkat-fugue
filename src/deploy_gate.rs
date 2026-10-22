@@ -337,7 +337,10 @@ pub fn plan_deploy_gate(input: DeployGateInput) -> DeployGatePlan {
             );
         }
     }
-    if config.require_ci_success && !ci_is_green(input.ci_status) {
+    if config.require_ci_success
+        && !ci_is_green(input.ci_status)
+        && !(config.allow_no_ci_checks && input.ci_status == Some(CiStatus::NoChecks))
+    {
         return deploy_failure_plan(
             DeployGateDecision::Rework,
             config.rework_lane,
@@ -497,6 +500,31 @@ mod tests {
             ota_update_enabled: true,
             deploy_auth_available: true,
             idempotency_key: IdempotencyKey("deploy:LUC-631:201:abc123".to_string()),
+        }
+    }
+
+    #[test]
+    fn absent_ci_requires_explicit_policy_and_does_not_allow_pending_or_failed_checks() {
+        let mut input = gate_input();
+        input.ci_status = Some(CiStatus::NoChecks);
+        assert_eq!(
+            plan_deploy_gate(input.clone()).failure_category,
+            Some(DeployFailureCategory::CiNotGreen)
+        );
+        input.config.allow_no_ci_checks = true;
+        assert_eq!(plan_deploy_gate(input.clone()).failure_category, None);
+        for status in [
+            None,
+            Some(CiStatus::Pending),
+            Some(CiStatus::Failure),
+            Some(CiStatus::Error),
+            Some(CiStatus::Cancelled),
+        ] {
+            input.ci_status = status;
+            assert_eq!(
+                plan_deploy_gate(input.clone()).failure_category,
+                Some(DeployFailureCategory::CiNotGreen)
+            );
         }
     }
 

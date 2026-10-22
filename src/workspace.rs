@@ -27,6 +27,7 @@ pub struct WorkspaceInspection {
 pub struct WorkspaceManager {
     root: PathBuf,
     hooks: HooksConfig,
+    connections: Option<std::sync::Arc<crate::setup::connections::Connections>>,
 }
 
 impl WorkspaceManager {
@@ -34,6 +35,15 @@ impl WorkspaceManager {
         Self {
             root: config.root.clone(),
             hooks: hooks.clone(),
+            connections: None,
+        }
+    }
+
+    pub fn for_service(config: &crate::config::ServiceConfig) -> Self {
+        Self {
+            root: config.workspace.root.clone(),
+            hooks: config.hooks.clone(),
+            connections: config.meerkat.runtime_connections.clone(),
         }
     }
 
@@ -309,7 +319,11 @@ impl WorkspaceManager {
         fatal: bool,
     ) -> Result<()> {
         info!(hook = name, workspace = %workspace.display(), "hook starting");
-        let child = Command::new("sh")
+        let mut command = Command::new("sh");
+        if let Some(connections) = &self.connections {
+            command.envs(connections.github_environment());
+        }
+        let child = command
             .arg("-lc")
             .arg(script)
             .current_dir(workspace)

@@ -714,6 +714,12 @@ impl IssueAdapter {
         if runtime.required_states.is_empty() {
             return Ok(());
         }
+        // Built-in ticket states are configuration, not a remotely provisioned
+        // workflow. Native config validation already checks their roles and
+        // types; there is no external team or workflow to look up.
+        if matches!(self, Self::FugueIms(_)) {
+            return Ok(());
+        }
         if let Self::Jira(client) = self {
             if runtime.provisioning.mode == NativeLinearProvisioningMode::CreateMissing {
                 return Err(FugueError::InvalidConfig("Jira workflows must be provisioned by an administrator; use provisioning.mode=validate".to_string()));

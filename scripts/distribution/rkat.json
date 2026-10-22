@@ -1,0 +1,10 @@
+{
+  "version": "0.9.3",
+  "repository": "lukacf/meerkat",
+  "assets": {
+    "rkat-0.9.3-aarch64-apple-darwin.tar.gz": "c77b057dabd6c5df8d88c7dc466c855bda4d0ca66d8af6c1016a620e108c6f7c",
+    "rkat-0.9.3-aarch64-unknown-linux-gnu.tar.gz": "24d7fd6f430b6169066649b853d1d5b18fa0127a00a66b200dcd6d20d38b3a61",
+    "rkat-0.9.3-x86_64-apple-darwin.tar.gz": "11f662bb488d0b191b93d907d79b74a033e1533590510adf4fb8a80849e03418",
+    "rkat-0.9.3-x86_64-unknown-linux-gnu.tar.gz": "02f47dee7559f6210e0ec497af503b47fe4f0241fc8722daeb2a4a759c0cea63"
+  }
+}

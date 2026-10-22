@@ -94,6 +94,7 @@ pub struct RepositoryStatus {
     pub members: Vec<MemberStatus>,
     pub preparation: PreparationState,
     pub discovery: super::team::DiscoveryProvenance,
+    pub notifications: super::notifications::NotificationStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,6 +108,7 @@ pub struct MemberStatus {
     /// study admission. This does not claim that the member is currently busy.
     pub memory_enabled: bool,
     pub ownership_paths: Vec<PathBuf>,
+    pub subscriptions: Vec<PathBuf>,
     pub identity: String,
     pub runtime_alias: Option<String>,
     pub session_id: Option<String>,
@@ -128,6 +130,8 @@ struct RepositoryRuntime {
     studies: Arc<tokio::sync::Mutex<StudyJournal>>,
     study_path: PathBuf,
     grants: BTreeMap<String, MemberGrant>,
+    events: Arc<super::notifications::RepositoryEvents>,
+    event_notifications: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     event_drain: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     handoff_notifications: tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
     handoff_failure: std::sync::OnceLock<String>,
@@ -200,11 +204,20 @@ pub struct EnsembleRuntime {
     lifecycle: tokio::sync::RwLock<bool>,
     peer_coordinators: Vec<SameProcessTopologyCoordinator>,
     _state_guard: EnsembleStateGuard,
+    queue: Option<crate::meta_runtime::MetaRuntimeRegistry>,
 }
 
 impl EnsembleRuntime {
     pub async fn build(config: EnsembleConfig) -> Result<Self> {
-        Box::pin(Self::build_inner(config, None)).await
+        Box::pin(Self::build_inner(config, None, None)).await
+    }
+
+    #[cfg(not(test))]
+    pub(crate) async fn build_for_queue(
+        config: EnsembleConfig,
+        queue: crate::meta_runtime::MetaRuntimeRegistry,
+    ) -> Result<Self> {
+        Box::pin(Self::build_inner(config, None, Some(queue))).await
     }
 
     #[cfg(test)]
@@ -212,14 +225,27 @@ impl EnsembleRuntime {
         config: EnsembleConfig,
         client: Arc<dyn meerkat::LlmClient>,
     ) -> Result<Self> {
-        Box::pin(Self::build_inner(config, Some(client))).await
+        Box::pin(Self::build_inner(config, Some(client), None)).await
     }
 
-    async fn build_inner(
+    pub(crate) async fn build_inner(
         mut config: EnsembleConfig,
         client: Option<Arc<dyn meerkat::LlmClient>>,
+        queue: Option<crate::meta_runtime::MetaRuntimeRegistry>,
     ) -> Result<Self> {
         config.resolve_and_validate(&std::env::current_dir()?)?;
+        if let Some(queue) = &queue {
+            config.auth_binding = queue.auth_binding();
+            let binding = queue
+                .repository_binding()
+                .context("queue repository binding is required")?;
+            if config.repositories.len() != 1
+                || !config.repositories.contains_key(&binding.repository)
+                || binding.state_path != config.state_root.join(binding.repository.as_str())
+            {
+                bail!("queue must bind the same repository and native state directory as its team");
+            }
+        }
         let state_guard = config.claim_state()?;
         let mut this = Self {
             config,
@@ -227,6 +253,7 @@ impl EnsembleRuntime {
             lifecycle: tokio::sync::RwLock::new(false),
             peer_coordinators: Vec::new(),
             _state_guard: state_guard,
+            queue,
         };
         let result = Box::pin(this.initialize(client)).await;
         if let Err(error) = result {
@@ -241,7 +268,7 @@ impl EnsembleRuntime {
     }
 
     async fn initialize(&mut self, client: Option<Arc<dyn meerkat::LlmClient>>) -> Result<()> {
-        let connection_config = if client.is_some() {
+        let mut connection_config = if client.is_some() {
             meerkat::Config::default()
         } else {
             super::team_discovery::isolated_connection_config(
@@ -249,6 +276,9 @@ impl EnsembleRuntime {
             )
             .await?
         };
+        if let Some(queue) = &self.queue {
+            queue.configure_model(&mut connection_config)?;
+        }
         for (id, repository) in &self.config.repositories {
             let brief = discover_repository(&repository.path)?;
             let state = self.config.state_root.join(id.as_str());
@@ -265,6 +295,7 @@ impl EnsembleRuntime {
                         &brief,
                         &self.config.model,
                         self.config.auth_binding.clone(),
+                        Some(&connection_config),
                     )
                     .await?;
                     self.config.validate_team_capacity(id, &team)?;
@@ -273,6 +304,14 @@ impl EnsembleRuntime {
                 }
             };
             self.config.validate_team_capacity(id, &team)?;
+            let events = super::notifications::RepositoryEvents::open(
+                id.clone(),
+                repository.path.clone(),
+                &state,
+                self.queue
+                    .as_ref()
+                    .and_then(|queue| queue.connections().cloned()),
+            )?;
             let study_path = state.join("studies.json");
             let mut studies: StudyJournal = match std::fs::read(&study_path) {
                 Ok(bytes) => serde_json::from_slice(&bytes).context("read study journal")?,
@@ -313,7 +352,24 @@ impl EnsembleRuntime {
                 meerkat_meta::mob_composition_manifest::persistent_mob_storage(
                     state.join("mob.sqlite3"),
                 )?;
-            let desired_definition = definition(id, &self.config.model, &grants);
+            let mut desired_definition = definition(id, &self.config.model, &grants);
+            let queue_definition = self
+                .queue
+                .as_ref()
+                .map(|queue| queue.repository_definition().map_err(anyhow::Error::msg))
+                .transpose()?;
+            if let Some(queue_definition) = &queue_definition {
+                for (name, profile) in &queue_definition.profiles {
+                    if desired_definition
+                        .profiles
+                        .insert(name.clone(), profile.clone())
+                        .is_some()
+                    {
+                        bail!("ticket profile {name} conflicts with a repository specialist");
+                    }
+                }
+                desired_definition.limits = queue_definition.limits.clone();
+            }
             let handoff_runtime: super::handoff::RuntimeSlot = Arc::new(std::sync::OnceLock::new());
             if let Some(previous) = storage.created_definition_snapshot().await? {
                 let canonical = previous.definition();
@@ -336,8 +392,10 @@ impl EnsembleRuntime {
                     // Earlier Ensemble definitions omitted native memory. Only
                     // this host-owned capability changes for an existing team;
                     // model, roster and other policy drift still fail closed.
-                    for binding in migrated.profiles.values_mut() {
-                        if let ProfileBinding::Inline(profile) = binding {
+                    for (name, binding) in &mut migrated.profiles {
+                        if grants.contains_key(name.as_str())
+                            && let ProfileBinding::Inline(profile) = binding
+                        {
                             profile.tools.memory = true;
                         }
                     }
@@ -349,6 +407,17 @@ impl EnsembleRuntime {
                         .flows
                         .entry(flow_id.clone())
                         .or_insert_with(|| flow.clone());
+                }
+                if let Some(queue_definition) = &queue_definition {
+                    for (name, profile) in &queue_definition.profiles {
+                        migrated
+                            .profiles
+                            .entry(name.clone())
+                            .or_insert_with(|| profile.clone());
+                    }
+                    if migrated.limits.is_none() {
+                        migrated.limits = queue_definition.limits.clone();
+                    }
                 }
                 if canonical != &desired_definition && migrated == desired_definition {
                     // The native epoch CAS preserves history and makes the new profile
@@ -446,6 +515,26 @@ impl EnsembleRuntime {
                     concurrency: 1,
                 })
                 .session_hook(Arc::new(RepositorySessionHook {
+                    events: Arc::clone(&events),
+                    connections: self
+                        .queue
+                        .as_ref()
+                        .and_then(|queue| queue.connections().cloned()),
+                    queue_hook: self
+                        .queue
+                        .as_ref()
+                        .map(|queue| queue.repository_session_hook().map_err(anyhow::Error::msg))
+                        .transpose()?,
+                    queue_profiles: queue_definition
+                        .as_ref()
+                        .map(|definition| {
+                            definition
+                                .profiles
+                                .keys()
+                                .map(ToString::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     root: repository.path.clone(),
                     state_root: self.config.state_root.clone(),
                     auth_binding: self.config.auth_binding.clone(),
@@ -484,6 +573,8 @@ impl EnsembleRuntime {
                     studies,
                     study_path,
                     grants,
+                    events,
+                    event_notifications: tokio::sync::Mutex::new(None),
                     event_drain: tokio::sync::Mutex::new(Some(event_drain)),
                     handoff_notifications: tokio::sync::Mutex::new(None),
                     handoff_failure: std::sync::OnceLock::new(),
@@ -498,9 +589,25 @@ impl EnsembleRuntime {
         // Persisted native rosters retain historical assignments. Retire any
         // former live worker absent from the authoritative saved team before
         // wiring or admitting study work; history remains available.
+        let queue_profiles: std::collections::BTreeSet<String> = self
+            .queue
+            .as_ref()
+            .map(|queue| {
+                queue.repository_definition().map(|definition| {
+                    definition
+                        .profiles
+                        .keys()
+                        .map(ToString::to_string)
+                        .collect()
+                })
+            })
+            .transpose()
+            .map_err(anyhow::Error::msg)?
+            .unwrap_or_default();
         for (repo, entry) in &self.repositories {
             for member in entry.runtime.mob_handle().list_members().await {
-                if !entry.grants.contains_key(member.role.as_str()) {
+                let queue_member = queue_profiles.contains(member.role.as_str());
+                if !entry.grants.contains_key(member.role.as_str()) && !queue_member {
                     // The new identity registry intentionally omits this old
                     // assignment. Its surviving native mob row remains owned
                     // by the mob lifecycle, which can retire it by exact ID.
@@ -689,6 +796,20 @@ impl EnsembleRuntime {
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
         }
+        if self.config.notifications.enabled && client.is_none() {
+            for entry in self.repositories.values() {
+                for member in entry.team.specialists.keys() {
+                    entry
+                        .events
+                        .request_subscription(&entry.runtime, member)
+                        .await?;
+                }
+                *entry.event_notifications.lock().await = Some(entry.events.start(
+                    &entry.runtime,
+                    Duration::from_secs(self.config.notifications.poll_interval_secs.max(1)),
+                ));
+            }
+        }
         // Do not advertise a partially hydrated team as ready.
         for (repo, entry) in &self.repositories {
             if entry.runtime.workgraph_service().is_none() {
@@ -717,6 +838,33 @@ impl EnsembleRuntime {
             )
             .await?;
             *entry.handoff_notifications.lock().await = Some(task);
+        }
+        if let Some(queue) = &self.queue {
+            let binding = queue
+                .repository_binding()
+                .context("repository binding missing")?;
+            let runtime = self
+                .repository(&binding.repository)
+                .context("repository mob missing")?;
+            let entry = self
+                .repositories
+                .get(&binding.repository)
+                .context("repository team missing")?;
+            let specialists = entry
+                .team
+                .specialists
+                .iter()
+                .map(|(id, spec)| crate::meta_runtime::RepositorySpecialist {
+                    identity: format!("{}:{id}", binding.repository),
+                    label: spec.label.clone(),
+                    focus: spec.focus.clone(),
+                    paths: spec.ownership_paths.clone(),
+                })
+                .collect();
+            queue
+                .attach_repository_runtime(Arc::clone(runtime), specialists)
+                .await
+                .map_err(anyhow::Error::msg)?;
         }
         Ok(())
     }
@@ -918,6 +1066,7 @@ impl EnsembleRuntime {
                             .and_then(ProfileBinding::as_inline)
                             .is_some_and(|profile| profile.tools.memory),
                     ownership_paths: spec.map(|s| s.ownership_paths.clone()).unwrap_or_default(),
+                    subscriptions: entry.events.subscriptions(name).await,
                     identity: identity.to_string(),
                     runtime_alias: status.agent_runtime_id.map(|id| id.to_string()),
                     session_id: status.session_id.map(|id| id.to_string()),
@@ -930,6 +1079,7 @@ impl EnsembleRuntime {
                 brief: entry.brief.clone(),
                 members,
                 discovery: entry.team.discovery.clone(),
+                notifications: entry.events.status(&self.config.notifications).await,
                 preparation: if entry
                     .grants
                     .values()
@@ -945,6 +1095,36 @@ impl EnsembleRuntime {
             repositories,
             peers: self.config.peers.clone(),
         })
+    }
+
+    /// Enrollment reconnects native teams. Refuse while native execution is
+    /// active or cannot be observed, rather than interrupting someone's work.
+    pub async fn ensure_idle_for_configuration(&self) -> Result<()> {
+        for (repo, entry) in &self.repositories {
+            let members = entry.runtime.mob_handle().list_members().await;
+            if members.len() < entry.grants.len() {
+                bail!(
+                    "Team {repo} is not fully observable yet. Wait for setup before adding a repository."
+                );
+            }
+            for member in members {
+                let snapshot = entry
+                    .runtime
+                    .mob_handle()
+                    .member_status(&member.agent_identity)
+                    .await?;
+                let idle = snapshot.progress.as_ref().is_some_and(|progress| {
+                    progress.run_state == meerkat_mob::MemberRunState::Idle
+                        && progress.in_flight_work == 0
+                });
+                if !idle {
+                    bail!(
+                        "Team {repo} still has active or unobserved work. Wait for its conversation to finish before adding a repository."
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn ask(&self, repo: &RepoId, text: &str) -> Result<EnsembleAccepted> {
@@ -991,6 +1171,14 @@ impl EnsembleRuntime {
         *stopping = true;
         let mut errors = Vec::new();
         for (repo, entry) in &self.repositories {
+            if let Some(task) = entry.event_notifications.lock().await.take() {
+                task.abort();
+                if let Err(error) = task.await
+                    && !error.is_cancelled()
+                {
+                    errors.push(format!("{repo} repository notifications: {error}"));
+                }
+            }
             if let Some(task) = entry.handoff_notifications.lock().await.take() {
                 task.abort();
                 match task.await {
@@ -1044,7 +1232,11 @@ For those ordinary peer requests, explicitly require the recipient to return its
 verification results, or blocker evidence through the matching native reply path. Retain the \
 requesting peer and correlation while work is pending. Send substantive completion or failure \
 evidence; do not create acknowledgement loops or reply to a terminal result merely to acknowledge \
-it. A delivery receipt is not task completion.\n\n\
+it. A delivery receipt is not task completion. For informational messages, peer lifecycle \
+introductions, or messages saying no reply is needed, do not send a peer acknowledgement. \
+Still finish your own turn with a short, nonempty final-text record of what you learned or \
+that no action is needed. Every activated turn must have a visible outcome, even when no \
+tool use or peer response is appropriate.\n\n\
 Exception: during an explicit initial read-only domain study, only inspect repository files and \
 return the Domain Brief as final text. That study is host-initiated, requires no peer reply, and \
 must not send messages or delegate.";
@@ -1498,6 +1690,10 @@ impl meerkat_core::tool_execution_policy::ToolDispatchAdmission for StudyAdmissi
 }
 
 struct RepositorySessionHook {
+    connections: Option<Arc<crate::setup::connections::Connections>>,
+    events: Arc<super::notifications::RepositoryEvents>,
+    queue_hook: Option<Arc<dyn SessionHook>>,
+    queue_profiles: BTreeSet<String>,
     handoff_runtime: super::handoff::RuntimeSlot,
     studies: Arc<tokio::sync::Mutex<StudyJournal>>,
     study_path: PathBuf,
@@ -1513,6 +1709,21 @@ impl SessionHook for RepositorySessionHook {
         &self,
         request: &mut CreateSessionRequest,
     ) -> std::result::Result<(), SessionError> {
+        let queue_member = request
+            .build
+            .as_ref()
+            .and_then(|build| build.mob_member_binding.as_ref())
+            .is_some_and(|binding| self.queue_profiles.contains(&binding.role));
+        if queue_member {
+            return self
+                .queue_hook
+                .as_ref()
+                .ok_or_else(|| {
+                    SessionError::Unsupported("ticket profile has no repository queue hook".into())
+                })?
+                .before_create(request)
+                .await;
+        }
         let build = request
             .build
             .get_or_insert_with(SessionBuildOptions::default);
@@ -1552,7 +1763,13 @@ impl SessionHook for RepositorySessionHook {
                         Arc::new(MemoryTaskStore::new()),
                         &config,
                         Some(self.root.clone()),
-                        Some(ShellConfig::with_project_root(self.root.clone())),
+                        Some({
+                            let mut shell = ShellConfig::with_project_root(self.root.clone());
+                            if let Some(connections) = &self.connections {
+                                shell.env_vars.extend(connections.github_environment());
+                            }
+                            shell
+                        }),
                         Some(files),
                         None,
                     )
@@ -1577,6 +1794,24 @@ impl SessionHook for RepositorySessionHook {
             meerkat_meta::tool_compose::ComposedExternalTools::over(
                 Arc::new(super::handoff::HandoffTools::new(
                     self.handoff_runtime.clone(),
+                )),
+                Some(owned),
+            )
+        } else {
+            owned
+        };
+        let owned = if let Some(grant) = grant
+            && let Some(member) = build
+                .mob_member_binding
+                .as_ref()
+                .filter(|binding| binding.role != REPRESENTATIVE)
+                .and_then(|binding| MemberId::try_from(binding.role.clone()).ok())
+        {
+            meerkat_meta::tool_compose::ComposedExternalTools::over(
+                Arc::new(super::notifications::SubscriptionTools::new(
+                    self.events.clone(),
+                    member,
+                    grant.studied.clone(),
                 )),
                 Some(owned),
             )
@@ -1835,6 +2070,7 @@ mod tests {
             );
         }
         let config = EnsembleConfig {
+            notifications: Default::default(),
             version: 1,
             name: "Test ensemble".into(),
             state_root: root.join("state"),
@@ -1849,6 +2085,276 @@ mod tests {
         };
         write_fixture_teams(&config);
         config
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repository_mob_preserves_specialists_and_ticket_members_together_on_restart() {
+        if !isolated("repository_mob_preserves_specialists_and_ticket_members_together_on_restart")
+        {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = fixture_config(temp.path());
+        config.repositories.retain(|id, _| id.as_str() == "alpha");
+        config.peers.clear();
+        let repo = RepoId::try_from("alpha".to_string()).unwrap();
+        let mut queue_config =
+            crate::meta_runtime::tests::test_meerkat_config(temp.path().join("queue"));
+        queue_config.repository_runtime = Some(crate::config::RepositoryRuntimeBinding {
+            repository: repo.clone(),
+            state_path: config.state_root.join("alpha"),
+        });
+        let mut previous = BTreeMap::new();
+        for iteration in 0..2 {
+            let queue = crate::meta_runtime::MetaRuntimeRegistry::new(queue_config.clone());
+            let ensemble = EnsembleRuntime::build_inner(
+                config.clone(),
+                Some(Arc::new(meerkat_llm_core::TestClient::default())),
+                Some(queue.clone()),
+            )
+            .await
+            .unwrap();
+            queue.bootstrap_repo_kapellmeister().await.unwrap();
+            let runtime = ensemble.repository(&repo).unwrap();
+            let identity = meerkat_mob::AgentIdentity::from("issue_DEMO-1__issue_5Flead");
+            runtime
+                .mob_handle()
+                .ensure_member(meerkat_mob::SpawnMemberSpec::new(
+                    "issue_lead",
+                    identity.clone(),
+                ))
+                .await
+                .unwrap();
+            queue.wire_repository_members(runtime).await.unwrap();
+            let console =
+                crate::console::ConsoleHub::open(&temp.path().join("console.sqlite3")).unwrap();
+            console.register("alpha".into(), runtime.clone());
+            let records = console.aggregator.list_identities().await.unwrap();
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record.identity.contains("alpha:coder")),
+                "specialist must be visible: {records:?}"
+            );
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record.runtime_member_id == "kapellmeister"),
+                "queue coordinator must be visible: {records:?}"
+            );
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record.runtime_member_id == identity.as_str()),
+                "ticket lead must be visible: {records:?}"
+            );
+            let visible: BTreeSet<_> = records.iter().map(|record| &record.identity).collect();
+            let unresolved_peers: Vec<_> = records
+                .iter()
+                .flat_map(|record| {
+                    record
+                        .topology_peers
+                        .iter()
+                        .filter(|peer| !visible.contains(peer))
+                        .map(|peer| (record.identity.clone(), peer.clone()))
+                })
+                .collect();
+            console.unregister("alpha");
+            drop(console);
+            let members = runtime.mob_handle().list_all_members().await;
+            assert!(
+                members
+                    .iter()
+                    .any(|member| member.agent_identity.as_str() == "kapellmeister")
+            );
+            let coder = members
+                .iter()
+                .find(|member| member.role.as_str() == "coder")
+                .unwrap();
+            let lead = members
+                .iter()
+                .find(|member| member.agent_identity == identity)
+                .unwrap();
+            assert!(lead.wired_to.contains(&coder.agent_identity));
+            for member in &members {
+                for peer in &members {
+                    if member.agent_identity != peer.agent_identity {
+                        assert!(
+                            member.wired_to.contains(&peer.agent_identity),
+                            "repository members must have direct peer access: {} -> {}",
+                            member.agent_identity,
+                            peer.agent_identity,
+                        );
+                    }
+                }
+            }
+            for member in members {
+                if iteration == 0 {
+                    previous.insert(
+                        member.agent_identity.clone(),
+                        member.bridge_session_id().cloned(),
+                    );
+                } else {
+                    assert_eq!(
+                        previous.get(&member.agent_identity),
+                        Some(&member.bridge_session_id().cloned())
+                    );
+                }
+            }
+            queue.shutdown().await.unwrap();
+            assert!(
+                runtime.mob_handle().list_members().await.len() >= 6,
+                "borrower shutdown must not stop the native owner"
+            );
+            ensemble.shutdown().await.unwrap();
+            drop(ensemble);
+            assert!(
+                unresolved_peers.is_empty(),
+                "console topology endpoints must resolve to visible identities: {unresolved_peers:?}"
+            );
+        }
+    }
+
+    #[derive(Default)]
+    struct NotificationScript {
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl LlmClient for NotificationScript {
+        fn project_replay_messages(
+            &self,
+            messages: &[Message],
+        ) -> std::result::Result<Vec<Message>, LlmError> {
+            Ok(messages.to_vec())
+        }
+        fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
+            assert!(
+                serde_json::to_string(&request.messages)
+                    .unwrap()
+                    .contains("[REPOSITORY CHANGE]")
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(futures::stream::iter(vec![
+                Ok(LlmEvent::TextDelta {
+                    delta: "Domain update assessed.".into(),
+                    meta: None,
+                }),
+                Ok(LlmEvent::UsageUpdate {
+                    usage: TurnUsage::host_declared(
+                        Provider::OpenAI,
+                        &request.model,
+                        Usage::default(),
+                    ),
+                }),
+                Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Success {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                }),
+            ]))
+        }
+        fn provider(&self) -> Provider {
+            Provider::OpenAI
+        }
+        async fn health_check(&self) -> std::result::Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repository_changes_notify_only_subscribers_and_do_not_repeat_after_restart() {
+        if !isolated("repository_changes_notify_only_subscribers_and_do_not_repeat_after_restart") {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = fixture_config(temp.path());
+        config.repositories.retain(|id, _| id.as_str() == "alpha");
+        config.peers.clear();
+        let root = &config.repositories.values().next().unwrap().path;
+        let git = |path: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args([
+                    "-c",
+                    "user.name=Fugue Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "initial"]);
+        let remote = temp.path().join("origin.git");
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "--bare",
+                root.to_str().unwrap(),
+                remote.to_str().unwrap(),
+            ],
+        );
+        git(root, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        let client = Arc::new(NotificationScript::default());
+        let ensemble = EnsembleRuntime::build_with_client(config.clone(), client.clone())
+            .await
+            .unwrap();
+        let repo = RepoId::try_from("alpha".to_string()).unwrap();
+        let entry = &ensemble.repositories[&repo];
+        entry
+            .events
+            .subscribe(
+                &MemberId::try_from("coder".to_string()).unwrap(),
+                vec!["README.md".into()],
+            )
+            .await
+            .unwrap();
+        entry
+            .events
+            .subscribe(
+                &MemberId::try_from("reviewer".to_string()).unwrap(),
+                vec!["tests".into()],
+            )
+            .await
+            .unwrap();
+        entry.events.poll(&entry.runtime).await.unwrap();
+        assert_eq!(client.calls.load(Ordering::SeqCst), 0);
+        std::fs::write(root.join("README.md"), "# alpha\nChanged API contract.\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "change domain"]);
+        git(root, &["push", "origin", "HEAD"]);
+        entry.events.poll(&entry.runtime).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while client.calls.load(Ordering::SeqCst) != 1 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        entry.events.poll(&entry.runtime).await.unwrap();
+        assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+        ensemble.shutdown().await.unwrap();
+        drop(ensemble);
+        let next = Arc::new(NotificationScript::default());
+        let ensemble = EnsembleRuntime::build_with_client(config, next.clone())
+            .await
+            .unwrap();
+        let entry = &ensemble.repositories[&repo];
+        entry.events.poll(&entry.runtime).await.unwrap();
+        assert_eq!(
+            next.calls.load(Ordering::SeqCst),
+            0,
+            "unchanged revision must stay idle after restart"
+        );
+        ensemble.shutdown().await.unwrap();
     }
 
     #[derive(Default)]
@@ -2601,6 +3107,59 @@ mod tests {
         );
         let before = ensemble.status().await.expect("status");
         assert_eq!(before.repositories.len(), 2);
+        let console =
+            crate::console::ConsoleHub::open(&temp.path().join("console.sqlite3")).unwrap();
+        for repo in config.repositories.keys() {
+            console.register(repo.to_string(), ensemble.repository(repo).unwrap().clone());
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let identities = console.aggregator.list_identities().await.unwrap();
+                if ["alpha", "beta"].iter().all(|repo| {
+                    identities.iter().any(|record| {
+                        record.runtime_key == *repo
+                            && record.identity.contains(&format!("{repo}:coder"))
+                    })
+                }) && identities.iter().any(|record| {
+                    record.identity == "alpha/alpha:representative"
+                        && record
+                            .topology_peers
+                            .contains(&"beta/beta:representative".to_owned())
+                }) {
+                    let visible: BTreeSet<_> =
+                        identities.iter().map(|record| &record.identity).collect();
+                    for record in &identities {
+                        assert!(
+                            record
+                                .topology_peers
+                                .iter()
+                                .all(|peer| visible.contains(peer)),
+                            "all registered repository peers resolve in the console: {record:?}"
+                        );
+                    }
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("both repository mobs appear in the shared native console");
+        console.unregister("alpha");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let identities = console.aggregator.list_identities().await.unwrap();
+                if !identities.is_empty()
+                    && identities.iter().all(|record| record.runtime_key == "beta")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("stopping one mob removes its live roster without removing the other mob");
+        console.unregister("beta");
+        drop(console);
         assert!(before.repositories.iter().all(|repo| {
             repo.members.len() == 4
                 && repo

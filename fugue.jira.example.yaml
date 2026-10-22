@@ -52,15 +52,15 @@ mcp_servers:
 
 agents:
   planner:
-    model: gpt-5.5
+    model: gpt-6-astra
     tools: [mob, workgraph, mcp:jira, mcp:github]
     system_prompt: Plan the issue in its Fugue Workpad and record blocking obligations.
   coder:
-    model: gpt-5.5
+    model: gpt-6-astra
     tools: [mob, shell, git, workgraph, mcp:jira, mcp:github]
     system_prompt: Implement the Workpad plan in the supplied worktree and verify the change.
   reviewer:
-    model: gpt-5.5
+    model: gpt-6-astra
     tools: [mob, shell, git, workgraph, mcp:jira, mcp:github]
     system_prompt: Review the diff and evidence, then close verified WorkGraph obligations.
 

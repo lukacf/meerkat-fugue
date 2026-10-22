@@ -819,6 +819,14 @@ pub fn execute_github_fugue_tool(
     name: &str,
     arguments: &Value,
 ) -> (bool, String, Vec<KapellmeisterShadowSignal>) {
+    execute_github_fugue_tool_with_host(name, arguments, &GitHubToolHost::new())
+}
+
+pub(crate) fn execute_github_fugue_tool_with_host(
+    name: &str,
+    arguments: &Value,
+    host: &GitHubToolHost,
+) -> (bool, String, Vec<KapellmeisterShadowSignal>) {
     let operation = match name.parse::<FugueToolOperation>() {
         Ok(operation) => operation,
         Err(_) => {
@@ -826,7 +834,6 @@ pub fn execute_github_fugue_tool(
             return (is_error, content, Vec::new());
         }
     };
-    let host = GitHubToolHost::new();
     let mut source_signals = None;
     let result = match operation {
         FugueToolOperation::GitHubInspectRepo => serde_json::from_value(arguments.clone())

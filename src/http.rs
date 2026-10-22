@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Read;
 use std::net::SocketAddr;
@@ -91,7 +91,7 @@ pub async fn serve(
     refresh_tx: mpsc::Sender<()>,
     internal_tx: mpsc::Sender<InternalMessage>,
     meta_runtime_registry: MetaRuntimeRegistry,
-    ensemble: Option<Arc<crate::ensemble::runtime::EnsembleRuntime>>,
+    ensemble: Option<Router>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     serve_on_listener(
@@ -113,7 +113,7 @@ pub async fn serve_on_listener(
     refresh_tx: mpsc::Sender<()>,
     internal_tx: mpsc::Sender<InternalMessage>,
     meta_runtime_registry: MetaRuntimeRegistry,
-    ensemble: Option<Arc<crate::ensemble::runtime::EnsembleRuntime>>,
+    ensemble: Option<Router>,
 ) -> anyhow::Result<()> {
     let local_addr = listener.local_addr()?;
     let app = router(
@@ -136,7 +136,7 @@ pub(crate) async fn router(
     refresh_tx: mpsc::Sender<()>,
     internal_tx: mpsc::Sender<InternalMessage>,
     meta_runtime_registry: MetaRuntimeRegistry,
-    ensemble: Option<Arc<crate::ensemble::runtime::EnsembleRuntime>>,
+    ensemble: Option<Router>,
 ) -> anyhow::Result<Router> {
     let app_state = AppState {
         state,
@@ -146,7 +146,11 @@ pub(crate) async fn router(
     };
     let app = Router::new()
         .route("/api/v1/build", get(crate::build_identity::endpoint))
-        .route("/", get(dashboard))
+        .route("/api/v1/workspace", get(workspace_context))
+        .route(
+            "/",
+            get(|| async { axum::response::Redirect::temporary("/issues") }),
+        )
         .route("/overview", get(dashboard))
         .route("/issues", get(issues_board))
         .route("/issues/{issue_identifier}", get(issue_detail_page))
@@ -217,8 +221,7 @@ pub(crate) async fn router(
         app = app.route("/ensemble", get(ensemble_page));
     }
     let mut app = app.with_state(app_state);
-    if let Some(runtime) = ensemble {
-        let routes = crate::ensemble::http::integrated_router(runtime).await?;
+    if let Some(routes) = ensemble {
         app = app.merge(
             routes.layer(middleware::from_fn(move |request: Request, next: Next| {
                 let config = config.clone();
@@ -245,7 +248,14 @@ async fn authorize_meta_console_request(
     inject_console_browser_compat(next.run(request).await).await
 }
 
-async fn inject_console_browser_compat(response: Response) -> Response {
+pub(crate) async fn inject_console_browser_compat(response: Response) -> Response {
+    inject_console_browser_compat_for_workspace(response, true).await
+}
+
+pub(crate) async fn inject_console_browser_compat_for_workspace(
+    response: Response,
+    queue_enabled: bool,
+) -> Response {
     let is_html = response
         .headers()
         .get(CONTENT_TYPE)
@@ -270,17 +280,18 @@ async fn inject_console_browser_compat(response: Response) -> Response {
     let Ok(html) = String::from_utf8(bytes.to_vec()) else {
         return Response::from_parts(parts, Body::from(bytes));
     };
-    let html = inject_console_browser_compat_html(&html);
+    let html = inject_console_browser_compat_html(&html, queue_enabled);
     parts.headers.remove(CONTENT_LENGTH);
     Response::from_parts(parts, Body::from(html))
 }
 
-fn inject_console_browser_compat_html(html: &str) -> String {
+fn inject_console_browser_compat_html(html: &str, queue_enabled: bool) -> String {
     let mut patched = html.to_string();
+
     if let Some(next) = inject_random_uuid_polyfill(&patched) {
         patched = next;
     }
-    if let Some(next) = inject_console_app_chrome(&patched) {
+    if let Some(next) = inject_app_chrome(&patched, AppPage::Console, queue_enabled) {
         patched = next;
     }
     patched
@@ -324,12 +335,10 @@ fn inject_random_uuid_polyfill(html: &str) -> Option<String> {
     Some(patched)
 }
 
-fn inject_console_app_chrome(html: &str) -> Option<String> {
-    inject_app_chrome(html, AppPage::Console, true)
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AppPage {
+    Home,
+    Work,
     Console,
     Ensemble,
 }
@@ -340,47 +349,41 @@ pub(crate) fn inject_app_chrome(
     queue_enabled: bool,
 ) -> Option<String> {
     const MARKER: &str = "data-fugue-console-chrome";
-    const STYLE: &str = r#"<style data-fugue-console-chrome>
-:root { color-scheme: light; --bs-paper: #ECEAE4; --bs-paper-soft: #F6F4EE; --bs-paper-raised: #FAF8F2; --bs-ink: #1C1A17; --bs-muted: #6B6760; --bs-subtle: #A8A49B; --bs-line: #D6D2C8; --bs-accent: #D95A1E; --bs-accent-dark: #E76A2F; --bs-ok: #3E6B4F; --bs-warn: #A56A18; --bs-crit: #A43F32; --bs-font-sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --bs-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; --bg: var(--bs-paper); --surface: var(--bs-paper-soft); --ink: var(--bs-ink); --muted: var(--bs-muted); --hair: var(--bs-line); --accent: var(--bs-accent); --r-sm: 2px; --r-md: 6px; --type-micro: 10px; --type-rail: 11px; --type-meta: 12px; --type-body: 13px; --type-card: 14px; --type-panel-heading: 15px; --type-heading: 16px; --line-compact: 1.35; --control-h: 38px; }
-body.fugue-console-embedded { margin:0; padding-top:var(--control-h); background:var(--bg); color:var(--ink); }
-.fugue-console-rail { position:fixed; z-index:2147483000; inset:0 0 auto 0; height:var(--control-h); display:flex; align-items:center; border-bottom:1px solid var(--ink); background:var(--surface); color:var(--ink); font-family:var(--bs-font-mono); font-size:var(--type-rail); letter-spacing:.12em; text-transform:uppercase; line-height:var(--line-compact); }
-.fugue-console-rail a { color:inherit; text-decoration:none; }
-.fugue-console-brand { height:var(--control-h); display:flex; align-items:center; gap:10px; padding:0 16px; border-right:1px solid var(--hair); font-weight:500; }
-.fugue-console-mark { width:12px; height:12px; border:1px solid var(--ink); transform:rotate(45deg); flex:0 0 auto; }
-.fugue-console-tabs { display:flex; height:var(--control-h); }
-.fugue-console-tabs a { display:flex; align-items:center; padding:0 18px; border-right:1px solid var(--hair); }
-.fugue-console-tabs a.active { background:var(--ink); color:var(--bg); }
-.fugue-console-spacer { flex:1; }
-.fugue-console-meta { display:flex; height:var(--control-h); }
-.fugue-console-meta span { display:flex; align-items:center; padding:0 10px; border-left:1px solid var(--hair); color:var(--muted); }
-@media(max-width:760px) { .fugue-console-meta { display:none; } .fugue-console-brand { padding:0 10px; font-size:9px; } .fugue-console-brand span:last-child { display:none; } .fugue-console-tabs { overflow-x:auto; } .fugue-console-tabs a { padding:0 10px; font-size:10px; white-space:nowrap; } }
-</style>"#;
+    let style = format!(
+        "<style data-fugue-console-chrome>{}</style>",
+        include_str!("ui/app.css")
+    );
     let mut nav = String::new();
-    if queue_enabled {
-        nav.push_str(r#"<a href="/overview">OVERVIEW</a><a href="/issues">IMS</a>"#);
-        nav.push_str(if active == AppPage::Console {
-            r#"<a class="active" href="/console">CONSOLE</a>"#
+    let tabs = [
+        (AppPage::Work, "/issues", "Work queue"),
+        (AppPage::Home, "/overview", "Overview"),
+        (AppPage::Ensemble, "/ensemble", "Repository setup"),
+        (AppPage::Console, "/console", "Conversations"),
+    ];
+    for (page, href, label) in tabs {
+        if !queue_enabled && page == AppPage::Home {
+            continue;
+        }
+        let href = if page == AppPage::Work && !queue_enabled {
+            "/queues"
         } else {
-            r#"<a href="/console">CONSOLE</a>"#
-        });
+            href
+        };
+        let selected = if page == active {
+            " class=\"active\" aria-current=\"page\""
+        } else {
+            ""
+        };
+        nav.push_str(&format!(r#"<a href="{href}"{selected}>{label}</a>"#));
     }
-    nav.push_str(if active == AppPage::Ensemble {
-        r#"<a class="active" href="/ensemble">ENSEMBLE</a>"#
+    let home = if queue_enabled { "/issues" } else { "/queues" };
+    let context = if active == AppPage::Console {
+        r#"<span class="fugue-console-meta">All repository mobs</span>"#
     } else {
-        r#"<a href="/ensemble">ENSEMBLE</a>"#
-    });
-    let home = if queue_enabled {
-        "/overview"
-    } else {
-        "/ensemble"
-    };
-    let label = if active == AppPage::Ensemble {
-        "REPOSITORY TEAMS"
-    } else {
-        "META CONSOLE"
+        "Development workspace"
     };
     let chrome = format!(
-        r#"<div class="fugue-console-rail" data-fugue-console-chrome><a class="fugue-console-brand" href="{home}" aria-label="Meerkat Fugue overview"><span class="fugue-console-mark" aria-hidden="true"></span><span>MEERKAT FUGUE</span></a><nav class="fugue-console-tabs" aria-label="Primary app navigation">{nav}</nav><div class="fugue-console-spacer"></div><div class="fugue-console-meta" aria-label="Console context"><span>{label}</span></div></div>"#
+        r#"<div class="fugue-console-rail" data-fugue-console-chrome><a class="fugue-console-brand" href="{home}" aria-label="Fugue home"><span class="fugue-console-mark" aria-hidden="true">≋</span><span>Fugue</span></a><nav class="fugue-console-tabs" aria-label="Primary app navigation">{nav}</nav><div class="fugue-console-spacer"></div><div class="fugue-console-meta">{context}</div></div>"#
     );
 
     if html.contains(MARKER) {
@@ -388,17 +391,30 @@ body.fugue-console-embedded { margin:0; padding-top:var(--control-h); background
     }
 
     let mut patched = html.to_string();
+    let settings_script = r#"<script>fugueFetch('/api/workspaces',{cache:'no-store'}).then(r=>r.ok?r.json():null).then(data=>{if(!data?.hub)return;const nav=document.querySelector('.fugue-console-tabs');if(nav){const link=document.createElement('a');link.href=data.hub.replace(/\/$/,'')+'/ensemble';link.textContent='All repositories';nav.prepend(link);}}).catch(()=>{});fugueFetch('/api/setup/connections',{cache:'no-store'}).then(response=>{if(!response.ok)return;const nav=document.querySelector('.fugue-console-tabs');if(nav){const link=document.createElement('a');link.href=fugueUrl('/settings');link.textContent='Settings';nav.append(link);}}).catch(()=>{});</script>"#;
+    patched = patched.replace("</body>", &format!("{settings_script}</body>"));
+    if active == AppPage::Work {
+        let script = format!("<script>{}</script>", include_str!("ui/work-context.js"));
+        patched = patched.replace("</body>", &format!("{script}</body>"));
+    }
+    if !queue_enabled {
+        patched = patched.replace(
+            "<div class=\"queue-context\">",
+            "<div class=\"queue-context\" hidden>",
+        );
+        patched = patched.replace("<body>", "<body data-queue-enabled=\"false\">");
+    }
     let head_insertion = patched
         .find("</head>")
         .or_else(|| patched.find("<body"))
         .unwrap_or(0);
-    patched.insert_str(head_insertion, STYLE);
+    patched.insert_str(head_insertion, &style);
 
     let Some(body_start) = patched.find("<body") else {
-        return Some(format!("{STYLE}{chrome}{patched}"));
+        return Some(format!("{style}{chrome}{patched}"));
     };
     let Some(body_tag_end_offset) = patched[body_start..].find('>') else {
-        return Some(format!("{STYLE}{chrome}{patched}"));
+        return Some(format!("{style}{chrome}{patched}"));
     };
     let body_tag_end = body_start + body_tag_end_offset;
     let body_tag = &patched[body_start..=body_tag_end];
@@ -409,313 +425,62 @@ body.fugue-console-embedded { margin:0; padding-top:var(--control-h); background
         replacement.insert_str(replacement.len() - 1, " class=\"fugue-console-embedded\"");
         replacement
     };
+    if !queue_enabled && !replacement.contains("data-queue-enabled=") {
+        replacement.insert_str(replacement.len() - 1, " data-queue-enabled=\"false\"");
+    }
     if !replacement.contains("data-bs-theme=") {
         replacement.insert_str(replacement.len() - 1, " data-bs-theme=\"paper\"");
     }
     patched.replace_range(body_start..=body_tag_end, &replacement);
     let body_tag_end = body_start + replacement.len();
     patched.insert_str(body_tag_end, &chrome);
-    Some(patched)
+    Some(browser_document(&patched))
 }
 
-struct DashboardView {
-    running: usize,
-    retrying: usize,
-    tokens: u64,
-    seconds: f64,
-    error: Option<String>,
-    shadow_health: String,
-    shadow_recommendations: usize,
-    shadow_comparisons: usize,
-    shadow_authority: String,
-    running_rows: String,
-    retry_rows: String,
-    console_enabled: bool,
-    in_flight_count: usize,
-    picker_tabs: String,
-    focus_identifier: String,
-    focus_title: String,
-    focus_lane: String,
-    focus_runtime: String,
-    active_role: String,
-    current_action: String,
-    workpad_files: String,
-    activity_rows: String,
+pub(crate) fn browser_document(html: &str) -> String {
+    let script = format!("<script>{}</script>", include_str!("ui/browser-paths.js"));
+    html.replacen("<head>", &format!("<head>{script}"), 1)
+        .replace("href=\"/", "href=\"./")
 }
 
-async fn dashboard(State(app): State<AppState>, headers: HeaderMap) -> axum::response::Response {
+fn render_dashboard_html() -> String {
+    inject_app_chrome(include_str!("ui/overview.html"), AppPage::Home, true)
+        .unwrap_or_else(|| include_str!("ui/overview.html").to_owned())
+}
+
+async fn dashboard(State(app): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
-    let snapshot = snapshot(&app.state, &app.config).await;
-    let focus = snapshot.running.first();
-    let in_flight_count = snapshot.running.len();
-    let focus_identifier = focus
-        .map(|row| row.issue_identifier.clone())
-        .unwrap_or_else(|| "NO MOB".to_string());
-    let focus_title = focus
-        .map(|row| row.issue.title.clone())
-        .unwrap_or_else(|| "Nothing is running right now.".to_string());
-    let focus_lane = focus
-        .map(|row| row.state.clone())
-        .unwrap_or_else(|| "idle".to_string());
-    let focus_runtime = focus
-        .map(|row| compact_duration((Utc::now() - row.started_at).num_seconds().max(0) as u64))
-        .unwrap_or_else(|| "unavailable".to_string());
-    let active_role = focus
-        .and_then(|row| role_from_state(&row.state))
-        .unwrap_or("MOB")
-        .to_string();
-    let current_action = focus
-        .and_then(|row| row.last_message.as_ref().or(row.last_event.as_ref()))
-        .cloned()
-        .unwrap_or_else(|| "Awaiting runtime event from Fugue.".to_string());
-    let picker_tabs = dashboard_picker_tabs(&snapshot.running);
-    let activity_rows = dashboard_activity_rows(&snapshot.running, &snapshot.retrying);
-    // rework-note: the current runtime snapshot does not expose a structured workpad diff or live topology stream here; render honest runtime evidence instead of prototype file fixtures.
-    let workpad_files = focus
-        .map(|row| {
-            format!(
-                r#"<div class="file"><span class="meta">{} · {}</span><span class="meta">{}t</span></div>"#,
-                html_escape(&row.workspace_key),
-                html_escape(&row.state),
-                row.turn_count
-            )
-        })
-        .unwrap_or_else(|| {
-            // rework-note: no focused runtime means the dashboard has no live workpad or turn-count evidence; render an explicit unavailable state instead of a measured-looking zero.
-            r#"<div class="file unavailable"><span class="meta">No active mob workpad evidence available</span><span class="meta">turns unavailable</span></div>"#.to_string()
-        });
-    let view = DashboardView {
-        running: snapshot.counts.running,
-        retrying: snapshot.counts.retrying,
-        tokens: snapshot.meerkat_totals.total_tokens,
-        seconds: snapshot.meerkat_totals.seconds_running,
-        error: snapshot.last_error.clone(),
-        shadow_health: format!("{:?}", snapshot.kapellmeister_shadow.health),
-        shadow_recommendations: snapshot.kapellmeister_shadow.recommendation_count,
-        shadow_comparisons: snapshot.kapellmeister_shadow.comparison_count,
-        shadow_authority: format!("{:?}", snapshot.kapellmeister_shadow.authority.mode),
-        running_rows: snapshot
-            .running
+    Html(render_dashboard_html()).into_response()
+}
+
+#[derive(Serialize)]
+struct WorkspaceContext {
+    tracker: String,
+    project: Option<String>,
+    repositories: Vec<String>,
+}
+
+async fn workspace_context(State(app): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = authorize_console_browser(&app.config, &headers) {
+        return response;
+    }
+    Json(WorkspaceContext {
+        tracker: app.config.tracker.kind.clone(),
+        project: app.config.tracker.project_slug.clone(),
+        repositories: app
+            .config
+            .kapellmeister
+            .shadow_mode
+            .authority
+            .safe_selectors
+            .repositories
             .iter()
-            .map(|row| {
-                format!(
-                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                    html_escape(&row.issue_identifier),
-                    html_escape(&format!("{:?}", row.policy_mode)),
-                    html_escape(&row.state),
-                    row.session_id
-                        .as_deref()
-                        .map(html_escape)
-                        .unwrap_or_default(),
-                    row.turn_count,
-                    row.last_event
-                        .as_deref()
-                        .map(html_escape)
-                        .unwrap_or_default(),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        retry_rows: snapshot
-            .retrying
-            .iter()
-            .map(|row| {
-                format!(
-                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                    html_escape(&row.issue_identifier),
-                    html_escape(&format!("{:?}", row.policy_mode)),
-                    row.attempt,
-                    row.due_at,
-                    row.error.as_deref().map(html_escape).unwrap_or_default(),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        console_enabled: meta_console_enabled(&app.config),
-        in_flight_count,
-        picker_tabs,
-        focus_identifier,
-        focus_title,
-        focus_lane,
-        focus_runtime,
-        active_role,
-        current_action,
-        workpad_files,
-        activity_rows,
-    };
-    Html(render_dashboard_html(&view)).into_response()
-}
-
-fn compact_duration(seconds: u64) -> String {
-    if seconds >= 3600 {
-        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
-    } else if seconds >= 60 {
-        format!("{}m {}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{}s", seconds)
-    }
-}
-
-fn role_from_state(state: &str) -> Option<&'static str> {
-    let state = state.to_ascii_lowercase();
-    if state.contains("plan") {
-        Some("PLANNER")
-    } else if state.contains("review") {
-        Some("REVIEWER")
-    } else if state.contains("final") {
-        Some("PUBLISHER")
-    } else if state.contains("implement") || state.contains("progress") || state.contains("active")
-    {
-        Some("CODER")
-    } else {
-        None
-    }
-}
-
-fn phase_label_for_runtime_state(state: &str) -> String {
-    phase_label_for_state(state)
-        .unwrap_or("fugue:phase:implementing")
-        .to_string()
-}
-
-fn dashboard_picker_tabs(running: &[RunningRow]) -> String {
-    if running.is_empty() {
-        return r#"<div class="mob-tab focused"><span class="radio"></span><span class="mob-tab-main"><span class="meta">NO MOB IN FLIGHT</span><div class="mob-tab-title">Move an issue to Queue or Active to start one.</div></span><span class="meta">0s<br>OPEN IMS</span></div>"#.to_string();
-    }
-    running
-        .iter()
-        .take(3)
-        .enumerate()
-        .map(|(index, row)| {
-            let focused = index == 0;
-            let runtime = compact_duration((Utc::now() - row.started_at).num_seconds().max(0) as u64);
-            let state_label = if focused {
-                r#"<span class="badge">● FOCUSED</span>"#.to_string()
-            } else {
-                html_escape(&phase_label_for_runtime_state(&row.state))
-            };
-            format!(
-                r#"<a class="mob-tab {focused_class}" href="/issues/{id}"><span class="radio"></span><span class="mob-tab-main"><span class="meta">{id} {state_label}</span><div class="mob-tab-title">{title}</div></span><span class="meta">{runtime}<br>{role}</span></a>"#,
-                focused_class = if focused { "focused" } else { "" },
-                id = html_escape(&row.issue_identifier),
-                state_label = state_label,
-                title = html_escape(&row.issue.title),
-                runtime = html_escape(&runtime),
-                role = if focused {
-                    html_escape(role_from_state(&row.state).unwrap_or("MOB"))
-                } else {
-                    "SWITCH →".to_string()
-                },
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-fn dashboard_activity_rows(running: &[RunningRow], retrying: &[RetryRow]) -> String {
-    let mut rows = Vec::new();
-    for row in running.iter().take(5) {
-        rows.push(format!(
-            r#"<div class="log-row"><span class="meta">{time}</span><span class="meta">{id}</span><span>{message}</span></div>"#,
-            time = row
-                .last_event_at
-                .map(|time| time.format("%H:%M:%S").to_string())
-                .unwrap_or_else(|| "running".to_string()),
-            id = html_escape(&row.issue_identifier),
-            message = html_escape(row.last_event.as_deref().unwrap_or("mob running")),
-        ));
-    }
-    for row in retrying.iter().take(3) {
-        rows.push(format!(
-            r#"<div class="log-row"><span class="meta">retry</span><span class="meta">{id}</span><span>{message}</span></div>"#,
-            id = html_escape(&row.issue_identifier),
-            message = html_escape(row.error.as_deref().unwrap_or("retry scheduled")),
-        ));
-    }
-    if rows.is_empty() {
-        rows.push(r#"<div class="log-row"><span class="meta">idle</span><span class="meta">—</span><span>No mob runtime events are currently active.</span></div>"#.to_string());
-    }
-    rows.join("")
-}
-
-fn render_dashboard_html(view: &DashboardView) -> String {
-    let console_hint = if view.console_enabled { "LIVE" } else { "OFF" };
-    let _legacy_runtime_tables = (
-        &view.shadow_health,
-        &view.shadow_comparisons,
-        &view.shadow_authority,
-        &view.running_rows,
-        &view.retry_rows,
-    );
-    let error = view
-        .error
-        .as_ref()
-        .map(|error| format!(r#"<p class="error">{}</p>"#, html_escape(error)))
-        .unwrap_or_default();
-    let html = r##"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Meerkat Fugue</title>
-  <style>
-    :root { color-scheme: light; --bs-paper: #ECEAE4; --bs-paper-soft: #F6F4EE; --bs-paper-raised: #FAF8F2; --bs-ink: #1C1A17; --bs-muted: #6B6760; --bs-subtle: #A8A49B; --bs-line: #D6D2C8; --bs-accent: #D95A1E; --bs-accent-dark: #E76A2F; --bs-ok: #3E6B4F; --bs-warn: #A56A18; --bs-crit: #A43F32; --bs-font-sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --bs-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; --bg: var(--bs-paper); --surface: var(--bs-paper-soft); --paper: var(--bs-paper-raised); --ink: var(--bs-ink); --muted: var(--bs-muted); --subtle: var(--bs-subtle); --hair: var(--bs-line); --accent: var(--bs-accent); --ok: var(--bs-ok); --warn: var(--bs-warn); --crit: var(--bs-crit); --r-sm: 2px; --r-md: 6px; --type-micro: 10px; --type-rail: 11px; --type-meta: 12px; --type-body: 13px; --type-card: 14px; --type-panel-heading: 15px; --type-heading: 16px; --line-compact: 1.35; --control-h: 38px; --font-display: var(--bs-font-sans); --shadow-sheet: 0 24px 60px rgba(28,26,23,.28); }
-    * { box-sizing: border-box; } body { margin:0; min-height:100vh; overflow:auto; background:var(--bg); color:var(--ink); font-family:var(--bs-font-sans); font-size:var(--type-body); line-height:var(--line-compact); } a { color:inherit; text-decoration:none; }
-    .mono, .top-rail, .eyebrow, .chip, .meta { font-family:var(--bs-font-mono); text-transform:uppercase; letter-spacing:.12em; font-size:var(--type-rail); line-height:var(--line-compact); }
-    .top-rail { min-height:var(--control-h); display:flex; align-items:stretch; flex-wrap:nowrap; border-bottom:1px solid var(--ink); background:var(--surface); position:sticky; top:0; z-index:4; }
-    .brand { height:var(--control-h); display:flex; align-items:center; gap:10px; padding:0 16px; border-right:1px solid var(--hair); font-weight:500; } .mark { width:12px; height:12px; border:1px solid var(--ink); transform:rotate(45deg); }
-    .tabs { display:flex; height:var(--control-h); } .tabs a { display:flex; align-items:center; padding:0 18px; border-right:1px solid var(--hair); } .tabs a.active { background:var(--ink); color:var(--bg); }
-    .spacer { flex:1 1 auto; min-width:12px; } .kpis { display:flex; min-height:var(--control-h); flex:0 1 auto; overflow-x:auto; max-width:100%; } .kpis span { display:flex; align-items:center; gap:6px; padding:0 10px; border-left:1px solid var(--hair); color:var(--muted); white-space:nowrap; } .kpis b { color:var(--ink); font-variant-numeric:tabular-nums; } .refresh { width:var(--control-h); height:var(--control-h); flex:0 0 var(--control-h); display:grid; place-items:center; border-left:1px solid var(--ink); }
-    .picker { min-height:64px; display:flex; flex-wrap:wrap; align-items:stretch; border-bottom:1px solid var(--ink); background:var(--surface); } .picker-eye { flex:0 0 160px; min-height:64px; padding:9px 14px; background:var(--paper); border-right:1px solid var(--ink); } .picker-eye strong { font:600 var(--type-heading)/1 var(--bs-font-sans); margin-right:5px; }
-    .mob-tab { flex:1 1 240px; min-width:220px; min-height:64px; display:flex; align-items:center; gap:14px; padding:8px 16px; border-right:1px solid var(--hair); border-top:3px solid transparent; color:var(--muted); } .mob-tab.focused { background:var(--bg); border-top-color:var(--accent); color:var(--ink); border-bottom:1px solid var(--bg); } .radio { width:18px; height:18px; flex:0 0 18px; border:1px solid var(--hair); border-radius:50%; background:var(--bg); position:relative; } .focused .radio { border-color:var(--accent); background:var(--accent); box-shadow:0 0 0 4px color-mix(in oklch, var(--accent) 18%, transparent); } .focused .radio::after { content:""; position:absolute; width:5px; height:5px; border-radius:50%; background:white; left:50%; top:50%; transform:translate(-50%, -50%); }
-    .mob-tab-main { min-width:0; flex:1; } .mob-tab-title { font-size:var(--type-card); font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; } .badge { border:1px solid var(--accent); color:var(--accent); padding:1px 5px; background:color-mix(in oklch, var(--accent) 8%, transparent); }
-    .focus-other { flex:0 0 170px; min-height:64px; display:grid; place-items:center; border-left:1px solid var(--ink); color:var(--ink); }
-    .hero { min-height:520px; display:grid; grid-template-rows:auto auto minmax(360px,1fr); border-bottom:1px solid var(--ink); } .identity { min-height:42px; display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding:8px 14px; border-bottom:1px solid var(--hair); } .identity h1 { margin:0; font-size:var(--type-heading); font-weight:500; flex:1 1 260px; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; } .identity .eyebrow, .identity .meta { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .chip { display:inline-flex; border:1px solid color-mix(in oklch, var(--accent) 35%, var(--hair)); color:var(--accent); padding:1px 6px; text-transform:none; } .chip.template { color:var(--muted); border-color:var(--hair); }
-    .timeline { display:grid; grid-template-columns:repeat(4,minmax(180px,1fr)); background:var(--surface); border-bottom:1px solid var(--hair); overflow-x:auto; } .phase { min-width:0; min-height:72px; display:flex; align-items:center; gap:10px; padding:10px 18px; border-right:1px solid var(--hair); } .phase span:last-child { min-width:0; overflow:hidden; text-overflow:ellipsis; } .disc { width:22px; height:22px; flex:0 0 22px; border:1px solid var(--hair); display:grid; place-items:center; border-radius:50%; font-family:var(--bs-font-mono); font-size:var(--type-rail); } .phase.done .disc { background:var(--ok); color:white; border-color:var(--ok); } .phase.active { background:color-mix(in oklch, var(--accent) 8%, transparent); color:var(--accent); } .phase.active .disc { background:var(--accent); color:white; border-color:var(--accent); }
-    .hero-body { min-height:0; display:grid; grid-template-columns:minmax(420px,1fr) minmax(280px,340px); align-items:stretch; } .flow { border-right:1px solid var(--hair); padding:24px; min-width:0; overflow:auto; } svg { width:100%; height:100%; min-width:520px; min-height:260px; } .agent { min-width:0; display:grid; grid-template-rows:minmax(0,1fr) minmax(0,1fr); } .agent-card { min-width:0; padding:18px; border-bottom:1px solid var(--hair); overflow:auto; } .agent-card h2 { margin:12px 0 4px; font-size:var(--type-heading); line-height:1.25; } .stats { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); border-top:1px solid var(--hair); border-bottom:1px solid var(--hair); margin:16px 0; } .stats div { min-width:0; padding:8px; border-right:1px solid var(--hair); overflow:hidden; text-overflow:ellipsis; } .file { display:flex; justify-content:space-between; gap:10px; padding:7px 0; border-bottom:1px solid var(--hair); } .file span { min-width:0; overflow:hidden; text-overflow:ellipsis; }
-    .lower { min-height:220px; display:grid; grid-template-columns:minmax(0,1.4fr) minmax(280px,1fr); border-top:1px solid var(--ink); } .activity, .lanes { min-width:0; padding:14px 18px; overflow:auto; } .activity { border-right:1px solid var(--hair); } .log-row { display:grid; grid-template-columns:minmax(64px,74px) minmax(60px,72px) minmax(0,1fr); gap:12px; padding:8px 0; border-bottom:1px solid var(--hair); font-size:var(--type-body); line-height:var(--line-compact); } .log-row span { min-width:0; overflow:hidden; text-overflow:ellipsis; } .bar { display:grid; grid-template-columns:repeat(8,minmax(72px,1fr)); min-height:32px; overflow-x:auto; border:1px solid var(--ink); margin:12px 0; } .bar span { display:grid; place-items:center; min-width:0; padding:0 6px; color:white; background:var(--accent); border-right:1px solid var(--bg); text-align:center; } .lane-row { display:grid; grid-template-columns:28px minmax(0,1fr) minmax(70px,88px) auto; gap:8px; padding:5px 0; border-bottom:1px solid var(--hair); } .lane-row span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .error { color:var(--crit); padding:8px 14px; margin:0; border-bottom:1px solid var(--crit); }
-    @media (max-height: 720px), (max-width: 980px) { body { min-height:100vh; overflow:auto; } .top-rail { flex-wrap:wrap; align-items:stretch; } .brand, .tabs, .refresh { flex:0 0 auto; } .kpis { order:2; flex:1 0 100%; border-top:1px solid var(--hair); } .picker { min-width:0; height:auto; } .picker-eye { flex:0 0 160px; } .mob-tab { flex:1 1 280px; } .hero { height:auto; min-height:0; grid-template-rows:auto auto auto; } .timeline { grid-template-columns:repeat(2,minmax(220px,1fr)); } .hero-body { grid-template-columns:1fr; } .flow { min-height:320px; border-right:0; border-bottom:1px solid var(--hair); } .agent { grid-template-columns:1fr 1fr; grid-template-rows:auto; } .lower { height:auto; min-height:220px; grid-template-columns:1fr; } .activity { border-right:0; border-bottom:1px solid var(--hair); } }
-    @media (max-width: 720px) { .top-rail { position:sticky; top:0; } .tabs { overflow-x:auto; max-width:100%; } .picker { min-width:0; height:auto; flex-direction:column; } .picker-eye, .focus-other { width:100%; flex-basis:auto; min-height:48px; border-right:0; border-left:0; } .mob-tab { min-width:0; min-height:64px; } .timeline { grid-template-columns:1fr; } .phase { min-height:64px; } .agent { grid-template-columns:1fr; } .stats { grid-template-columns:1fr; } .log-row { grid-template-columns:64px minmax(0,1fr); } .log-row span:last-child { grid-column:1 / -1; } }
-  </style>
-</head>
-<body data-bs-theme="paper">
-  <div class="top-rail"><a class="brand" href="/overview"><span class="mark"></span><span>MEERKAT FUGUE</span></a><nav class="tabs"><a class="active" href="/overview">OVERVIEW</a><a href="/issues">IMS</a><a href="/console">CONSOLE</a><a href="/ensemble">ENSEMBLE</a></nav><div class="spacer"></div><div class="kpis"><span>RUN <b>__RUNNING__</b></span><span>RETRY <b>__RETRYING__</b></span><span>TOK <b>__TOKENS__</b></span><span>T <b>__SECONDS__s</b></span><span>SHAD <b>__SHADOW__r</b></span><span>CON <b>__CONSOLE_HINT__</b></span></div><a class="refresh" href="/overview">↻</a></div>
-  __ERROR__
-  <section class="picker"><div class="picker-eye"><div class="eyebrow">FOCUS MOB</div><strong>__IN_FLIGHT_COUNT__</strong><span class="meta">in flight</span></div>__PICKER_TABS__<a class="focus-other mono" href="/issues">◇ FOCUS OTHER</a></section>
-
-  <main class="hero"><section class="identity"><span class="eyebrow">__FOCUS_IDENTIFIER__ · __FOCUS_LANE__</span><h1>__FOCUS_TITLE__</h1><span class="chip">__FOCUS_PHASE__</span><span class="chip template">fugue:template:planner-coder-reviewer</span><span class="meta">RUNTIME · __FOCUS_RUNTIME__</span><a class="meta" href="/issues">OPEN IMS</a><a class="meta" href="/console">CONSOLE</a></section><section class="timeline"><div class="phase done"><span class="disc">✓</span><span><span class="chip">fugue:phase:planning</span><br><span class="meta">done when runtime reports it</span></span></div><div class="phase active"><span class="disc">2</span><span><span class="chip">__FOCUS_PHASE__</span><br><span class="meta">active when mob is running</span></span></div><div class="phase"><span class="disc">3</span><span><span class="chip">fugue:phase:reviewing</span><br><span class="meta">pending</span></span></div><div class="phase"><span class="disc">4</span><span><span class="chip">fugue:phase:finalizing</span><br><span class="meta">pending</span></span></div></section><section class="hero-body"><div class="flow"><svg viewBox="0 0 760 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="actual Fugue mob topology: issue lead hub, planner coder reviewer worker mesh, and repo handoff"><defs><marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#D95A1E"/></marker><marker id="arr-ok" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#3E6B4F"/></marker></defs><g font-family="JetBrains Mono,monospace" font-size="11"><rect x="24" y="34" width="148" height="58" fill="#ECEAE4" stroke="#A8A49B"/><text x="38" y="58" fill="#6B6760">REPO MOB</text><text x="38" y="80" font-family="Inter,sans-serif" font-size="14" font-weight="600" fill="#1C1A17">Kapellmeister</text><rect x="296" y="24" width="168" height="72" fill="#F5E6DF" stroke="#D95A1E"/><text x="312" y="50" fill="#D95A1E">ISSUE COORDINATOR</text><text x="312" y="75" font-family="Inter,sans-serif" font-size="16" font-weight="600" fill="#1C1A17">Issue lead</text><text x="312" y="90" fill="#6B6760">Linear lane + Workpad</text><rect x="72" y="174" width="148" height="70" fill="#F6F4EE" stroke="#3E6B4F"/><text x="88" y="198" fill="#3E6B4F">PLANNER</text><text x="88" y="222" font-family="Inter,sans-serif" font-size="14" font-weight="600" fill="#1C1A17">Plan</text><rect x="306" y="174" width="148" height="70" fill="#F5E6DF" stroke="#D95A1E"/><text x="322" y="198" fill="#D95A1E">CODER</text><text x="322" y="222" font-family="Inter,sans-serif" font-size="14" font-weight="600" fill="#1C1A17">Implement</text><rect x="540" y="174" width="148" height="70" fill="#F6F4EE" stroke="#3E6B4F"/><text x="556" y="198" fill="#3E6B4F">REVIEWER</text><text x="556" y="222" font-family="Inter,sans-serif" font-size="14" font-weight="600" fill="#1C1A17">Gate</text><rect x="566" y="34" width="160" height="58" fill="#ECEAE4" stroke="#3E6B4F" stroke-dasharray="4 4"/><text x="582" y="58" fill="#3E6B4F">PR HANDOFF</text><text x="582" y="80" font-family="Inter,sans-serif" font-size="14" font-weight="600" fill="#1C1A17">Repo boundary</text><path d="M172 63 L296 60" stroke="#A8A49B" stroke-width="1.4" marker-end="url(#arr)"/><path d="M296 70 L172 72" stroke="#A8A49B" stroke-width="1.4" marker-end="url(#arr)"/><path d="M350 96 L168 174" stroke="#D95A1E" stroke-width="1.2" marker-end="url(#arr)"/><path d="M380 96 L380 174" stroke="#D95A1E" stroke-width="1.2" marker-end="url(#arr)"/><path d="M410 96 L592 174" stroke="#D95A1E" stroke-width="1.2" marker-end="url(#arr)"/><path d="M220 202 L306 202" stroke="#3E6B4F" stroke-width="1.4" marker-end="url(#arr-ok)"/><path d="M454 202 L540 202" stroke="#3E6B4F" stroke-width="1.4" marker-end="url(#arr-ok)"/><path d="M160 244 C250 286 510 286 600 244" stroke="#A8A49B" stroke-width="1.1" stroke-dasharray="4 4" fill="none" marker-end="url(#arr)"/><path d="M200 174 C285 130 475 130 560 174" stroke="#A8A49B" stroke-width="1.1" stroke-dasharray="4 4" fill="none" marker-end="url(#arr)"/><path d="M632 174 L646 92" stroke="#3E6B4F" stroke-width="1.4" stroke-dasharray="4 4" marker-end="url(#arr-ok)"/><text x="252" y="152" fill="#6B6760">issue lead wires every worker</text><text x="254" y="270" fill="#6B6760">worker peer mesh: planner↔coder · planner↔reviewer · coder↔reviewer</text><text x="70" y="116" fill="#6B6760">repo lead ↔ issue lead</text><text x="468" y="116" fill="#6B6760">review green → PR/check handoff</text></g></svg></div><aside class="agent"><div class="agent-card"><span class="eyebrow">ACTIVE AGENT <span class="badge">● RUNTIME</span></span><h2>__ACTIVE_ROLE__</h2><div class="meta">live state snapshot</div><div class="stats"><div><span class="meta">Runtime</span><br>__FOCUS_RUNTIME__</div><div><span class="meta">Tokens</span><br>__TOKENS__</div><div><span class="meta">Turn</span><br>runtime</div></div><div class="meta">CURRENT ACTION</div><p>→ __CURRENT_ACTION__</p><p class="meta">No live topology/workpad diff stream is exposed yet; showing runtime snapshot evidence only.</p></div><div class="agent-card"><span class="eyebrow">WORKPAD · RUNTIME EVIDENCE</span>__WORKPAD_FILES__</div></aside></section></main>
-
-  <section class="lower"><div class="activity"><div class="eyebrow">RUNTIME · LAST EVENTS · TAIL -f</div>__ACTIVITY_ROWS__</div><div class="lanes"><div class="eyebrow">8 LANES · ISSUES</div><div class="bar"><span>Backlog</span><span>Queue</span><span>Active</span><span>Review</span><span>Deploy</span><span>Blocked</span><span>Done</span><span>Canceled</span></div><div class="lane-row"><span>◇</span><span>Review</span><span class="meta">▸ ACTION</span><span class="meta">see IMS</span></div><div class="lane-row"><span>↑</span><span>Deploy</span><span class="meta">▸ ACTION</span><span class="meta">see IMS</span></div><div class="lane-row"><span>≋</span><span>Ensemble</span><span class="meta">▸ LOCAL</span><a class="meta" href="/ensemble">open teams</a></div></div></section>
-</body>
-</html>"##;
-    html.replace("__RUNNING__", &view.running.to_string())
-        .replace("__RETRYING__", &view.retrying.to_string())
-        .replace("__TOKENS__", &view.tokens.to_string())
-        .replace("__SECONDS__", &format!("{:.1}", view.seconds))
-        .replace("__SHADOW__", &view.shadow_recommendations.to_string())
-        .replace("__ERROR__", &error)
-        .replace("__IN_FLIGHT_COUNT__", &view.in_flight_count.to_string())
-        .replace("__PICKER_TABS__", &view.picker_tabs)
-        .replace("__FOCUS_IDENTIFIER__", &html_escape(&view.focus_identifier))
-        .replace("__FOCUS_TITLE__", &html_escape(&view.focus_title))
-        .replace(
-            "__FOCUS_LANE__",
-            &html_escape(&view.focus_lane.to_ascii_uppercase()),
-        )
-        .replace("__FOCUS_RUNTIME__", &html_escape(&view.focus_runtime))
-        .replace(
-            "__FOCUS_PHASE__",
-            &html_escape(&phase_label_for_runtime_state(&view.focus_lane)),
-        )
-        .replace("__ACTIVE_ROLE__", &html_escape(&view.active_role))
-        .replace("__CURRENT_ACTION__", &html_escape(&view.current_action))
-        .replace("__WORKPAD_FILES__", &view.workpad_files)
-        .replace("__ACTIVITY_ROWS__", &view.activity_rows)
-        .replace("__CONSOLE_HINT__", console_hint)
+            .map(|repo| format!("{}/{}/{}", repo.hostname(), repo.owner.0, repo.name.0))
+            .collect(),
+    })
+    .into_response()
 }
 
 async fn issues_board(State(app): State<AppState>, headers: HeaderMap) -> axum::response::Response {
@@ -756,9 +521,7 @@ fn create_issue_editor_html(lane_options: &str) -> String {
         "createDescription",
         Some("description"),
         "Description",
-        Some(
-            "Write the issue in Markdown. Attachments are submitted to the create API for explicit backend handling.",
-        ),
+        Some("Describe the change, the expected result, and how to verify it."),
         "",
     );
     format!(
@@ -782,7 +545,7 @@ fn create_issue_editor_html(lane_options: &str) -> String {
               <span>Attach files</span>
               <input id="createAttachments" name="attachments" type="file" multiple>
             </label>
-            <span>Attachments upload after issue creation and are persisted as issue attachment comments.</span>
+            <span>Add screenshots, logs, or other files that help explain the issue.</span>
           </div>
           <div class="attachment-drop-affordance" aria-hidden="true">Drop files here to attach them</div>
           <div class="create-attachments" id="createAttachmentList" aria-live="polite"></div>
@@ -809,10 +572,11 @@ fn create_issue_lane_options(config: &ServiceConfig) -> String {
 
 fn render_issues_board_html(config: &ServiceConfig) -> String {
     let lane_options = create_issue_lane_options(config);
-    ISSUES_BOARD_HTML.replace(
+    let html = ISSUES_BOARD_HTML.replace(
         "__FUGUE_CREATE_EDITOR__",
         &create_issue_editor_html(&lane_options),
-    )
+    );
+    inject_app_chrome(&html, AppPage::Work, true).unwrap_or(html)
 }
 
 async fn issue_detail_page(
@@ -823,7 +587,11 @@ async fn issue_detail_page(
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
-    Html(ISSUE_DETAIL_HTML).into_response()
+    Html(
+        inject_app_chrome(ISSUE_DETAIL_HTML, AppPage::Work, true)
+            .unwrap_or_else(|| ISSUE_DETAIL_HTML.to_owned()),
+    )
+    .into_response()
 }
 
 async fn ensemble_page(
@@ -847,7 +615,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Fugue IMS</title>
+  <title>Work queue | Fugue</title>
   <style>
     :root {
       color-scheme: light;
@@ -1463,10 +1231,11 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       <div class="rail-kpis" aria-label="Runtime metrics"><span>RUN <b id="kpiRun">—</b></span><span>RETRY <b id="kpiRetry">—</b></span><span>TOK <b id="kpiTok">unavailable</b></span><span>T <b id="kpiTime">unavailable</b></span><span>SHAD <b id="kpiShad">unavailable</b></span></div>
       <button class="rail-refresh" id="refresh" type="button" title="Refresh" aria-label="Refresh">↻</button>
     </header>
+    <section class="work-heading"><div><h1>Work queue</h1><p id="queueConnection">Loading queue connection...</p></div><div class="fugue-actions"><a class="fugue-button" href="/ensemble">Repository teams</a><a class="fugue-button" href="/console">Talk to queue coordinator</a></div></section>
     <section class="lane-ribbon" id="laneRibbon" aria-label="Lane filter ribbon"></section>
     <section class="toolbar sub-toolbar">
       <div class="summary" id="summary"><span><span class="metric">0</span> shown</span></div>
-      <div class="toolbar-actions"><button class="active" type="button">VIEW: BOARD</button><button type="button">VIEW: LIST</button><label class="command" for="search"><span class="kbd">/</span><input id="search" autocomplete="off" placeholder="to search…"></label><button id="newIssue" type="button">+ NEW</button><button class="icon ghost" id="shortcutButton" type="button" title="Shortcuts" aria-label="Shortcuts">?</button><span class="updated" id="selectionHint"></span></div>
+      <div class="toolbar-actions"><label class="command" for="search"><span class="kbd">/</span><input id="search" autocomplete="off" placeholder="to search…"></label><button id="newIssue" type="button" class="primary">+ New issue</button><button class="icon ghost" id="shortcutButton" type="button" title="Shortcuts" aria-label="Shortcuts">?</button><span class="updated" id="selectionHint"></span></div>
     </section>
     <section class="create-panel" id="createPanel" aria-label="Create issue">
       __FUGUE_CREATE_EDITOR__
@@ -1586,7 +1355,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
     };
 
     const api = async (url, options = {}) => {
-      const response = await fetch(url, {
+      const response = await fugueFetch(url, {
         ...options,
         headers: {
           "Accept": "application/json",
@@ -1609,7 +1378,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
     };
 
 
-    const isActionLane = (name) => name === "Review" || name === "Deploy";
+    const isActionLane = (name) => app.board?.lanes.find(lane=>lane.name===name)?.action;
     const laneGlyph = (name) => ({
       Backlog: "○",
       Queue: "◉",
@@ -1658,7 +1427,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       const selected = issue.identifier === app.selected ? " selected" : "";
       const multiSelected = app.selectedIssues.has(issue.identifier) ? " multi-selected" : "";
       // rework-note: non-running issue cards do not have measured turn evidence in this payload; avoid rendering a fabricated zero-turn count.
-      const turns = issue.runtime?.kind === "running" ? `${escapeHtml(issue.runtime.turn_count)}t` : "turns unavailable";
+      const turns = issue.runtime?.kind === "running" ? `${escapeHtml(issue.runtime.turn_count)}t` : "";
       return `
         <button class="card${selected}${multiSelected}" data-issue="${escapeHtml(issue.identifier)}" data-runtime="${runtimeKind(issue.runtime)}" draggable="true" type="button">
           <div class="keyrow"><span class="key">${escapeHtml(issue.identifier)}</span>${priority}</div>
@@ -1672,11 +1441,8 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
     const renderLane = (lane) => {
       const issues = lane.issues.filter(issueMatchesFilter);
       const action = isActionLane(lane.name);
-      if (!issues.length && !action) {
-        return `<section class="lane empty-strip" data-lane="${escapeHtml(lane.name)}" data-kind="${escapeHtml(lane.kind)}"><div class="lane-head">${laneGlyph(lane.name)}</div><div class="rotated">${escapeHtml(lane.name)} · 0</div></section>`;
-      }
-      const cards = issues.length ? issues.map(renderIssue).join("") : '<div class="empty action-drop">empty · action drop target</div>';
-      const hint = action ? `<div class="lane-action-hint">▸ Drop to run ${lane.name.toLowerCase()} procedure</div>` : "";
+      const cards = issues.length ? issues.map(renderIssue).join("") : '<div class="empty">No issues in this lane</div>';
+      const hint = action ? `<div class="lane-action-hint">▸ Drop to run ${escapeHtml(lane.action)} procedure</div>` : "";
       return `
         <section class="lane full ${lane.name === "Active" && issues.length ? "active-lane" : ""}" data-lane="${escapeHtml(lane.name)}" data-kind="${escapeHtml(lane.kind)}">
           <div class="lane-head"><div class="lane-title"><span aria-hidden="true">${laneGlyph(lane.name)}</span><strong>${escapeHtml(lane.name)}</strong></div><span class="count">${issues.length}</span></div>
@@ -1806,7 +1572,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
 
     const openFullDetail = (identifier = app.selected) => {
       if (!identifier) return;
-      window.location.href = `/issues/${encodeURIComponent(identifier)}`;
+      window.fugueNavigate(`/issues/${encodeURIComponent(identifier)}`);
     };
 
     const renderDetail = () => {
@@ -1818,8 +1584,9 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
         `<option value="${escapeHtml(lane)}" ${lane === issue.state.name ? "selected" : ""}>${escapeHtml(lane)}</option>`
       ).join("");
       const labels = issue.labels.map((label) => `<span class="pill">${escapeHtml(label)}</span>`).join("");
-      const comments = detail.comments.length
-        ? detail.comments.map(renderComment).join("")
+      const activity = detail.comments.filter(comment => newtype(comment.comment_id) !== newtype(detail.workpad?.comment_id));
+      const comments = activity.length
+        ? activity.map(renderComment).join("")
         : '<div class="empty">No comments</div>';
       drawerInner.innerHTML = `
         <div class="drawer-head">
@@ -1833,7 +1600,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
           <section class="section">
             <div class="section-head">
               <h3>Issue</h3>
-              ${issue.url ? `<a class="pill" href="${escapeHtml(issue.url)}">Open Linear</a>` : ""}
+              ${/^https?:\/\//.test(issue.url || "") ? `<a class="pill" href="${escapeHtml(issue.url)}" target="_blank" rel="noopener">Open in tracker</a>` : ""}
             </div>
             <div class="fields">
               <div class="field"><span>Status</span><strong>${escapeHtml(issue.state.name)}</strong></div>
@@ -1855,11 +1622,11 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
             <div class="description">${escapeHtml(issue.description || "No description")}</div>
           </section>
           <section class="section">
-            <div class="section-head"><h3>Workpad</h3></div>
+            <details><summary>Agent workpad</summary>
             <textarea id="workpadEditor" class="issue-markdown-editor" spellcheck="false">${escapeHtml(workpad)}</textarea>
             <div class="editor-actions">
               <button id="saveWorkpad" class="primary" type="button">Save Workpad</button>
-            </div>
+            </div></details>
           </section>
           <section class="section attachment-drop-zone" id="detailAttachmentDropZone" data-attachment-drop-zone aria-label="Drop files to attach them to this issue">
             <div class="section-head"><h3>Attachments</h3></div>
@@ -2016,7 +1783,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       for (const attachment of attachments) {
         form.append("attachments", attachment.file, attachment.name);
       }
-      const response = await fetch(`/api/v1/issues/${encodeURIComponent(identifier)}/attachments`, {
+      const response = await fugueFetch(`/api/v1/issues/${encodeURIComponent(identifier)}/attachments`, {
         method: "POST",
         headers: { "Accept": "application/json" },
         body: form,
@@ -2427,11 +2194,11 @@ const ISSUE_DETAIL_HTML: &str = r#"<!doctype html>
   let detail = null; let targetLane = null; const issueAttachmentState = []; const commentAttachmentState = []; const maxAttachmentCount = 20; const maxAttachmentBytes = 25 * 1024 * 1024; const maxAttachmentTotalBytes = 100 * 1024 * 1024;
   const escapeHtml = (value) => String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;");
   const newtype = (value) => value && typeof value === "object" && "0" in value ? value["0"] : value;
-  const api = async (url, options = {}) => { const response = await fetch(url, { ...options, headers: { "Accept":"application/json", ...(options.body ? {"Content-Type":"application/json"} : {}), ...(options.headers || {}) }}); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload?.error?.message || `Request failed: ${response.status}`); return payload; };
+  const api = async (url, options = {}) => { const response = await fugueFetch(url, { ...options, headers: { "Accept":"application/json", ...(options.body ? {"Content-Type":"application/json"} : {}), ...(options.headers || {}) }}); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload?.error?.message || `Request failed: ${response.status}`); return payload; };
   const showNotice = (message) => { $("notice").textContent = message; $("notice").style.display = "block"; };
   const clearNotice = () => { $("notice").textContent = ""; $("notice").style.display = "none"; };
   const laneGlyph = (name) => ({Backlog:"○", Queue:"◉", Active:"◐", Review:"◇", Deploy:"↑", Blocked:"!", Done:"✓", Canceled:"×"}[name] || "○");
-  const isAction = (lane) => lane === "Review" || lane === "Deploy";
+  const isAction = (lane) => detail?.lane_actions?.[lane];
   const renderKpis = () => { const runtime = detail.runtime; $("kpiTime").textContent = "unavailable"; $("kpiShadow").textContent = "unavailable"; if (!runtime) { $("kpiRun").textContent = "unavailable"; $("kpiRetry").textContent = "unavailable"; $("kpiTok").textContent = "unavailable"; return; } if (runtime.kind === "running") { $("kpiRun").textContent = "1"; $("kpiRetry").textContent = "0"; $("kpiTok").textContent = String(runtime.token_total ?? "unavailable"); return; } if (runtime.kind === "retrying") { $("kpiRun").textContent = "0"; $("kpiRetry").textContent = String(runtime.attempt ?? "1"); $("kpiTok").textContent = "unavailable"; return; } $("kpiRun").textContent = "unavailable"; $("kpiRetry").textContent = "unavailable"; $("kpiTok").textContent = "unavailable"; };
   const formatFileSize = (bytes) => bytes < 1024 ? `${bytes} B` : bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KiB` : `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
   const attachmentCommentId = (attachment) => newtype(attachment?.source?.Comment?.comment_id ?? attachment?.source?.comment?.comment_id ?? attachment?.source?.comment_id ?? null);
@@ -2441,16 +2208,16 @@ const ISSUE_DETAIL_HTML: &str = r#"<!doctype html>
   const dataTransferHasFiles = (event) => Array.from(event.dataTransfer?.types || []).includes("Files");
   const renderIssueAttachments = () => { const list = $("issueAttachmentList"); if (!list) return; const persistedHtml = (detail.attachments || []).map(renderPersistedAttachmentChip).join(""); const pendingHtml = issueAttachmentState.length ? issueAttachmentState.map((attachment) => `<span class="attachment-chip">${escapeHtml(attachment.name)} · ${escapeHtml(formatFileSize(attachment.size))}</span>`).join("") : ""; list.innerHTML = persistedHtml || pendingHtml ? `${persistedHtml}${pendingHtml}` : '<span class="meta">No attachments added for this issue editor.</span>'; };
   const validateIssueAttachment = (file, state = issueAttachmentState) => { if (state.length >= maxAttachmentCount) throw new Error("At most 20 attachments can be added."); if (file.size > maxAttachmentBytes) throw new Error(`${file.name} exceeds the 25 MiB per-file attachment limit.`); const nextTotal = state.reduce((sum, attachment) => sum + attachment.size, 0) + file.size; if (nextTotal > maxAttachmentTotalBytes) throw new Error("Attachments exceed the 100 MiB total attachment limit."); return { name:file.name, size:file.size, content_type:file.type || null, file }; };
-  const uploadIssueAttachments = async (attachments) => { const form = new FormData(); for (const attachment of attachments) form.append("attachments", attachment.file, attachment.name); const response = await fetch(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/attachments`, { method:"POST", headers:{"Accept":"application/json"}, body:form }); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload?.error?.message || `Attachment upload failed: ${response.status}`); return payload; };
+  const uploadIssueAttachments = async (attachments) => { const form = new FormData(); for (const attachment of attachments) form.append("attachments", attachment.file, attachment.name); const response = await fugueFetch(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/attachments`, { method:"POST", headers:{"Accept":"application/json"}, body:form }); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload?.error?.message || `Attachment upload failed: ${response.status}`); return payload; };
   const renderCommentAttachments = () => { const list = $("commentAttachmentList"); if (!list) return; list.innerHTML = commentAttachmentState.length ? commentAttachmentState.map((attachment, index) => `<span class="attachment-chip">${escapeHtml(attachment.name)} · ${escapeHtml(formatFileSize(attachment.size))} <button type="button" data-comment-attachment-remove="${index}" aria-label="Remove ${escapeHtml(attachment.name)}">×</button></span>`).join("") : '<span class="meta">No files selected for this comment.</span>'; };
   const installCommentAttachmentInput = () => { const input = $("commentAttachmentInput"); if (!input || input.dataset.attachmentReady === "true") return; input.dataset.attachmentReady = "true"; input.addEventListener("change", () => { const error = $("commentError"); try { for (const file of Array.from(input.files || [])) commentAttachmentState.push(validateIssueAttachment(file, commentAttachmentState)); renderCommentAttachments(); } catch (caught) { if (error) error.textContent = caught.message; showNotice(caught.message); } finally { input.value = ""; } }); };
   const installAttachmentDropTarget = () => { const zone = $("issueAttachmentDropZone"); if (!zone || zone.dataset.dropReady === "true") return; zone.dataset.dropReady = "true"; const error = $("issueAttachmentError"); const setActive = (active) => zone.classList.toggle("drag-over", active); for (const type of ["dragenter", "dragover"]) zone.addEventListener(type, (event) => { if (!dataTransferHasFiles(event)) return; event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = "copy"; setActive(true); }); zone.addEventListener("dragleave", (event) => { if (!zone.contains(event.relatedTarget)) setActive(false); }); const addFiles = async (files) => { error.textContent = ""; const added = []; for (const file of Array.from(files || [])) { const attachment = validateIssueAttachment(file); issueAttachmentState.push(attachment); added.push(attachment); } renderIssueAttachments(); if (added.length) { const payload = await uploadIssueAttachments(added); error.textContent = `Attached ${payload.attachments?.length || added.length} file(s).`; showNotice(error.textContent); await load(true); } }; zone.addEventListener("drop", async (event) => { if (!dataTransferHasFiles(event)) return; event.preventDefault(); event.stopPropagation(); setActive(false); try { await addFiles(event.dataTransfer.files); } catch (caught) { error.textContent = caught.message; showNotice(caught.message); } }); const input = $("issueAttachmentInput"); input?.addEventListener("change", async () => { try { await addFiles(input.files); } catch (caught) { error.textContent = caught.message; showNotice(caught.message); } finally { input.value = ""; } }); };
   document.addEventListener("dragover", (event) => { if (dataTransferHasFiles(event)) event.preventDefault(); }, true); document.addEventListener("drop", (event) => { if (dataTransferHasFiles(event)) event.preventDefault(); }, true);
-  const render = () => { renderKpis(); const issue = detail.issue; const id = newtype(issue.identifier); const current = issue.state.name; targetLane = targetLane || current; $("issueId").textContent = id; $("title").textContent = issue.title; $("stateChip").textContent = `${laneGlyph(current)} ${current.toUpperCase()}`; const dirty = targetLane !== current; $("dirtyFlag").hidden = !dirty; $("save").disabled = !dirty; $("save").innerHTML = dirty && isAction(targetLane) ? `SAVE & RUN ${targetLane.toUpperCase()} <span class="meta">⌘S</span>` : `SAVE CHANGES <span class="meta">⌘S</span>`; $("diff").innerHTML = dirty ? `● 1 UNSAVED CHANGE&nbsp;&nbsp; Lane: ${escapeHtml(current)} → ${escapeHtml(targetLane)} ${isAction(targetLane) ? `<span class="trigger">▸ triggers ${targetLane.toLowerCase()} procedure</span>` : ""}` : "No changes"; $("props").innerHTML = `<div class="field ${dirty ? "dirty" : ""}"><div class="field-head"><span>LANE</span>${dirty ? "<span>● CHANGED</span>" : ""}</div><div class="value">${dirty ? `<del>${escapeHtml(current)}</del> → <strong>${escapeHtml(targetLane)}</strong>` : escapeHtml(current)}</div></div><div class="field"><div class="field-head"><span>LABELS</span></div><div>${issue.labels.map((l) => `<span class="label-chip">${escapeHtml(l)}</span>`).join("")}</div></div><div class="field"><div class="field-head"><span>ASSIGNEE</span></div><div>${escapeHtml(issue.assignee?.name || "Unassigned")}</div></div><div class="field"><div class="field-head"><span>BRANCH</span></div><div>${escapeHtml(newtype(issue.branch_name) || "None")}</div></div>`; $("middle").innerHTML = `<h2 class="section-title mono">DESCRIPTION</h2><div class="description">${escapeHtml(issue.description || "No description")}</div><h2 class="section-title mono">ACTIVITY</h2>${detail.comments.map(renderComment).join("") || '<div class="meta">No comments</div>'}<h2 class="section-title mono">ATTACHMENTS</h2><section class="attachment-drop-zone" id="issueAttachmentDropZone" data-attachment-drop-zone aria-label="Drop files to attach them to this issue"><label class="attachment-input-label" for="issueAttachmentInput"><span>Choose files</span><input id="issueAttachmentInput" type="file" multiple></label><div class="attachment-drop-affordance" aria-hidden="true">Drop files here to attach them to this issue</div><div class="attachment-list" id="issueAttachmentList" aria-live="polite"></div><div class="attachment-error meta" id="issueAttachmentError" role="alert"></div></section><h2 class="section-title mono">NEW COMMENT</h2><section class="comment-composer" aria-label="New comment"><textarea id="commentEditor" class="issue-markdown-editor" spellcheck="true" placeholder="Add a comment…"></textarea><label class="attachment-input-label" for="commentAttachmentInput"><span>Attach files to this comment</span><input id="commentAttachmentInput" type="file" multiple></label><div class="attachment-list" id="commentAttachmentList" aria-live="polite"></div><div class="comment-actions"><div class="comment-error meta" id="commentError" role="alert"></div><button class="comment-submit" id="postComment" type="button">POST COMMENT <span class="meta">C</span></button></div></section><h2 class="section-title mono">WORKPAD</h2><textarea id="workpadEditor" class="issue-markdown-editor">${escapeHtml(detail.workpad?.body_markdown || "")}</textarea>`; $("lanePicker").innerHTML = detail.lanes.map((lane) => `<button class="lane-row ${targetLane === lane ? "target" : ""}" data-lane="${escapeHtml(lane)}" type="button"><span>${laneGlyph(lane)}</span><span>${escapeHtml(lane)}${isAction(lane) ? `<span class="sub">▸ runs ${lane.toLowerCase()} procedure</span>` : ""}</span><span class="meta">${lane === current ? "FROM" : targetLane === lane ? "NEW LANE" : ""}</span></button>`).join(""); renderIssueAttachments(); renderCommentAttachments(); installAttachmentDropTarget(); installCommentAttachmentInput(); };
+  const render = () => { const commentDraft = $("commentEditor")?.value || ""; const workpadOpen = $("agentWorkpad")?.open || false; renderKpis(); const issue = detail.issue; const id = newtype(issue.identifier); const current = issue.state.name; targetLane = targetLane || current; $("issueId").textContent = id; $("title").textContent = issue.title; $("stateChip").textContent = `${laneGlyph(current)} ${current.toUpperCase()}`; const dirty = targetLane !== current; $("dirtyFlag").hidden = !dirty; $("save").disabled = !dirty; $("save").innerHTML = dirty && isAction(targetLane) ? `SAVE & RUN ${escapeHtml(isAction(targetLane).toUpperCase())} <span class="meta">⌘S</span>` : `SAVE CHANGES <span class="meta">⌘S</span>`; $("diff").innerHTML = dirty ? `● 1 UNSAVED CHANGE&nbsp;&nbsp; Lane: ${escapeHtml(current)} → ${escapeHtml(targetLane)} ${isAction(targetLane) ? `<span class="trigger">▸ triggers ${escapeHtml(isAction(targetLane))} procedure</span>` : ""}` : "No changes"; $("props").innerHTML = `<div class="field ${dirty ? "dirty" : ""}"><div class="field-head"><span>LANE</span>${dirty ? "<span>● CHANGED</span>" : ""}</div><div class="value">${dirty ? `<del>${escapeHtml(current)}</del> → <strong>${escapeHtml(targetLane)}</strong>` : escapeHtml(current)}</div></div><div class="field"><div class="field-head"><span>LABELS</span></div><div>${issue.labels.map((l) => `<span class="label-chip">${escapeHtml(l)}</span>`).join("")}</div></div><div class="field"><div class="field-head"><span>ASSIGNEE</span></div><div>${escapeHtml(issue.assignee?.name || "Unassigned")}</div></div><div class="field"><div class="field-head"><span>BRANCH</span></div><div>${escapeHtml(newtype(issue.branch_name) || "None")}</div></div>`; $("middle").innerHTML = `<h2 class="section-title mono">DESCRIPTION</h2><div class="description">${escapeHtml(issue.description || "No description")}</div><h2 class="section-title mono">ACTIVITY</h2>${detail.comments.filter(comment => newtype(comment.comment_id) !== newtype(detail.workpad?.comment_id)).map(renderComment).join("") || '<div class="meta">No comments</div>'}<h2 class="section-title mono">ATTACHMENTS</h2><section class="attachment-drop-zone" id="issueAttachmentDropZone" data-attachment-drop-zone aria-label="Drop files to attach them to this issue"><label class="attachment-input-label" for="issueAttachmentInput"><span>Choose files</span><input id="issueAttachmentInput" type="file" multiple></label><div class="attachment-drop-affordance" aria-hidden="true">Drop files here to attach them to this issue</div><div class="attachment-list" id="issueAttachmentList" aria-live="polite"></div><div class="attachment-error meta" id="issueAttachmentError" role="alert"></div></section><h2 class="section-title mono">NEW COMMENT</h2><section class="comment-composer" aria-label="New comment"><textarea id="commentEditor" class="issue-markdown-editor" spellcheck="true" placeholder="Add a comment…"></textarea><label class="attachment-input-label" for="commentAttachmentInput"><span>Attach files to this comment</span><input id="commentAttachmentInput" type="file" multiple></label><div class="attachment-list" id="commentAttachmentList" aria-live="polite"></div><div class="comment-actions"><div class="comment-error meta" id="commentError" role="alert"></div><button class="comment-submit" id="postComment" type="button">POST COMMENT <span class="meta">C</span></button></div></section><details id="agentWorkpad" ${workpadOpen ? "open" : ""}><summary class="section-title mono">AGENT WORKPAD</summary><p class="meta">Execution notes and validation evidence maintained by the agents.</p><textarea id="workpadEditor" class="issue-markdown-editor" aria-label="Agent workpad" readonly>${escapeHtml(detail.workpad?.body_markdown || "No workpad yet.")}</textarea></details>`; $("lanePicker").innerHTML = detail.lanes.map((lane) => `<button class="lane-row ${targetLane === lane ? "target" : ""}" data-lane="${escapeHtml(lane)}" type="button"><span>${laneGlyph(lane)}</span><span>${escapeHtml(lane)}${isAction(lane) ? `<span class="sub">▸ runs ${escapeHtml(isAction(lane))} procedure</span>` : ""}</span><span class="meta">${lane === current ? "FROM" : targetLane === lane ? "NEW LANE" : ""}</span></button>`).join(""); $("commentEditor").value = commentDraft; renderIssueAttachments(); renderCommentAttachments(); installAttachmentDropTarget(); installCommentAttachmentInput(); };
   const load = async (preserveTarget = false) => { const previousTarget = targetLane; try { detail = await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}`); targetLane = preserveTarget && previousTarget ? previousTarget : detail.issue.state.name; render(); } catch (error) { showNotice(error.message); } };
-  const postComment = async () => { const editor = $("commentEditor"); const button = $("postComment"); const error = $("commentError"); if (!editor || !button || !error) return; const body = editor.value.trim(); clearNotice(); error.textContent = ""; if (!body && commentAttachmentState.length === 0) { error.textContent = "Comment or attachment is required."; editor.focus(); return; } button.disabled = true; try { if (commentAttachmentState.length) { const form = new FormData(); form.append("body_markdown", body); for (const attachment of commentAttachmentState) form.append("attachments", attachment.file, attachment.name); const response = await fetch(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/comments`, { method:"POST", headers:{"Accept":"application/json"}, body:form }); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload?.error?.message || `Comment failed: ${response.status}`); commentAttachmentState.length = 0; renderCommentAttachments(); } else { await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/comments`, { method: "POST", body: JSON.stringify({ body_markdown: body }) }); } editor.value = ""; await load(true); } catch (caught) { error.textContent = caught.message; showNotice(caught.message); } finally { button.disabled = false; } };
-  document.addEventListener("click", async (event) => { if (event.target.id === "close" || event.target.id === "cancel" || event.target === document.body) location.href = "/issues"; const row = event.target.closest(".lane-row"); if (row) { targetLane = row.dataset.lane; render(); } if (event.target.dataset.commentAttachmentRemove) { commentAttachmentState.splice(Number(event.target.dataset.commentAttachmentRemove), 1); renderCommentAttachments(); } if (event.target.id === "postComment") { await postComment(); } if (event.target.id === "save" && detail && targetLane !== detail.issue.state.name) { try { await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/state`, { method:"PATCH", body: JSON.stringify({ state: targetLane }) }); location.href = "/issues"; } catch (error) { showNotice(error.message); } } });
-  document.addEventListener("keydown", async (event) => { const target = event.target; const editing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement; if (event.key === "Escape") location.href = "/issues"; if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") { event.preventDefault(); $("save").click(); } else if (!editing && event.key.toLowerCase() === "c") { event.preventDefault(); $("commentEditor")?.focus(); } });
+  const postComment = async () => { const editor = $("commentEditor"); const button = $("postComment"); const error = $("commentError"); if (!editor || !button || !error) return; const body = editor.value.trim(); clearNotice(); error.textContent = ""; if (!body && commentAttachmentState.length === 0) { error.textContent = "Comment or attachment is required."; editor.focus(); return; } button.disabled = true; try { if (commentAttachmentState.length) { const form = new FormData(); form.append("body_markdown", body); for (const attachment of commentAttachmentState) form.append("attachments", attachment.file, attachment.name); const response = await fugueFetch(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/comments`, { method:"POST", headers:{"Accept":"application/json"}, body:form }); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload?.error?.message || `Comment failed: ${response.status}`); commentAttachmentState.length = 0; renderCommentAttachments(); } else { await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/comments`, { method: "POST", body: JSON.stringify({ body_markdown: body }) }); } editor.value = ""; await load(true); } catch (caught) { error.textContent = caught.message; showNotice(caught.message); } finally { button.disabled = false; } };
+  document.addEventListener("click", async (event) => { if (event.target.id === "close" || event.target.id === "cancel" || event.target === document.body) fugueNavigate("/issues"); const row = event.target.closest(".lane-row"); if (row) { targetLane = row.dataset.lane; render(); } if (event.target.dataset.commentAttachmentRemove) { commentAttachmentState.splice(Number(event.target.dataset.commentAttachmentRemove), 1); renderCommentAttachments(); } if (event.target.id === "postComment") { await postComment(); } if (event.target.id === "save" && detail && targetLane !== detail.issue.state.name) { try { await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/state`, { method:"PATCH", body: JSON.stringify({ state: targetLane }) }); fugueNavigate("/issues"); } catch (error) { showNotice(error.message); } } });
+  document.addEventListener("keydown", async (event) => { const target = event.target; const editing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement; if (event.key === "Escape") fugueNavigate("/issues"); if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") { event.preventDefault(); $("save").click(); } else if (!editing && event.key.toLowerCase() === "c") { event.preventDefault(); $("commentEditor")?.focus(); } });
   load();
 </script>
 </body>
@@ -2492,6 +2259,7 @@ struct IssueBoardTotals {
 struct IssueBoardLane {
     name: String,
     kind: IssueBoardLaneKind,
+    action: Option<LaneAction>,
     issues: Vec<IssueBoardIssue>,
 }
 
@@ -2504,6 +2272,27 @@ enum IssueBoardLaneKind {
     Attention,
     Terminal,
     Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LaneAction {
+    Review,
+    Merge,
+    Deploy,
+}
+
+fn lane_action(config: &ServiceConfig, lane: &str) -> Option<LaneAction> {
+    match lane {
+        "Review" if config.final_review.enabled || config.independent_review.enabled => {
+            Some(LaneAction::Review)
+        }
+        "Deploy" if config.deploy.enabled && config.deploy.procedure == "merge-only" => {
+            Some(LaneAction::Merge)
+        }
+        "Deploy" if config.deploy.enabled => Some(LaneAction::Deploy),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2555,6 +2344,7 @@ struct IssueDetailSnapshot {
     attachments: Vec<crate::tools::LinearFileAttachmentSnapshot>,
     runtime: Option<IssueBoardRuntimeStatus>,
     lanes: Vec<String>,
+    lane_actions: BTreeMap<String, LaneAction>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3252,6 +3042,10 @@ async fn issue_detail_snapshot(
         attachments: inspected.attachments,
         comments,
         runtime,
+        lane_actions: canonical_issue_board_lanes()
+            .into_iter()
+            .filter_map(|name| lane_action(&app.config, &name).map(|action| (name, action)))
+            .collect(),
         lanes: canonical_issue_board_lanes(),
     })
 }
@@ -3350,12 +3144,13 @@ fn issue_board_snapshot_from_rows(
             sort_issue_board_issues(&mut issues);
             IssueBoardLane {
                 kind: canonical_lane_kind(&name),
+                action: lane_action(config, &name),
                 name,
                 issues,
             }
         })
         .collect::<Vec<_>>();
-    // rework-note: the IMS board always renders the eight canonical Fugue lanes; empty non-action lanes collapse in the client instead of disappearing into a sidebar.
+    // Keep empty lanes visible so operators can move tickets into them.
     let issue_count = lanes.iter().map(|lane| lane.issues.len()).sum();
     IssueBoardSnapshot {
         generated_at: Utc::now(),
@@ -3796,8 +3591,9 @@ fn tracker_state_for_canonical_lane(config: &ServiceConfig, lane: &str) -> Strin
         "review" => config
             .linear
             .lanes
-            .review_ready
+            .do_review
             .clone()
+            .or_else(|| config.linear.lanes.review_ready.clone())
             .unwrap_or_else(|| "In Review".to_string()),
         "deploy" => config
             .linear
@@ -4339,7 +4135,8 @@ pub async fn execute_deploy_transaction(
             ota: None,
         };
     };
-    let merge_result = GitHubToolHost::new().merge_pr(merge_input);
+    let merge_result = GitHubToolHost::with_connections(config.meerkat.runtime_connections.clone())
+        .merge_pr(merge_input);
     let merge_output = match merge_result {
         crate::tools::FugueToolResult::Ok {
             output: FugueToolOutput::GitHubMergePr(output),
@@ -5766,264 +5563,39 @@ mod tests {
         }
     }
 
-    fn sample_dashboard_view(console_enabled: bool) -> DashboardView {
-        DashboardView {
-            running: 2,
-            retrying: 1,
-            tokens: 144,
-            seconds: 12.5,
-            error: None,
-            shadow_health: "Healthy".to_string(),
-            shadow_recommendations: 3,
-            shadow_comparisons: 4,
-            shadow_authority: "ObserveOnly".to_string(),
-            running_rows: "<tr><td>LUC-621</td><td>Native</td><td>Implementing</td><td>s1</td><td>2</td><td>started</td></tr>".to_string(),
-            retry_rows: "<tr><td>LUC-620</td><td>Native</td><td>1</td><td>soon</td><td>retry</td></tr>".to_string(),
-            console_enabled,
-            in_flight_count: 1,
-            picker_tabs: r#"<a class="mob-tab focused" href="/issues/TEST-1"><span class="radio"></span><span class="mob-tab-main"><span class="meta">TEST-1 <span class="badge">● FOCUSED</span></span><div class="mob-tab-title">Runtime supplied issue</div></span><span class="meta">42s<br>CODER</span></a>"#.to_string(),
-            focus_identifier: "TEST-1".to_string(),
-            focus_title: "Runtime supplied issue".to_string(),
-            focus_lane: "Active".to_string(),
-            focus_runtime: "42s".to_string(),
-            active_role: "CODER".to_string(),
-            current_action: "Runtime supplied event".to_string(),
-            workpad_files: r#"<div class="file"><span class="meta">runtime evidence</span><span class="meta">2t</span></div>"#.to_string(),
-            activity_rows: r#"<div class="log-row"><span class="meta">now</span><span class="meta">TEST-1</span><span>Runtime supplied event</span></div>"#.to_string(),
-        }
-    }
-
-    fn assert_banana_sorbet_contract(html: &str) {
-        for required in [
-            "--bs-paper: #ECEAE4",
-            "--bs-paper-soft: #F6F4EE",
-            "--bs-paper-raised: #FAF8F2",
-            "--bs-ink: #1C1A17",
-            "--bs-muted: #6B6760",
-            "--bs-line: #D6D2C8",
-            "--bs-accent: #D95A1E",
-            "--bs-accent-dark: #E76A2F",
-            "--bs-font-sans: Inter",
-            r#"--bs-font-mono: "JetBrains Mono""#,
-            "--r-sm: 2px",
-            "--r-md: 6px",
-            "--type-micro: 10px",
-            "--type-rail: 11px",
-            "--type-meta: 12px",
-            "--type-body: 13px",
-            "--type-card: 14px",
-            "--type-panel-heading: 15px",
-            "--type-heading: 16px",
-            "--line-compact: 1.35",
-            "--control-h: 38px",
-            r#"data-bs-theme="paper""#,
-        ] {
-            assert!(
-                html.contains(required),
-                "missing Banana Sorbet token: {required}"
-            );
-        }
-        for banned in [
-            &format!("--{}cc", "_"),
-            &format!("data-{}-theme", "cc"),
-            &format!("{}-gradient", "linear"),
-            &format!("border-radius: {}px", 12),
-            &format!("border-left: {}px solid var(--accent)", 3),
-            &format!("border-left: {}px solid var(--brand)", 3),
-            &format!("border-top: {}px solid var(--accent)", 2),
-            &format!("border-top: {}px solid var(--brand)", 2),
-            &format!("deck{}reveal", "-"),
-            &format!("{}: translateY(", "transform"),
-            &format!("{}: deck", "animation"),
-            &format!("{}px", 999),
-            &format!("#{}{}", "78", "f7ff"),
-            &format!("#{}{}", "6c", "f5ff"),
-            &format!("cockpit{}scan", "-"),
-            "font:600 28px",
-            "font-size:20px",
-            "font-size: 20px",
-            "font-size:17px",
-            "font-size: 17px",
-            "font-size=\"22\"",
-        ] {
-            assert!(
-                !html.contains(banned),
-                "found stale console styling token: {banned}"
-            );
-        }
+    fn assert_document_contract(html: &str) {
+        assert!(html.contains("<!doctype html>"));
+        assert!(html.contains("name=\"viewport\""));
+        assert!(html.contains("charset=\"utf-8\""));
     }
 
     #[test]
-    fn fugue_status_shells_use_meta_console_compact_type_scale() {
-        let dashboard = render_dashboard_html(&sample_dashboard_view(true));
-        let ims = render_issues_board_html(&issue_board_config());
-
-        for (name, html) in [
-            ("dashboard", dashboard.as_str()),
-            ("ims", ims.as_str()),
-            ("issue detail", ISSUE_DETAIL_HTML),
+    fn home_and_work_share_navigation_and_real_data_sources() {
+        for html in [
+            render_dashboard_html(),
+            render_issues_board_html(&issue_board_config()),
         ] {
-            assert_banana_sorbet_contract(html);
-            for token in [
-                "--type-rail",
-                "--type-body",
-                "--type-card",
-                "--type-panel-heading",
-                "--type-heading",
-                "--line-compact",
-            ] {
-                assert!(
-                    html.contains(token),
-                    "{name} missing compact type-scale token {token}"
-                );
+            for destination in ["/overview", "/ensemble", "/issues", "/console"] {
+                assert!(html.contains(&format!("href=\".{destination}\"")));
             }
+            assert!(html.contains("Primary app navigation"));
         }
-
-        assert!(dashboard.contains(
-            ".agent-card h2 { margin:12px 0 4px; font-size:var(--type-heading); line-height:1.25; }"
-        ));
-        assert!(
-            ims.contains("button.icon { width: 32px; padding: 0; font-size: var(--type-card); }")
-        );
-        assert!(ims.contains(".palette-input"));
-        assert!(ims.contains("font-size: var(--type-body);"));
-        assert!(ISSUE_DETAIL_HTML.contains(
-            ".sheet-title { flex:1; padding:0 14px; font-size:var(--type-panel-heading);"
-        ));
-        assert!(
-            ISSUE_DETAIL_HTML
-                .contains(".lane-row { width:100%; min-height:50px; font-size:var(--type-meta);")
-        );
-    }
-
-    #[test]
-    fn dashboard_renders_framing_and_console_issues_tabs() {
-        let html = render_dashboard_html(&sample_dashboard_view(true));
-
-        assert_banana_sorbet_contract(&html);
-        assert!(html.contains("MEERKAT FUGUE"));
-        assert!(html.contains("FOCUS MOB"));
-        assert!(html.contains(".top-rail"));
-        assert!(html.contains(".hero {"));
-        assert!(html.contains("actual Fugue mob topology"));
-        assert!(html.contains("Issue lead"));
-        assert!(html.contains("Kapellmeister"));
-        assert!(
-            html.contains("worker peer mesh: planner↔coder · planner↔reviewer · coder↔reviewer")
-        );
-        assert!(html.contains("review green → PR/check handoff"));
-        assert!(!html.contains("Active role"));
-        assert!(!html.contains("FLOW</text>"));
-        assert!(html.contains("fugue:phase:implementing"));
-        assert!(html.contains("CON <b>LIVE</b>"));
-        assert!(html.contains("@media (max-height: 720px), (max-width: 980px)"));
-        assert!(html.contains("see IMS"));
-        assert!(
-            !html.contains("<span>Review</span><span class=\"meta\">▸ ACTION</span><span>0</span>")
-        );
-        assert!(html.contains("Runtime supplied issue"));
-        assert!(html.contains("--shadow-sheet"));
-        assert!(html.contains(r#"href="/issues""#));
-        assert!(html.contains(r#"href="/console""#));
-        assert!(html.contains(r#"href="/console""#));
-        assert!(html.contains(r#"href="/issues""#));
-        assert!(html.contains("CONSOLE"));
-        assert!(html.contains(r#"href="/issues""#));
-        assert!(html.contains("TEST-1"));
-        for fabricated in ["LUC-642", "Tracker simplification", "29m 46s", "12m 08s"] {
-            assert!(
-                !html.contains(fabricated),
-                "dashboard leaked fabricated prototype value: {fabricated}"
-            );
-        }
-    }
-
-    #[test]
-    fn dashboard_no_focus_workpad_empty_state_is_honest() {
-        let mut view = sample_dashboard_view(true);
-        view.focus_runtime = "unavailable".to_string();
-        view.workpad_files = r#"<div class="file unavailable"><span class="meta">No active mob workpad evidence available</span><span class="meta">turns unavailable</span></div>"#.to_string();
-        let html = render_dashboard_html(&view);
-
-        assert!(html.contains("No active mob workpad evidence available"));
-        assert!(html.contains("turns unavailable"));
-        assert!(!html.contains(concat!("No active ", "workpad files")));
-        assert!(!html.contains(concat!(">", "0", "t<")));
-    }
-
-    #[test]
-    fn dashboard_renders_disabled_console_panel_without_losing_issues_tab() {
-        let html = render_dashboard_html(&sample_dashboard_view(false));
-
-        assert_banana_sorbet_contract(&html);
-        assert!(html.contains("CONSOLE"));
-        assert!(html.contains("MEERKAT FUGUE"));
-        assert!(html.contains("CON <b>OFF</b>"));
-        assert!(html.contains("FOCUS MOB"));
-        assert!(html.contains("OPEN IMS"));
-        assert!(html.contains(r#"href="/issues""#));
-    }
-
-    #[test]
-    fn dashboard_overview_layout_is_responsive_and_readable() {
-        let html = render_dashboard_html(&sample_dashboard_view(true));
-
-        assert_banana_sorbet_contract(&html);
-        for required in [
-            "body { margin:0; min-height:100vh; overflow:auto;",
-            ".top-rail { min-height:var(--control-h); display:flex; align-items:stretch; flex-wrap:nowrap;",
-            ".kpis { display:flex; min-height:var(--control-h); flex:0 1 auto; overflow-x:auto;",
-            ".picker { min-height:64px; display:flex; flex-wrap:wrap; align-items:stretch;",
-            ".mob-tab { flex:1 1 240px; min-width:220px; min-height:64px;",
-            ".hero { min-height:520px; display:grid; grid-template-rows:auto auto minmax(360px,1fr);",
-            ".identity h1 { margin:0; font-size:var(--type-heading); font-weight:500; flex:1 1 260px;",
-            ".timeline { display:grid; grid-template-columns:repeat(4,minmax(180px,1fr));",
-            ".hero-body { min-height:0; display:grid; grid-template-columns:minmax(420px,1fr) minmax(280px,340px);",
-            ".flow { border-right:1px solid var(--hair); padding:24px; min-width:0; overflow:auto;",
-            "svg { width:100%; height:100%; min-width:520px; min-height:260px; }",
-            ".agent-card { min-width:0; padding:18px; border-bottom:1px solid var(--hair); overflow:auto; }",
-            ".lower { min-height:220px; display:grid; grid-template-columns:minmax(0,1.4fr) minmax(280px,1fr);",
-            ".log-row { display:grid; grid-template-columns:minmax(64px,74px) minmax(60px,72px) minmax(0,1fr);",
-            ".lane-row { display:grid; grid-template-columns:28px minmax(0,1fr) minmax(70px,88px) auto;",
-            "@media (max-height: 720px), (max-width: 980px) { body { min-height:100vh; overflow:auto; } .top-rail { flex-wrap:wrap;",
-            ".kpis { order:2; flex:1 0 100%; border-top:1px solid var(--hair); }",
-            "@media (max-width: 720px) { .top-rail { position:sticky; top:0; } .tabs { overflow-x:auto; max-width:100%; }",
-        ] {
-            assert!(
-                html.contains(required),
-                "dashboard missing responsive layout contract: {required}"
-            );
-        }
-
-        for preserved in [
-            r#"href="/overview""#,
-            r#"href="/issues""#,
-            r#"href="/console""#,
-            "CON <b>LIVE</b>",
-            "Runtime supplied issue",
-            "worker peer mesh: planner↔coder · planner↔reviewer · coder↔reviewer",
-        ] {
-            assert!(
-                html.contains(preserved),
-                "dashboard lost protected behavior while changing layout: {preserved}"
-            );
-        }
-
-        assert!(!html.contains("height:100vh; overflow:hidden;"));
-        assert!(!html.contains(".picker { min-width:900px;"));
-        assert!(!html.contains("height:calc(100vh - 38px - 64px - 220px)"));
-        assert!(!html.contains(".activity, .lanes { padding:14px 18px; overflow:hidden;"));
+        let html = render_dashboard_html();
+        assert!(html.contains("/api/ensemble"));
+        assert!(html.contains("/api/v1/state"));
+        assert!(html.contains("/ensemble#add"));
+        assert!(!html.contains("actual Fugue mob topology"));
     }
 
     #[test]
     fn issue_routes_keep_dashboard_navigation_targets() {
         let html = render_issues_board_html(&issue_board_config());
 
-        assert_banana_sorbet_contract(&html);
-        assert!(html.contains(r#"href="/overview""#));
-        assert!(html.contains(r#"href="/console""#));
-        assert!(html.contains(r#"href="/ensemble""#));
-        assert!(html.contains(r#"href="/issues""#));
+        assert_document_contract(&html);
+        assert!(html.contains(r#"href="./overview""#));
+        assert!(html.contains(r#"href="./console""#));
+        assert!(html.contains(r#"href="./ensemble""#));
+        assert!(html.contains(r#"href="./issues""#));
         assert!(html.contains("banana-sorbet ims-subsystem"));
         assert!(html.contains("MEERKAT FUGUE"));
         assert!(html.contains("to search…"));
@@ -6049,7 +5621,7 @@ mod tests {
                 ".palette-row:hover, .palette-row.active { background: var(--bg-elev-2);"
             )
         );
-        assert!(html.contains("+ NEW"));
+        assert!(html.contains("+ New issue"));
         assert!(html.contains("openFullDetail(card.dataset.issue)"));
         assert!(!html.contains("loadDetail(card.dataset.issue);"));
         assert!(html.contains(r#"id="kpiTok">unavailable</b>"#));
@@ -6057,7 +5629,7 @@ mod tests {
         assert!(html.contains(r#"id="kpiShad">unavailable</b>"#));
         assert!(html.contains("app.board.totals.tokens ?? \"unavailable\""));
         assert!(!html.contains(concat!("app.board.totals.tokens ", "|| 0")));
-        assert!(html.contains("turns unavailable"));
+        assert!(!html.contains("turns unavailable"));
         assert!(!html.contains(concat!(": \\\"", "0", "t\\\"")));
         for fabricated in [
             concat!("TOK <b id=\"kpiTok\">", "0"),
@@ -6077,7 +5649,9 @@ mod tests {
         assert!(html.contains(r#"id="createAttachments""#));
         assert!(html.contains("createAttachmentPayload"));
         assert!(html.contains("attachments: createAttachmentPayload()"));
-        assert!(html.contains("Attachments upload after issue creation and are persisted as issue attachment comments."));
+        assert!(
+            html.contains("Add screenshots, logs, or other files that help explain the issue.")
+        );
         assert!(!html.contains("createDescriptionWithAttachments"));
         assert!(!html.contains(concat!("File", "Reader")));
         assert!(!html.contains(concat!("readAs", "DataURL")));
@@ -6096,7 +5670,7 @@ mod tests {
         assert!(html.contains("--ensemble-config"));
         assert!(html.contains("No Ensemble is configured"));
         assert!(!html.contains("http://127.0.0.1"));
-        assert!(html.contains(r#"class="active" href="/ensemble""#));
+        assert!(html.contains(r#"href="./ensemble" class="active" aria-current="page""#));
     }
 
     #[test]
@@ -6198,7 +5772,7 @@ mod tests {
 
     #[test]
     fn issue_detail_page_keeps_integrated_navigation_and_ims_controls() {
-        assert_banana_sorbet_contract(ISSUE_DETAIL_HTML);
+        assert_document_contract(ISSUE_DETAIL_HTML);
         assert!(ISSUE_DETAIL_HTML.contains("Meerkat Fugue · Issue sheet"));
         assert!(ISSUE_DETAIL_HTML.contains("banana-sorbet issue-subsystem"));
         assert!(ISSUE_DETAIL_HTML.contains("--font-display"));
@@ -6455,6 +6029,7 @@ mod tests {
             }],
             runtime: None,
             lanes: Vec::new(),
+            lane_actions: BTreeMap::new(),
         };
 
         let value = serde_json::to_value(snapshot).expect("snapshot serializes");
@@ -6922,20 +6497,20 @@ mod tests {
     #[test]
     fn console_browser_compat_embeds_meta_in_fugue_shell_once() {
         let html = r#"<!doctype html><html><head><title>Meta</title></head><body class="meta"><main id="meta-root"></main></body></html>"#;
-        let patched = inject_console_browser_compat_html(html);
+        let patched = inject_console_browser_compat_html(html, true);
 
         assert!(patched.contains("data-fugue-random-uuid-polyfill"));
         assert!(patched.contains("data-fugue-console-chrome"));
         assert!(patched.contains("class=\"fugue-console-embedded meta\""));
-        assert!(patched.contains("MEERKAT FUGUE"));
-        assert!(patched.contains(r#"href="/overview""#));
-        assert!(patched.contains(r#"href="/issues""#));
-        assert!(patched.contains(r#"class="active" href="/console""#));
-        assert!(patched.contains("META CONSOLE"));
+        assert!(patched.contains("Fugue home"));
+        assert!(patched.contains(r#"href="./overview""#));
+        assert!(patched.contains(r#"href="./issues""#));
+        assert!(patched.contains(r#"href="./console" class="active" aria-current="page""#));
+        assert!(patched.contains("Conversations"));
         assert!(patched.contains("meta-root"));
-        assert_banana_sorbet_contract(&patched);
+        assert!(patched.contains("--bs-accent:#176b58"));
 
-        let repatched = inject_console_browser_compat_html(&patched);
+        let repatched = inject_console_browser_compat_html(&patched, true);
         assert_eq!(
             repatched.matches("data-fugue-console-chrome").count(),
             patched.matches("data-fugue-console-chrome").count()
@@ -6944,6 +6519,18 @@ mod tests {
             repatched.matches("data-fugue-random-uuid-polyfill").count(),
             patched.matches("data-fugue-random-uuid-polyfill").count()
         );
+    }
+
+    #[test]
+    fn console_browser_compat_hub_links_only_to_shared_pages() {
+        let html = "<html><head></head><body><main id=\"meta-root\"></main></body></html>";
+        let patched = inject_console_browser_compat_html(html, false);
+        assert!(patched.contains(r#"href="./ensemble""#));
+        assert!(patched.contains(r#"href="./console" class="active""#));
+        assert!(patched.contains(r#"href="./queues""#));
+        assert!(patched.contains("Work queue"));
+        assert!(!patched.contains(r#"href="./issues""#));
+        assert!(!patched.contains(r#"href="./overview""#));
     }
 
     #[tokio::test]

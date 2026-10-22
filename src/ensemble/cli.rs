@@ -109,7 +109,7 @@ pub async fn run(args: EnsembleArgs) -> Result<()> {
             Ok(())
         }
         EnsembleCommand::Serve { config, host, port } => {
-            super::serve(EnsembleConfig::load(&config)?, SocketAddr::new(host, port)).await
+            super::serve(config, SocketAddr::new(host, port)).await
         }
         EnsembleCommand::Status { url } => {
             let response = client()?

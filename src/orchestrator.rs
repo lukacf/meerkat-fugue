@@ -571,7 +571,8 @@ impl KapellmeisterHostToolExecutor for FinalPrGateProjectionExecutor {
             meta_runtime_state_path(&self.config.meerkat).join("workgraph.sqlite3"),
             self.config.tracker.terminal_states.clone(),
             native_workgraph_blocked_states(&self.config),
-        );
+        )
+        .for_mob(self.config.meerkat.mob_id().into_owned());
         if let Err(message) = gate.guard_terminal_move(&input).await {
             return FugueToolResult::Err {
                 error: FugueToolError {
@@ -661,7 +662,8 @@ impl KapellmeisterHostToolExecutor for FinalPrGateProjectionExecutor {
     }
 
     async fn merge_pr(&mut self, input: MergePrInput) -> FugueToolResult {
-        GitHubToolHost::new().merge_pr(input)
+        GitHubToolHost::with_connections(self.config.meerkat.runtime_connections.clone())
+            .merge_pr(input)
     }
 }
 
@@ -1145,7 +1147,9 @@ impl Orchestrator {
         adapter: &IssueAdapter,
         issues: &[Issue],
     ) -> NativePrHandoffReconcileResult {
-        let github_host = GitHubToolHost::new();
+        let github_host = GitHubToolHost::with_connections(
+            self.config.effective().meerkat.runtime_connections.clone(),
+        );
         let mut result = NativePrHandoffReconcileResult::default();
         for issue in issues {
             if matches!(
@@ -1342,7 +1346,9 @@ impl Orchestrator {
         if !self.config.effective().deploy.enabled {
             return false;
         }
-        let github_host = GitHubToolHost::new();
+        let github_host = GitHubToolHost::with_connections(
+            self.config.effective().meerkat.runtime_connections.clone(),
+        );
         let mut changed = false;
         for issue in issues {
             if !native_deploy_lane_candidate(self.config.effective(), issue) {
@@ -1410,18 +1416,28 @@ impl Orchestrator {
             .await?
             .unwrap_or_else(|| "## Fugue Workpad".to_string());
         let linear = recover_native_linear_evidence(issue, Some(&workpad_body));
-        let Some(handoff) = recover_existing_native_pr_monitor_handoff_for_issue(
-            self.config.effective(),
-            issue,
-            Some(&linear),
-            github_host,
-        ) else {
+        let recorded =
+            recover_recorded_native_pr_handoff(self.config.effective(), issue, github_host)?;
+        let Some(handoff) = recorded.or_else(|| {
+            recover_existing_native_pr_monitor_handoff_for_issue(
+                self.config.effective(),
+                issue,
+                Some(&linear),
+                github_host,
+            )
+        }) else {
             warn!(
                 issue_identifier = %issue.identifier,
                 "mechanical deploy lane found no durable PR evidence"
             );
             return Ok(None);
         };
+        if !handoff.rejected_pull_requests.is_empty() {
+            return Err(FugueError::ResponseError(
+                "PR evidence conflicts with the current issue branch".into(),
+            ));
+        }
+        crate::pr_handoff::record(self.config.effective(), issue, &handoff.pull_request)?;
         let ci = if handoff.pull_request.state == PullRequestState::Open {
             inspect_native_pr_handoff_ci(github_host, &handoff.pull_request)
                 .map_err(|message| {
@@ -1462,7 +1478,8 @@ impl Orchestrator {
             meta_runtime_state_path(&self.config.effective().meerkat).join("workgraph.sqlite3"),
             self.config.effective().tracker.terminal_states.clone(),
             native_workgraph_blocked_states(self.config.effective()),
-        );
+        )
+        .for_mob(self.config.effective().meerkat.mob_id().into_owned());
         gate.unresolved_blocking_items(issue_identifier)
             .await
             .map(|items| items.len())
@@ -1474,7 +1491,9 @@ impl Orchestrator {
         adapter: &IssueAdapter,
         issues: &[Issue],
     ) -> bool {
-        let github_host = GitHubToolHost::new();
+        let github_host = GitHubToolHost::with_connections(
+            self.config.effective().meerkat.runtime_connections.clone(),
+        );
         let mut changed = false;
         for issue in issues {
             if !matches!(
@@ -1749,9 +1768,11 @@ impl Orchestrator {
             .iter()
             .map(|signal| signal.id.0.clone())
             .collect::<Vec<_>>();
-        match repo_kapellmeister_signal_message_with_success_lane(
+        match repo_kapellmeister_signal_message_with_lanes(
             &signals,
             &self.config.effective().linear.lanes.success,
+            self.config.effective().linear.lanes.review_ready.as_deref(),
+            self.config.effective().independent_review.enabled,
         ) {
             Ok(message) => {
                 let registry = self.meta_runtime_registry.clone();
@@ -2259,11 +2280,10 @@ impl Orchestrator {
         if runs.is_empty() {
             return;
         }
-        let workspace = WorkspaceManager::new(
-            &self.config.effective().workspace,
-            &self.config.effective().hooks,
+        let workspace = WorkspaceManager::for_service(self.config.effective());
+        let github_host = GitHubToolHost::with_connections(
+            self.config.effective().meerkat.runtime_connections.clone(),
         );
-        let github_host = GitHubToolHost::new();
         let mut recovered = Vec::new();
         for run in newest_native_runs_by_issue(runs) {
             let workpad_body = match run.issue.as_ref() {
@@ -2336,7 +2356,9 @@ impl Orchestrator {
     }
 
     async fn reconcile_native_mob_events(&mut self) {
-        let github_host = GitHubToolHost::new();
+        let github_host = GitHubToolHost::with_connections(
+            self.config.effective().meerkat.runtime_connections.clone(),
+        );
         self.reconcile_native_mob_events_with_tools(None, Some(&github_host))
             .await;
     }
@@ -2394,7 +2416,9 @@ impl Orchestrator {
     }
 
     async fn reconcile_final_pr_gate_events_internal(&mut self) {
-        let github_host = GitHubToolHost::new();
+        let github_host = GitHubToolHost::with_connections(
+            self.config.effective().meerkat.runtime_connections.clone(),
+        );
         self.reconcile_final_pr_gate_events_with_projector(
             None::<&mut FinalPrGateProjectionExecutor>,
             &github_host,
@@ -2726,10 +2750,7 @@ impl Orchestrator {
                             "native mob status heartbeat",
                         )
                         .await;
-                    let workspace = WorkspaceManager::new(
-                        &self.config.effective().workspace,
-                        &self.config.effective().hooks,
-                    );
+                    let workspace = WorkspaceManager::for_service(self.config.effective());
                     let mut state = self.state.write().await;
                     if let Some(entry) = state.running.get_mut(&issue_id) {
                         let status_is_fresh = entry
@@ -2810,10 +2831,7 @@ impl Orchestrator {
                         );
                         cumulative_events = Some(native_run.observed_events.clone());
                         if let Some(run) = inspected_run.as_ref() {
-                            let workspace = WorkspaceManager::new(
-                                &self.config.effective().workspace,
-                                &self.config.effective().hooks,
-                            );
+                            let workspace = WorkspaceManager::for_service(self.config.effective());
                             native_run.recovery = refresh_native_status_recovery(
                                 run,
                                 &entry.issue,
@@ -3016,10 +3034,7 @@ impl Orchestrator {
                 };
                 match workpad_result {
                     FugueToolResult::Ok { .. } => {
-                        let workspace = WorkspaceManager::new(
-                            &self.config.effective().workspace,
-                            &self.config.effective().hooks,
-                        );
+                        let workspace = WorkspaceManager::for_service(self.config.effective());
                         let mut state = self.state.write().await;
                         if let Some(entry) = state.running.get_mut(&issue_id)
                             && let Some(native_run) = entry.native_run.as_mut()
@@ -3442,10 +3457,7 @@ impl Orchestrator {
                 "native PR handoff requires a configured GitHub repository scope".to_string(),
             ));
         };
-        let workspace = WorkspaceManager::new(
-            &self.config.effective().workspace,
-            &self.config.effective().hooks,
-        );
+        let workspace = WorkspaceManager::for_service(self.config.effective());
         let workspace_key = workspace_key_for_identifier(&entry.identifier);
         let inspection = workspace
             .inspect_workspace_key(&workspace_key.0)?
@@ -3476,9 +3488,19 @@ impl Orchestrator {
         if !git_staged_changes_empty(&inspection.path)? {
             git_run(&inspection.path, &["commit", "-m", &commit_message])?;
         }
-        git_run(&inspection.path, &["push", "-u", "origin", &head_branch.0])?;
+        git_output_with_connections(
+            &inspection.path,
+            &["push", "-u", "origin", &head_branch.0],
+            self.config
+                .effective()
+                .meerkat
+                .runtime_connections
+                .as_deref(),
+        )?;
 
-        let github = GitHubToolHost::new();
+        let github = GitHubToolHost::with_connections(
+            self.config.effective().meerkat.runtime_connections.clone(),
+        );
         let base_branch = match github.inspect_repo(InspectRepoInput { repo: repo.clone() }) {
             FugueToolResult::Ok {
                 output: FugueToolOutput::GitHubInspectRepo(output),
@@ -3527,6 +3549,7 @@ impl Orchestrator {
         entry: &RunningEntry,
         pull_request: &GitHubPullRequestSnapshot,
     ) -> Result<()> {
+        crate::pr_handoff::record(self.config.effective(), issue, pull_request)?;
         let adapter = IssueAdapter::from_config(&self.config.effective().tracker)?;
         let issue_ref = issue_ref_for_identifier(&issue.identifier);
         let body = adapter
@@ -3550,6 +3573,14 @@ impl Orchestrator {
     }
 
     async fn record_detected_native_pr_handoff(&self, handoff: DetectedNativePrHandoff) {
+        if let Err(error) = crate::pr_handoff::record(
+            self.config.effective(),
+            &handoff.issue,
+            &handoff.pull_request,
+        ) {
+            self.state.write().await.last_error = Some(error.to_string());
+            return;
+        }
         let adapter = match IssueAdapter::from_config(&self.config.effective().tracker) {
             Ok(adapter) => adapter,
             Err(err) => {
@@ -3621,6 +3652,7 @@ impl Orchestrator {
         action: &NativePrHandoffMonitorAction,
         final_gate_start: Option<&FinalPrGateStartRequest>,
     ) -> Result<bool> {
+        crate::pr_handoff::record(self.config.effective(), issue, &github.pull_request)?;
         let body = append_native_pr_handoff_monitor_evidence(
             workpad_body,
             github,
@@ -4483,25 +4515,29 @@ impl Orchestrator {
         &self,
         mut request: IndependentReviewStartRequest,
     ) -> KapellmeisterStartIssueResult {
+        let issue_identifier =
+            issue_identifier_from_ref(&request.issue).unwrap_or_else(|| "unknown".to_string());
+        if !self.config.effective().independent_review.enabled {
+            return KapellmeisterStartIssueResult {
+                issue_identifier,
+                accepted: false,
+                message: "independent review lane is disabled by configuration".to_string(),
+            };
+        }
         request.orchestrator_profile = self
             .config
             .effective()
             .independent_review
             .orchestrator_profile
             .clone();
-        let issue_identifier =
-            issue_identifier_from_ref(&request.issue).unwrap_or_else(|| "unknown".to_string());
         if request
             .spawn_input
             .worktree_path
             .as_deref()
             .is_none_or(str::is_empty)
         {
-            match WorkspaceManager::new(
-                &self.config.effective().workspace,
-                &self.config.effective().hooks,
-            )
-            .path_for_issue(&issue_identifier)
+            match WorkspaceManager::for_service(self.config.effective())
+                .path_for_issue(&issue_identifier)
             {
                 Ok(path) => {
                     request.spawn_input.worktree_path = Some(path.display().to_string());
@@ -5573,8 +5609,9 @@ impl Orchestrator {
             )
             .await
         };
-        let workspace_manager = WorkspaceManager::new(&config.workspace, &config.hooks);
-        let github_host = GitHubToolHost::new();
+        let workspace_manager = WorkspaceManager::for_service(&config);
+        let github_host =
+            GitHubToolHost::with_connections(config.meerkat.runtime_connections.clone());
         let recovery = refresh_native_status_recovery(
             &run,
             &issue,
@@ -6134,7 +6171,7 @@ fn native_pr_handoff_monitor_action(
                     NativePrHandoffWaitingReason::CiPending,
                 );
             }
-            CiStatus::Pending | CiStatus::Success | CiStatus::Skipped => {}
+            CiStatus::NoChecks | CiStatus::Pending | CiStatus::Success | CiStatus::Skipped => {}
         }
     }
     if github.pull_request.draft {
@@ -6155,7 +6192,7 @@ fn native_final_pr_gate_start_request_from_handoff(
 ) -> Result<Option<FinalPrGateStartRequest>> {
     let final_review = config.final_review.clone();
     let issue_ref = issue_ref_for_identifier(&issue.identifier);
-    let worktree_path = WorkspaceManager::new(&config.workspace, &config.hooks)
+    let worktree_path = WorkspaceManager::for_service(config)
         .path_for_issue(&issue.identifier)?
         .display()
         .to_string();
@@ -6194,7 +6231,7 @@ fn native_pr_handoff_monitor_signal_decision(
             NativePrHandoffWaitingReason::AwaitingReviewOrMerge,
         ) => (
             PrHandoffMonitorDecision::ReadyForDone,
-            "CI is green or no checks are configured, and the PR handoff is acceptable; if reviewer and WorkGraph obligations are satisfied, move the issue to Done. Merge/OTA is a separate Deploy action.",
+            "PR is eligible for handoff: CI is acceptable or no checks were reported. Follow the configured review holding lane and completion policy after reviewer and WorkGraph obligations are satisfied. This signal does not authorize a merge or claim checks ran.",
         ),
         NativePrHandoffMonitorAction::Replan(_) => (
             PrHandoffMonitorDecision::Replan,
@@ -6202,7 +6239,7 @@ fn native_pr_handoff_monitor_signal_decision(
         ),
         NativePrHandoffMonitorAction::Complete => (
             PrHandoffMonitorDecision::Merged,
-            "Merged PR observed; move the issue to Done if it is not already terminal.",
+            "Merged PR observed; project to the configured terminal success lane after verifying remaining completion obligations.",
         ),
     }
 }
@@ -6412,7 +6449,7 @@ fn native_pr_handoff_waiting_reason(reason: NativePrHandoffWaitingReason) -> &'s
             "CI is still pending; keep the issue Active and continue polling"
         }
         NativePrHandoffWaitingReason::AwaitingReviewOrMerge => {
-            "PR is open, CI is green or no checks are configured, and the handoff is acceptable; close to Done once reviewer/WorkGraph obligations are satisfied"
+            "PR is open and eligible for handoff; follow the configured holding lane after reviewer and WorkGraph obligations are satisfied; no merge is implied"
         }
     }
 }
@@ -6539,7 +6576,19 @@ fn ensure_workspace_runtime_git_excludes(workspace: &Path) -> Result<()> {
 }
 
 fn git_output(workspace: &Path, args: &[&str]) -> Result<String> {
-    let output = StdCommand::new("git")
+    git_output_with_connections(workspace, args, None)
+}
+
+fn git_output_with_connections(
+    workspace: &Path,
+    args: &[&str],
+    connections: Option<&crate::setup::connections::Connections>,
+) -> Result<String> {
+    let mut command = StdCommand::new("git");
+    if let Some(connections) = connections {
+        command.envs(connections.github_environment());
+    }
+    let output = command
         .args(args)
         .current_dir(workspace)
         .output()
@@ -7489,7 +7538,7 @@ fn recover_existing_native_pr_handoff_for_issue(
     linear: Option<&RecoveredLinearEvidence>,
 ) -> Option<RecoveredGitHubEvidence> {
     let repo = repository_scope_from_config(config)?;
-    let workspace = WorkspaceManager::new(&config.workspace, &config.hooks);
+    let workspace = WorkspaceManager::for_service(config);
     let workspace_key = workspace_key_for_identifier(&issue.identifier);
     let workspace_evidence = workspace
         .inspect_workspace_key(&workspace_key.0)
@@ -7504,7 +7553,7 @@ fn recover_existing_native_pr_handoff_for_issue(
         .ok()
         .flatten()
         .map(|inspection| recover_native_workspace_evidence(&inspection));
-    let github_host = GitHubToolHost::new();
+    let github_host = GitHubToolHost::with_connections(config.meerkat.runtime_connections.clone());
     recover_native_github_evidence_from_durable_sources(
         &repo,
         linear,
@@ -7514,6 +7563,48 @@ fn recover_existing_native_pr_handoff_for_issue(
     )
 }
 
+fn recover_recorded_native_pr_handoff(
+    config: &ServiceConfig,
+    issue: &Issue,
+    github: &dyn NativeStatusGitHubInspector,
+) -> Result<Option<RecoveredGitHubEvidence>> {
+    let Some(repo) = repository_scope_from_config(config) else {
+        return Ok(None);
+    };
+    let Some(record) = crate::pr_handoff::load(config, issue, &repo)? else {
+        return Ok(None);
+    };
+    let result = github.inspect_pr(crate::tools::InspectPrInput {
+        repo: repo.clone(),
+        pull_request: GitHubPullRequestRef::Number {
+            number: record.number,
+        },
+    });
+    match result {
+        FugueToolResult::Ok {
+            output: FugueToolOutput::GitHubInspectPr(output),
+            ..
+        } => {
+            let pr = output.pull_request;
+            if pr.repo != repo || pr.number != record.number || pr.head_branch != record.head_branch
+            {
+                return Err(FugueError::ResponseError(
+                    "GitHub PR identity differs from the recorded issue association".into(),
+                ));
+            }
+            // Never use a cached merge state, check result, or approval.
+            Ok(Some(RecoveredGitHubEvidence {
+                pull_request: pr,
+                rejected_pull_requests: Vec::new(),
+            }))
+        }
+        FugueToolResult::Err { error, .. } => Err(FugueError::ResponseError(error.message)),
+        FugueToolResult::Ok { .. } => Err(FugueError::ResponseError(
+            "GitHub PR inspection returned an unexpected result".into(),
+        )),
+    }
+}
+
 fn recover_existing_native_pr_monitor_handoff_for_issue(
     config: &ServiceConfig,
     issue: &Issue,
@@ -7521,7 +7612,7 @@ fn recover_existing_native_pr_monitor_handoff_for_issue(
     github: &dyn NativeStatusGitHubInspector,
 ) -> Option<RecoveredGitHubEvidence> {
     let repo = repository_scope_from_config(config)?;
-    let workspace = WorkspaceManager::new(&config.workspace, &config.hooks);
+    let workspace = WorkspaceManager::for_service(config);
     let workspace_key = workspace_key_for_identifier(&issue.identifier);
     let workspace_evidence = workspace
         .inspect_workspace_key(&workspace_key.0)
@@ -7707,7 +7798,10 @@ fn workpad_pr_handoff_section_lines(body: &str) -> impl Iterator<Item = &str> {
             let heading = trimmed.trim_start_matches('#').trim().to_ascii_lowercase();
             in_handoff_section = matches!(
                 heading.as_str(),
-                "pull request or handoff" | "pull request" | "pr handoff"
+                "pull request or handoff"
+                    | "pull request"
+                    | "pr handoff"
+                    | "review / pr handoff evidence"
             );
             return false;
         }
@@ -9159,14 +9253,29 @@ fn sort_retry_rows(rows: &mut [RetryRow]) {
 fn repo_kapellmeister_signal_message(
     signals: &[KapellmeisterShadowSignal],
 ) -> std::result::Result<String, serde_json::Error> {
-    repo_kapellmeister_signal_message_with_success_lane(signals, "Done")
+    repo_kapellmeister_signal_message_with_lanes(signals, "Done", None, true)
 }
 
-fn repo_kapellmeister_signal_message_with_success_lane(
+fn repo_kapellmeister_signal_message_with_lanes(
     signals: &[KapellmeisterShadowSignal],
     success: &str,
+    review_ready: Option<&str>,
+    independent_review_enabled: bool,
 ) -> std::result::Result<String, serde_json::Error> {
     let payload = serde_json::to_string_pretty(signals)?;
+    let handoff_instruction = match review_ready {
+        Some(lane) => format!(
+            "When reviewer and WorkGraph obligations are satisfied, move the issue to {lane} to await operator review. This is a holding lane, not a review action trigger. Keep it there until an explicit merge action; only verified merge completion projects to {success}."
+        ),
+        None => format!(
+            "When reviewer and WorkGraph obligations are satisfied, move the issue to {success}. In this workspace that lane records accepted development; merging still requires a separate explicit action."
+        ),
+    };
+    let review_instruction = if independent_review_enabled {
+        "For a configured Review action lane, inspect the issue/PR evidence and use fugue_start_independent_review with a typed IndependentReviewStartRequest; the review orchestrator must choose exactly three reviewers and spawn them through Meta."
+    } else {
+        "The independent Review action is disabled in this workspace. Review is a holding lane only; do not start an independent review orchestrator or create three-reviewer quorum obligations. Ordinary issue-mob review still applies."
+    };
     Ok(format!(
         "Fugue host signal batch for the repo-scoped Kapellmeister.\n\
          Treat this JSON as authoritative host-observed lifecycle input. \
@@ -9181,14 +9290,12 @@ fn repo_kapellmeister_signal_message_with_success_lane(
          from that observation alone. For a configured final-review/merge lane, wait for or act on \
          a final_pr_gate_requested signal and use fugue_start_final_pr_gate with its exact typed \
          request; do not substitute fugue_start_issue_mob. \
-         For a configured Review action lane, inspect the issue/PR evidence and use \
-         fugue_start_independent_review with a typed IndependentReviewStartRequest; the review \
-         orchestrator must choose exactly three reviewers and spawn them through Meta. \
+         {review_instruction} \
          For a configured Deploy lane, do not start the implementation mob and do not try to \
          orchestrate merge/OTA yourself; Fugue host handles Deploy as a guarded mechanical \
          transaction after verifying durable PR evidence, CI, WorkGraph blockers, and deploy \
          policy. \
-         If a pr_handoff_monitor_changed signal reports ready_for_done, CI is green or no checks are configured and the PR handoff is acceptable; inspect reviewer/WorkGraph evidence and move the issue to {success} when those obligations are satisfied. {success} means accepted development work, not merged PR. Merge/OTA only happens through the Deploy action lane. \
+         If a pr_handoff_monitor_changed signal reports ready_for_done, the PR is eligible for handoff. Inspect reviewer/WorkGraph evidence. {handoff_instruction} Report CI evidence literally: an empty check list means no checks were reported, not that checks ran successfully. \
          Do not wait for an external flow-step feeder. If an active issue reports missing concrete handoff, stale worker_started signals, or offline issue peers, actively inspect/ask the issue mob for status or decide resume/replan through Kapellmeister-owned coordination. \
          A linear_issue_moved signal means Fugue observed external projection drift from the \
          issue lane map. It is not proof that lifecycle work completed, but it is an \
@@ -9213,7 +9320,7 @@ fn repo_kapellmeister_signal_message_with_success_lane(
          PR handoff evidence while keeping ordinary issue-mob work on the active projection lane. \
          Do not ask issue agents to move issues into configured Review, Deploy, or \
          final-review action lanes; those lanes are operator or host-observed control inputs. \
-         Merge is not implicit repo authority: green review/CI evidence can close the issue to Done, \
+         Merge is not implicit repo authority: accepted review and CI evidence supports a handoff, \
          but it is not merge authorization. Do not merge a PR unless Deploy policy or an operator \
          explicitly approves that specific PR merge in the current session. \
          If a Meerkat mob operator tool such as list_members returns access_denied, treat that as a scope boundary and continue from these signals and comms peers.\n\n\
@@ -9227,10 +9334,33 @@ mod tests {
 
     #[test]
     fn repo_signal_prompt_uses_configured_success_lane() {
-        let body = super::repo_kapellmeister_signal_message_with_success_lane(&[], "Accepted")
+        let body = super::repo_kapellmeister_signal_message_with_lanes(&[], "Accepted", None, true)
             .expect("prompt");
         assert!(body.contains("move the issue to Accepted"));
         assert!(!body.contains("move the issue to Done"));
+    }
+
+    #[test]
+    fn repo_signal_prompt_holds_review_before_configured_completion() {
+        let body = super::repo_kapellmeister_signal_message_with_lanes(
+            &[],
+            "Closed",
+            Some("Resolved"),
+            false,
+        )
+        .expect("prompt");
+        assert!(body.contains("move the issue to Resolved to await operator review"));
+        assert!(body.contains("only verified merge completion projects to Closed"));
+        assert!(!body.contains("move the issue to Closed"));
+        assert!(!body.contains("means accepted development work, not merged PR"));
+    }
+
+    #[test]
+    fn repo_signal_prompt_does_not_request_disabled_review_action() {
+        let body = super::repo_kapellmeister_signal_message_with_lanes(&[], "Done", None, false)
+            .expect("prompt");
+        assert!(body.contains("Review is a holding lane only"));
+        assert!(!body.contains("fugue_start_independent_review"));
     }
 
     use super::*;
@@ -10254,6 +10384,78 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn recorded_pr_handoff_survives_workpad_rewrite_and_workspace_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let (orchestrator, _) =
+            native_orchestrator_for_definition(native_kapellmeister_workflow_definition());
+        let mut config = orchestrator.config.effective().clone();
+        config.meerkat.state_root = Some(directory.path().join("runtime"));
+        config.workspace.root = directory.path().join("removed-workspaces");
+        config
+            .kapellmeister
+            .shadow_mode
+            .authority
+            .safe_selectors
+            .repositories = vec![repo_ref()];
+        let issue = issue("immutable-issue-1", "TEST-1", None, 10);
+        let pr = pr_snapshot(42, "feature/test-1", "reviewed-head");
+        crate::pr_handoff::record(&config, &issue, &pr).unwrap();
+        let notes = recover_native_linear_evidence(
+            &issue,
+            Some("## Fugue Workpad\n\nRewritten notes without a PR reference."),
+        );
+        assert_eq!(
+            parse_first_pr_number(
+                "## Fugue Workpad\n\n### Review / PR Handoff Evidence\nPR: https://github.com/example/application/pull/42"
+            ),
+            Some(GitHubPullRequestNumber(42))
+        );
+        assert!(
+            recover_existing_native_pr_monitor_handoff_for_issue(
+                &config,
+                &issue,
+                Some(&notes),
+                &StaticGitHubInspector::ok(pr.clone())
+            )
+            .is_none()
+        );
+
+        // A fresh process reads the durable association, then obtains current
+        // state and head from GitHub rather than replaying a stored snapshot.
+        let mut current = pr.clone();
+        current.state = PullRequestState::Merged;
+        current.head_sha = GitSha("current-head".into());
+        let recovered = recover_recorded_native_pr_handoff(
+            &config,
+            &issue,
+            &StaticGitHubInspector::ok(current.clone()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered.pull_request, current);
+        assert!(
+            recover_recorded_native_pr_handoff(
+                &config,
+                &issue,
+                &StaticGitHubInspector::err("GitHub unavailable")
+            )
+            .is_err()
+        );
+        let mut wrong = current;
+        wrong.head_branch = BranchName("unrelated-branch".into());
+        assert!(
+            recover_recorded_native_pr_handoff(&config, &issue, &StaticGitHubInspector::ok(wrong))
+                .is_err()
+        );
+        config.tracker.project_slug = Some("another-project".into());
+        assert!(
+            recover_recorded_native_pr_handoff(&config, &issue, &StaticGitHubInspector::ok(pr))
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[derive(Clone)]
     struct StaticGitHubInspector {
         result: FugueToolResult,
@@ -11028,6 +11230,32 @@ mod tests {
             Orchestrator::new_with_native_execution_host(manager, refresh_rx, native_host.clone()),
             native_host,
         )
+    }
+
+    #[tokio::test]
+    async fn disabled_independent_review_cannot_start_or_create_runtime_work() {
+        let (orchestrator, native_host) =
+            native_orchestrator_for_definition(native_workflow_definition());
+        let request = IndependentReviewStartRequest {
+            issue: issue_ref_for_identifier("LUC-631"),
+            spawn_input: SpawnOrResumeExecutionInput {
+                issue: issue_ref_for_identifier("LUC-631"),
+                workspace_key: workspace_key_for_identifier("LUC-631"),
+                template_id: crate::tools::MobTemplateId("independent_review".to_string()),
+                worktree_path: None,
+                instructions: None,
+                idempotency_key: IdempotencyKey("disabled-review".to_string()),
+            },
+            pull_request: pr_snapshot(206, "luka/luc-631", "head-a"),
+            orchestrator_profile: "review_orchestrator".to_string(),
+        };
+        let result = orchestrator
+            .handle_kapellmeister_start_independent_review(request)
+            .await;
+        assert!(!result.accepted);
+        assert!(result.message.contains("disabled by configuration"));
+        assert_eq!(native_host.raw_spawn_call_count(), 0);
+        assert_eq!(native_host.plan_call_count(), 0);
     }
 
     #[tokio::test]
@@ -12027,7 +12255,7 @@ worker:
             updated_at: Utc.timestamp_opt(20, 0).unwrap(),
             completed_at: None,
         };
-        let workspace = WorkspaceManager::new(&config.workspace, &config.hooks);
+        let workspace = WorkspaceManager::for_service(&config);
 
         let (recovered_issue, entry) = recover_native_running_entry(
             &run,
@@ -12131,7 +12359,7 @@ worker:
             updated_at: Utc.timestamp_opt(20, 0).unwrap(),
             completed_at: None,
         };
-        let workspace = WorkspaceManager::new(&config.workspace, &config.hooks);
+        let workspace = WorkspaceManager::for_service(&config);
 
         let (recovered_issue, entry) = recover_native_running_entry(
             &run,
@@ -12586,7 +12814,8 @@ worker:
             native_pr_handoff_monitor_action(&github, Some(&ci)),
         );
         assert_eq!(decision, PrHandoffMonitorDecision::ReadyForDone);
-        assert!(detail.contains("no checks are configured"));
+        assert!(detail.contains("no checks were reported"));
+        assert!(!detail.contains("move the issue to Done"));
     }
 
     #[test]
@@ -14521,7 +14750,7 @@ worker:
         .unwrap()
         .effective()
         .clone();
-        let workspace_manager = WorkspaceManager::new(&config.workspace, &config.hooks);
+        let workspace_manager = WorkspaceManager::for_service(&config);
         let mut issue = active_issue_with_labels(&["native"]);
         issue.identifier = "LUC-338".to_string();
         issue.state = "Reviewing".to_string();
@@ -14601,7 +14830,7 @@ worker:
         .unwrap()
         .effective()
         .clone();
-        let workspace_manager = WorkspaceManager::new(&config.workspace, &config.hooks);
+        let workspace_manager = WorkspaceManager::for_service(&config);
         let mut issue = active_issue_with_labels(&["native"]);
         issue.identifier = "LUC-620".to_string();
         issue.state = "Reviewing".to_string();
@@ -15206,7 +15435,7 @@ worker:
         .unwrap()
         .effective()
         .clone();
-        let workspace_manager = WorkspaceManager::new(&config.workspace, &config.hooks);
+        let workspace_manager = WorkspaceManager::for_service(&config);
         let run_id = MobRunId("native-execution:native-execution:LUC-168".to_string());
         let run = MobRunSnapshot {
             run_id: run_id.clone(),

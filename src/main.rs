@@ -33,6 +33,11 @@ struct Cli {
     #[command(subcommand)]
     command: Option<CliCommand>,
 
+    #[arg(long, hide = true)]
+    managed_child: bool,
+    #[arg(long, hide = true)]
+    managed_workspace: Option<PathBuf>,
+
     /// Path to fugue.yaml. When a directory is
     /// provided, Fugue onboards that repository instead of starting a queue.
     #[arg(value_name = "WORKFLOW")]
@@ -87,6 +92,10 @@ struct Cli {
 enum CliCommand {
     /// Print the immutable build identity as JSON and exit.
     BuildInfo,
+    /// Start Fugue with one browser address for all repositories and their setup.
+    Serve(ServeArgs),
+    /// Open local first-run setup for credentials, repositories, and tickets.
+    Setup(SetupArgs),
     /// Run long-lived repository teams connected through their representatives.
     Ensemble(meerkat_fugue::ensemble::cli::EnsembleArgs),
     /// Configure Fugue operator backends.
@@ -95,6 +104,34 @@ enum CliCommand {
     Stage(StageArgs),
     /// Alias for stage.
     Init(StageArgs),
+}
+
+#[derive(Debug, Args)]
+struct SetupArgs {
+    /// Private application state directory. Defaults to the user's state directory.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 8788)]
+    port: u16,
+    /// Reopen setup instead of resuming this directory's configured workspace.
+    #[arg(long)]
+    reconfigure: bool,
+}
+
+#[derive(Debug, Args)]
+struct ServeArgs {
+    /// Private persistent state, kept outside repository checkouts.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 8788)]
+    port: u16,
+}
+
+fn setup_state_dir(path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(path) = path {
+        return Ok(std::path::absolute(path)?);
+    }
+    meerkat_fugue::setup::default_state_dir()
 }
 
 #[derive(Debug, Args)]
@@ -211,19 +248,48 @@ fn main() -> anyhow::Result<()> {
     // Native machine transitions need the same deep stacks as Meta's gateways.
     // Size the root thread too, so direct binary execution is independent of
     // Cargo's test environment and the OS main-thread stack default.
-    std::thread::Builder::new()
+    let result = std::thread::Builder::new()
         .name("fugue-runtime".to_string())
         .stack_size(16 * 1024 * 1024)
         .spawn(|| meerkat_meta::gateway_composition::gateway_tokio_runtime()?.block_on(run()))?
         .join()
-        .map_err(|_| anyhow::anyhow!("Fugue runtime thread panicked"))?
+        .map_err(|_| anyhow::anyhow!("Fugue runtime thread panicked"))?;
+    if result
+        .as_ref()
+        .is_err_and(|error| error.is::<meerkat_fugue::setup::managed::RestartRequested>())
+    {
+        std::process::exit(meerkat_fugue::setup::managed::RESTART_EXIT_CODE);
+    }
+    if result
+        .as_ref()
+        .is_err_and(|error| error.is::<meerkat_fugue::setup::managed::ReconfigureRequested>())
+    {
+        std::process::exit(meerkat_fugue::setup::managed::RECONFIGURE_EXIT_CODE);
+    }
+    result
 }
 
 async fn run() -> anyhow::Result<()> {
     init_logging();
+    meerkat_fugue::browser_access::configure_from_environment()?;
 
     let cli = Cli::parse();
     match cli.command {
+        Some(CliCommand::Serve(args)) => {
+            return meerkat_fugue::setup::host::serve(setup_state_dir(args.state_dir)?, args.port)
+                .await;
+        }
+        Some(CliCommand::Setup(args)) => {
+            if !cli.host.is_loopback() {
+                anyhow::bail!("First-run setup requires a loopback listener");
+            }
+            return meerkat_fugue::setup::managed::supervise(
+                &setup_state_dir(args.state_dir)?,
+                args.port,
+                args.reconfigure,
+            )
+            .await;
+        }
         Some(CliCommand::BuildInfo) => {
             println!(
                 "{}",
@@ -243,6 +309,30 @@ async fn run() -> anyhow::Result<()> {
             return Ok(());
         }
         None => {}
+    }
+
+    if cli.managed_child && cli.workflow.is_none() {
+        let root = cli
+            .managed_workspace
+            .context("Managed workspace directory is required")?;
+        return meerkat_fugue::setup::web::serve(
+            &root,
+            SocketAddr::new(cli.host, cli.port.unwrap_or(8788)),
+        )
+        .await;
+    }
+
+    if cli.workflow.is_none() && !Path::new("fugue.yaml").exists() && !cli.check && !cli.ota_update
+    {
+        if !cli.host.is_loopback() {
+            anyhow::bail!("First-run setup requires a loopback listener");
+        }
+        return meerkat_fugue::setup::managed::supervise(
+            &setup_state_dir(None)?,
+            cli.port.unwrap_or(8788),
+            false,
+        )
+        .await;
     }
 
     let workflow_path = cli.workflow.unwrap_or_else(|| PathBuf::from("fugue.yaml"));
@@ -374,16 +464,84 @@ async fn run() -> anyhow::Result<()> {
         }
         None => None,
     };
-    let ensemble = match cli.ensemble_config {
-        Some(path) => {
-            let config = meerkat_fugue::ensemble::config::EnsembleConfig::load(&path)
-                .with_context(|| format!("load Ensemble configuration {}", path.display()))?;
-            Some(Arc::new(
-                meerkat_fugue::ensemble::runtime::EnsembleRuntime::build(config).await?,
-            ))
+    let directory = if let Some(listener) = &listener {
+        if cli.host.is_loopback() && std::env::var_os("FUGUE_HUB_URL").is_none() {
+            let port = listener.local_addr()?.port();
+            let root = setup_state_dir(None)?
+                .join("directories")
+                .join(format!("ui-{port}"));
+            let directory = meerkat_fugue::setup::directory::Directory::open(root, port)?;
+            directory.restore().await?;
+            Some(directory)
+        } else {
+            None
         }
-        None => None,
+    } else {
+        None
     };
+    if let Some(directory) = &directory {
+        meta_runtime_registry
+            .use_console(directory.console())
+            .map_err(anyhow::Error::msg)?;
+    }
+    let ensemble = if listener.is_some() && cli.host.is_loopback() {
+        let effective = orchestrator.config().effective();
+        let path = cli.ensemble_config.unwrap_or_else(|| {
+            effective
+                .meerkat
+                .state_root
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(".fugue"))
+                .join("repositories.yaml")
+        });
+        let workspace = meerkat_fugue::ensemble::workspace::Workspace::open(
+            path,
+            true,
+            effective.meerkat.model.clone(),
+            effective.meerkat.auth_binding.clone(),
+            effective
+                .meerkat
+                .repository_runtime
+                .as_ref()
+                .map(|_| meta_runtime_registry.clone()),
+        )?;
+        if let Some(directory) = &directory {
+            workspace.use_console(directory.console())?;
+        }
+        workspace.start().await?;
+        if effective.meerkat.repository_runtime.is_some() {
+            workspace.await_ready().await?;
+        }
+        Some(workspace)
+    } else {
+        None
+    };
+    let reconfigure = CancellationToken::new();
+    let mut ensemble_routes = ensemble
+        .as_ref()
+        .map(|workspace| {
+            meerkat_fugue::ensemble::http::workspace_router(Arc::clone(workspace), true)
+        })
+        .transpose()?;
+    if let Some(directory) = &directory {
+        ensemble_routes = Some(ensemble_routes.unwrap_or_default().merge(
+            meerkat_fugue::setup::directory::router(Arc::clone(directory)),
+        ));
+    } else if let Ok(hub) = std::env::var("FUGUE_HUB_URL") {
+        ensemble_routes = Some(
+            ensemble_routes
+                .unwrap_or_default()
+                .merge(meerkat_fugue::setup::directory::hub_router(hub)?),
+        );
+    }
+    if cli.managed_child {
+        let root = cli
+            .managed_workspace
+            .as_ref()
+            .context("Managed workspace directory is required")?;
+        let settings = meerkat_fugue::setup::settings::router(root, reconfigure.clone())?;
+        ensemble_routes = Some(ensemble_routes.unwrap_or_default().merge(settings));
+    }
     let http_handle = listener.map(|listener| {
         tokio::spawn(http::serve_on_listener(
             listener,
@@ -392,7 +550,7 @@ async fn run() -> anyhow::Result<()> {
             refresh_tx.clone(),
             internal_tx.clone(),
             meta_runtime_registry.clone(),
-            ensemble.clone(),
+            ensemble_routes,
         ))
     });
 
@@ -404,6 +562,13 @@ async fn run() -> anyhow::Result<()> {
     let result: anyhow::Result<()> = async {
         if let Some(mut http_handle) = http_handle {
             tokio::select! {
+                _ = reconfigure.cancelled() => {
+                    shutdown.cancel();
+                    let settled = orchestrator_handle.await;
+                    http_handle.abort();
+                    settled.context("orchestrator task join failed")??;
+                    return Err(meerkat_fugue::setup::managed::ReconfigureRequested.into());
+                }
                 result = &mut orchestrator_handle => {
                     http_handle.abort();
                     result.context("orchestrator task join failed")??;
@@ -439,6 +604,10 @@ async fn run() -> anyhow::Result<()> {
         Ok(())
     }
     .await;
+
+    if let Some(directory) = directory {
+        directory.shutdown().await?;
+    }
 
     // Every server/orchestrator/signal exit settles the one shared team owner,
     // including errors. An HTTP bind failure must not leave its agents running.

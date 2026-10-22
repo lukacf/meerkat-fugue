@@ -59,6 +59,8 @@ impl fmt::Display for RepoId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnsembleConfig {
+    #[serde(default)]
+    pub notifications: super::notifications::NotificationConfig,
     #[serde(default = "default_version")]
     pub version: u32,
     #[serde(default = "default_name")]
@@ -281,6 +283,9 @@ impl EnsembleConfig {
 
     /// Resolve configured paths relative to the configuration file's directory.
     pub fn resolve_and_validate(&mut self, base: &Path) -> Result<()> {
+        if self.notifications.enabled && self.notifications.poll_interval_secs == 0 {
+            bail!("notification poll_interval_secs must be positive");
+        }
         if self.version != 1 {
             bail!(
                 "unsupported Ensemble configuration version {}",
@@ -294,9 +299,6 @@ impl EnsembleConfig {
             bail!(
                 "max_sessions must be at least 2; it must also fit each repository's discovered specialists and representative"
             );
-        }
-        if self.repositories.is_empty() {
-            bail!("Ensemble requires at least one repository");
         }
         if self.state_root.as_os_str().is_empty() {
             bail!("state_root must be nonempty");
@@ -394,6 +396,7 @@ impl EnsembleConfig {
             }));
         }
         let mut config = Self {
+            notifications: Default::default(),
             version: default_version(),
             name,
             state_root: default_state_root(),
@@ -456,7 +459,7 @@ fn default_state_root() -> PathBuf {
     PathBuf::from(".fugue/ensemble")
 }
 fn default_model() -> String {
-    crate::config::DEFAULT_AGENT_MODEL.to_string()
+    crate::config::default_agent_model().to_string()
 }
 fn default_max_sessions() -> usize {
     64

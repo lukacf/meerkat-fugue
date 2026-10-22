@@ -127,7 +127,7 @@ fn dashboard_search_browser_coverage_is_checked_in() {
     for required in [
         "typing a repository match shows the whole team",
         "specialist-only search narrows to matching members",
-        "query expanded member target and draft survive refresh",
+        "query and expanded specialist survive refresh",
         "restores q on initial load and updates q without history spam",
         "empty filter removes q and browser back and forward restore bookmarkable query",
         "clear and no-results states remain keyboard accessible",
@@ -140,8 +140,6 @@ fn dashboard_search_browser_coverage_is_checked_in() {
         "await page.goForward()",
         "await page.keyboard.press('Enter')",
         "await page.evaluate(() => window.refresh())",
-        "targetSelect).toHaveValue('api')",
-        "objective).toHaveValue('Draft objective that must survive filtering.')",
     ] {
         assert!(
             spec.contains(required),
@@ -207,7 +205,23 @@ async fn http_proof() {
             .await
             .unwrap(),
     );
-    let app = super::http::router(Arc::clone(&runtime)).await.unwrap();
+    let console =
+        crate::console::ConsoleHub::open(&fixture.path().join("console.sqlite3")).unwrap();
+    for repo in runtime.config().repositories.keys() {
+        console.register(repo.to_string(), runtime.repository(repo).unwrap().clone());
+    }
+    let app = super::http::router(Arc::clone(&runtime))
+        .await
+        .unwrap()
+        .fallback_service(
+            console.router(meerkat_meta::RuntimeDecisionState::local_console(
+                meerkat_meta::ConsolePolicy {
+                    require_app_auth: false,
+                    ..Default::default()
+                },
+                None,
+            )),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -219,7 +233,7 @@ async fn http_proof() {
     let response = client.get(&base).send().await.unwrap();
     assert!(response.status().is_success());
     assert_eq!(response.headers()["cache-control"], "no-store");
-    assert!(response.text().await.unwrap().contains("Ensemble"));
+    assert!(response.text().await.unwrap().contains("Repositories"));
     let overview: Overview = client
         .get(format!("{base}/api/ensemble"))
         .send()
@@ -267,7 +281,7 @@ async fn http_proof() {
             .text()
             .await
             .unwrap();
-        assert!(html.contains(&format!("content=\"/api/repos/{repo}/meta\"")));
+        assert!(!html.contains("content=\"/api/repos/"));
         assert!(html.contains("/console/assets/console-app.js"));
         assert!(
             client
@@ -378,6 +392,8 @@ async fn http_proof() {
     let _ = server.await;
     integrated_http_proof(fixture.path(), Arc::clone(&runtime)).await;
     runtime.shutdown().await.unwrap();
+    drop(runtime);
+    workspace_enrollment_proof().await;
 }
 
 async fn integrated_http_proof(root: &Path, runtime: Arc<EnsembleRuntime>) {
@@ -434,7 +450,7 @@ server:
         refresh_tx,
         orchestrator.internal_sender(),
         registry.clone(),
-        Some(runtime),
+        Some(super::http::integrated_router(runtime).await.unwrap()),
     )
     .await
     .unwrap();
@@ -476,7 +492,7 @@ server:
             "{path} sent the user to another server"
         );
         if path == "/repos/api/console" {
-            assert!(html.contains("content=\"/api/repos/api/meta\""));
+            assert!(!html.contains("content=\"/api/repos/"));
         }
     }
     let overview: Overview = client
@@ -572,4 +588,182 @@ server:
     server.abort();
     let _ = server.await;
     registry.shutdown().await.unwrap();
+}
+
+// Exercise enrollment through HTTP, real native routes, and durable restart.
+async fn workspace_enrollment_proof() {
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("enrolled-one");
+    let second = root.path().join("enrolled-two");
+    git_repository(&first);
+    git_repository(&second);
+    let path = root.path().join("workspace.yaml");
+    let mut config = EnsembleConfig::for_repositories(
+        &[first.clone(), second.clone()],
+        "Enrollment proof".into(),
+    )
+    .unwrap();
+    config.state_root = root.path().join("native-state");
+    config.peers.clear();
+    super::runtime::write_fixture_teams(&config);
+    config.repositories.clear();
+    std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    let llm = Arc::new(CountingClient::default());
+    let workspace = super::workspace::Workspace::open_with_client(path.clone(), llm.clone());
+    let console = crate::console::ConsoleHub::open(&root.path().join("console.sqlite3")).unwrap();
+    workspace.use_console(console.clone()).unwrap();
+    workspace.start().await.unwrap();
+    let app = super::http::workspace_router(Arc::clone(&workspace), true)
+        .unwrap()
+        .fallback_service(
+            console.router(meerkat_meta::RuntimeDecisionState::local_console(
+                meerkat_meta::ConsolePolicy {
+                    require_app_auth: false,
+                    ..Default::default()
+                },
+                None,
+            )),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let initial: serde_json::Value = client
+        .get(format!("{base}/api/ensemble"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(initial["setup"]["phase"], "empty");
+    let request = serde_json::json!({"id":"enrolled-one", "path":first});
+    let forbidden = client
+        .post(format!("{base}/api/repos"))
+        .header("Origin", "https://untrusted.example")
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+    let invalid = client
+        .post(format!("{base}/api/repos"))
+        .json(&serde_json::json!({"id":"invalid", "path":"relative/path"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::CONFLICT);
+    assert!(EnsembleConfig::load(&path).unwrap().repositories.is_empty());
+    let added = client
+        .post(format!("{base}/api/repos"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(added.status(), reqwest::StatusCode::ACCEPTED);
+    let ready = wait_for_workspace(&client, &base).await;
+    assert_eq!(
+        ready["runtime"]["repositories"].as_array().unwrap().len(),
+        1
+    );
+    assert!(
+        client
+            .get(format!("{base}/repos/enrolled-one/console"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+            .contains("/console/assets/console-app.js")
+    );
+    let accepted = client
+        .post(format!("{base}/api/repos/enrolled-one/messages"))
+        .json(&Ask {
+            message: "Enrollment conversation persists.",
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), reqwest::StatusCode::ACCEPTED);
+    let accepted: Accepted = accepted.json().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let response = client
+                .post(format!("{base}/api/repos"))
+                .json(&serde_json::json!({"id":"enrolled-two", "path":second}))
+                .send()
+                .await
+                .unwrap();
+            if response.status() == reqwest::StatusCode::ACCEPTED {
+                break;
+            }
+            let body = response.text().await.unwrap();
+            assert!(body.contains("active or unobserved work"), "{body}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let updated = wait_for_workspace(&client, &base).await;
+    assert_eq!(
+        updated["runtime"]["repositories"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(updated["runtime"]["peers"], serde_json::json!([]));
+    assert_eq!(EnsembleConfig::load(&path).unwrap().repositories.len(), 2);
+    assert!(
+        updated["runtime"]["repositories"][0]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|member| member["session_id"] == accepted.session_id)
+    );
+    workspace.shutdown().await.unwrap();
+    server.abort();
+    let _ = server.await;
+    drop(workspace);
+    let restored = super::workspace::Workspace::open_with_client(path, llm);
+    restored.start().await.unwrap();
+    let app = super::http::workspace_router(Arc::clone(&restored), true).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let status = wait_for_workspace(&client, &base).await;
+    assert_eq!(
+        status["runtime"]["repositories"].as_array().unwrap().len(),
+        2
+    );
+    assert!(
+        status["runtime"]["repositories"][0]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|member| member["session_id"] == accepted.session_id)
+    );
+    restored.shutdown().await.unwrap();
+    server.abort();
+    let _ = server.await;
+}
+
+async fn wait_for_workspace(client: &reqwest::Client, base: &str) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let status: serde_json::Value = client
+                .get(format!("{base}/api/ensemble"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_ne!(status["setup"]["phase"], "failed", "{status}");
+            if status["setup"]["phase"] == "ready" {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap()
 }

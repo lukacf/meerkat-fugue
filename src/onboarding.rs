@@ -141,18 +141,27 @@ fn render_native_fugue_yaml(options: &NewRepoOnboardingOptions<'_>) -> String {
     rendered.push('\n');
     rendered.push_str("agents:\n");
     rendered.push_str("  planner:\n");
-    rendered.push_str("    model: gpt-5.5\n");
+    rendered.push_str(&format!(
+        "    model: {}\n",
+        crate::config::default_agent_model()
+    ));
     rendered.push_str("    tools: [mob, workgraph, mcp:linear, mcp:github]\n");
     rendered.push_str(
         "    system_prompt: Own the detailed Workpad checkbox plan and create blocking WorkGraph items from comments/reviews before implementation.\n",
     );
     rendered.push_str("  coder:\n");
-    rendered.push_str("    model: claude-sonnet-4-6\n");
+    rendered.push_str(&format!(
+        "    model: {}\n",
+        crate::config::default_agent_model()
+    ));
     rendered.push_str("    tools: [mob, shell, git, workgraph, mcp:linear, mcp:github]\n");
     rendered
         .push_str("    system_prompt: Implement the current Workpad plan and open WorkGraph obligations; update checkoffs and evidence.\n");
     rendered.push_str("  reviewer:\n");
-    rendered.push_str("    model: gpt-5.5\n");
+    rendered.push_str(&format!(
+        "    model: {}\n",
+        crate::config::default_agent_model()
+    ));
     rendered.push_str("    tools: [mob, shell, git, workgraph, mcp:linear, mcp:github]\n");
     rendered.push_str(
         "    system_prompt: Gate local implementation, inspect diff/WorkGraph yourself, close completed WorkGraph obligations, and route red findings to Active with phase evidence.\n\n",

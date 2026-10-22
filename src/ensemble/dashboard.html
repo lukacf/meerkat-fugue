@@ -1,68 +1,87 @@
 <!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="color-scheme" content="light">
-  <title>Ensemble · Fugue</title>
-  <style>
-    :root { color-scheme:light; --bg:#ECEAE4; --panel:#F6F4EE; --line:#D6D2C8; --text:#1C1A17; --muted:#6B6760; --mint:#D95A1E; --gold:#A56A18; --red:#A43F32; font:13px/1.45 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--text); background:var(--bg); }
-    * { box-sizing:border-box; } body { margin:0; } button,input,select,textarea { font:inherit; } button { cursor:pointer; } button:disabled { opacity:.5; cursor:wait; } a { color:inherit; }
-    :focus-visible { outline:2px solid var(--mint); outline-offset:3px; } [hidden] { display:none!important; }
-    .shell { max-width:1600px; margin:auto; padding:0 28px 28px; } header { display:flex; justify-content:space-between; align-items:center; gap:16px; padding:17px 0; border-bottom:1px solid var(--line); }
-    .brand,.eyebrow,.label,.badge,.section-heading h2 { font:10px/1.4 "JetBrains Mono",ui-monospace,monospace; letter-spacing:.1em; text-transform:uppercase; }
-    .brand { font-size:11px; } .status { display:flex; align-items:center; gap:8px; color:var(--muted); font:11px ui-monospace,monospace; } .dot { width:6px; height:6px; background:var(--gold); } .dot.live { background:#3E6B4F; }
-    .hero { padding:30px 0; display:flex; align-items:end; justify-content:space-between; gap:30px; } .eyebrow { color:var(--mint); } h1 { font-size:36px; line-height:1.1; font-weight:500; letter-spacing:-1px; margin:9px 0 13px; } .intro { margin:0; max-width:660px; color:var(--muted); } .stats { display:flex; gap:30px; flex-shrink:0; } .count { font-size:30px; font-variant-numeric:tabular-nums; line-height:1.1; } .stats small { color:var(--muted); font:10px ui-monospace,monospace; text-transform:uppercase; letter-spacing:.08em; }
-    .workspace { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:24px; align-items:start; } .section-heading { display:flex; justify-content:space-between; align-items:center; border-top:1px solid var(--text); padding:15px 0; gap:10px; } .section-heading h2 { margin:0; } .label { color:var(--muted); } .team-search { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:end; margin:0 0 14px; } .team-search label { margin:0; grid-column:1 / -1; } .team-search input { grid-column:1; width:100%; border:1px solid var(--line); background:var(--panel); color:var(--text); padding:10px; border-radius:2px; } .clear-search { grid-column:2; grid-row:2; min-height:38px; border:1px solid var(--line); background:var(--panel); color:var(--mint); padding:0 12px; border-radius:2px; } .match-summary { margin:0 0 12px; color:var(--muted); font-size:12px; } .no-results { padding:20px; border:1px dashed var(--line); color:var(--muted); background:var(--panel); } .match-chip { display:inline-block; margin:0 0 10px; color:var(--mint); font:9px/1.5 "JetBrains Mono",ui-monospace,monospace; letter-spacing:.08em; text-transform:uppercase; } #repos { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }
-    .repo { border:1px solid var(--line); background:var(--panel); padding:20px; min-width:0; } .repo.selected { border-color:var(--mint); } .repo-top { display:flex; justify-content:space-between; align-items:center; gap:12px; } .repo-icon { color:var(--mint); font:20px ui-monospace,monospace; } .badge { color:#3E6B4F; border:1px solid #abb9a8; padding:3px 7px; letter-spacing:.04em; } h3 { font-size:20px; font-weight:550; margin:12px 0 4px; letter-spacing:-.5px; overflow-wrap:anywhere; } .path { font:10px/1.5 ui-monospace,monospace; color:var(--muted); overflow-wrap:anywhere; } .description { color:var(--muted); font-size:12px; margin:14px 0; } .roles { display:grid; margin:16px 0; } .specialist { border-top:1px solid var(--line); padding:10px 0; } .specialist summary { cursor:pointer; list-style:none; } .specialist summary::-webkit-details-marker { display:none; } .specialist summary:hover { color:var(--mint); } .role { display:flex; justify-content:space-between; align-items:center; gap:8px; font-size:12px; } .role-name { display:flex; align-items:center; gap:7px; } .role-glyph { color:var(--mint); } .role-state { color:var(--muted); font:10px ui-monospace,monospace; white-space:nowrap; } .specialist-focus { font-size:12px; color:var(--muted); margin:10px 0; } .specialist-paths { font:10px/1.6 ui-monospace,monospace; overflow-wrap:anywhere; margin:8px 0; } .specialist .label { font-size:9px; line-height:1.7; }
-    .actions { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; border-top:1px solid var(--line); padding-top:14px; } .small-button { border:0; padding:0; background:transparent; color:var(--mint); font-size:12px; } .console-link { font-size:12px; text-underline-offset:3px; }
-    aside { position:sticky; top:60px; border:1px solid var(--text); background:#FAF8F2; padding:22px; } aside h2 { font-size:23px; font-weight:500; line-height:1.2; margin:10px 0; letter-spacing:-.5px; } aside p { font-size:12px; color:var(--muted); margin:0 0 18px; } label { display:block; font-size:11px; margin:15px 0 7px; } select,textarea { width:100%; border:1px solid var(--line); background:var(--panel); color:var(--text); padding:10px; border-radius:2px; } textarea { resize:vertical; min-height:160px; font-size:12px; line-height:1.5; } .submit { width:100%; border:1px solid var(--mint); border-radius:2px; padding:11px; margin-top:12px; color:white; background:var(--mint); } .hint { display:block; color:var(--muted); font-size:10px; margin-top:8px; } .study { width:100%; border:0; background:transparent; color:var(--muted); font-size:11px; margin-top:14px; } .notice { margin-top:16px; font-size:12px; color:#3E6B4F; overflow-wrap:anywhere; } .notice.error { color:var(--red); }
-    .peering { margin-top:25px; } .peer-intro { margin:0 0 12px; color:var(--muted); font-size:12px; } .peer { display:flex; align-items:center; gap:12px; padding:12px; border:1px solid var(--line); background:var(--panel); font-size:12px; margin-top:8px; } .peer-name { overflow-wrap:anywhere; } .peer-line { flex:1; border-top:1px solid var(--line); text-align:center; height:1px; } .peer-line span { position:relative; top:-10px; background:var(--panel); padding:0 8px; color:var(--mint); } .empty { padding:20px; border:1px dashed var(--line); color:var(--muted); } footer { display:flex; flex-wrap:wrap; justify-content:space-between; gap:10px; padding-top:18px; margin-top:28px; border-top:1px solid var(--line); color:var(--muted); font-size:10px; } .error-banner { padding:12px; border:1px solid var(--red); color:var(--red); margin-bottom:16px; }
-    @media(max-width:1150px) { #repos { grid-template-columns:1fr; } }
-    @media(max-width:760px) { .shell { padding:0 14px 20px; } .hero { display:block; padding:24px 0; } .stats { margin-top:20px; } h1 { font-size:30px; } .workspace { grid-template-columns:1fr; } .team-search { grid-template-columns:1fr; } .clear-search { grid-column:1; grid-row:auto; justify-self:start; } aside { position:static; grid-row:1; } header { flex-wrap:wrap; } .status { font-size:10px; } }
-  </style>
-</head>
-<body>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Repositories | Fugue</title>
+<style>
+.shell { max-width:1280px; margin:auto; padding:40px 32px 64px; font:14px/1.5 var(--bs-font-sans,system-ui); }
+.hero { display:flex; align-items:center; justify-content:space-between; gap:24px; margin-bottom:28px; }
+h1 { margin:8px 0 12px; font-size:32px; letter-spacing:-1px; font-weight:620; line-height:1.2; }
+.intro { color:var(--muted,#65777d); max-width:650px; margin:0; }
+.status { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:12px; margin-bottom:22px; }
+.dot { height:7px; width:7px; border-radius:50%; background:#bd934b; } .dot.live { background:#36896e; }
+.workspace { display:grid; grid-template-columns:minmax(0,1fr) 330px; gap:24px; align-items:start; }
+.section-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:16px; }
+h2 { font-size:18px; font-weight:600; letter-spacing:-.4px; margin:0; }
+.label { font-size:12px; color:var(--muted); }
+.team-search { display:flex; align-items:center; gap:10px; }
+.team-search label { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
+.team-search input { width:100%; background:white; border:1px solid var(--line,#dfe7e8); border-radius:7px; padding:11px 14px; font:14px var(--bs-font-sans,system-ui); }
+.clear-search { border:0; background:none; color:var(--accent); cursor:pointer; }
+.match-summary { color:var(--muted); font-size:12px; margin:10px 0 18px; }
+#repos { display:grid; gap:18px; }
+.repo { background:white; border:1px solid var(--line,#dfe7e8); border-radius:12px; padding:24px; min-width:0; }
+.repo.selected { border-color:#92b9aa; box-shadow:0 0 0 1px #92b9aa; }
+.repo-top { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.repo-icon { color:var(--accent); font:18px ui-monospace,monospace; }
+.badge { border-radius:5px; padding:4px 8px; color:var(--accent); background:#edf5f1; font-size:12px; }
+h3 { font-size:21px; font-weight:600; letter-spacing:-.5px; margin:14px 0 4px; overflow-wrap:anywhere; }
+.path { color:var(--muted); font:12px/1.5 ui-monospace,monospace; overflow-wrap:anywhere; }
+.description { font-size:14px; color:var(--muted); margin:16px 0; }
+.roles { margin:20px 0; }
+.specialist { border-top:1px solid var(--line,#dfe7e8); padding:12px 0; }
+.specialist summary { cursor:pointer; list-style:none; } .specialist summary::-webkit-details-marker { display:none; }
+.role { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.role-name { display:flex; align-items:center; gap:9px; font-size:14px; }
+.role-glyph { color:var(--accent); } .role-state { color:var(--muted); font-size:12px; }
+.specialist-focus { color:var(--muted); line-height:1.6; margin:12px 0; }
+.specialist-paths { font:12px/1.6 ui-monospace,monospace; overflow-wrap:anywhere; margin:10px 0; }
+.actions { display:flex; align-items:center; justify-content:space-between; gap:12px; border-top:1px solid var(--line); padding-top:18px; }
+.small-button,.console-link { font:500 14px var(--bs-font-sans,system-ui); color:var(--accent); border:0; background:none; cursor:pointer; text-decoration:none; padding:0; }
+.small-button:disabled { color:var(--muted); cursor:default; }
+aside { position:sticky; top:88px; background:white; border:1px solid var(--line,#dfe7e8); border-radius:12px; padding:24px; }
+aside h2 { font-size:22px; margin:10px 0; } aside p { color:var(--muted); font-size:13px; line-height:1.6; }
+label { display:block; font-size:13px; font-weight:500; margin:18px 0 8px; }
+select,textarea,dialog input { width:100%; border:1px solid var(--line,#dfe7e8); border-radius:7px; padding:10px 12px; background:white; color:var(--ink); font:14px/1.5 var(--bs-font-sans,system-ui); }
+textarea { resize:vertical; min-height:150px; }
+.submit { width:100%; margin-top:14px; }
+.hint { display:block; font-size:12px; color:var(--muted); margin:10px 0; }
+.study { border:0; background:none; color:var(--accent); font:13px var(--bs-font-sans,system-ui); padding:10px 0 0; cursor:pointer; }
+.study:disabled { color:var(--muted); cursor:default; }
+.notice { margin-top:14px; font-size:13px; color:var(--accent); overflow-wrap:anywhere; } .notice.error { color:#b94242; }
+.peering { margin-top:28px; border-top:1px solid var(--line); padding-top:20px; }
+.peer-intro,.empty,.no-results { color:var(--muted); font-size:13px; }
+.peer { display:flex; align-items:center; gap:12px; padding:12px 0; font-size:13px; }
+.peer-line { color:var(--accent); }
+.match-chip { color:var(--accent); background:#edf5f1; padding:5px 9px; margin:12px 0; border-radius:5px; font-size:12px; }
+.error-banner { border:1px solid #ebc5c1; background:#fff3f2; color:#a42f2f; border-radius:8px; padding:14px 18px; margin-bottom:22px; }
+.setup { margin-bottom:20px; }
+.empty { padding:28px; border:1px dashed var(--line); border-radius:10px; background:white; }
+.queue-context { margin-top:24px; padding-top:20px; border-top:1px solid var(--line); }
+.queue-context a { color:var(--accent); text-decoration:none; }
+dialog { width:520px; max-width:calc(100vw - 32px); border:1px solid var(--line); border-radius:14px; padding:28px; color:var(--ink); box-shadow:0 24px 90px #162a3030; }
+dialog::backdrop { background:#172b3055; backdrop-filter:blur(2px); }
+dialog h2 { font-size:24px; } dialog p { font-size:14px; color:var(--muted); line-height:1.6; }
+dialog .fugue-actions { margin-top:24px; justify-content:flex-end; }
+@media(max-width:900px) { .workspace { grid-template-columns:minmax(0,1fr) 300px; gap:18px; } }
+@media(max-width:760px) { .shell { padding:26px 18px 40px; } .hero { display:block; } .hero .fugue-button { margin-top:20px; } h1 { font-size:28px; } .workspace { grid-template-columns:1fr; } aside { position:static; } .repo { padding:20px; } }
+.setup-steps { padding-left:22px; margin:24px 0; } .setup-steps li { padding-left:6px; margin:18px 0; color:var(--ink); } .setup-steps p { margin:6px 0; }
+</style></head><body>
 <div class="shell">
-  <header>
-    <div class="brand">Ensemble / repository teams</div>
-    <div class="status"><span class="dot" id="health-dot"></span><span id="health" role="status">Connecting to native runtimes</span></div>
-  </header>
-  <section class="hero">
-    <div><div class="eyebrow" id="ensemble-name">Your development ensemble</div><h1>Your repository teams.</h1><p class="intro">Persistent specialists shaped by each codebase. Give a representative an objective, follow the work in Console, and let the teams collaborate across repositories.</p></div>
-    <div class="stats"><div><div class="count" id="repo-count">—</div><small>repositories</small></div><div><div class="count" id="agent-count">—</div><small>persistent agents</small></div></div>
-  </section>
-  <div class="error-banner" id="error-banner" role="alert" hidden></div>
-  <main class="workspace">
-    <div>
-      <div class="section-heading"><h2>Your repository teams</h2><span class="label">Persistent native mobs</span></div>
-      <div class="team-search" role="search"><label for="teamSearch">Search repository teams</label><input id="teamSearch" type="search" autocomplete="off" placeholder="Search repository, path, specialist, focus, or owned path" aria-describedby="matchSummary"><button class="clear-search" id="clearSearch" type="button" hidden>Clear</button></div>
-      <p class="match-summary" id="matchSummary" aria-live="polite">Loading repositories…</p>
-      <div id="repos"><div class="empty">Loading the native roster…</div></div>
-      <section class="peering">
-        <div class="section-heading"><h2>Across the ensemble</h2><span class="label">Configured representative links</span></div>
-        <p class="peer-intro">These routes are established at startup. Representatives carry context between teams; open a native console to inspect live peers and conversations.</p>
-        <div id="peers"></div>
-      </section>
-    </div>
-    <aside>
-      <div class="eyebrow">Begin a collaboration</div><h2>Set the direction.</h2><p>Send an objective to a repository's representative. Follow delegation, replies, and results in its native console.</p>
-      <form id="objective-form">
-        <label for="target">Repository</label><select id="target" required aria-label="Target repository"><option value="">Waiting for roster…</option></select>
-        <label for="objective">What should the team accomplish?</label><textarea id="objective" required maxlength="60000" placeholder="Map the API contract with the frontend team, propose a plan, then implement and review the change."></textarea>
-        <button class="submit" id="submit" type="submit" disabled>Send to representative ↗</button><span class="hint">⌘ / Ctrl + Enter to send · starts model usage</span>
-      </form>
-      <button class="study" id="study" type="button" disabled>Or start with a repository study →</button>
-      <div class="notice" id="notice" role="status" aria-live="polite"></div>
-    </aside>
-  </main>
-  <footer><span>Fugue Ensemble · Meerkat + Meta 0.9.3</span><span>Native identity. Durable conversations. Real peer communication.</span></footer>
-</div>
-<template id="repo-template"><article class="repo"><div class="repo-top"><div class="repo-icon" aria-hidden="true">⌘</div><span class="badge">Native mob</span></div><h3></h3><div class="path"></div><p class="description"></p><div class="roles"></div><div class="actions"><button class="small-button" type="button">Give an objective →</button><a class="console-link">Open console ↗</a></div></article></template>
+<section class="hero"><div><div class="fugue-kicker" id="ensemble-name">YOUR WORKSPACE</div><h1>Repository setup</h1><p class="intro">Connect a GitHub repository, choose its issue tracker, and prepare its agents. Once setup is complete, manage day-to-day work through tickets.</p></div><button class="fugue-button primary" id="addRepo" type="button">+ Add repository</button></section>
+<div class="status"><span class="dot" id="health-dot"></span><span id="health" role="status">Connecting to your teams</span><span aria-hidden="true"> / </span><span><b id="repo-count">0</b> teams in this workspace</span><span aria-hidden="true"> / </span><span><b id="agent-count">0</b> team members</span></div>
+<div class="error-banner" id="error-banner" role="alert" hidden></div>
+<div class="fugue-message setup" id="setup" role="status" hidden><span id="setupText"></span> <button class="fugue-button" id="retrySetup" type="button" hidden>Retry setup</button></div>
+<main class="workspace"><section>
+<section id="repositoryWorkspacesPanel" hidden><div class="section-heading"><h2>Repository workspaces</h2></div><p class="peer-intro">Each workspace has its own repository, tracker, and work queue.</p><div id="repositoryWorkspaces"></div></section>
+<div class="team-search" role="search"><label for="teamSearch">Search repository teams</label><input id="teamSearch" type="search" autocomplete="off" placeholder="Find a repository or specialist..." aria-describedby="matchSummary"><button class="clear-search" id="clearSearch" type="button" hidden>Clear</button></div>
+<p class="match-summary" id="matchSummary" aria-live="polite">Loading repositories...</p>
+<div id="repos"><div class="empty">Loading your teams...</div></div>
+<section class="peering"><div class="section-heading"><h2>Team connections</h2><span class="label">Representatives</span></div><p class="peer-intro">Connected teams can share context with each other through their representatives.</p><div id="peers"></div></section>
+</section><aside><div class="fugue-kicker">ONE-TIME SETUP</div><h2>Prepare the repository.</h2><ol class="setup-steps"><li><strong>Connect the repository</strong><p>Choose its GitHub URL, issue tracker, and access.</p></li><li><strong>Map the codebase</strong><p>Fugue discovers the structure, instructions, and areas of responsibility.</p></li><li><strong>Create its agents</strong><p>Specialists study their areas and keep their context for future work.</p></li></ol><div class="queue-context"><h2>Then work with tickets.</h2><p>Create an issue, follow it across the board, and review its result.</p><p id="queueDescription">The work queue uses your connected issue tracker.</p><a class="fugue-button primary" href="/issues">Open work queue &rarr;</a></div></aside></main></div>
+<dialog id="addDialog" aria-labelledby="addTitle"><form id="addForm"><h2 id="addTitle">Add a repository</h2><p>Start with its GitHub.com or GitHub Enterprise URL. Next, configure its tracker, repository access, and rkat account.</p><label for="repoUrl">Repository URL</label><input id="repoUrl" required placeholder="https://github.com/owner/repository" autocomplete="off"><p>Each repository has its own work queue and team. Existing repositories keep running during setup.</p><div id="addError" class="notice error" role="alert"></div><div class="fugue-actions"><button type="button" class="fugue-button" id="cancelAdd">Cancel</button><button type="submit" class="fugue-button primary" id="confirmAdd">Configure repository</button></div></form></dialog>
+<template id="repo-template"><article class="repo"><div class="repo-top"><div class="repo-icon" aria-hidden="true">&lt;/&gt;</div><span class="badge">Preparing</span></div><h3></h3><div class="path"></div><p class="description"></p><div class="roles"></div><div class="actions"><a class="work-link fugue-button" href="/issues">Open work queue &rarr;</a><a class="console-link">Inspect team &rarr;</a></div></article></template>
 <script>
   "use strict";
   const $ = id => document.getElementById(id);
-  let snapshot = null, sending = false;
+  let snapshot = null, enrolling = false;
   const expandedMembers = new Set();
 
   function node(tag, className, text) { const element = document.createElement(tag); element.className = className; element.textContent = text; return element; }
@@ -76,8 +95,7 @@
     if (query) url.searchParams.set("q", query); else url.searchParams.delete("q");
     window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
   }
-  function selectRepo(id) { $("target").value = id; highlight(); $("objective").focus(); }
-  function highlight() { document.querySelectorAll(".repo").forEach(card => card.classList.toggle("selected", card.dataset.repo === $("target").value)); }
+  function highlight() { const selected=new URL(location.href).searchParams.get("repo");document.querySelectorAll(".repo").forEach(card=>card.classList.toggle("selected",card.dataset.repo===selected)); }
   function memberMatches(member, needle) {
     if (!needle) return true;
     return includesNeedle([member.member_id, member.label, member.focus, ...(member.ownership_paths || [])], needle);
@@ -94,12 +112,19 @@
   function render(data) {
     snapshot = data;
     $("ensemble-name").textContent = data.name;
-    const repos = data.runtime.repositories || [];
+    const available = data.runtime.repositories || [];
+    const repos = Object.keys(data.repositories).map(id => available.find(repo => repo.repo === id) || {repo:id,members:[],preparation:"preparing"});
+    const phase = data.setup?.phase || "ready";
+    const ready = phase === "ready";
+    $("setup").hidden = !["preparing","failed"].includes(phase);
+    $("setupText").textContent = phase === "failed" ? `Team setup needs attention: ${data.setup.error}` : "Preparing repository teams. Discovering specialists, restoring conversations, and studying the code can take a few minutes. You can keep using the work queue.";
+    $("retrySetup").hidden = phase !== "failed";
+    $("addRepo").disabled = enrolling;
+    $("confirmAdd").disabled = enrolling;
     $("repo-count").textContent = repos.length;
     $("agent-count").textContent = repos.reduce((total, repo) => total + repo.members.length, 0);
-    const selected = $("target").value;
     const needle = searchNeedle();
-    $("repos").replaceChildren(); $("target").replaceChildren();
+    $("repos").replaceChildren();
     const visible = [];
     for (const repo of repos) {
       const id = repo.repo, config = data.repositories[id] || {};
@@ -107,19 +132,15 @@
       if (needle && !filtered.wholeTeam && !filtered.members.length) continue;
       visible.push({repo, config, members: filtered.members, wholeTeam: filtered.wholeTeam});
     }
-    for (const repo of repos) {
-      const option = document.createElement("option"); option.value = repo.repo; option.textContent = repo.repo; $("target").append(option);
-    }
-    if (repos.some(repo => repo.repo === selected)) $("target").value = selected;
     for (const entry of visible) {
       const repo = entry.repo, id = repo.repo, config = entry.config;
       const card = $("repo-template").content.firstElementChild.cloneNode(true);
       card.dataset.repo = id;
-      card.querySelector(".badge").textContent = repo.preparation === "ready" ? "Prepared team" : "Preparing";
+      card.querySelector(".badge").textContent = phase === "failed" ? "Setup failed" : ready && repo.preparation === "ready" ? "Team ready" : "Preparing team";
       card.querySelector("h3").textContent = id;
       card.querySelector(".path").textContent = config.path || "";
       const brief = repo.brief || {};
-      card.querySelector(".description").textContent = config.description || brief.summary || "A persistent team with repository-specific context and native peer communication.";
+      card.querySelector(".description").textContent = config.description || brief.summary || "Specialists with context from this repository.";
       if (needle) {
         const chip = node("div", "match-chip", entry.wholeTeam ? "Repository match · showing whole team" : `${entry.members.length} matching specialist${entry.members.length === 1 ? "" : "s"}`);
         card.querySelector(".description").before(chip);
@@ -127,6 +148,12 @@
       if (brief.languages && brief.languages.length) {
         const languages = node("div", "label", brief.languages.join(" · "));
         card.querySelector(".description").after(languages);
+      }
+      if (repo.notifications) {
+        const notifications = repo.notifications;
+        const health = notifications.health || {};
+        const text = !notifications.enabled ? "Repository change notifications disabled" : health.state === "retrying" ? health.error : health.state === "watching" ? `Checking repository changes every ${notifications.poll_interval_secs}s` : "Repository change notifications starting";
+        card.querySelector(".description").after(node("p", "notification-health label", text));
       }
       for (const member of entry.members) {
         const row = node("div", "role", "");
@@ -143,12 +170,12 @@
         details.append(node("div", "label", member.capability === "code" ? "Repository code & verification tools" : "Read-only repository tools"));
         if (member.memory_enabled) details.append(node("div", "label", "Persistent memory enabled"));
         if (member.study_state === "completed") details.append(node("div", "label", "Initial domain study completed"));
+        if (member.subscriptions && member.subscriptions.length) details.append(node("div", "specialist-paths", "Following: " + member.subscriptions.join(" · ")));
         card.querySelector(".roles").append(details);
       }
-      card.querySelector("button").addEventListener("click", () => selectRepo(id));
-      card.querySelector("a").href = `/repos/${encodeURIComponent(id)}/console`;
-
-      card.querySelector("a").rel = "noopener";
+      card.querySelector(".console-link").hidden = !ready;
+      card.querySelector(".console-link").href = fugueUrl("/console");
+      card.querySelector(".work-link").hidden = document.body.dataset.queueEnabled === "false";
       $("repos").append(card);
     }
     const visibleSpecialists = visible.reduce((total, entry) => total + entry.members.length, 0);
@@ -161,7 +188,7 @@
       $("matchSummary").textContent = `Showing all ${repos.length} repositories and ${totalSpecialists} specialists.`;
     }
     if (!visible.length) {
-      const empty = node("div", "no-results", "No repository teams match your search. Clear search to show every repository team.");
+      const empty = node("div", "no-results empty", repos.length ? "No repository teams match your search. Clear search to show every repository team." : "No repositories yet. Add your first repository using the button above to prepare a team.");
       $("repos").append(empty);
     }
     highlight();
@@ -173,43 +200,47 @@
       row.append(node("span","peer-name",peer.from),line,node("span","peer-name",peer.to));
       $("peers").append(row);
     }
-    if (!peers.length) $("peers").append(node("div","empty","No repository peers configured. Add a pair to ensemble.yaml and restart to connect their representatives."));
-    $("submit").disabled = !repos.length || sending; $("study").disabled = !repos.length || sending;
+    if (!peers.length) $("peers").append(node("div","empty","These teams work independently. Connections between repositories are configured explicitly in the workspace configuration."));
   }
   async function refresh() {
     try {
-      const response = await fetch("/api/ensemble", {cache:"no-store"});
+      const response = await fugueFetch("/api/ensemble", {cache:"no-store"});
       if (!response.ok) throw new Error(`Runtime status unavailable (${response.status})`);
       render(await response.json()); $("error-banner").hidden = true;
-      $("health-dot").classList.add("live"); $("health").textContent = `Native roster · ${new Date().toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"})}`;
+      $("health-dot").classList.add("live"); $("health").textContent = `Updated ${new Date().toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"})}`;
     } catch (error) {
       $("health-dot").classList.remove("live"); $("health").textContent = "Connection interrupted";
       $("error-banner").textContent = `${error.message}. Displayed state may be stale; reconnecting…`; $("error-banner").hidden = false;
-      $("submit").disabled = true; $("study").disabled = true;
+      $("addRepo").disabled = true;
     }
   }
-  async function send(message) {
-    const repo = $("target").value; if (!repo || sending || !message.trim()) return;
-    sending = true; $("submit").disabled = true; $("study").disabled = true;
-    $("notice").className = "notice"; $("notice").textContent = "Submitting to the native runtime…";
-    try {
-      const response = await fetch(`/api/repos/${encodeURIComponent(repo)}/messages`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({message})});
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error || `Request failed (${response.status})`);
-      $("notice").replaceChildren(document.createTextNode("Accepted by the representative. "));
-      const link = node("a","","Open console → select representative"); link.href = `/repos/${encodeURIComponent(repo)}/console`;  link.rel = "noopener"; $("notice").append(link);
-      $("objective").value = "";
-    } catch (error) { $("notice").className = "notice error"; $("notice").textContent = error.message; }
-    finally { sending = false; await refresh(); }
-  }
-  $("target").addEventListener("change", highlight);
   $("teamSearch").value = queryFromUrl();
   $("teamSearch").addEventListener("input", () => { writeSearchToUrl($("teamSearch").value); if (snapshot) render(snapshot); });
   $("clearSearch").addEventListener("click", () => { $("teamSearch").value = ""; writeSearchToUrl(""); if (snapshot) render(snapshot); $("teamSearch").focus(); });
   window.addEventListener("popstate", () => { $("teamSearch").value = queryFromUrl(); if (snapshot) render(snapshot); });
-  $("objective-form").addEventListener("submit", event => { event.preventDefault(); send($("objective").value); });
-  $("objective").addEventListener("keydown", event => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") { event.preventDefault(); if (!$("submit").disabled) send($("objective").value); } });
-  $("study").addEventListener("click", () => send("Refresh this repository study with your domain specialists. Ask each specialist through native comms to inspect their assigned ownership paths and domain, then combine their findings about architecture, interfaces, implementation, verification and risks. Read the repository guidelines and actual relevant files. Return a concise evidenced repository briefing, collaboration opportunities with any connected repositories, and useful next steps. Do not modify files during this study."));
+  const dialog = $("addDialog");
+  let workspaceHub = null;
+  async function loadWorkspaces(){try{const response=await fugueFetch('/api/workspaces',{cache:'no-store'});if(!response.ok)return;const data=await response.json();workspaceHub=data.hub;const root=$('repositoryWorkspaces');$('repositoryWorkspacesPanel').hidden=data.workspaces.length===0;root.replaceChildren();for(const workspace of data.workspaces){const card=node('article','repo','');card.append(node('span','badge',workspace.running?(workspace.configured?'Configured':'Setup draft'):'Stopped'),node('h3','',workspace.repository.repository),node('p','path',`https://${workspace.repository.host}/${workspace.repository.owner}/${workspace.repository.repository}`));const link=node('a','fugue-button primary',workspace.configured?'Open work queue':'Continue configuration');link.href=workspace.url;if(workspace.running){card.append(link);if(workspace.configured){const settings=node('a','fugue-button','Configure');settings.href=new URL('settings',new URL(workspace.url,location.href)).href;card.append(settings);}}else{const resume=node('button','fugue-button','Resume workspace');resume.onclick=async()=>{resume.disabled=true;try{const response=await fugueFetch('/api/workspaces/'+encodeURIComponent(workspace.id)+'/resume',{method:'POST'});if(!response.ok){const error=await response.json();throw new Error(error.error);}await loadWorkspaces();}catch(error){resume.disabled=false;card.append(node('p','notice error',error.message));}};card.append(resume);}root.append(card);}if(workspaceHub&&location.hash==='#add')location.href=workspaceHub.replace(/\/$/,'')+'/ensemble#add';}catch(error){$('error-banner').hidden=false;$('error-banner').textContent='Could not load repository workspaces: '+error.message;}}
+  function openAdd() { if(workspaceHub){location.href=workspaceHub.replace(/\/$/,'')+'/ensemble#add';return;} $('addError').textContent='';if(!dialog.open)dialog.showModal();$('repoUrl').focus(); }
+  $('addRepo').addEventListener('click',openAdd);
+  $('cancelAdd').addEventListener('click',()=>dialog.close());
+  dialog.addEventListener('close',()=>{if(location.hash==='#add')history.replaceState(null,'',location.pathname+location.search);});
+  $('addForm').addEventListener('submit',async event=>{
+    event.preventDefault();if(enrolling)return;enrolling=true;$('confirmAdd').disabled=true;$('addError').textContent='Opening repository configuration...';
+    try{const response=await fugueFetch('/api/workspaces',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({repository_url:$('repoUrl').value.trim()})});const result=await response.json();if(!response.ok)throw new Error(result.error||'Unable to create repository configuration');location.href=result.url;}
+    catch(error){$('addError').textContent=error.message;}
+    finally{enrolling=false;$('confirmAdd').disabled=false;}
+  });
+  loadWorkspaces();setInterval(loadWorkspaces,5000);
+  $("retrySetup").addEventListener("click",async()=>{
+    $("retrySetup").disabled=true;
+    try {const response=await fugueFetch("/api/ensemble/retry",{method:"POST"});if(!response.ok){const result=await response.json();throw new Error(result.error||"Unable to retry setup");}await refresh();}
+    catch(error){$("error-banner").textContent=error.message;$("error-banner").hidden=false;}
+    finally{$("retrySetup").disabled=false;}
+  });
+  window.addEventListener("hashchange",()=>{if(location.hash==="#add")openAdd();});
+  if(location.hash==="#add")openAdd();
+  if(document.body.dataset.queueEnabled!=="false")fugueFetch("/api/v1/workspace").then(r=>r.ok?r.json():null).then(data=>{if(data)$("queueDescription").textContent=`This workspace: ${data.tracker} / ${data.project||"configured project"}. New repositories receive their own tracker configuration and queue.`;}).catch(()=>{});
   refresh(); setInterval(refresh, 5000);
 </script>
 </body>

@@ -101,6 +101,7 @@ pub async fn review_team(
     model: &str,
     auth_binding: Option<AuthBindingRef>,
     team: &TeamManifest,
+    connection_config: Option<&meerkat::Config>,
 ) -> Result<TeamReview> {
     let review_root = state_dir.join("formation-review");
     tokio::fs::create_dir_all(&review_root)
@@ -131,8 +132,12 @@ pub async fn review_team(
         max_duration: Some(REVIEW_TIMEOUT),
         max_turn_duration: Some(REVIEW_TIMEOUT),
     });
-    let config =
-        isolated_connection_config(meerkat::Config::global_config_path().as_deref()).await?;
+    let config = match connection_config {
+        Some(config) => config.clone(),
+        None => {
+            isolated_connection_config(meerkat::Config::global_config_path().as_deref()).await?
+        }
+    };
     // Build a new session rather than resuming any previous review's reasoning.
     let mut agent = factory.build_agent(build, &config).await?;
     let proposal = serde_json::to_string_pretty(team).context("encode proposed team for review")?;

@@ -21,3 +21,13 @@ pub fn current() -> BuildIdentity {
 pub async fn endpoint() -> axum::Json<BuildIdentity> {
     axum::Json(current())
 }
+
+/// All cooperating executables expose the same immutable release identity.
+pub fn print_if_requested() -> anyhow::Result<bool> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().is_some_and(|argument| argument == "build-info") && args.next().is_none() {
+        println!("{}", serde_json::to_string(&current())?);
+        return Ok(true);
+    }
+    Ok(false)
+}

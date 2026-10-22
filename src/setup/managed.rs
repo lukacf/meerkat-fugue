@@ -1,0 +1,412 @@
+//! Process lifecycle for a configured local workspace. Each child receives its
+//! own credential environment; the supervisor retains the original environment.
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use super::{
+    connections::{ConnectionStore, Connections},
+    workflow::WorkflowSetup,
+};
+
+pub const RESTART_EXIT_CODE: i32 = 42;
+pub const RECONFIGURE_EXIT_CODE: i32 = 43;
+
+#[derive(Debug, thiserror::Error)]
+#[error("workspace restart requested")]
+pub struct RestartRequested;
+
+#[derive(Debug, thiserror::Error)]
+#[error("workspace reconfiguration requested")]
+pub struct ReconfigureRequested;
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveWorkspace {
+    pub generation: String,
+    pub setup: WorkflowSetup,
+}
+
+impl ActiveWorkspace {
+    pub fn load(root: &Path) -> Result<Option<Self>> {
+        let bytes = match std::fs::read(root.join("workspace.json")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let manifest: Self = serde_json::from_slice(&bytes).context("read workspace manifest")?;
+        if !manifest.generation.starts_with("generation-")
+            || !manifest
+                .generation
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            bail!("Invalid workspace generation");
+        }
+        Ok(Some(manifest))
+    }
+
+    pub fn workflow(&self, root: &Path) -> PathBuf {
+        root.join(&self.generation).join("fugue.yaml")
+    }
+    pub fn ensemble(&self, root: &Path) -> PathBuf {
+        root.join(&self.generation).join("ensemble.yaml")
+    }
+
+    pub fn activate(&self, root: &Path) -> Result<()> {
+        use std::io::Write;
+        let pending = root.join("workspace.pending");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pending)?;
+        let result = (|| -> Result<()> {
+            file.write_all(&serde_json::to_vec_pretty(self)?)?;
+            file.sync_all()?;
+            std::fs::rename(&pending, root.join("workspace.json"))?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            std::fs::remove_file(&pending)?;
+            return Err(error);
+        }
+        #[cfg(unix)]
+        std::fs::File::open(root)?.sync_all()?;
+        Ok(())
+    }
+}
+
+/// Prepare immutable config files and a checkout. Does not start agents or
+/// change the active manifest until the operator presses Start.
+pub async fn prepare(
+    root: &Path,
+    setup: &WorkflowSetup,
+    connections: &Connections,
+    port: u16,
+) -> Result<ActiveWorkspace> {
+    let binary = std::env::current_exe()?;
+    let bin_dir = binary
+        .parent()
+        .context("Fugue executable has no directory")?;
+    let mut generated = setup.render(connections, root, port, bin_dir)?;
+    if matches!(
+        connections.tracker,
+        Some(super::connections::TrackerConnection::Jira { .. })
+    ) {
+        let states = connections
+            .jira_client(setup.tracker_project.as_deref().unwrap_or_default())?
+            .list_project_states()
+            .await?
+            .states;
+        let lanes = &setup.lanes;
+        for (role, name) in [
+            ("draft", &lanes.parked),
+            ("ready", &lanes.intake),
+            ("in progress", &lanes.active),
+            ("awaiting review", &lanes.review_action),
+            ("merge", &lanes.deploy_action),
+            ("blocked", &lanes.blocked),
+            ("completed", &lanes.success),
+            ("canceled", &lanes.canceled),
+        ] {
+            if !states
+                .iter()
+                .any(|state| state.name.eq_ignore_ascii_case(name))
+            {
+                bail!(
+                    "Jira has no {name:?} status for {role}. Load the project's statuses and update the workflow mapping"
+                );
+            }
+        }
+    }
+    let github = connections
+        .github
+        .as_ref()
+        .context("Connect GitHub first")?;
+    github.check().await?;
+    let mut access = tokio::process::Command::new("gh");
+    for name in super::connections::SERVICE_CREDENTIAL_ENV {
+        access.env_remove(name);
+    }
+    access
+        .args([
+            "repo",
+            "view",
+            &format!("{}/{}/{}", github.host, setup.owner, setup.repository),
+            "--json",
+            "viewerPermission,defaultBranchRef",
+        ])
+        .envs(connections.environment())
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let access = tokio::time::timeout(Duration::from_secs(30), access.output())
+        .await
+        .context("Repository access check timed out")??;
+    if !access.status.success() {
+        bail!("Cannot read this repository with the saved GitHub account");
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RepositoryAccess {
+        viewer_permission: String,
+        default_branch_ref: Option<Branch>,
+    }
+    #[derive(Deserialize)]
+    struct Branch {
+        name: String,
+    }
+    let access: RepositoryAccess =
+        serde_json::from_slice(&access.stdout).context("Invalid repository access response")?;
+    if !matches!(
+        access.viewer_permission.as_str(),
+        "ADMIN" | "MAINTAIN" | "WRITE"
+    ) {
+        bail!("This GitHub account needs write access to push branches and open pull requests");
+    }
+    let branch = access
+        .default_branch_ref
+        .filter(|branch| !branch.name.is_empty())
+        .context("The repository needs an initial commit and default branch before setup")?;
+    if let Some(deploy) = &mut generated.workflow.deploy {
+        deploy.base_branch = branch.name;
+    }
+
+    for helper in [
+        "fugue-github-mcp",
+        "fugue-host-mcp",
+        "fugue-jira-mcp",
+        "fugue-linear-mcp",
+    ] {
+        if !bin_dir.join(helper).is_file() {
+            bail!("Missing {helper}. Install all Fugue binaries together before starting");
+        }
+    }
+    if generated.checkout.exists() {
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&generated.checkout)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .await?;
+        if !output.status.success() {
+            bail!("The checkout path is not a Git repository");
+        }
+        let actual = PathBuf::from(String::from_utf8(output.stdout)?.trim());
+        if actual.canonicalize()? != generated.checkout.canonicalize()? {
+            bail!("Choose the checkout root, not a subdirectory");
+        }
+        let remote = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&generated.checkout)
+            .args(["remote", "get-url", "origin"])
+            .output()
+            .await?;
+        let remote = String::from_utf8(remote.stdout)?;
+        let remote = remote.trim().trim_end_matches(".git");
+        let https = format!(
+            "https://{}/{}/{}",
+            github.host, setup.owner, setup.repository
+        );
+        let ssh = format!("git@{}:{}/{}", github.host, setup.owner, setup.repository);
+        if remote != https && remote != ssh {
+            bail!("The checkout's origin does not match the selected GitHub repository");
+        }
+    } else {
+        if setup.checkout.is_some() {
+            bail!("The selected local checkout does not exist");
+        }
+        let parent = generated
+            .checkout
+            .parent()
+            .context("Checkout has no parent directory")?;
+        std::fs::create_dir_all(parent)?;
+        // An owned temporary directory makes failure and cancellation retryable
+        // without deleting an existing user checkout.
+        let pending = tempfile::Builder::new()
+            .prefix(".fugue-clone-")
+            .tempdir_in(parent)?;
+        let pending_checkout = pending.path().join("repository");
+        let mut clone = tokio::process::Command::new("git");
+        for name in super::connections::SERVICE_CREDENTIAL_ENV {
+            clone.env_remove(name);
+        }
+        clone
+            .arg("-c")
+            .arg("credential.helper=")
+            .arg("-c")
+            .arg(format!(
+                "credential.https://{}.helper=!gh auth git-credential",
+                github.host
+            ))
+            .arg("clone")
+            .arg(format!(
+                "https://{}/{}/{}.git",
+                github.host, setup.owner, setup.repository
+            ))
+            .arg(&pending_checkout)
+            .envs(connections.environment())
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(180), clone.output())
+            .await
+            .context("Repository clone timed out; check the connection and retry")??;
+        if !output.status.success() {
+            bail!("Could not clone this repository. Check GitHub access and Git installation");
+        }
+        std::fs::rename(&pending_checkout, &generated.checkout)?;
+    }
+    let generation = format!(
+        "generation-{}-{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        std::process::id()
+    );
+    let directory = root.join(&generation);
+    std::fs::create_dir(&directory)?;
+    if !setup.jira_transition_fields.is_empty()
+        && let Some(jira) = &mut generated.workflow.linear.jira
+    {
+        use std::io::Write;
+        let path = directory.join("jira-transition-fields.json");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        file.write_all(&serde_json::to_vec_pretty(&setup.jira_transition_fields)?)?;
+        file.sync_all()?;
+        jira.transition_fields_file = Some(path.display().to_string());
+    }
+    std::fs::write(
+        directory.join("fugue.yaml"),
+        serde_yaml::to_string(&generated.workflow)?,
+    )?;
+    std::fs::write(
+        directory.join("ensemble.yaml"),
+        serde_yaml::to_string(&generated.ensemble)?,
+    )?;
+    let manifest = ActiveWorkspace {
+        generation,
+        setup: setup.clone(),
+    };
+    let mut check = tokio::process::Command::new(&binary);
+    for name in super::connections::SERVICE_CREDENTIAL_ENV {
+        check.env_remove(name);
+    }
+    check
+        .arg(manifest.workflow(root))
+        .arg("--check")
+        .envs(connections.environment())
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(60), check.output())
+        .await
+        .context("Tracker and repository checks timed out")??;
+    if !output.status.success() {
+        // Runtime error details may contain upstream response bodies. Return an
+        // actionable boundary error without reflecting credentials or responses.
+        bail!(
+            "Workflow access check failed. Check tracker credentials, project, selected statuses, and repository access"
+        );
+    }
+    Ok(manifest)
+}
+
+pub async fn supervise(root: &Path, port: u16, mut open_setup: bool) -> Result<()> {
+    if port == 0 {
+        bail!("Choose a fixed port so setup and the running workspace share one address");
+    }
+    let store = ConnectionStore::open(root)?;
+    drop(store);
+    let root = root.canonicalize()?;
+    let executable = std::env::current_exe()?;
+    loop {
+        let store = ConnectionStore::open(&root)?;
+        let connections = store.load()?;
+        drop(store);
+        let manifest = if open_setup {
+            None
+        } else {
+            ActiveWorkspace::load(&root)?
+        };
+        let was_runtime = manifest.is_some();
+        let mut child = tokio::process::Command::new(&executable);
+        for name in super::connections::SERVICE_CREDENTIAL_ENV {
+            child.env_remove(name);
+        }
+        child
+            .arg("--managed-child")
+            .arg("--managed-workspace")
+            .arg(&root)
+            .arg("--port")
+            .arg(port.to_string())
+            .envs(connections.environment())
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GH_PROMPT_DISABLED", "1")
+            .kill_on_drop(true)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        if let Some(manifest) = manifest {
+            child
+                .arg(manifest.workflow(&root))
+                .arg("--ensemble-config")
+                .arg(manifest.ensemble(&root));
+        }
+        let mut child = child.spawn().context("start managed Fugue workspace")?;
+        let status = tokio::select! {
+            status=child.wait()=>status?,
+            signal=shutdown_signal()=>{
+                signal?;
+                if let Some(id)=child.id() {
+                    #[cfg(unix)] {
+                        let sent=tokio::process::Command::new("kill").args(["-TERM",&id.to_string()]).status().await?;
+                        if !sent.success() { bail!("Could not request graceful workspace shutdown"); }
+                    }
+                    #[cfg(not(unix))] child.start_kill()?;
+                }
+                child.wait().await?;
+                return Ok(());
+            }
+        };
+        if status.code() == Some(RESTART_EXIT_CODE) {
+            open_setup = false;
+            continue;
+        }
+        if status.code() == Some(RECONFIGURE_EXIT_CODE) {
+            open_setup = true;
+            continue;
+        }
+        if !status.success() {
+            if was_runtime {
+                std::fs::write(
+                    root.join("startup-error.txt"),
+                    "Fugue could not start the saved workspace. Check its connections and configuration, then prepare and start again.",
+                )?;
+                open_setup = true;
+                continue;
+            }
+            bail!("Fugue workspace stopped ({status}); reopen setup to check its connections");
+        }
+        return Ok(());
+    }
+}
+
+pub async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! { result=tokio::signal::ctrl_c()=>result,_=terminate.recv()=>Ok(()) }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
+}

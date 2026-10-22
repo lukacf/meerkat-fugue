@@ -2132,6 +2132,7 @@ dependencies = [
  "meerkat-llm-core",
  "meerkat-meta",
  "meerkat-mob",
+ "meerkat-models",
  "meerkat-tools",
  "minijinja",
  "reqwest 0.12.28",
@@ -2140,11 +2141,13 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "toml 0.9.12+spec-1.1.0",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2379,7 +2382,7 @@ dependencies = [
 [[package]]
 name = "meerkat-meta"
 version = "0.9.3"
-source = "git+https://github.com/lukacf/meerkat-meta.git?rev=a206916aeb8495368b7b1e286c8b6cf65bc33d83#a206916aeb8495368b7b1e286c8b6cf65bc33d83"
+source = "git+https://github.com/lukacf/meerkat-meta.git?rev=3df23f310fc89b868d904ba0e46d8d7aa27f5f50#3df23f310fc89b868d904ba0e46d8d7aa27f5f50"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3778,7 +3781,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -654,7 +654,7 @@ pub fn final_pr_gate_ci_status(ci: Option<&CheckCiOutput>) -> FinalPrGateCiStatu
     }
     match ci.status {
         CiStatus::Success | CiStatus::Skipped => FinalPrGateCiStatus::Success,
-        CiStatus::Pending => FinalPrGateCiStatus::Pending,
+        CiStatus::Pending | CiStatus::NoChecks => FinalPrGateCiStatus::Pending,
         CiStatus::Failure | CiStatus::Error | CiStatus::Cancelled => FinalPrGateCiStatus::Failed,
     }
 }

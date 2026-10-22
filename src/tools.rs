@@ -982,6 +982,8 @@ pub struct GitHubCheckSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CiStatus {
+    /// The host reported neither checks nor commit statuses. This is not success.
+    NoChecks,
     Pending,
     Success,
     Failure,

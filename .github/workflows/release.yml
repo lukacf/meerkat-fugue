@@ -1,0 +1,42 @@
+name: Release bundle
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify installer failure and upgrade behavior
+        run: python3 -m unittest discover -s scripts/distribution -p 'test_*.py' -v
+      - name: Build all cooperating binaries from the locked source
+        run: cargo build --release --bins --locked
+      - name: Package with pinned rkat and file checksums
+        run: python3 scripts/distribution/package.py --bin-dir target/release --target x86_64-unknown-linux-gnu --output /tmp/fugue-dist
+      - name: Exercise the exact package on a fresh installation path
+        run: |
+          archive=$(find /tmp/fugue-dist -name '*.tar.gz')
+          checksum=$(cut -d ' ' -f 1 "$archive.sha256")
+          python3 scripts/distribution/install.py --archive "$archive" --sha256 "$checksum" --prefix /tmp/fugue-installed
+          /tmp/fugue-installed/bin/meerkat-fugue build-info
+          /tmp/fugue-installed/bin/rkat --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fugue-linux-x64
+          path: /tmp/fugue-dist/*
+          if-no-files-found: error
+          retention-days: 30

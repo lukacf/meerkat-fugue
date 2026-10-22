@@ -19,7 +19,7 @@ use crate::tools::{
 };
 
 /// Default model used by the meerkat agent when a workflow does not specify one.
-pub const DEFAULT_AGENT_MODEL: &str = "gpt-5.5";
+pub use meerkat_models::global_default_model as default_agent_model;
 pub const DEFAULT_KAPELLMEISTER_SHADOW_PROMPT: &str = "You are Kapellmeister running in Meerkat Fugue shadow mode. Observe repository-scoped orchestration signals, preserve durable cursors, and produce recommendations only. The Rust orchestrator remains authoritative; do not mutate Linear, GitHub, the workspace, or production state.";
 const DEFAULT_PLAYWRIGHT_MCP_SERVER_ID: &str = "playwright";
 const DEFAULT_PLAYWRIGHT_MCP_COMMAND: [&str; 4] =
@@ -326,6 +326,8 @@ pub struct DeployLaneConfig {
     pub base_branch: String,
     pub merge_method: MergeMethod,
     pub require_ci_success: bool,
+    /// Permit an explicitly empty host check set, while retaining all other CI gates.
+    pub allow_no_ci_checks: bool,
     pub require_fresh_head: bool,
     pub require_no_blocking_workgraph: bool,
     pub require_ota_update: bool,
@@ -346,6 +348,7 @@ impl Default for DeployLaneConfig {
             base_branch: "main".to_string(),
             merge_method: MergeMethod::Squash,
             require_ci_success: true,
+            allow_no_ci_checks: false,
             require_fresh_head: true,
             require_no_blocking_workgraph: true,
             require_ota_update: true,
@@ -532,8 +535,26 @@ pub enum SkillRef {
     },
 }
 
+/// The repository mob owns both durable domain specialists and ticket members.
+/// Legacy queue-only workflows have no repository binding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryRuntimeBinding {
+    pub repository: crate::ensemble::config::RepoId,
+    pub state_path: PathBuf,
+}
+
+impl RepositoryRuntimeBinding {
+    pub fn mob_id(&self) -> String {
+        format!("ensemble-{}", self.repository)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MeerkatConfig {
+    #[serde(skip)]
+    pub runtime_connections: Option<std::sync::Arc<crate::setup::connections::Connections>>,
+    pub repository_runtime: Option<RepositoryRuntimeBinding>,
     pub command: String,
     pub realm: Option<String>,
     pub instance: Option<String>,
@@ -573,6 +594,13 @@ pub struct MeerkatConfig {
 }
 
 impl MeerkatConfig {
+    pub fn mob_id(&self) -> std::borrow::Cow<'_, str> {
+        match &self.repository_runtime {
+            Some(binding) => std::borrow::Cow::Owned(binding.mob_id()),
+            None => std::borrow::Cow::Borrowed(crate::native_mob_contract::FUGUE_MOB_ID),
+        }
+    }
+
     pub fn command_line(&self) -> String {
         let mut command = self.command.clone();
         append_flag(&mut command, "--realm", self.realm.as_deref());
@@ -921,7 +949,7 @@ pub struct OtaUpdateConfig {
     pub trigger_token_env: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeFugueConfig {
     #[serde(default)]
@@ -968,7 +996,7 @@ pub struct NativeFugueConfig {
     pub ota_update: Option<NativeOtaUpdateConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeLinearConfig {
     #[serde(default)]
@@ -1038,7 +1066,7 @@ pub struct NativeMcpServerConfig {
     pub env: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeMobTemplate {
     #[serde(default)]
@@ -1052,7 +1080,7 @@ pub struct NativeMobTemplate {
     pub max_review_cycles: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeMobExecutionSection {
     #[serde(default)]
@@ -1061,7 +1089,7 @@ pub struct NativeMobExecutionSection {
     pub native: Option<NativeMobRuntimeConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum NativeMobMember {
     Profile(String),
@@ -1084,7 +1112,7 @@ impl NativeMobMember {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeWorkerConfig {
     #[serde(default)]
@@ -1139,9 +1167,11 @@ pub struct NativeRuntimeAgentConfig {
     pub max_concurrent_agents_by_state: Option<BTreeMap<String, usize>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeMeerkatConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_runtime: Option<RepositoryRuntimeBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1247,7 +1277,7 @@ pub struct NativeServerConfig {
     pub meta_console: Option<NativeMetaConsoleServerConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeMetaConsoleServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1309,6 +1339,7 @@ pub struct WorkflowConfigManager {
     definition: WorkflowDefinition,
     effective: ServiceConfig,
     last_reload_error: Option<String>,
+    connections: Option<std::sync::Arc<crate::setup::connections::Connections>>,
 }
 
 impl WorkflowConfigManager {
@@ -1324,6 +1355,7 @@ impl WorkflowConfigManager {
             definition,
             effective,
             last_reload_error: None,
+            connections: None,
         })
     }
 
@@ -1340,6 +1372,33 @@ impl WorkflowConfigManager {
             definition,
             effective,
             last_reload_error: None,
+            connections: None,
+        })
+    }
+
+    pub fn load_scoped(
+        path: PathBuf,
+        connections: std::sync::Arc<crate::setup::connections::Connections>,
+    ) -> Result<Self> {
+        let (mut definition, modified) = load_workflow_file(&path)?;
+        resolve_connection_variables(&mut definition.config, &connections);
+        let mut effective = ServiceConfig::from_definition(path.clone(), &definition)?;
+        effective.meerkat.runtime_connections = Some(connections.clone());
+        if let Some(binding) = connections
+            .model_binding(&crate::meta_runtime::meta_runtime_state_path(
+                &effective.meerkat,
+            ))
+            .map_err(|error| FugueError::InvalidConfig(error.to_string()))?
+        {
+            effective.meerkat.auth_binding = Some(binding);
+        }
+        Ok(Self {
+            workflow_path: path,
+            last_modified: modified,
+            definition,
+            effective,
+            last_reload_error: None,
+            connections: Some(connections),
         })
     }
 
@@ -1367,9 +1426,22 @@ impl WorkflowConfigManager {
             return false;
         }
 
-        match load_workflow_file(&self.workflow_path).and_then(|(definition, modified)| {
-            let effective =
+        match load_workflow_file(&self.workflow_path).and_then(|(mut definition, modified)| {
+            if let Some(connections) = &self.connections {
+                resolve_connection_variables(&mut definition.config, connections);
+            }
+            let mut effective =
                 ServiceConfig::from_definition(self.workflow_path.clone(), &definition)?;
+            effective.meerkat.runtime_connections = self.connections.clone();
+            if let Some(connections) = &self.connections
+                && let Some(binding) = connections
+                    .model_binding(&crate::meta_runtime::meta_runtime_state_path(
+                        &effective.meerkat,
+                    ))
+                    .map_err(|error| FugueError::InvalidConfig(error.to_string()))?
+            {
+                effective.meerkat.auth_binding = Some(binding);
+            }
             Ok((definition, modified, effective))
         }) {
             Ok((definition, modified, effective)) => {
@@ -1388,6 +1460,33 @@ impl WorkflowConfigManager {
 
     pub fn render_prompt(&self, issue: &Issue, attempt: Option<u32>) -> Result<String> {
         render_prompt(&self.definition.prompt_template, issue, attempt)
+    }
+}
+
+fn resolve_connection_variables(
+    config: &mut Map<String, Value>,
+    connections: &crate::setup::connections::Connections,
+) {
+    fn visit(value: &mut Value, env: &BTreeMap<&str, String>) {
+        match value {
+            Value::String(text) => {
+                if let Some(variable) = text.strip_prefix('$') {
+                    if let Some(value) = env.get(variable) {
+                        *text = value.clone();
+                    } else if crate::setup::connections::SERVICE_CREDENTIAL_ENV.contains(&variable)
+                    {
+                        text.clear();
+                    }
+                }
+            }
+            Value::Array(values) => values.iter_mut().for_each(|value| visit(value, env)),
+            Value::Object(values) => values.values_mut().for_each(|value| visit(value, env)),
+            _ => {}
+        }
+    }
+    let env = connections.environment();
+    for value in config.values_mut() {
+        visit(value, &env);
     }
 }
 
@@ -1418,7 +1517,13 @@ impl ServiceConfig {
             section_object(&definition.config, "meerkat")?,
             &workflow_dir,
         )?;
-        let mob = MobExecutionConfig::from_raw(section_object(&definition.config, "mob")?)?;
+        let mut mob = MobExecutionConfig::from_raw(section_object(&definition.config, "mob")?)?;
+        for server in mob.mcp_servers.values_mut() {
+            server.env.insert(
+                crate::workgraph_gate::WORKGRAPH_MOB_ID_ENV.into(),
+                meerkat.mob_id().into_owned(),
+            );
+        }
         let mut worker_policy =
             WorkerPolicyConfig::from_raw(section_object(&definition.config, "worker_policy")?)?;
         if worker_policy.native_launch_context_template.is_none() {
@@ -2082,7 +2187,22 @@ impl MeerkatConfig {
             FugueError::InvalidConfig("meerkat.max_sessions exceeds platform capacity".to_string())
         })?;
         Ok(Self {
+            runtime_connections: None,
             command,
+            repository_runtime: raw
+                .and_then(|raw| raw.get("repository_runtime"))
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    let mut binding: RepositoryRuntimeBinding =
+                        serde_json::from_value(value.clone()).map_err(|error| {
+                            FugueError::InvalidConfig(format!(
+                                "meerkat.repository_runtime: {error}"
+                            ))
+                        })?;
+                    binding.state_path = absolute_clean_path(workflow_dir, &binding.state_path);
+                    Ok::<_, FugueError>(binding)
+                })
+                .transpose()?,
             realm: opt_string(raw, "realm")?.and_then(|v| resolve_env_string(&v)),
             instance: opt_string(raw, "instance")?.and_then(|v| resolve_env_string(&v)),
             realm_backend,
@@ -2090,7 +2210,7 @@ impl MeerkatConfig {
             context_root: path_field(raw, "context_root", workflow_dir)?,
             user_config_root: path_field(raw, "user_config_root", workflow_dir)?,
             auth_binding,
-            model: opt_string(raw, "model")?.or_else(|| Some(DEFAULT_AGENT_MODEL.to_string())),
+            model: opt_string(raw, "model")?.or_else(|| Some(default_agent_model().to_string())),
             provider: opt_string(raw, "provider")?,
             max_tokens: opt_u64(raw, "max_tokens")?,
             system_prompt: opt_string(raw, "system_prompt")?,
@@ -4182,8 +4302,8 @@ mod tests {
         assert!(!config.mob.native.shadow);
         assert_eq!(
             config.meerkat.model.as_deref(),
-            Some(DEFAULT_AGENT_MODEL),
-            "meerkat.model should default to {DEFAULT_AGENT_MODEL} when unspecified"
+            Some(default_agent_model()),
+            "meerkat.model should use the Meerkat catalog default when unspecified"
         );
         assert_eq!(config.tracker.active_states, vec!["Todo", "Active"]);
     }

@@ -1,3 +1,4 @@
+import {browserDocument} from './browser-document.mjs';
 import { test, expect } from '@playwright/test';
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -33,12 +34,18 @@ let server;
 let baseUrl;
 
 test.beforeAll(async () => {
-  const dashboard = await readFile(DASHBOARD_PATH, 'utf8');
+  const dashboard = (await readFile(DASHBOARD_PATH, 'utf8')).replace('</head>', `<style>${await readFile(new URL('../src/ui/app.css', import.meta.url), 'utf8')}</style></head>`);
   server = http.createServer((request, response) => {
     const url = new URL(request.url, 'http://127.0.0.1');
     if (url.pathname === '/' || url.pathname === '/ensemble') {
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-      response.end(dashboard);
+      response.end(browserDocument(dashboard));
+      return;
+    }
+    if (url.pathname === '/api/workspaces') { response.writeHead(200, {'content-type':'application/json'});response.end(JSON.stringify({hub:null,workspaces:[]}));return; }
+    if (url.pathname === '/api/v1/workspace') {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({tracker:'Fixture',project:'Test',repositories:[]}));
       return;
     }
     if (url.pathname === '/api/ensemble') {
@@ -109,12 +116,8 @@ test.describe('Ensemble dashboard team search behavior', () => {
     await expect(page.locator('#matchSummary')).toContainText('Showing 1 of 2 repositories and 1 of 6 specialists');
   });
 
-  test('query expanded member target and draft survive refresh', async ({ page }) => {
+  test('query and expanded specialist survive refresh', async ({ page }) => {
     const search = page.getByLabel('Search repository teams');
-    const targetSelect = page.locator('#target');
-    const objective = page.locator('#objective');
-    await targetSelect.selectOption('api');
-    await objective.fill('Draft objective that must survive filtering.');
     await search.fill('accessible search');
     const frontendDetails = repoCard(page, 'web').locator('details.specialist').filter({ hasText: FRONTEND_MEMBER_LABEL });
     await frontendDetails.locator('summary').click();
@@ -123,8 +126,6 @@ test.describe('Ensemble dashboard team search behavior', () => {
     await page.evaluate(() => window.refresh());
 
     await expect(search).toHaveValue('accessible search');
-    await expect(targetSelect).toHaveValue('api');
-    await expect(objective).toHaveValue('Draft objective that must survive filtering.');
     await expect(repoCard(page, 'web').locator('details.specialist').filter({ hasText: FRONTEND_MEMBER_LABEL })).toHaveJSProperty('open', true);
     await expect(page.locator('.repo')).toHaveCount(1);
   });
@@ -236,3 +237,82 @@ function member(member_id, label, focus, ownership_paths) {
 function repoCard(page, name) {
   return page.locator('.repo').filter({ has: page.locator('h3', { hasText: name }) });
 }
+
+test('setup is separate from ticket-based operation', async ({ page }) => {
+  await expect(page.getByRole('heading', { name: 'Repository setup', exact: true })).toBeVisible();
+  await expect(page.locator('#objective-form')).toHaveCount(0);
+  await expect(page.locator('textarea')).toHaveCount(0);
+  await expect(page.getByRole('link', { name: /Open work queue/ }).first()).toHaveJSProperty('href', baseUrl + '/issues');
+  await expect(page.getByRole('button', { name: '+ Add repository', exact: true })).toBeVisible();
+});
+
+test('adding a remote repository opens its independent configuration', async ({ page }) => {
+  let submitted;
+  await page.route('**/api/workspaces', async route => {
+    if(route.request().method()==='GET')return route.fulfill({json:{hub:null,workspaces:[]}});
+    submitted=route.request().postDataJSON();
+    await route.fulfill({status:201,json:{url:baseUrl+'/setup'}});
+  });
+  await page.route('**/setup', route=>route.fulfill({contentType:'text/html',body:'<h1>Repository configuration</h1>'}));
+  await page.getByRole('button', {name:'+ Add repository',exact:true}).click();
+  await page.getByLabel('Repository URL', {exact:true}).fill('https://git.example.com/team/new-repo');
+  await page.getByRole('dialog').getByRole('button', {name:'Configure repository',exact:true}).click();
+  await expect(page).toHaveURL(baseUrl+'/setup');
+  expect(submitted).toEqual({repository_url:'https://git.example.com/team/new-repo'});
+});
+
+test('failed enrollment keeps the URL and shows the actionable error', async ({ page }) => {
+  await page.route('**/api/workspaces', route => route.request().method()==='GET'?route.fulfill({json:{hub:null,workspaces:[]}}):route.fulfill({status:409,json:{error:'This repository already has a workspace.'}}));
+  await page.getByRole('button', {name:'+ Add repository',exact:true}).click();
+  await page.getByLabel('Repository URL', {exact:true}).fill('https://github.com/example/repository');
+  await page.getByRole('dialog').getByRole('button', {name:'Configure repository',exact:true}).click();
+  await expect(page.locator('#addError')).toContainText('already has a workspace');
+  await expect(page.getByLabel('Repository URL', {exact:true})).toHaveValue('https://github.com/example/repository');
+  await expect(page.getByRole('dialog').getByRole('button', {name:'Configure repository',exact:true})).toBeEnabled();
+  await page.getByRole('button', {name:'Cancel',exact:true}).click();
+  await expect(page.getByRole('dialog')).not.toBeVisible();
+});
+
+test('failed formation has a retry action and never offers a ready console', async ({ page }) => {
+  const current = {...structuredClone(fixture),setup:{phase:'failed',error:'Model authentication failed'},runtime:{repositories:[],peers:[]}};
+  await page.route('**/api/ensemble', route => route.fulfill({json:current}));
+  await page.route('**/api/ensemble/retry', async route => {
+    current.setup = {phase:'preparing'};
+    await route.fulfill({status:202,json:{phase:'preparing'}});
+  });
+  await page.reload();
+  await expect(page.locator('#setup')).toContainText('Model authentication failed');
+  await expect(page.getByRole('link', {name:/Inspect team/})).toHaveCount(0);
+  await page.getByRole('button', {name:'Retry setup',exact:true}).click();
+  await expect(page.locator('#setup')).toContainText('Preparing repository teams');
+});
+
+for (const width of [390, 1024, 1440]) {
+  test(`repository setup fits a ${width}px viewport`, async ({ page }) => {
+    await page.setViewportSize({width,height:900});
+    await expect(page.getByRole('button', {name:'+ Add repository',exact:true})).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await page.getByRole('button', {name:'+ Add repository',exact:true}).click();
+    await expect(page.getByRole('dialog')).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  });
+}
+
+test('all repository teams open the same console', async ({ page }) => {
+  const links = page.getByRole('link', {name: /Inspect team/});
+  await expect(links).toHaveCount(2);
+  for (const link of await links.all()) await expect(link).toHaveAttribute('href', '/console');
+});
+
+test('specialist subscriptions and notification failures are visible', async ({ page }) => {
+  const current = structuredClone(fixture);
+  current.runtime.repositories[0].notifications = {enabled: true, health: {state: 'retrying', error: 'Repository access failed; retrying.'}};
+  current.runtime.repositories[0].members[1].subscriptions = ['src/api.rs', 'tests/api'];
+  await page.route('**/api/ensemble', route => route.fulfill({json: current}));
+  await page.reload();
+  const api = repoCard(page, 'api');
+  await expect(api.locator('.notification-health')).toContainText('Repository access failed; retrying.');
+  const specialist = api.locator('details.specialist').filter({hasText: 'Backend Contracts'});
+  await specialist.locator('summary').click();
+  await expect(specialist).toContainText('Following: src/api.rs · tests/api');
+});

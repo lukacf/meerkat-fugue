@@ -22,33 +22,37 @@ clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
 indexmap = { version = "2", features = ["serde"] }
 meerkat-core = "=0.9.3"
+meerkat-models = "=0.9.3"
 meerkat-mob = "=0.9.3"
 meerkat-meta = "=0.9.3"
 meerkat-tools = "=0.9.3"
 meerkat = { version = "=0.9.3", features = ["workgraph"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 serde_yaml = "0.9"
 sha2 = "0.10"
+subtle = "2.6"
 minijinja = { version = "2.12", features = ["json"] }
+tempfile = "3.23"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["full"] }
 tokio-util = "0.7"
+tower = { version = "0.5", features = ["util"] }
 toml = "0.9.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
 meerkat-llm-core = "=0.9.3"
-tempfile = "3.23"
 
-# Published 0.9.3 omits continuity owner restoration before library recovery.
-# Pin the minimal upstream backport until a released crate includes the fix.
+# Published 0.9.3 omits continuity owner restoration and aggregate peer projection.
+# Pin the upstream compatibility fixes until a released crate includes them.
 # Upstream: https://github.com/lukacf/meerkat-meta/pull/674
+# Console: https://github.com/lukacf/meerkat-meta/pull/688
 [patch.crates-io]
-meerkat-meta = { version = "=0.9.3", git = "https://github.com/lukacf/meerkat-meta.git", rev = "a206916aeb8495368b7b1e286c8b6cf65bc33d83" }
+meerkat-meta = { version = "=0.9.3", git = "https://github.com/lukacf/meerkat-meta.git", rev = "3df23f310fc89b868d904ba0e46d8d7aa27f5f50" }
 
 # Keep the large generated platform crates inexpensive to link in the offline suite.
 [profile.test]

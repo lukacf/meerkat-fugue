@@ -69,6 +69,7 @@ pub async fn discover_team(
     brief: &RepoBrief,
     model: &str,
     auth_binding: Option<meerkat_core::AuthBindingRef>,
+    connection_config: Option<&meerkat::Config>,
 ) -> Result<TeamManifest> {
     let formation = state_dir.join("formation");
     std::fs::create_dir_all(&formation)?;
@@ -98,8 +99,12 @@ pub async fn discover_team(
         max_duration: None,
         max_turn_duration: Some(Duration::from_secs(600)),
     });
-    let config =
-        isolated_connection_config(meerkat::Config::global_config_path().as_deref()).await?;
+    let config = match connection_config {
+        Some(config) => config.clone(),
+        None => {
+            isolated_connection_config(meerkat::Config::global_config_path().as_deref()).await?
+        }
+    };
     let mut agent = factory.build_agent(build, &config).await?;
     let mut prompt = format!(
         "Discover the specialist team for {}.\n\n{}",
@@ -139,6 +144,7 @@ pub async fn discover_team(
             model,
             auth_binding.clone(),
             &team,
+            Some(&config),
         )
         .await?;
         std::fs::write(
