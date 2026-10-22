@@ -3408,7 +3408,9 @@ for line in sys.stdin:
         )?;
         let mut meerkat = meerkat_config_with_mutating_capabilities();
         meerkat.command = format!("python3 {}", script.display());
-        meerkat.read_timeout_ms = 1_000;
+        // This tests response routing, not interpreter startup latency. Allow
+        // the fixture process to start under a busy parallel CI test suite.
+        meerkat.read_timeout_ms = 10_000;
         let mut client = KapellmeisterRpcClient::start(&meerkat, temp.path()).await?;
         let result = client
             .call("session/create", json!({}), Duration::from_secs(2))
