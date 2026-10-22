@@ -33,6 +33,9 @@ pub struct JiraConfig {
     pub transition_fields_file: Option<String>,
     /// Jira issue-link type names whose inward side blocks this issue.
     pub blocking_link_types: Vec<String>,
+    /// Exact Jira priority names mapped to dispatch ranks (lower runs first).
+    /// Jira IDs are opaque; unmapped names have no numeric priority.
+    pub priority_ranks: BTreeMap<String, std::num::NonZeroU32>,
 }
 
 impl Default for JiraConfig {
@@ -46,6 +49,7 @@ impl Default for JiraConfig {
             create_fields_file: None,
             transition_fields_file: None,
             blocking_link_types: vec!["Blocks".to_string()],
+            priority_ranks: BTreeMap::new(),
         }
     }
 }
@@ -427,7 +431,13 @@ impl JiraClient {
             identifier: issue.key,
             title: issue.fields.summary,
             description: issue.fields.description.map(|body| body.markdown()),
-            priority: issue.fields.priority.map(|priority| priority.id),
+            priority: issue.fields.priority.and_then(|priority| {
+                self.config
+                    .priority_ranks
+                    .get(&priority.name)
+                    .copied()
+                    .map(|rank| i64::from(rank.get()))
+            }),
             state: issue.fields.status.name,
             branch_name: None,
             labels: issue.fields.labels,
@@ -1322,14 +1332,7 @@ struct JiraId {
 }
 #[derive(Deserialize)]
 struct JiraPriority {
-    #[serde(deserialize_with = "deserialize_priority")]
-    id: i64,
-}
-fn deserialize_priority<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<i64, D::Error> {
-    let id = String::deserialize(deserializer)?;
-    id.parse().map_err(serde::de::Error::custom)
+    name: String,
 }
 #[derive(Deserialize)]
 struct JiraProject {

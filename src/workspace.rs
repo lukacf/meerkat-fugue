@@ -95,7 +95,9 @@ impl WorkspaceManager {
                 false
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir_all(&path).map_err(|err| {
+                // Claim a new directory atomically. A concurrent creator must
+                // not be mistaken for a directory owned by this attempt.
+                fs::create_dir(&path).map_err(|err| {
                     FugueError::Workspace(format!(
                         "failed to create workspace {}: {err}",
                         path.display()
@@ -112,8 +114,27 @@ impl WorkspaceManager {
             }
         };
 
-        if created_now && let Some(script) = &self.hooks.after_create {
-            self.run_hook("after_create", script, &path, true).await?;
+        if created_now
+            && let Some(script) = &self.hooks.after_create
+            && let Err(error) = self.run_hook("after_create", script, &path, true).await
+        {
+            // Callers run after_run even when creation fails. Preserve the
+            // directory when that configured cleanup hook needs it.
+            if self.hooks.after_run.is_some() {
+                return Err(error);
+            }
+            // Authentication can fail before Git creates anything. Remove only
+            // an empty directory claimed above so a corrected connection can
+            // retry. Preserve partial work and report why cleanup could not run.
+            if let Err(cleanup) = fs::remove_dir(&path)
+                && cleanup.kind() != ErrorKind::NotFound
+            {
+                return Err(FugueError::Workspace(format!(
+                    "{error}; incomplete workspace retained at {}: {cleanup}",
+                    path.display()
+                )));
+            }
+            return Err(error);
         }
 
         Ok(WorkspaceInfo {
@@ -558,6 +579,38 @@ mod tests {
         fs::remove_file(workspace.path.join("marker")).unwrap();
         manager.create_for_issue("ABC-1").await.unwrap();
         assert!(!workspace.path.join("marker").exists());
+    }
+
+    #[tokio::test]
+    async fn failed_after_create_removes_only_an_empty_new_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspaces");
+        let config = WorkspaceConfig { root: root.clone() };
+        let mut hooks = HooksConfig {
+            after_create: Some("exit 1".into()),
+            before_run: None,
+            after_run: None,
+            before_remove: None,
+            timeout_ms: 10_000,
+        };
+        let failed = WorkspaceManager::new(&config, &hooks);
+        assert!(failed.create_for_issue("ABC-1").await.is_err());
+        assert!(!root.join("ABC-1").exists());
+        hooks.after_create = Some("touch ready".into());
+        let recovered = WorkspaceManager::new(&config, &hooks)
+            .create_for_issue("ABC-1")
+            .await
+            .unwrap();
+        assert!(recovered.created_now);
+        assert!(recovered.path.join("ready").exists());
+
+        hooks.after_create = Some("touch partial-work; exit 1".into());
+        let error = WorkspaceManager::new(&config, &hooks)
+            .create_for_issue("ABC-2")
+            .await
+            .unwrap_err();
+        assert!(root.join("ABC-2/partial-work").exists());
+        assert!(error.to_string().contains("retained"));
     }
 
     #[tokio::test]

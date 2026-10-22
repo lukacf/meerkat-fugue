@@ -77,7 +77,7 @@ async fn run_agent_worker_inner(
     tx: &mpsc::Sender<WorkerMessage>,
     cancel: CancellationToken,
 ) -> Result<LiveSession> {
-    let workspace_manager = WorkspaceManager::new(&config.workspace, &config.hooks);
+    let workspace_manager = WorkspaceManager::for_service(config);
     let tool_layer = FugueToolLayer::new(config);
     let workspace = match tool_layer.create_workspace_for_issue(issue).await {
         Ok(workspace) => workspace,

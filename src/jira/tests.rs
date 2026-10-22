@@ -148,6 +148,41 @@ fn tracker(endpoint: &str) -> TrackerConfig {
 fn issue(status: &str) -> Value {
     json!({"id":"10001","key":"TEST-1","fields":{"summary":"Integration fixture","description":null,"project":{"id":"10","key":"TEST"},"updated":"2026-01-01T00:00:00.000+0000","status":{"id":if status == "Done" { "3" } else { "2" },"name":status,"statusCategory":{"key":if status == "Done" { "done" } else { "indeterminate" }}}}})
 }
+
+#[test]
+fn opaque_jira_priority_ids_are_not_numeric_ranks() {
+    let mut config = tracker("https://jira.example.com");
+    let client = JiraClient::from_config(&config).unwrap();
+    let mut value = issue("In Progress");
+    value["fields"]["priority"] = json!({"id":"10002", "name":"Normal"});
+    assert_eq!(
+        client
+            .normalize(serde_json::from_value(value.clone()).unwrap())
+            .priority,
+        None
+    );
+    config
+        .jira
+        .as_mut()
+        .unwrap()
+        .priority_ranks
+        .insert("Normal".into(), std::num::NonZeroU32::new(3).unwrap());
+    let client = JiraClient::from_config(&config).unwrap();
+    assert_eq!(
+        client
+            .normalize(serde_json::from_value(value.clone()).unwrap())
+            .priority,
+        Some(3)
+    );
+    value["fields"]["priority"]["id"] = json!("opaque-priority-id");
+    assert_eq!(
+        client
+            .normalize(serde_json::from_value(value).unwrap())
+            .priority,
+        Some(3)
+    );
+    assert!(serde_json::from_value::<JiraConfig>(json!({"priority_ranks":{"Normal":0}})).is_err());
+}
 fn reference() -> LinearIssueRef {
     LinearIssueRef::Identifier {
         identifier: LinearIssueIdentifier("TEST-1".to_string()),

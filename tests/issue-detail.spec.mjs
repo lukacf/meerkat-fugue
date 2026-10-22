@@ -24,3 +24,14 @@ test('ticket details keep workpad evidence separate and preserve comment drafts'
   await expect(page.getByLabel('Agent workpad',{exact:true})).toHaveAttribute('readonly','');
   expect(errors).toEqual([]);
 });
+
+test('Jira statuses remain literal and the configured merge action stays available',async({page})=>{
+  const detail={issue:{identifier:'TEST-2',title:'Closed acceptance attempt',state:{name:'Closed'},labels:[],description:'No PR was created'},comments:[],attachments:[],workpad:null,runtime:null,lanes:['Open','In Progress','Resolved','Reopened','Closed'],lane_actions:{Reopened:'merge'}};
+  await page.route('http://fugue.test/**',route=>route.request().url().includes('/api/')?route.fulfill({json:detail}):route.fulfill({contentType:'text/html',body:browserDocument(html)}));
+  await page.goto('http://fugue.test/issues/TEST-2');
+  await expect(page.locator('#stateChip')).toContainText('Closed', {ignoreCase:true});
+  await expect(page.locator('#lanePicker')).not.toContainText('Canceled', {ignoreCase:true});
+  await expect(page.locator('#lanePicker')).not.toContainText('Done', {ignoreCase:true});
+  await page.getByRole('button',{name:/Reopened/}).click();
+  await expect(page.locator('#save')).toContainText('SAVE & RUN MERGE');
+});

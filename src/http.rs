@@ -2187,7 +2187,7 @@ const ISSUE_DETAIL_HTML: &str = r#"<!doctype html>
   <div class="top-rail"><a class="brand" href="/overview"><span class="mark"></span><span>MEERKAT FUGUE</span></a><nav class="tabs"><a href="/overview">OVERVIEW</a><a class="active" href="/issues">IMS</a><a href="/console">CONSOLE</a><a href="/ensemble">ENSEMBLE</a></nav><div class="spacer"></div><div class="kpis"><span>RUN&nbsp;<b id="kpiRun">—</b></span><span>RETRY&nbsp;<b id="kpiRetry">—</b></span><span>TOK&nbsp;<b id="kpiTok">—</b></span><span>T&nbsp;<b id="kpiTime">unavailable</b></span><span>SHAD&nbsp;<b id="kpiShadow">unavailable</b></span></div></div>
   <div class="notice" id="notice"></div>
   <main class="sheet" id="sheet">
-    <header class="sheet-head"><div class="state-chip" id="stateChip">◐ RUNNING</div><div class="issue-id" id="issueId">ISSUE</div><div class="sheet-title" id="title">loading…</div><div class="dirty" id="dirtyFlag" hidden>● UNSAVED · 1 CHANGE</div><button class="close" id="close" type="button">×</button></header>
+    <header class="sheet-head"><div class="state-chip" id="stateChip">Loading</div><div class="issue-id" id="issueId">ISSUE</div><div class="sheet-title" id="title">loading…</div><div class="dirty" id="dirtyFlag" hidden>● UNSAVED · 1 CHANGE</div><button class="close" id="close" type="button">×</button></header>
     <section class="body"><aside class="props" id="props"></aside><section class="middle" id="middle"><div class="meta">loading…</div></section><aside class="lanes" id="lanePicker"></aside></section>
     <footer class="footer"><div class="diff" id="diff">No changes</div><button class="cancel" id="cancel" type="button">CANCEL <span class="meta">ESC</span></button><button class="save" id="save" type="button" disabled>SAVE CHANGES <span class="meta">⌘S</span></button></footer>
   </main>
@@ -2286,6 +2286,29 @@ enum LaneAction {
 }
 
 fn lane_action(config: &ServiceConfig, lane: &str) -> Option<LaneAction> {
+    if config.tracker.kind == "jira" {
+        // Only configured action statuses trigger a procedure. A Jira status
+        // named "Deploy" or "Review" is not itself authorization to run one.
+        if config.deploy.enabled && lane.eq_ignore_ascii_case(&config.deploy.lane) {
+            return Some(if config.deploy.procedure == "merge-only" {
+                LaneAction::Merge
+            } else {
+                LaneAction::Deploy
+            });
+        }
+        if (config.final_review.enabled || config.independent_review.enabled)
+            && config
+                .linear
+                .lanes
+                .do_review
+                .as_ref()
+                .or(config.linear.lanes.review_ready.as_ref())
+                .is_some_and(|state| state.eq_ignore_ascii_case(lane))
+        {
+            return Some(LaneAction::Review);
+        }
+        return None;
+    }
     match lane {
         "Review" if config.final_review.enabled || config.independent_review.enabled => {
             Some(LaneAction::Review)
@@ -2432,10 +2455,11 @@ async fn api_issue_create(
         )
         .await
     {
-        Ok(issue) => Json(
-            json!({ "issue": issue_board_issue(issue, "Queue", &HashMap::new(), &HashMap::new()) }),
-        )
-        .into_response(),
+        Ok(issue) => {
+            let lane = canonical_lane_for_state(&app.config, &issue.state);
+            Json(json!({ "issue": issue_board_issue(issue, &lane, &HashMap::new(), &HashMap::new()) }))
+                .into_response()
+        }
         Err(error) => issue_adapter_error_response(error),
     }
 }
@@ -3016,7 +3040,8 @@ async fn issue_detail_snapshot(
         })
         .await
         .map_err(issue_adapter_error_response)?;
-    // rework-note: the adapter may still project Linear/Todo/Planning-style states; the UI exposes only Fugue canonical lanes and keeps phase information on labels.
+    // Jira statuses may combine multiple roles, so preserve their real names.
+    // Other trackers retain the existing canonical board projection.
     let canonical_lane = canonical_lane_for_state(&app.config, &inspected.issue.state.name);
     if let Some(phase) = phase_label_for_state(&inspected.issue.state.name)
         && !inspected
@@ -3045,11 +3070,11 @@ async fn issue_detail_snapshot(
         attachments: inspected.attachments,
         comments,
         runtime,
-        lane_actions: canonical_issue_board_lanes()
+        lane_actions: issue_board_lanes(&app.config)
             .into_iter()
             .filter_map(|name| lane_action(&app.config, &name).map(|action| (name, action)))
             .collect(),
-        lanes: canonical_issue_board_lanes(),
+        lanes: issue_board_lanes(&app.config),
     })
 }
 
@@ -3112,7 +3137,7 @@ fn issue_board_snapshot_from_rows(
         runtime_by_identifier.insert(row.issue_identifier.clone(), status);
     }
 
-    let lanes = canonical_issue_board_lanes();
+    let lanes = issue_board_lanes(config);
     let mut grouped = lanes
         .iter()
         .map(|lane| (lane.clone(), Vec::new()))
@@ -3146,7 +3171,11 @@ fn issue_board_snapshot_from_rows(
         .map(|(name, mut issues)| {
             sort_issue_board_issues(&mut issues);
             IssueBoardLane {
-                kind: canonical_lane_kind(&name),
+                kind: if config.tracker.kind == "jira" {
+                    canonical_lane_kind(&canonical_role_for_state(config, &name))
+                } else {
+                    canonical_lane_kind(&name)
+                },
                 action: lane_action(config, &name),
                 name,
                 issues,
@@ -3236,7 +3265,12 @@ fn validate_issue_create_attachments(
     Ok(())
 }
 
-fn issue_creation_lanes(_config: &ServiceConfig) -> Vec<String> {
+fn issue_creation_lanes(config: &ServiceConfig) -> Vec<String> {
+    if config.tracker.kind == "jira" {
+        let mut lanes = vec![config.linear.lanes.parked.clone()];
+        push_unique_lane(&mut lanes, config.linear.lanes.ready.clone());
+        return lanes;
+    }
     vec!["Backlog".to_string(), "Queue".to_string()]
 }
 
@@ -3389,7 +3423,16 @@ fn add_missing_runtime_rows(
         if seen_issue_ids.contains(&row.issue_id) {
             continue;
         }
-        let lane = "Active".to_string();
+        let lane = if config.tracker.kind == "jira" {
+            config
+                .tracker
+                .in_flight_states
+                .first()
+                .cloned()
+                .unwrap_or_else(|| config.linear.lanes.ready.clone())
+        } else {
+            "Active".to_string()
+        };
         let issue = synthetic_issue_board_issue(
             &row.issue_id,
             &row.issue_identifier,
@@ -3437,6 +3480,14 @@ fn canonical_issue_board_lanes() -> Vec<String> {
         .iter()
         .map(|lane| (*lane).to_string())
         .collect()
+}
+
+fn issue_board_lanes(config: &ServiceConfig) -> Vec<String> {
+    if config.tracker.kind == "jira" {
+        tracker_fetch_lanes(config)
+    } else {
+        canonical_issue_board_lanes()
+    }
 }
 
 fn tracker_fetch_lanes(config: &ServiceConfig) -> Vec<String> {
@@ -3487,6 +3538,14 @@ fn tracker_fetch_lanes(config: &ServiceConfig) -> Vec<String> {
 }
 
 fn canonical_lane_for_state(config: &ServiceConfig, state: &str) -> String {
+    if config.tracker.kind == "jira" {
+        state.to_string()
+    } else {
+        canonical_role_for_state(config, state)
+    }
+}
+
+fn canonical_role_for_state(config: &ServiceConfig, state: &str) -> String {
     let normalized = state.trim().to_ascii_lowercase();
     if config.tracker.is_intake_state(state) {
         return "Queue".to_string();
@@ -3576,6 +3635,13 @@ fn canonical_lane_kind(lane: &str) -> IssueBoardLaneKind {
 }
 
 fn tracker_state_for_canonical_lane(config: &ServiceConfig, lane: &str) -> String {
+    if config.tracker.kind == "jira"
+        && let Some(state) = tracker_fetch_lanes(config)
+            .into_iter()
+            .find(|state| state.eq_ignore_ascii_case(lane.trim()))
+    {
+        return state;
+    }
     match lane.trim().to_ascii_lowercase().as_str() {
         "backlog" => config.linear.lanes.parked.clone(),
         "queue" => config
@@ -6166,6 +6232,54 @@ mod tests {
         };
         ServiceConfig::from_definition(std::path::PathBuf::from("/tmp/WORKFLOW.md"), &definition)
             .unwrap()
+    }
+
+    #[test]
+    fn jira_board_preserves_actual_statuses_when_roles_overlap() {
+        let mut config = issue_board_config();
+        config.tracker.kind = "jira".into();
+        config.linear.lanes.parked = "Open".into();
+        config.linear.lanes.ready = "Open".into();
+        config.linear.lanes.success = "Closed".into();
+        config.linear.lanes.canceled = "Closed".into();
+        config.linear.lanes.duplicate = "Closed".into();
+        config.linear.lanes.blocked = None;
+        config.linear.lanes.review_ready = Some("Resolved".into());
+        config.linear.lanes.deploy = Some("Reopened".into());
+        config.tracker.intake_states = vec!["Open".into()];
+        config.tracker.in_flight_states = vec!["In Progress".into()];
+        config.tracker.active_states = vec!["Open".into(), "In Progress".into()];
+        config.tracker.terminal_states = vec!["Closed".into()];
+        config.deploy.enabled = true;
+        config.deploy.lane = "Reopened".into();
+        config.deploy.success_lane = "Closed".into();
+        config.deploy.procedure = "merge-only".into();
+        let board = issue_board_snapshot_from_rows(&config, vec![], &[], &[], 0, 0);
+        assert_eq!(
+            board
+                .lanes
+                .iter()
+                .map(|lane| lane.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Open", "In Progress", "Resolved", "Reopened", "Closed"]
+        );
+        assert_eq!(
+            board.lanes.last().unwrap().kind,
+            IssueBoardLaneKind::Terminal
+        );
+        assert_eq!(lane_action(&config, "Reopened"), Some(LaneAction::Merge));
+        assert_eq!(lane_action(&config, "Deploy"), None);
+        config.independent_review.enabled = true;
+        assert_eq!(lane_action(&config, "Resolved"), Some(LaneAction::Review));
+        assert_eq!(lane_action(&config, "Review"), None);
+        assert_eq!(canonical_lane_for_state(&config, "Closed"), "Closed");
+        assert_eq!(issue_creation_lanes(&config), ["Open"]);
+        // A real status that happens to match a canonical label stays literal.
+        config.tracker.in_flight_states.push("Active".into());
+        assert_eq!(
+            tracker_state_for_canonical_lane(&config, "Active"),
+            "Active"
+        );
     }
 
     #[test]

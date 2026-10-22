@@ -17,7 +17,7 @@ pub struct FugueToolLayer {
 impl FugueToolLayer {
     pub fn new(config: &ServiceConfig) -> Self {
         Self {
-            workspace: WorkspaceToolHost::new(&config.workspace, &config.hooks),
+            workspace: WorkspaceToolHost::for_service(config),
         }
     }
 
@@ -173,7 +173,7 @@ pub async fn clean_workspace_for_issue_identifier_best_effort(
 }
 
 pub async fn after_run_if_workspace_exists(config: &ServiceConfig, issue_identifier: &str) {
-    let manager = WorkspaceManager::new(&config.workspace, &config.hooks);
+    let manager = WorkspaceManager::for_service(config);
     let Ok(path) = manager.path_for_issue(issue_identifier) else {
         return;
     };
@@ -249,6 +249,50 @@ mod tests {
         assert!(
             provenance.exists(),
             "workspace tool must persist provenance"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_workspace_hooks_receive_only_their_repository_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspaces");
+        let mut config = config_with_workspace(&root);
+        config.meerkat.runtime_connections = Some(std::sync::Arc::new(
+            serde_json::from_value(json!({
+                "github": {"host": "git.example.com", "credential": {
+                    "method": "token", "token": "workspace-token-sentinel"
+                }},
+                "tracker": {"kind": "jira", "site": "https://jira.example.com",
+                    "email": "operator@example.com", "api_token": "tracker-token-sentinel"}
+            }))
+            .unwrap(),
+        ));
+        let check = "test \"$GH_HOST\" = git.example.com && test \"$GH_ENTERPRISE_TOKEN\" = workspace-token-sentinel && test -z \"$GH_TOKEN\" && test -z \"$JIRA_API_TOKEN\" && test -z \"$JIRA_EMAIL\"";
+        config.hooks.after_create = Some(format!("{check} && touch created-with-repository-auth"));
+        config.hooks.before_run = Some(format!("{check} && touch prepared-with-repository-auth"));
+        config.hooks.after_run = Some(format!("{check} && touch finished-with-repository-auth"));
+        let layer = FugueToolLayer::new(&config);
+        let issue = issue("ABC-1");
+        let workspace = layer.create_workspace_for_issue(&issue).await.unwrap();
+        layer.run_repository_setup_for_issue(&issue).await.unwrap();
+        after_run_if_workspace_exists(&config, &issue.identifier).await;
+        assert!(
+            workspace
+                .path
+                .join("created-with-repository-auth")
+                .is_file()
+        );
+        assert!(
+            workspace
+                .path
+                .join("prepared-with-repository-auth")
+                .is_file()
+        );
+        assert!(
+            workspace
+                .path
+                .join("finished-with-repository-auth")
+                .is_file()
         );
     }
 
