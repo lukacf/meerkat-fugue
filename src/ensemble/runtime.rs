@@ -379,6 +379,9 @@ impl EnsembleRuntime {
                 }
                 desired_definition.limits = queue_definition.limits.clone();
             }
+            // Native admission applies these rules to later spawns and forks,
+            // including two members using the same execution profile.
+            desired_definition.wiring = repository_wiring(&desired_definition);
             let handoff_runtime: super::handoff::RuntimeSlot = Arc::new(std::sync::OnceLock::new());
             if let Some(previous) = storage.created_definition_snapshot().await? {
                 let canonical = previous.definition();
@@ -427,6 +430,14 @@ impl EnsembleRuntime {
                     if migrated.limits.is_none() {
                         migrated.limits = queue_definition.limits.clone();
                     }
+                }
+                // Upgrade the old empty policy or our exact generated policy.
+                // A supported profile migration must also replace its generated
+                // edges; customized wiring still fails definition validation.
+                if canonical.wiring == Default::default()
+                    || canonical.wiring == repository_wiring(canonical)
+                {
+                    migrated.wiring = desired_definition.wiring.clone();
                 }
                 if canonical != &desired_definition && migrated == desired_definition {
                     // The native epoch CAS preserves history and makes the new profile
@@ -1421,6 +1432,21 @@ fn mob_id(repo: &RepoId) -> String {
     format!("ensemble-{repo}")
 }
 
+fn repository_wiring(definition: &MobDefinition) -> meerkat_mob::definition::WiringRules {
+    let mut wiring = meerkat_mob::definition::WiringRules::default();
+    for (index, a) in definition.profiles.keys().enumerate() {
+        for b in definition.profiles.keys().skip(index) {
+            wiring
+                .role_wiring
+                .push(meerkat_mob::definition::RoleWiringRule {
+                    a: a.clone(),
+                    b: b.clone(),
+                });
+        }
+    }
+    wiring
+}
+
 struct TeamTopology(Vec<ManagedPeerEdge>);
 
 #[async_trait]
@@ -2156,6 +2182,32 @@ mod tests {
                 .await
                 .unwrap();
             queue.wire_repository_members(runtime).await.unwrap();
+            // Members admitted after ticket startup must join the same team
+            // through native wiring rules, without another host repair pass.
+            runtime
+                .mob_handle()
+                .ensure_member(meerkat_mob::SpawnMemberSpec::new(
+                    "issue_lead",
+                    "late-ticket-helper",
+                ))
+                .await
+                .unwrap();
+            if iteration == 0 {
+                let fork = runtime
+                    .mob_handle()
+                    .fork_member_at_turn_boundary(
+                        &identity,
+                        meerkat_mob::SpawnMemberSpec::new("issue_lead", "late-ticket-fork"),
+                        Some(0),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    fork,
+                    meerkat_mob::ForkMemberAtTurnBoundary::Forked(_)
+                ));
+            }
             let console =
                 crate::console::ConsoleHub::open(&temp.path().join("console.sqlite3")).unwrap();
             console.register("alpha".into(), runtime.clone());
@@ -2238,6 +2290,25 @@ mod tests {
             );
             ensemble.shutdown().await.unwrap();
             drop(ensemble);
+            if iteration == 0 {
+                // Simulate the exact persisted policy from an older Fugue
+                // deployment while retaining its members and session history.
+                let (storage, _) = meerkat_meta::mob_composition_manifest::persistent_mob_storage(
+                    config.state_root.join("alpha/mob.sqlite3"),
+                )
+                .unwrap();
+                let snapshot = storage
+                    .created_definition_snapshot()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut legacy = snapshot.definition().clone();
+                legacy.wiring = Default::default();
+                storage
+                    .update_definition(snapshot.epoch(), legacy)
+                    .await
+                    .unwrap();
+            }
             assert!(
                 unresolved_peers.is_empty(),
                 "console topology endpoints must resolve to visible identities: {unresolved_peers:?}"

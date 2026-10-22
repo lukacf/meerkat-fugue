@@ -29,6 +29,7 @@ meerkat-tools = "=0.9.3"
 meerkat = { version = "=0.9.3", features = ["workgraph"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
+schemars = "1.2.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 serde_yaml = "0.9"
@@ -45,6 +46,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
+jsonschema = { version = "0.26.2", default-features = false }
 meerkat-llm-core = "=0.9.3"
 meerkat-providers = { version = "=0.9.3", default-features = false }
 
