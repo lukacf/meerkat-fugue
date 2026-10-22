@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path, process::Stdio, sync::Arc, time::Duration};
 use tokio::{io::AsyncWriteExt, sync::Mutex};
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, Serialize)]
 struct HostConnections {
     #[serde(default)]
     realm: BTreeMap<String, meerkat_core::connection::RealmConfigSection>,
@@ -95,16 +95,116 @@ impl ModelProvider {
             Self::Gemini => Provider::Gemini,
         }
     }
+
+    fn api_key_route(self) -> (&'static str, &'static str) {
+        use meerkat_core::provider_matrix::{
+            AnthropicAuthMethod, AnthropicBackendKind, GoogleAuthMethod, GoogleBackendKind,
+            OpenAiAuthMethod, OpenAiBackendKind,
+        };
+        match self {
+            Self::Openai => (
+                OpenAiBackendKind::OpenAiApi.as_str(),
+                OpenAiAuthMethod::ApiKey.as_str(),
+            ),
+            Self::Anthropic => (
+                AnthropicBackendKind::AnthropicApi.as_str(),
+                AnthropicAuthMethod::ApiKey.as_str(),
+            ),
+            Self::Gemini => (
+                GoogleBackendKind::GoogleGenAi.as_str(),
+                GoogleAuthMethod::ApiKey.as_str(),
+            ),
+        }
+    }
+}
+
+/// Non-interactive rkat login only stores the secret. Register the matching
+/// non-secret route in its owning global document using Meerkat's config store.
+/// Never replace an existing OAuth, custom backend, or shared credential route.
+async fn ensure_api_key_binding(path: &Path, provider: ModelProvider) -> Result<()> {
+    use meerkat_core::{
+        AuthProfileConfig, BackendProfileConfig, ConfigDelta, ConfigStore, CredentialSourceSpec,
+        FileConfigStore, ProviderBindingConfig, RealmConfigSection,
+    };
+    let id = format!("default_{}", provider.name());
+    let (backend_kind, auth_method) = provider.api_key_route();
+    let backend = BackendProfileConfig {
+        provider: provider.name().into(),
+        backend_kind: backend_kind.into(),
+        base_url: None,
+        options: serde_json::Value::Null,
+        server: None,
+    };
+    let auth = AuthProfileConfig {
+        provider: provider.name().into(),
+        auth_method: auth_method.into(),
+        source: CredentialSourceSpec::ManagedStore,
+        constraints: Default::default(),
+        metadata_defaults: Default::default(),
+    };
+    let binding = ProviderBindingConfig {
+        backend_profile: id.clone(),
+        auth_profile: id.clone(),
+        credential_account: None,
+        default_model: None,
+        policy: Default::default(),
+        provider_default: false,
+    };
+    let store = FileConfigStore::new(path.to_path_buf(), meerkat_models::canonical());
+    let config = store
+        .get()
+        .await
+        .map_err(|_| anyhow::anyhow!("Could not read rkat account configuration"))?;
+    if let Some(global) = config.realm.get("global") {
+        if global
+            .backend
+            .get(&id)
+            .is_some_and(|value| value != &backend)
+            || global.auth.get(&id).is_some_and(|value| value != &auth)
+            || global
+                .binding
+                .get(&id)
+                .is_some_and(|value| value != &binding)
+        {
+            bail!(
+                "The default rkat account already uses another configuration. Select that account or configure a separate API-key account with rkat."
+            );
+        }
+        if global.backend.contains_key(&id)
+            && global.auth.contains_key(&id)
+            && global.binding.contains_key(&id)
+        {
+            return Ok(());
+        }
+    }
+    let section = RealmConfigSection {
+        backend: BTreeMap::from([(id.clone(), backend)]),
+        auth: BTreeMap::from([(id.clone(), auth)]),
+        binding: BTreeMap::from([(id, binding)]),
+        ..Default::default()
+    };
+    let patch = HostConnections {
+        realm: BTreeMap::from([("global".into(), section)]),
+    };
+    store
+        .patch(ConfigDelta(serde_json::to_value(patch)?))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("Could not register the API-key account in rkat configuration")
+        })?;
+    Ok(())
 }
 
 /// Secret travels through stdin only. The native CLI chooses storage and writes
-/// its owning global config; nothing is copied to Fugue's connection file.
+/// its token store; nothing is copied to Fugue's connection file.
 pub async fn provision_key(
     provider: ModelProvider,
     key: &Secret,
     directory: &Path,
 ) -> Result<AuthBindingRef> {
     key.validate()?;
+    let path = Config::global_config_path().context("Cannot find rkat's user configuration")?;
+    ensure_api_key_binding(&path, provider).await?;
     let mut child = tokio::process::Command::new("rkat")
         .args([
             "auth",
@@ -212,6 +312,53 @@ impl Login {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn api_key_setup_creates_discoverable_native_bindings_and_preserves_other_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[agent]\nmodel = 'gpt-6-astra'\n").unwrap();
+        for provider in [
+            ModelProvider::Openai,
+            ModelProvider::Anthropic,
+            ModelProvider::Gemini,
+        ] {
+            ensure_api_key_binding(&path, provider).await.unwrap();
+            ensure_api_key_binding(&path, provider).await.unwrap();
+        }
+        let accounts = accounts_at(&path).await.unwrap();
+        assert_eq!(accounts.len(), 3);
+        assert!(accounts.iter().all(|a| a.method == "api_key"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (config, _) = Config::from_persisted_toml(&text).unwrap();
+        assert_eq!(config.agent.model, "gpt-6-astra");
+        assert!(
+            config.realm["global"]
+                .auth
+                .values()
+                .all(|a| a.source == meerkat_core::CredentialSourceSpec::ManagedStore)
+        );
+        assert!(config.realm["global"].default_binding.is_none());
+    }
+
+    #[tokio::test]
+    async fn api_key_setup_refuses_to_replace_existing_oauth_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        ensure_api_key_binding(&path, ModelProvider::Openai)
+            .await
+            .unwrap();
+        let original = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("api_key", "managed_chatgpt_oauth");
+        std::fs::write(&path, &original).unwrap();
+        assert!(
+            ensure_api_key_binding(&path, ModelProvider::Openai)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
     #[tokio::test]
     async fn account_discovery_is_empty_without_config_and_redacts_parse_errors() {
         let dir = tempfile::tempdir().unwrap();
