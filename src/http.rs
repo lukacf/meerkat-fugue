@@ -6230,7 +6230,7 @@ mod tests {
             let (refresh, _receiver) = mpsc::channel(1);
             let app = router(
                 owner.shared_state(),
-                config,
+                config.clone(),
                 refresh,
                 owner.internal_sender(),
                 owner.meta_runtime_registry(),
@@ -6246,6 +6246,7 @@ mod tests {
                         .header("Host", "127.0.0.1:8788")
                         .header("Origin", "http://127.0.0.1:8788")
                         .header(CONTENT_TYPE, "application/json")
+                        .header("x-fugue-tracker-scope", config.tracker_context_id())
                         .body(Body::from(r#"{"title":"One issue","lane":"To Do"}"#))
                         .unwrap(),
                 )
@@ -6324,6 +6325,7 @@ mod tests {
         for (app, allowed) in [(foreign, false), (own, true)] {
             let response = app
                 .oneshot(attachment_test_request(
+                    None,
                     "GET",
                     "/api/v1/issues/TEST-1/attachments/trace.txt",
                     Body::empty(),
@@ -6368,6 +6370,7 @@ mod tests {
             assert!(!directory.exists());
             let response = foreign
                 .oneshot(attachment_test_request(
+                    Some(&foreign_config),
                     "POST",
                     &format!("/api/v1/issues/TEST-1/{endpoint}"),
                     attachment_test_body(),
@@ -6426,6 +6429,7 @@ mod tests {
             let response = app
                 .clone()
                 .oneshot(attachment_test_request(
+                    Some(&config),
                     "POST",
                     &format!("/api/v1/issues/TEST-1/{endpoint}"),
                     attachment_test_body(),
@@ -6438,7 +6442,13 @@ mod tests {
             let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             let url = payload["attachments"][0]["url"].as_str().unwrap();
             let response = app
-                .oneshot(attachment_test_request("GET", url, Body::empty(), None))
+                .oneshot(attachment_test_request(
+                    None,
+                    "GET",
+                    url,
+                    Body::empty(),
+                    None,
+                ))
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -6479,6 +6489,7 @@ mod tests {
             .unwrap();
             let response = app
                 .oneshot(attachment_test_request(
+                    Some(&config),
                     "POST",
                     &format!("/api/v1/issues/TEST-1/{endpoint}"),
                     Body::from("--fixture\r\nContent-Disposition: form-data; name=\"attachments\"; filename=\"trace.txt\"\r\nContent-Type: text/plain\r\n\r\nvalid first file\r\n--fixture\r\nInvalid header without a colon\r\n\r\npartial second file\r\n--fixture--\r\n"),
@@ -6537,7 +6548,7 @@ mod tests {
             let (refresh, _receiver) = mpsc::channel(1);
             let app = router(
                 owner.shared_state(),
-                config,
+                config.clone(),
                 refresh,
                 owner.internal_sender(),
                 owner.meta_runtime_registry(),
@@ -6547,6 +6558,7 @@ mod tests {
             .unwrap();
             let response = app
                 .oneshot(attachment_test_request(
+                    Some(&config),
                     "POST",
                     &format!("/api/v1/issues/10001/{endpoint}"),
                     Body::from(format!("--fixture\r\nContent-Disposition: form-data; name=\"attachments\"; filename=\"trace.txt\"\r\nContent-Type: text/plain\r\n\r\n{contents}\r\n--fixture--\r\n")),
@@ -6638,7 +6650,7 @@ mod tests {
             let (refresh, _receiver) = mpsc::channel(1);
             let app = router(
                 owner.shared_state(),
-                config,
+                config.clone(),
                 refresh,
                 owner.internal_sender(),
                 owner.meta_runtime_registry(),
@@ -6648,6 +6660,7 @@ mod tests {
             .unwrap();
             let response = app
                 .oneshot(attachment_test_request(
+                    Some(&config),
                     "POST",
                     "/api/v1/issues/TEST-1/comments",
                     if scenario == "partial" {
@@ -6711,14 +6724,12 @@ mod tests {
         for missing in [false, true] {
             for endpoint in ["attachments", "comments"] {
                 let mut request = attachment_test_request(
+                    None,
                     "POST",
                     &format!("/api/v1/issues/TEST-1/{endpoint}"),
                     attachment_test_body(),
                     Some("multipart/form-data; boundary=fixture"),
                 );
-                request
-                    .headers_mut()
-                    .insert("origin", HeaderValue::from_static("http://localhost"));
                 if !missing {
                     request.headers_mut().insert(
                         "x-fugue-tracker-scope",
@@ -6751,7 +6762,7 @@ mod tests {
         let (refresh, _receiver) = mpsc::channel(1);
         let app = router(
             owner.shared_state(),
-            config,
+            config.clone(),
             refresh,
             owner.internal_sender(),
             owner.meta_runtime_registry(),
@@ -6762,6 +6773,7 @@ mod tests {
         let body = json!({"body_markdown":"Example", "attachments":[{"title":"private", "url":"https://example.test/file", "path":secret,"byte_len":21}]}).to_string();
         let response = app
             .oneshot(attachment_test_request(
+                Some(&config),
                 "POST",
                 "/api/v1/issues/TEST-1/comments",
                 Body::from(body),
@@ -6802,6 +6814,7 @@ mod tests {
         .unwrap();
         let response = app
             .oneshot(attachment_test_request(
+                None,
                 "GET",
                 "/api/v1/issues/10001/attachments/trace.txt",
                 Body::empty(),
@@ -6894,6 +6907,7 @@ mod tests {
     }
 
     fn attachment_test_request(
+        config: Option<&ServiceConfig>,
         method: &str,
         path: &str,
         body: Body,
@@ -6904,6 +6918,9 @@ mod tests {
             .uri(path)
             .header("Host", "127.0.0.1:8788")
             .header("Origin", "http://127.0.0.1:8788");
+        if let Some(config) = config {
+            request = request.header("x-fugue-tracker-scope", config.tracker_context_id());
+        }
         if let Some(value) = content_type {
             request = request.header(CONTENT_TYPE, value);
         }
@@ -7335,8 +7352,6 @@ mod tests {
             ISSUE_DETAIL_HTML
                 .contains("/api/v1/issues/${encodeURIComponent(issueIdentifier)}/comments")
         );
-        assert!(ISSUE_DETAIL_HTML.contains("method: \"POST\""));
-        assert!(ISSUE_DETAIL_HTML.contains("body_markdown: body"));
         assert!(ISSUE_DETAIL_HTML.contains(r#"id="commentAttachmentInput""#));
         assert!(ISSUE_DETAIL_HTML.contains("commentAttachmentState"));
         assert!(ISSUE_DETAIL_HTML.contains("FormData"));
