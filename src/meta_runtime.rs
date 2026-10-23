@@ -5118,6 +5118,53 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn repo_host_signal_reaches_native_coordinator_history() {
+        if !isolated_runtime_test("repo_host_signal_reaches_native_coordinator_history") {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = MetaRuntimeRegistry::with_templates(
+            test_meerkat_config(temp.path().join("state")),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let message = "Fugue host signal fixture: worker completed fixture-123";
+        let accepted = registry
+            .deliver_repo_kapellmeister_signal_batch(message.to_owned())
+            .await
+            .expect("native signal acceptance");
+        assert_eq!(accepted.identity, format!("{RUNTIME_KEY}/{KAPELLMEISTER}"));
+        assert!(!accepted.interaction_id.is_empty());
+        let runtime = registry.runtime().await.expect("runtime");
+        let member = runtime
+            .mob_handle()
+            .get_member(&AgentIdentity::from(KAPELLMEISTER))
+            .await
+            .expect("member query")
+            .expect("coordinator");
+        let session = member.bridge_session_id().expect("coordinator session");
+        let delivered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let history = runtime
+                    .mob_runtime()
+                    .read_session_history(&session.to_string(), 0, None)
+                    .await
+                    .expect("canonical coordinator history");
+                if serde_json::to_string(&history.messages)
+                    .expect("serialize messages")
+                    .contains(message)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        registry.shutdown().await.expect("shutdown");
+        delivered.expect("host signal must reach the native coordinator session");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn runtime_members_emit_canonical_structural_events() {
         if !isolated_runtime_test("runtime_members_emit_canonical_structural_events") {
             return;

@@ -106,6 +106,8 @@ pub struct Orchestrator {
     native_worker_execution: bool,
     terminal_issue_refresh: bool,
     kapellmeister_signal_deduper: Arc<Mutex<RecentSignalDeduper>>,
+    #[cfg(test)]
+    captured_native_signal_messages: Option<Mutex<Vec<String>>>,
     linear_backoff_until: Option<DateTime<Utc>>,
 }
 
@@ -852,6 +854,8 @@ impl Orchestrator {
             kapellmeister_signal_deduper: Arc::new(Mutex::new(RecentSignalDeduper::new(
                 KAPELLMEISTER_SIGNAL_DEDUP_LIMIT,
             ))),
+            #[cfg(test)]
+            captured_native_signal_messages: None,
             linear_backoff_until: None,
         }
     }
@@ -866,6 +870,9 @@ impl Orchestrator {
         let mut orchestrator = Self::new(config, refresh_rx);
         orchestrator.native_execution_host = native_execution_host;
         orchestrator.native_worker_execution = false;
+        // A fake worker host must not bootstrap a real coordinator as a side
+        // effect. Real signal delivery is covered by the native runtime tests.
+        orchestrator.captured_native_signal_messages = Some(Mutex::new(Vec::new()));
         orchestrator
     }
 
@@ -1775,6 +1782,11 @@ impl Orchestrator {
             self.config.effective().independent_review.enabled,
         ) {
             Ok(message) => {
+                #[cfg(test)]
+                if let Some(messages) = &self.captured_native_signal_messages {
+                    messages.lock().expect("test signal recorder").push(message);
+                    return;
+                }
                 let registry = self.meta_runtime_registry.clone();
                 tokio::spawn(async move {
                     for attempt in 1..=3 {
@@ -15889,19 +15901,58 @@ worker:
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn kapellmeister_native_terminal_event_keeps_nonterminal_issue_running() {
+    // Exercise terminal handling against a real local tracker, including its
+    // fresh lane read. The worker and coordinator transports are recorded so
+    // these policy tests do not start competing process-global Meta runtimes.
+    async fn dispatched_terminal_fixture(
+        lane: &str,
+    ) -> (
+        tempfile::TempDir,
+        Orchestrator,
+        Arc<RecordingNativeMobExecutionHost>,
+        Issue,
+    ) {
         let workspace = tempfile::tempdir().expect("isolated workspace");
         let mut definition = native_kapellmeister_workflow_definition();
-        definition
-            .config
-            .insert("workspace".to_owned(), json!({"root": workspace.path()}));
-        let (mut orchestrator, native_host) = native_orchestrator_for_definition(definition);
-        orchestrator.terminal_issue_refresh = false;
+        definition.config.insert(
+            "tracker".to_owned(),
+            json!({
+                "kind": "fugue-ims",
+                "endpoint": workspace.path().join("issues.sqlite"),
+                "project_slug": "fixture",
+                "active_states": ["Todo", "In Progress"],
+                "terminal_states": ["Done", "Canceled"]
+            }),
+        );
+        definition.config.insert(
+            "workspace".to_owned(),
+            json!({"root": workspace.path().join("workspaces")}),
+        );
+        definition.config.insert(
+            "meerkat".to_owned(),
+            json!({"state_root": workspace.path().join("runtime")}),
+        );
+        let (orchestrator, native_host) = native_orchestrator_for_definition(definition);
         let config = orchestrator.config.effective().clone();
-        let mut issue = active_issue_with_labels(&["kapellmeister-safe"]);
-        issue.state = "Planning".to_string();
-
+        let created = crate::fugue_ims::create_issue_for_config(
+            &config.tracker,
+            crate::fugue_ims::CreateFugueIssue {
+                key: crate::ims::ImsIssueKey("LUC-168".to_owned()),
+                repo: "fixture/repository".to_owned(),
+                title: "Terminal event fixture".to_owned(),
+                description: None,
+                stage: crate::ims::ImsStageName("Todo".to_owned()),
+                labels: vec!["kapellmeister-safe".to_owned()],
+            },
+        )
+        .expect("create local issue");
+        let adapter = IssueAdapter::from_config(&config.tracker).expect("local tracker");
+        let issue = adapter
+            .fetch_issue_states_by_ids(&[created.id.0])
+            .await
+            .expect("read local issue")
+            .pop()
+            .expect("fixture issue");
         orchestrator
             .dispatch_native_execution_mob(
                 issue.clone(),
@@ -15911,7 +15962,6 @@ worker:
                 config,
             )
             .await;
-
         {
             let state = orchestrator.shared_state();
             let state = state.read().await;
@@ -15921,6 +15971,38 @@ worker:
                 state.last_error
             );
         }
+        adapter
+            .move_issue_as_operator(MoveIssueInput {
+                issue: issue_ref_for_identifier(&issue.identifier),
+                state: LinearStateRef::Name {
+                    name: lane.to_owned(),
+                },
+                expected_updated_at: None,
+                idempotency_key: IdempotencyKey(format!("fixture-lane:{lane}")),
+            })
+            .await
+            .expect("update tracker lane");
+        let messages = orchestrator
+            .captured_native_signal_messages
+            .as_ref()
+            .expect("recorded coordinator transport")
+            .lock()
+            .expect("signal messages");
+        assert_eq!(messages.len(), 1, "dispatch must notify the coordinator");
+        assert!(messages[0].contains("worker_started"));
+        assert!(messages[0].contains(&issue.identifier));
+        drop(messages);
+        assert!(
+            !workspace.path().join("runtime").exists(),
+            "recording worker tests must not start a real Meta runtime"
+        );
+        (workspace, orchestrator, native_host, issue)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kapellmeister_native_terminal_event_keeps_nonterminal_issue_running() {
+        let (_workspace, mut orchestrator, native_host, issue) =
+            dispatched_terminal_fixture("Planning").await;
 
         orchestrator
             .handle_native_run_finished(issue.id.clone(), issue.clone(), MobRunStatus::Succeeded)
@@ -15932,6 +16014,7 @@ worker:
             state.running.contains_key(&issue.id),
             "Meta terminal status alone must not retire prompt-controlled nonterminal issues"
         );
+        assert_eq!(state.running[&issue.id].issue.state, "Planning");
         assert!(
             native_host.cleanup_calls().is_empty(),
             "cleanup must wait until the issue agent moves the IMS lane to a terminal state"
@@ -15940,36 +16023,8 @@ worker:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn kapellmeister_native_terminal_event_keeps_review_ready_issue_running() {
-        let workspace = tempfile::tempdir().expect("isolated workspace");
-        let mut definition = native_kapellmeister_workflow_definition();
-        definition
-            .config
-            .insert("workspace".to_owned(), json!({"root": workspace.path()}));
-        let (mut orchestrator, native_host) = native_orchestrator_for_definition(definition);
-        orchestrator.terminal_issue_refresh = false;
-        let config = orchestrator.config.effective().clone();
-        let mut issue = active_issue_with_labels(&["kapellmeister-safe"]);
-        issue.state = "Ready for review".to_string();
-
-        orchestrator
-            .dispatch_native_execution_mob(
-                issue.clone(),
-                None,
-                None,
-                IssuePolicyMode::Kapellmeister,
-                config,
-            )
-            .await;
-
-        {
-            let state = orchestrator.shared_state();
-            let state = state.read().await;
-            assert!(
-                state.running.contains_key(&issue.id),
-                "native dispatch must succeed before terminal handling: {:?}",
-                state.last_error
-            );
-        }
+        let (_workspace, mut orchestrator, native_host, issue) =
+            dispatched_terminal_fixture("Ready for review").await;
 
         orchestrator
             .handle_native_run_finished(issue.id.clone(), issue.clone(), MobRunStatus::Succeeded)
@@ -15981,6 +16036,7 @@ worker:
             state.running.contains_key(&issue.id),
             "Ready for review is an attention lane and must keep the issue mob visible"
         );
+        assert_eq!(state.running[&issue.id].issue.state, "Ready for review");
         assert!(
             native_host.cleanup_calls().is_empty(),
             "Ready for review must not retire visible Meta members"
@@ -15989,36 +16045,8 @@ worker:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn kapellmeister_native_terminal_event_retires_terminal_issue_members() {
-        let workspace = tempfile::tempdir().expect("isolated workspace");
-        let mut definition = native_kapellmeister_workflow_definition();
-        definition
-            .config
-            .insert("workspace".to_owned(), json!({"root": workspace.path()}));
-        let (mut orchestrator, native_host) = native_orchestrator_for_definition(definition);
-        orchestrator.terminal_issue_refresh = false;
-        let config = orchestrator.config.effective().clone();
-        let mut issue = active_issue_with_labels(&["kapellmeister-safe"]);
-        issue.state = "Done".to_string();
-
-        orchestrator
-            .dispatch_native_execution_mob(
-                issue.clone(),
-                None,
-                None,
-                IssuePolicyMode::Kapellmeister,
-                config,
-            )
-            .await;
-
-        {
-            let state = orchestrator.shared_state();
-            let state = state.read().await;
-            assert!(
-                state.running.contains_key(&issue.id),
-                "native dispatch must succeed before terminal handling: {:?}",
-                state.last_error
-            );
-        }
+        let (_workspace, mut orchestrator, native_host, issue) =
+            dispatched_terminal_fixture("Done").await;
 
         orchestrator
             .handle_native_run_finished(issue.id.clone(), issue.clone(), MobRunStatus::Succeeded)
