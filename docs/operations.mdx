@@ -64,16 +64,17 @@ Stop the service or use an explicitly supported consistent snapshot mechanism;
 a copy of live SQLite files alone is not a proven consistent backup.
 
 Managed repositories keep uploaded files under their own state directory's
-`files` folder. Explicit workflow installations use
+`files/tracker-files/<scope-hash>` folder. Explicit workflow installations use
 `.fugue/tracker-files/<scope-hash>` beside the workflow. The scope includes the
 tracker kind, endpoint and project, so identical issue keys from separate
 trackers do not share files. Include these directories in your backup.
 
-Older explicit workflows may have files under `.fugue/issue-attachments`.
-Preserve that directory when upgrading. Fugue does not automatically read this
-shared location: an administrator must verify each file's repository and issue
-ownership before restoring it into the corresponding scoped directory. Managed
-repositories' existing `files` location does not change.
+Older explicit workflows may have files under `.fugue/issue-attachments`, and
+older managed repositories may have unscoped files under `files`. Preserve those
+directories when upgrading. Fugue does not automatically read these locations:
+an administrator must verify each file's tracker, repository and issue ownership
+before restoring it into the corresponding scoped directory. Changing a
+repository's tracker must never expose the previous tracker's files.
 
 Treat backups as secrets. They may contain tokens, private repository code,
 transcripts, native memory and pending work. Restrict access and retention, then

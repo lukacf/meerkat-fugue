@@ -172,11 +172,13 @@ pub(crate) async fn router(
         .route("/api/v1/issues/{issue_identifier}", get(api_issue_detail))
         .route(
             "/api/v1/issues/{issue_identifier}/comments",
-            post(api_issue_add_comment),
+            post(api_issue_add_comment)
+                .layer(axum::extract::DefaultBodyLimit::max(101 * 1024 * 1024)),
         )
         .route(
             "/api/v1/issues/{issue_identifier}/attachments",
-            post(api_issue_upload_attachments),
+            post(api_issue_upload_attachments)
+                .layer(axum::extract::DefaultBodyLimit::max(101 * 1024 * 1024)),
         )
         .route(
             "/api/v1/issues/{issue_identifier}/attachments/{file_name}",
@@ -606,10 +608,12 @@ fn create_issue_lane_options(config: &ServiceConfig) -> String {
 
 fn render_issues_board_html(config: &ServiceConfig) -> String {
     let lane_options = create_issue_lane_options(config);
-    let html = ISSUES_BOARD_HTML.replace(
-        "__FUGUE_CREATE_EDITOR__",
-        &create_issue_editor_html(&lane_options),
-    );
+    let html = ISSUES_BOARD_HTML
+        .replace("__FUGUE_TRACKER_SCOPE__", &config.tracker_context_id())
+        .replace(
+            "__FUGUE_CREATE_EDITOR__",
+            &create_issue_editor_html(&lane_options),
+        );
     inject_app_chrome(&html, AppPage::Work, true).unwrap_or(html)
 }
 
@@ -621,11 +625,9 @@ async fn issue_detail_page(
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
-    Html(
-        inject_app_chrome(ISSUE_DETAIL_HTML, AppPage::Work, true)
-            .unwrap_or_else(|| ISSUE_DETAIL_HTML.to_owned()),
-    )
-    .into_response()
+    let html =
+        ISSUE_DETAIL_HTML.replace("__FUGUE_TRACKER_SCOPE__", &app.config.tracker_context_id());
+    Html(inject_app_chrome(&html, AppPage::Work, true).unwrap_or(html)).into_response()
 }
 
 async fn ensemble_page(
@@ -651,6 +653,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Work queue | Fugue</title>
   <style>
+    #createSubmit[hidden] { display: none; }
     :root {
       color-scheme: light;
       --bs-paper: #ECEAE4;
@@ -1339,7 +1342,9 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
     const createAttachmentState = [];
     let createdIssueReceipt = null;
     let creationWarning = null;
-    const creationReceiptKey = `fugue.created-issue:${location.pathname}`;
+    const trackerScope = "__FUGUE_TRACKER_SCOPE__";
+    let creationUploadBlocked = false;
+    const creationReceiptKey = `fugue.created-issue:v2:${location.pathname}:${trackerScope}`;
     const detailAttachmentState = [];
     const maxCreateAttachmentCount = 20;
     const maxCreateAttachmentBytes = 25 * 1024 * 1024;
@@ -1396,6 +1401,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
         ...options,
         headers: {
           "Accept": "application/json",
+          "X-Fugue-Tracker-Scope": trackerScope,
           ...(options.body ? { "Content-Type": "application/json" } : {}),
           ...(options.headers || {}),
         },
@@ -1823,16 +1829,23 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       for (const attachment of attachments) {
         form.append("attachments", attachment.file, attachment.name);
       }
-      const response = await fugueFetch(`/api/v1/issues/${encodeURIComponent(identifier)}/attachments`, {
+      let response, payload;
+      try {
+      response = await fugueFetch(`/api/v1/issues/${encodeURIComponent(identifier)}/attachments`, {
         method: "POST",
-        headers: { "Accept": "application/json" },
+        headers: { "Accept": "application/json", "X-Fugue-Tracker-Scope": trackerScope },
         body: form,
       });
-      const payload = await response.json().catch(() => ({}));
+      payload = await response.json();
+      } catch {
+        const error = new Error("The upload result was lost. Check the existing issue before uploading any files again.");
+        error.uploadUncertain = true;
+        throw error;
+      }
       if (!response.ok) {
         throw new Error(payload?.error?.message || `Attachment upload failed: ${response.status}`);
       }
-      const message = `Attached ${payload.attachments?.length || attachments.length} file(s).`;
+      const message = payload.warning?.message || `Attached ${payload.attachments?.length || attachments.length} file(s).`;
       if (errorTarget) errorTarget.textContent = message;
       showNotice(message);
       return payload;
@@ -1842,7 +1855,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       const created = !!createdIssueReceipt;
       for (const field of [createTitle, createDescription, createLane]) field.disabled = created;
       createSubmit.textContent = created ? "Retry attachments" : "Create issue";
-      createSubmit.hidden = created && !createAttachmentState.length;
+      createSubmit.hidden = created && (creationUploadBlocked || !createAttachmentState.length);
       createCancel.textContent = created ? "Done" : "Cancel";
     };
 
@@ -1857,7 +1870,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       try {
         if (createdIssueReceipt) {
           sessionStorage.setItem(creationReceiptKey, JSON.stringify({
-            issue: createdIssueReceipt, warning: creationWarning,
+            issue: createdIssueReceipt, warning: creationWarning, uploadBlocked: creationUploadBlocked,
             title: createTitle.value, description: createDescription.value, lane: createLane.value,
           }));
         } else {
@@ -1882,6 +1895,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
     const resetCreateForm = () => {
       createdIssueReceipt = null;
       creationWarning = null;
+      creationUploadBlocked = false;
       saveCreationReceipt();
       createForm.reset();
       createAttachmentState.length = 0;
@@ -1893,6 +1907,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
         const saved = JSON.parse(sessionStorage.getItem(creationReceiptKey) || "null");
         if (!saved) return;
         createdIssueReceipt = creationReceipt(saved.issue);
+        creationUploadBlocked = saved.uploadBlocked === true;
         creationWarning = typeof saved.warning === "string" ? saved.warning : null;
         createTitle.value = typeof saved.title === "string" ? saved.title : "";
         createDescription.value = typeof saved.description === "string" ? saved.description : "";
@@ -1906,7 +1921,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
     };
 
     const createIssue = async () => {
-      if (createSubmit.disabled) return;
+      if (createSubmit.disabled || creationUploadBlocked) return;
       const title = createTitle.value.trim();
       createError.textContent = "";
       if (!createdIssueReceipt && !title) {
@@ -1942,7 +1957,12 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
         const createdIdentifier = createdIssueReceipt.identifier;
         if (createAttachmentState.length) {
           const pending = createAttachmentState.slice();
-          await uploadIssueAttachments(createdIdentifier, pending, createError);
+          const upload = await uploadIssueAttachments(createdIdentifier, pending, createError);
+          if (upload?.warning) {
+            creationWarning = upload.warning.message;
+            creationUploadBlocked = true;
+            saveCreationReceipt();
+          }
           for (const attachment of pending) {
             const index = createAttachmentState.indexOf(attachment);
             if (index >= 0) createAttachmentState.splice(index, 1);
@@ -1961,7 +1981,12 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
         showNotice(`Created ${createdIdentifier}.`);
       } catch (error) {
         if (createdIssueReceipt) {
-          showCreatedIssue(`${creationWarning || `Created ${createdIssueReceipt.identifier}.`} ${error.message} Retry attachments here or open the existing issue.`);
+          if (error.uploadUncertain) {
+            creationUploadBlocked = true;
+            creationWarning = error.message;
+            saveCreationReceipt();
+          }
+          showCreatedIssue(`${creationWarning || `Created ${createdIssueReceipt.identifier}.`} ${error.message}${creationUploadBlocked ? "" : " Retry attachments here or open the existing issue."}`);
         } else {
           createError.textContent = error.message;
         }
@@ -2327,7 +2352,8 @@ const ISSUE_DETAIL_HTML: &str = r#"<!doctype html>
   let detail = null; let targetLane = null; const issueAttachmentState = []; const commentAttachmentState = []; const maxAttachmentCount = 20; const maxAttachmentBytes = 25 * 1024 * 1024; const maxAttachmentTotalBytes = 100 * 1024 * 1024;
   const escapeHtml = (value) => String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;");
   const newtype = (value) => value && typeof value === "object" && "0" in value ? value["0"] : value;
-  const api = async (url, options = {}) => { const response = await fugueFetch(url, { ...options, headers: { "Accept":"application/json", ...(options.body ? {"Content-Type":"application/json"} : {}), ...(options.headers || {}) }}); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload?.error?.message || `Request failed: ${response.status}`); return payload; };
+  const trackerScope = "__FUGUE_TRACKER_SCOPE__";
+  const api = async (url, options = {}) => { const response = await fugueFetch(url, { ...options, headers: { "Accept":"application/json", "X-Fugue-Tracker-Scope":trackerScope, ...(options.body ? {"Content-Type":"application/json"} : {}), ...(options.headers || {}) }}); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload?.error?.message || `Request failed: ${response.status}`); return payload; };
   const showNotice = (message) => { $("notice").textContent = message; $("notice").style.display = "block"; };
   const clearNotice = () => { $("notice").textContent = ""; $("notice").style.display = "none"; };
   const laneGlyph = (name) => ({Backlog:"○", Queue:"◉", Active:"◐", Review:"◇", Deploy:"↑", Blocked:"!", Done:"✓", Canceled:"×"}[name] || "○");
@@ -2341,14 +2367,138 @@ const ISSUE_DETAIL_HTML: &str = r#"<!doctype html>
   const dataTransferHasFiles = (event) => Array.from(event.dataTransfer?.types || []).includes("Files");
   const renderIssueAttachments = () => { const list = $("issueAttachmentList"); if (!list) return; const persistedHtml = (detail.attachments || []).map(renderPersistedAttachmentChip).join(""); const pendingHtml = issueAttachmentState.length ? issueAttachmentState.map((attachment) => `<span class="attachment-chip">${escapeHtml(attachment.name)} · ${escapeHtml(formatFileSize(attachment.size))}</span>`).join("") : ""; list.innerHTML = persistedHtml || pendingHtml ? `${persistedHtml}${pendingHtml}` : '<span class="meta">No attachments added for this issue editor.</span>'; };
   const validateIssueAttachment = (file, state = issueAttachmentState) => { if (state.length >= maxAttachmentCount) throw new Error("At most 20 attachments can be added."); if (file.size > maxAttachmentBytes) throw new Error(`${file.name} exceeds the 25 MiB per-file attachment limit.`); const nextTotal = state.reduce((sum, attachment) => sum + attachment.size, 0) + file.size; if (nextTotal > maxAttachmentTotalBytes) throw new Error("Attachments exceed the 100 MiB total attachment limit."); return { name:file.name, size:file.size, content_type:file.type || null, file }; };
-  const uploadIssueAttachments = async (attachments) => { const form = new FormData(); for (const attachment of attachments) form.append("attachments", attachment.file, attachment.name); const response = await fugueFetch(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/attachments`, { method:"POST", headers:{"Accept":"application/json"}, body:form }); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload?.error?.message || `Attachment upload failed: ${response.status}`); return payload; };
+  let issueUploadPending = false;
+  let issueUploadWarning = "";
+  const renderUploadAvailability = () => {
+    $("issueAttachmentInput").disabled = issueUploadPending || Boolean(issueUploadWarning);
+    $("issueAttachmentError").textContent = issueUploadWarning;
+  };
+  const uploadIssueAttachments = async (attachments) => {
+    const form = new FormData();
+    for (const attachment of attachments) form.append("attachments", attachment.file, attachment.name);
+    let response, payload;
+    try {
+      response = await fugueFetch(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/attachments`, {
+        method:"POST", headers:{"Accept":"application/json","X-Fugue-Tracker-Scope":trackerScope}, body:form
+      });
+      payload = await response.json();
+    } catch {
+      issueUploadWarning = "The upload result was lost. Check the existing issue before uploading any files again.";
+      throw new Error(issueUploadWarning);
+    }
+    if (!response.ok) throw new Error(payload?.error?.message || `Attachment upload failed: ${response.status}`);
+    if (payload.warning) issueUploadWarning = payload.warning.message;
+    return payload;
+  };
   const renderCommentAttachments = () => { const list = $("commentAttachmentList"); if (!list) return; list.innerHTML = commentAttachmentState.length ? commentAttachmentState.map((attachment, index) => `<span class="attachment-chip">${escapeHtml(attachment.name)} · ${escapeHtml(formatFileSize(attachment.size))} <button type="button" data-comment-attachment-remove="${index}" aria-label="Remove ${escapeHtml(attachment.name)}">×</button></span>`).join("") : '<span class="meta">No files selected for this comment.</span>'; };
   const installCommentAttachmentInput = () => { const input = $("commentAttachmentInput"); if (!input || input.dataset.attachmentReady === "true") return; input.dataset.attachmentReady = "true"; input.addEventListener("change", () => { const error = $("commentError"); try { for (const file of Array.from(input.files || [])) commentAttachmentState.push(validateIssueAttachment(file, commentAttachmentState)); renderCommentAttachments(); } catch (caught) { if (error) error.textContent = caught.message; showNotice(caught.message); } finally { input.value = ""; } }); };
-  const installAttachmentDropTarget = () => { const zone = $("issueAttachmentDropZone"); if (!zone || zone.dataset.dropReady === "true") return; zone.dataset.dropReady = "true"; const error = $("issueAttachmentError"); const setActive = (active) => zone.classList.toggle("drag-over", active); for (const type of ["dragenter", "dragover"]) zone.addEventListener(type, (event) => { if (!dataTransferHasFiles(event)) return; event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = "copy"; setActive(true); }); zone.addEventListener("dragleave", (event) => { if (!zone.contains(event.relatedTarget)) setActive(false); }); const addFiles = async (files) => { error.textContent = ""; const added = []; for (const file of Array.from(files || [])) { const attachment = validateIssueAttachment(file); issueAttachmentState.push(attachment); added.push(attachment); } renderIssueAttachments(); if (added.length) { const payload = await uploadIssueAttachments(added); error.textContent = `Attached ${payload.attachments?.length || added.length} file(s).`; showNotice(error.textContent); await load(true); } }; zone.addEventListener("drop", async (event) => { if (!dataTransferHasFiles(event)) return; event.preventDefault(); event.stopPropagation(); setActive(false); try { await addFiles(event.dataTransfer.files); } catch (caught) { error.textContent = caught.message; showNotice(caught.message); } }); const input = $("issueAttachmentInput"); input?.addEventListener("change", async () => { try { await addFiles(input.files); } catch (caught) { error.textContent = caught.message; showNotice(caught.message); } finally { input.value = ""; } }); };
+  const installAttachmentDropTarget = () => {
+    const zone = $("issueAttachmentDropZone");
+    if (!zone || zone.dataset.dropReady === "true") return;
+    zone.dataset.dropReady = "true";
+    const setActive = (active) => zone.classList.toggle("drag-over", active);
+    for (const type of ["dragenter", "dragover"]) zone.addEventListener(type, (event) => {
+      if (!dataTransferHasFiles(event)) return;
+      event.preventDefault(); event.stopPropagation();
+      event.dataTransfer.dropEffect = issueUploadPending || issueUploadWarning ? "none" : "copy";
+      setActive(!issueUploadPending && !issueUploadWarning);
+    });
+    zone.addEventListener("dragleave", (event) => { if (!zone.contains(event.relatedTarget)) setActive(false); });
+    const addFiles = async (files) => {
+      if (issueUploadPending || issueUploadWarning) return;
+      const added = [];
+      try {
+        for (const file of Array.from(files || [])) added.push(validateIssueAttachment(file, added));
+        if (!added.length) return;
+        issueAttachmentState.push(...added);
+        issueUploadPending = true;
+        renderIssueAttachments(); renderUploadAvailability();
+        const payload = await uploadIssueAttachments(added);
+        showNotice(issueUploadWarning || `Attached ${payload.attachments?.length || added.length} file(s).`);
+        await load(true);
+      } catch (caught) {
+        showNotice(caught.message);
+        $("issueAttachmentError").textContent = caught.message;
+      } finally {
+        for (const attachment of added) {
+          const index = issueAttachmentState.indexOf(attachment);
+          if (index >= 0) issueAttachmentState.splice(index, 1);
+        }
+        issueUploadPending = false;
+        renderIssueAttachments();
+        $("issueAttachmentInput").disabled = Boolean(issueUploadWarning);
+        if (issueUploadWarning) $("issueAttachmentError").textContent = issueUploadWarning;
+      }
+    };
+    zone.addEventListener("drop", async (event) => {
+      if (!dataTransferHasFiles(event)) return;
+      event.preventDefault(); event.stopPropagation(); setActive(false);
+      await addFiles(event.dataTransfer.files);
+    });
+    const input = $("issueAttachmentInput");
+    input?.addEventListener("change", async () => {
+      await addFiles(input.files);
+      input.value = "";
+    });
+  };
   document.addEventListener("dragover", (event) => { if (dataTransferHasFiles(event)) event.preventDefault(); }, true); document.addEventListener("drop", (event) => { if (dataTransferHasFiles(event)) event.preventDefault(); }, true);
-  const render = () => { const commentDraft = $("commentEditor")?.value || ""; const workpadOpen = $("agentWorkpad")?.open || false; renderKpis(); const issue = detail.issue; const id = newtype(issue.identifier); const current = issue.state.name; targetLane = targetLane || current; $("issueId").textContent = id; $("title").textContent = issue.title; $("stateChip").textContent = `${laneGlyph(current)} ${current.toUpperCase()}`; const dirty = targetLane !== current; $("dirtyFlag").hidden = !dirty; $("save").disabled = !dirty; $("save").innerHTML = dirty && isAction(targetLane) ? `SAVE & RUN ${escapeHtml(isAction(targetLane).toUpperCase())} <span class="meta">⌘S</span>` : `SAVE CHANGES <span class="meta">⌘S</span>`; $("diff").innerHTML = dirty ? `● 1 UNSAVED CHANGE&nbsp;&nbsp; Lane: ${escapeHtml(current)} → ${escapeHtml(targetLane)} ${isAction(targetLane) ? `<span class="trigger">▸ triggers ${escapeHtml(isAction(targetLane))} procedure</span>` : ""}` : "No changes"; $("props").innerHTML = `<div class="field ${dirty ? "dirty" : ""}"><div class="field-head"><span>LANE</span>${dirty ? "<span>● CHANGED</span>" : ""}</div><div class="value">${dirty ? `<del>${escapeHtml(current)}</del> → <strong>${escapeHtml(targetLane)}</strong>` : escapeHtml(current)}</div></div><div class="field"><div class="field-head"><span>LABELS</span></div><div>${issue.labels.map((l) => `<span class="label-chip">${escapeHtml(l)}</span>`).join("")}</div></div><div class="field"><div class="field-head"><span>ASSIGNEE</span></div><div>${escapeHtml(issue.assignee?.name || "Unassigned")}</div></div><div class="field"><div class="field-head"><span>BRANCH</span></div><div>${escapeHtml(newtype(issue.branch_name) || "None")}</div></div>`; $("middle").innerHTML = `<h2 class="section-title mono">DESCRIPTION</h2><div class="description">${escapeHtml(issue.description || "No description")}</div><h2 class="section-title mono">ACTIVITY</h2>${detail.comments.filter(comment => newtype(comment.comment_id) !== newtype(detail.workpad?.comment_id)).map(renderComment).join("") || '<div class="meta">No comments</div>'}<h2 class="section-title mono">ATTACHMENTS</h2><section class="attachment-drop-zone" id="issueAttachmentDropZone" data-attachment-drop-zone aria-label="Drop files to attach them to this issue"><label class="attachment-input-label" for="issueAttachmentInput"><span>Choose files</span><input id="issueAttachmentInput" type="file" multiple></label><div class="attachment-drop-affordance" aria-hidden="true">Drop files here to attach them to this issue</div><div class="attachment-list" id="issueAttachmentList" aria-live="polite"></div><div class="attachment-error meta" id="issueAttachmentError" role="alert"></div></section><h2 class="section-title mono">NEW COMMENT</h2><section class="comment-composer" aria-label="New comment"><textarea id="commentEditor" class="issue-markdown-editor" spellcheck="true" placeholder="Add a comment…"></textarea><label class="attachment-input-label" for="commentAttachmentInput"><span>Attach files to this comment</span><input id="commentAttachmentInput" type="file" multiple></label><div class="attachment-list" id="commentAttachmentList" aria-live="polite"></div><div class="comment-actions"><div class="comment-error meta" id="commentError" role="alert"></div><button class="comment-submit" id="postComment" type="button">POST COMMENT <span class="meta">C</span></button></div></section><details id="agentWorkpad" ${workpadOpen ? "open" : ""}><summary class="section-title mono">AGENT WORKPAD</summary><p class="meta">Execution notes and validation evidence maintained by the agents.</p><textarea id="workpadEditor" class="issue-markdown-editor" aria-label="Agent workpad" readonly>${escapeHtml(detail.workpad?.body_markdown || "No workpad yet.")}</textarea></details>`; $("lanePicker").innerHTML = detail.lanes.map((lane) => `<button class="lane-row ${targetLane === lane ? "target" : ""}" data-lane="${escapeHtml(lane)}" type="button"><span>${laneGlyph(lane)}</span><span>${escapeHtml(lane)}${isAction(lane) ? `<span class="sub">▸ runs ${escapeHtml(isAction(lane))} procedure</span>` : ""}</span><span class="meta">${lane === current ? "FROM" : targetLane === lane ? "NEW LANE" : ""}</span></button>`).join(""); $("commentEditor").value = commentDraft; renderIssueAttachments(); renderCommentAttachments(); installAttachmentDropTarget(); installCommentAttachmentInput(); };
+  const render = () => { const commentDraft = $("commentEditor")?.value || ""; const workpadOpen = $("agentWorkpad")?.open || false; renderKpis(); const issue = detail.issue; const id = newtype(issue.identifier); const current = issue.state.name; targetLane = targetLane || current; $("issueId").textContent = id; $("title").textContent = issue.title; $("stateChip").textContent = `${laneGlyph(current)} ${current.toUpperCase()}`; const dirty = targetLane !== current; $("dirtyFlag").hidden = !dirty; $("save").disabled = !dirty; $("save").innerHTML = dirty && isAction(targetLane) ? `SAVE & RUN ${escapeHtml(isAction(targetLane).toUpperCase())} <span class="meta">⌘S</span>` : `SAVE CHANGES <span class="meta">⌘S</span>`; $("diff").innerHTML = dirty ? `● 1 UNSAVED CHANGE&nbsp;&nbsp; Lane: ${escapeHtml(current)} → ${escapeHtml(targetLane)} ${isAction(targetLane) ? `<span class="trigger">▸ triggers ${escapeHtml(isAction(targetLane))} procedure</span>` : ""}` : "No changes"; $("props").innerHTML = `<div class="field ${dirty ? "dirty" : ""}"><div class="field-head"><span>LANE</span>${dirty ? "<span>● CHANGED</span>" : ""}</div><div class="value">${dirty ? `<del>${escapeHtml(current)}</del> → <strong>${escapeHtml(targetLane)}</strong>` : escapeHtml(current)}</div></div><div class="field"><div class="field-head"><span>LABELS</span></div><div>${issue.labels.map((l) => `<span class="label-chip">${escapeHtml(l)}</span>`).join("")}</div></div><div class="field"><div class="field-head"><span>ASSIGNEE</span></div><div>${escapeHtml(issue.assignee?.name || "Unassigned")}</div></div><div class="field"><div class="field-head"><span>BRANCH</span></div><div>${escapeHtml(newtype(issue.branch_name) || "None")}</div></div>`; $("middle").innerHTML = `<h2 class="section-title mono">DESCRIPTION</h2><div class="description">${escapeHtml(issue.description || "No description")}</div><h2 class="section-title mono">ACTIVITY</h2>${detail.comments.filter(comment => newtype(comment.comment_id) !== newtype(detail.workpad?.comment_id)).map(renderComment).join("") || '<div class="meta">No comments</div>'}<h2 class="section-title mono">ATTACHMENTS</h2><section class="attachment-drop-zone" id="issueAttachmentDropZone" data-attachment-drop-zone aria-label="Drop files to attach them to this issue"><label class="attachment-input-label" for="issueAttachmentInput"><span>Choose files</span><input id="issueAttachmentInput" type="file" multiple></label><div class="attachment-drop-affordance" aria-hidden="true">Drop files here to attach them to this issue</div><div class="attachment-list" id="issueAttachmentList" aria-live="polite"></div><div class="attachment-error meta" id="issueAttachmentError" role="alert"></div></section><h2 class="section-title mono">NEW COMMENT</h2><section class="comment-composer" aria-label="New comment"><textarea id="commentEditor" class="issue-markdown-editor" spellcheck="true" placeholder="Add a comment…"></textarea><label class="attachment-input-label" for="commentAttachmentInput"><span>Attach files to this comment</span><input id="commentAttachmentInput" type="file" multiple></label><div class="attachment-list" id="commentAttachmentList" aria-live="polite"></div><div class="comment-actions"><div class="comment-error meta" id="commentError" role="alert"></div><button class="comment-submit" id="postComment" type="button">POST COMMENT <span class="meta">C</span></button></div></section><details id="agentWorkpad" ${workpadOpen ? "open" : ""}><summary class="section-title mono">AGENT WORKPAD</summary><p class="meta">Execution notes and validation evidence maintained by the agents.</p><textarea id="workpadEditor" class="issue-markdown-editor" aria-label="Agent workpad" readonly>${escapeHtml(detail.workpad?.body_markdown || "No workpad yet.")}</textarea></details>`; $("lanePicker").innerHTML = detail.lanes.map((lane) => `<button class="lane-row ${targetLane === lane ? "target" : ""}" data-lane="${escapeHtml(lane)}" type="button"><span>${laneGlyph(lane)}</span><span>${escapeHtml(lane)}${isAction(lane) ? `<span class="sub">▸ runs ${escapeHtml(isAction(lane))} procedure</span>` : ""}</span><span class="meta">${lane === current ? "FROM" : targetLane === lane ? "NEW LANE" : ""}</span></button>`).join(""); $("commentEditor").value = commentDraft; renderIssueAttachments(); renderCommentAttachments(); installAttachmentDropTarget(); installCommentAttachmentInput(); $("postComment").disabled = commentSubmissionUncertain; $("commentError").textContent = commentSubmissionWarning; renderUploadAvailability(); };
   const load = async (preserveTarget = false) => { const previousTarget = targetLane; try { detail = await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}`); targetLane = preserveTarget && previousTarget ? previousTarget : detail.issue.state.name; render(); } catch (error) { showNotice(error.message); } };
-  const postComment = async () => { const editor = $("commentEditor"); const button = $("postComment"); const error = $("commentError"); if (!editor || !button || !error) return; const body = editor.value.trim(); clearNotice(); error.textContent = ""; if (!body && commentAttachmentState.length === 0) { error.textContent = "Comment or attachment is required."; editor.focus(); return; } button.disabled = true; try { if (commentAttachmentState.length) { const form = new FormData(); form.append("body_markdown", body); for (const attachment of commentAttachmentState) form.append("attachments", attachment.file, attachment.name); const response = await fugueFetch(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/comments`, { method:"POST", headers:{"Accept":"application/json"}, body:form }); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload?.error?.message || `Comment failed: ${response.status}`); commentAttachmentState.length = 0; renderCommentAttachments(); } else { await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/comments`, { method: "POST", body: JSON.stringify({ body_markdown: body }) }); } editor.value = ""; await load(true); } catch (caught) { error.textContent = caught.message; showNotice(caught.message); } finally { button.disabled = false; } };
+  let commentSubmissionUncertain = false;
+  let commentSubmissionWarning = "";
+  const postComment = async () => {
+    const editor = $("commentEditor"), button = $("postComment"), error = $("commentError");
+    if (!editor || !button || !error || commentSubmissionUncertain || button.disabled) return;
+    const body = editor.value.trim();
+    clearNotice();
+    error.textContent = "";
+    if (!body && commentAttachmentState.length === 0) {
+      error.textContent = "Comment or attachment is required.";
+      editor.focus();
+      return;
+    }
+    button.disabled = true;
+    try {
+      if (commentAttachmentState.length) {
+        const pending = commentAttachmentState.slice();
+        const form = new FormData();
+        form.append("body_markdown", body);
+        for (const attachment of pending) form.append("attachments", attachment.file, attachment.name);
+        let response, payload;
+        try {
+          response = await fugueFetch(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/comments`, {
+            method:"POST", headers:{"Accept":"application/json","X-Fugue-Tracker-Scope":trackerScope}, body:form
+          });
+          payload = await response.json();
+        } catch {
+          commentSubmissionUncertain = true;
+          throw new Error("The upload result was lost. Check the existing issue before posting the comment or uploading files again.");
+        }
+        if (!response.ok) throw new Error(payload?.error?.message || `Comment failed: ${response.status}`);
+        for (const attachment of pending) {
+          const index = commentAttachmentState.indexOf(attachment);
+          if (index >= 0) commentAttachmentState.splice(index, 1);
+        }
+        renderCommentAttachments();
+        if (payload.warning) {
+          commentSubmissionUncertain = true;
+          throw new Error(payload.warning.message);
+        }
+      } else {
+        await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/comments`, {
+          method: "POST", body: JSON.stringify({ body_markdown: body })
+        });
+      }
+      editor.value = "";
+      await load(true);
+    } catch (caught) {
+      if (commentSubmissionUncertain) commentSubmissionWarning = caught.message;
+      error.textContent = caught.message;
+      showNotice(caught.message);
+    } finally {
+      button.disabled = commentSubmissionUncertain;
+    }
+  };
   document.addEventListener("click", async (event) => { if (event.target.id === "close" || event.target.id === "cancel" || event.target === document.body) fugueNavigate("/issues"); const row = event.target.closest(".lane-row"); if (row) { targetLane = row.dataset.lane; render(); } if (event.target.dataset.commentAttachmentRemove) { commentAttachmentState.splice(Number(event.target.dataset.commentAttachmentRemove), 1); renderCommentAttachments(); } if (event.target.id === "postComment") { await postComment(); } if (event.target.id === "save" && detail && targetLane !== detail.issue.state.name) { try { await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/state`, { method:"PATCH", body: JSON.stringify({ state: targetLane }) }); fugueNavigate("/issues"); } catch (error) { showNotice(error.message); } } });
   document.addEventListener("keydown", async (event) => { const target = event.target; const editing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement; if (event.key === "Escape") fugueNavigate("/issues"); if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") { event.preventDefault(); $("save").click(); } else if (!editing && event.key.toLowerCase() === "c") { event.preventDefault(); $("commentEditor")?.focus(); } });
   load();
@@ -2547,6 +2697,7 @@ struct IssueCommentRequest {
 struct ParsedIssueCommentRequest {
     body_markdown: String,
     attachments: Vec<LinearCommentAttachmentInput>,
+    uploads: Vec<IssueUploadedAttachment>,
 }
 
 #[derive(Serialize)]
@@ -2574,6 +2725,9 @@ async fn api_issue_create(
 ) -> axum::response::Response {
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
+    }
+    if let Err(response) = validate_browser_tracker_context(&app.config, &headers) {
+        return response.into_response();
     }
     let (title, lane) =
         match validate_issue_create_request(&app.config, &request.title, &request.lane) {
@@ -2749,6 +2903,14 @@ async fn api_issue_upsert_workpad(
 struct IssueAttachmentUploadResponse {
     attachments: Vec<IssueUploadedAttachment>,
     comment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<IssueUploadWarning>,
+}
+
+#[derive(Debug, Serialize)]
+struct IssueUploadWarning {
+    code: &'static str,
+    message: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -2759,6 +2921,58 @@ struct IssueUploadedAttachment {
     url: String,
     #[serde(skip_serializing)]
     path: Option<String>,
+    #[serde(skip_serializing)]
+    bytes: Vec<u8>,
+}
+
+impl From<LinearCommentAttachmentInput> for IssueUploadedAttachment {
+    fn from(attachment: LinearCommentAttachmentInput) -> Self {
+        Self {
+            name: attachment.title.unwrap_or_else(|| "attachment".to_string()),
+            size: attachment.byte_len,
+            content_type: attachment.content_type,
+            url: attachment.url,
+            path: None,
+            bytes: Vec::new(),
+        }
+    }
+}
+
+async fn publish_jira_uploads(
+    client: &crate::jira::JiraClient,
+    issue: &LinearIssueRef,
+    uploaded: Vec<IssueUploadedAttachment>,
+) -> crate::error::Result<crate::jira::JiraUploadReceipt> {
+    client
+        .upload_browser_files(
+            issue,
+            uploaded
+                .into_iter()
+                .map(|file| crate::jira::JiraUploadFile {
+                    name: file.name,
+                    content_type: file.content_type,
+                    bytes: file.bytes,
+                })
+                .collect(),
+        )
+        .await
+}
+
+fn jira_upload_attention_response(
+    attachments: Vec<LinearCommentAttachmentInput>,
+    comment_attempted: bool,
+) -> Response {
+    Json(IssueAttachmentUploadResponse {
+        attachments: attachments.into_iter().map(Into::into).collect(),
+        comment_id: None,
+        warning: Some(if comment_attempted {
+            IssueUploadWarning { code: "comment_not_confirmed", message:
+                "Jira accepted the files, but the comment was not confirmed. Check the existing issue before posting the comment again. Do not upload these files again." }
+        } else {
+            IssueUploadWarning { code: "upload_not_confirmed", message:
+                "Jira did not confirm the complete upload. Some files may already be attached. Check the existing issue before uploading any files again." }
+        }),
+    }).into_response()
 }
 
 async fn api_issue_upload_attachments(
@@ -2769,6 +2983,9 @@ async fn api_issue_upload_attachments(
 ) -> axum::response::Response {
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
+    }
+    if let Err(response) = validate_browser_tracker_context(&app.config, &headers) {
+        return response.into_response();
     }
     let (adapter, issue_identifier) =
         match attachment_issue_access(&app.config, &issue_identifier).await {
@@ -2849,6 +3066,7 @@ async fn api_issue_upload_attachments(
                 percent_encode_path_segment(&stored_name)
             ),
             path: Some(path.display().to_string()),
+            bytes: bytes.to_vec(),
         });
     }
     if uploaded.is_empty() {
@@ -2856,6 +3074,24 @@ async fn api_issue_upload_attachments(
             "missing_attachment",
             "at least one attachment file is required",
         );
+    }
+    if let IssueAdapter::Jira(client) = &adapter {
+        return match publish_jira_uploads(
+            client,
+            &issue_ref_for_identifier(&issue_identifier),
+            uploaded,
+        )
+        .await
+        {
+            Ok(receipt) if receipt.complete => Json(IssueAttachmentUploadResponse {
+                attachments: receipt.attachments.into_iter().map(Into::into).collect(),
+                comment_id: None,
+                warning: None,
+            })
+            .into_response(),
+            Ok(receipt) => jira_upload_attention_response(receipt.attachments, false),
+            Err(error) => issue_adapter_error_response(error),
+        };
     }
     let attachments = uploaded
         .iter()
@@ -2881,6 +3117,7 @@ async fn api_issue_upload_attachments(
     Json(IssueAttachmentUploadResponse {
         attachments: uploaded,
         comment_id,
+        warning: None,
     })
     .into_response()
 }
@@ -2922,6 +3159,30 @@ async fn api_issue_attachment_download(
             &format!("failed to read attachment: {error}"),
         ),
     }
+}
+
+#[derive(Debug)]
+struct TrackerContextChanged;
+
+impl IntoResponse for TrackerContextChanged {
+    fn into_response(self) -> Response {
+        (StatusCode::CONFLICT, Json(json!({"error": {
+            "code": "tracker_context_changed",
+            "message": "The repository's issue tracker changed. Reload the page and check the original tracker before retrying."
+        }}))).into_response()
+    }
+}
+
+fn validate_browser_tracker_context(
+    config: &ServiceConfig,
+    headers: &HeaderMap,
+) -> std::result::Result<(), TrackerContextChanged> {
+    if let Some(scope) = headers.get("x-fugue-tracker-scope")
+        && scope.to_str().ok() != Some(config.tracker_context_id().as_str())
+    {
+        return Err(TrackerContextChanged);
+    }
+    Ok(())
 }
 
 async fn attachment_issue_access(
@@ -3041,6 +3302,7 @@ async fn parse_json_issue_comment_request(
     Ok(ParsedIssueCommentRequest {
         body_markdown: request.body_markdown,
         attachments: request.attachments,
+        uploads: Vec::new(),
     })
 }
 
@@ -3089,16 +3351,8 @@ async fn parse_multipart_issue_comment_request(
     }
     Ok(ParsedIssueCommentRequest {
         body_markdown,
-        attachments: uploaded
-            .into_iter()
-            .map(|attachment| LinearCommentAttachmentInput {
-                title: Some(attachment.name),
-                url: attachment.url,
-                path: attachment.path,
-                content_type: attachment.content_type,
-                byte_len: attachment.size,
-            })
-            .collect(),
+        attachments: Vec::new(),
+        uploads: uploaded,
     })
 }
 
@@ -3160,6 +3414,7 @@ async fn persist_issue_comment_attachment(
             percent_encode_path_segment(&stored_name)
         ),
         path: Some(path.display().to_string()),
+        bytes: bytes.to_vec(),
     });
     Ok(())
 }
@@ -3213,22 +3468,57 @@ async fn api_issue_add_comment(
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
+    if let Err(response) = validate_browser_tracker_context(&app.config, &headers) {
+        return response.into_response();
+    }
     let (adapter, issue_identifier) =
         match attachment_issue_access(&app.config, &issue_identifier).await {
             Ok(access) => access,
             Err(response) => return response,
         };
     let issue_identifier = issue_identifier.0;
-    let parsed = match parse_issue_comment_request(&app, &issue_identifier, &headers, request).await
+    let mut parsed =
+        match parse_issue_comment_request(&app, &issue_identifier, &headers, request).await {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+    if parsed.body_markdown.trim().is_empty()
+        && parsed.attachments.is_empty()
+        && parsed.uploads.is_empty()
     {
-        Ok(parsed) => parsed,
-        Err(response) => return response,
-    };
-    if parsed.body_markdown.trim().is_empty() && parsed.attachments.is_empty() {
         return bad_request(
             "missing_comment",
             "body_markdown or at least one attachment must be provided",
         );
+    }
+    let mut native_uploads = Vec::new();
+    if !parsed.uploads.is_empty() {
+        if let IssueAdapter::Jira(client) = &adapter {
+            match publish_jira_uploads(
+                client,
+                &issue_ref_for_identifier(&issue_identifier),
+                parsed.uploads,
+            )
+            .await
+            {
+                Ok(receipt) if receipt.complete => native_uploads = receipt.attachments,
+                Ok(receipt) => return jira_upload_attention_response(receipt.attachments, false),
+                Err(error) => return issue_adapter_error_response(error),
+            }
+            parsed.attachments.extend(native_uploads.clone());
+        } else {
+            parsed
+                .attachments
+                .extend(parsed.uploads.into_iter().map(|attachment| {
+                    LinearCommentAttachmentInput {
+                        title: Some(attachment.name),
+                        url: attachment.url,
+                        path: attachment.path,
+                        content_type: attachment.content_type,
+                        byte_len: attachment.size,
+                    }
+                }));
+        }
     }
     match adapter
         .add_comment(AddCommentInput {
@@ -3240,6 +3530,10 @@ async fn api_issue_add_comment(
     {
         Ok(output) => {
             Json(json!({ "result": output, "attachments": parsed.attachments })).into_response()
+        }
+        Err(error) if !native_uploads.is_empty() => {
+            tracing::warn!(error = %error, "Jira accepted files but comment was not confirmed");
+            jira_upload_attention_response(native_uploads, true)
         }
         Err(error) => issue_adapter_error_response(error),
     }
@@ -5922,15 +6216,17 @@ mod tests {
             },
         )
         .unwrap();
-        // Deliberately share physical storage to exercise the ownership check,
-        // even for an operator who points two bindings at one file directory.
-        assert_eq!(
+        // Even a file copied into the wrong scoped directory must not be read
+        // when the tracker says the issue belongs to another repository.
+        assert_ne!(
             own_config.attachment_storage_root(),
             foreign_config.attachment_storage_root()
         );
-        let files = issue_attachment_dir(&own_config, "TEST-1");
-        std::fs::create_dir_all(&files).unwrap();
-        std::fs::write(files.join("trace.txt"), "private file contents").unwrap();
+        for config in [&own_config, &foreign_config] {
+            let files = issue_attachment_dir(config, "TEST-1");
+            std::fs::create_dir_all(&files).unwrap();
+            std::fs::write(files.join("trace.txt"), "private file contents").unwrap();
+        }
         for (app, allowed) in [(foreign, false), (own, true)] {
             let response = app
                 .oneshot(attachment_test_request(
@@ -6110,6 +6406,272 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tracker_boundary_jira_browser_uploads_publish_native_files() {
+        use crate::jira::tests::{issue, mock_jira, reply, tracker};
+        use tower::ServiceExt;
+        for endpoint in ["attachments", "comments"] {
+            let contents = if endpoint == "attachments" {
+                "x".repeat(2 * 1024 * 1024 + 1)
+            } else {
+                "attachment contents".to_string()
+            };
+            let mock = mock_jira(vec![]).await;
+            let content_url = format!("{}/secure/attachment/7/trace.txt", mock.endpoint);
+            let mut replies = vec![
+                reply("GET", "/rest/api/3/issue/10001", issue("To Do")),
+                reply("GET", "/rest/api/3/issue/TEST-1", issue("To Do")),
+                reply(
+                    "POST",
+                    "/rest/api/3/issue/TEST-1/attachments",
+                    json!([
+                        {"filename":"trace.txt","content":content_url,"size":contents.len(),"mimeType":"text/plain"}
+                    ]),
+                ),
+            ];
+            if endpoint == "comments" {
+                replies.push(reply("GET", "/rest/api/3/issue/TEST-1", issue("To Do")));
+                replies.push(reply(
+                    "POST",
+                    "/rest/api/3/issue/TEST-1/comment",
+                    json!({"id":"comment-7","body":"Attached"}),
+                ));
+            }
+            mock.responses.lock().unwrap().extend(replies);
+            let root = tempfile::tempdir().unwrap();
+            let (_, mut config, owner) = attachment_scope_test_router(root.path(), "TEST").await;
+            config.tracker = tracker(&mock.endpoint);
+            let (refresh, _receiver) = mpsc::channel(1);
+            let app = router(
+                owner.shared_state(),
+                config,
+                refresh,
+                owner.internal_sender(),
+                owner.meta_runtime_registry(),
+                None,
+            )
+            .await
+            .unwrap();
+            let response = app
+                .oneshot(attachment_test_request(
+                    "POST",
+                    &format!("/api/v1/issues/10001/{endpoint}"),
+                    Body::from(format!("--fixture\r\nContent-Disposition: form-data; name=\"attachments\"; filename=\"trace.txt\"\r\nContent-Type: text/plain\r\n\r\n{contents}\r\n--fixture--\r\n")),
+                    Some("multipart/form-data; boundary=fixture"),
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+            let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(payload["attachments"][0]["url"], content_url);
+            assert!(mock.responses.lock().unwrap().is_empty());
+            let requests = mock.requests.lock().unwrap();
+            let files = &requests[2].1["files"];
+            assert_eq!(files[0]["name"], "trace.txt");
+            assert_eq!(files[0]["bytes"], json!(contents.as_bytes().to_vec()));
+            if endpoint == "comments" {
+                assert!(requests[4].1.to_string().contains(&content_url));
+                assert!(!requests[4].1.to_string().contains("/api/v1/issues"));
+                assert!(
+                    !requests[4]
+                        .1
+                        .to_string()
+                        .contains(root.path().to_str().unwrap())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_jira_upload_failures_retain_acknowledged_files() {
+        use crate::jira::tests::{issue, mock_jira, reply, tracker};
+        use tower::ServiceExt;
+        for scenario in [
+            "server",
+            "malformed",
+            "incomplete",
+            "partial",
+            "comment",
+            "foreign_url",
+            "rejected",
+        ] {
+            let mock = mock_jira(vec![]).await;
+            let url = format!("{}/secure/attachment/7/trace.txt", mock.endpoint);
+            let response_body = match scenario {
+                "malformed" => json!({"private":"private-response-sentinel"}),
+                "incomplete" => json!([]),
+                "foreign_url" => {
+                    json!([{"id":"7","filename":"trace.txt","content":"https://foreign.example.test/private","size":19}])
+                }
+                _ => json!([{"id":"7","filename":"trace.txt","content":url,"size":19}]),
+            };
+            let status = match scenario {
+                "server" => StatusCode::SERVICE_UNAVAILABLE,
+                "rejected" => StatusCode::FORBIDDEN,
+                _ => StatusCode::OK,
+            };
+            let mut replies = vec![
+                reply("GET", "/rest/api/3/issue/TEST-1", issue("To Do")),
+                reply("GET", "/rest/api/3/issue/TEST-1", issue("To Do")),
+                reply(
+                    "POST",
+                    "/rest/api/3/issue/TEST-1/attachments",
+                    response_body,
+                )
+                .with_status(status),
+            ];
+            if scenario == "comment" {
+                replies.push(reply("GET", "/rest/api/3/issue/TEST-1", issue("To Do")));
+                replies.push(
+                    reply(
+                        "POST",
+                        "/rest/api/3/issue/TEST-1/comment",
+                        json!({"private":"private-response-sentinel"}),
+                    )
+                    .with_status(StatusCode::SERVICE_UNAVAILABLE),
+                );
+            }
+            mock.responses.lock().unwrap().extend(replies);
+            let root = tempfile::tempdir().unwrap();
+            let (_, mut config, owner) = attachment_scope_test_router(root.path(), "TEST").await;
+            config.tracker = tracker(&mock.endpoint);
+            let (refresh, _receiver) = mpsc::channel(1);
+            let app = router(
+                owner.shared_state(),
+                config,
+                refresh,
+                owner.internal_sender(),
+                owner.meta_runtime_registry(),
+                None,
+            )
+            .await
+            .unwrap();
+            let response = app
+                .oneshot(attachment_test_request(
+                    "POST",
+                    "/api/v1/issues/TEST-1/comments",
+                    if scenario == "partial" {
+                        Body::from("--fixture\r\nContent-Disposition: form-data; name=\"attachments\"; filename=\"trace.txt\"\r\n\r\nattachment contents\r\n--fixture\r\nContent-Disposition: form-data; name=\"attachments\"; filename=\"second.txt\"\r\n\r\nsecond\r\n--fixture--\r\n")
+                    } else { attachment_test_body() },
+                    Some("multipart/form-data; boundary=fixture"),
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("private-response-sentinel"));
+            let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if scenario == "rejected" {
+                assert_eq!(status, StatusCode::BAD_GATEWAY);
+            } else {
+                assert_eq!(status, StatusCode::OK, "{scenario}: {payload}");
+                assert_eq!(
+                    payload["warning"]["code"],
+                    if scenario == "comment" {
+                        "comment_not_confirmed"
+                    } else {
+                        "upload_not_confirmed"
+                    }
+                );
+                assert_eq!(
+                    payload["attachments"].as_array().unwrap().len(),
+                    usize::from(matches!(scenario, "comment" | "partial"))
+                );
+                assert!(payload["comment_id"].is_null());
+                if scenario == "comment" {
+                    assert_eq!(payload["attachments"][0]["url"], url);
+                }
+            }
+            assert!(mock.responses.lock().unwrap().is_empty(), "{scenario}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_stale_browser_context_denied_before_provider_or_storage() {
+        use crate::jira::tests::{mock_jira, tracker};
+        use tower::ServiceExt;
+        let mock = mock_jira(vec![]).await;
+        let root = tempfile::tempdir().unwrap();
+        let (_, mut config, owner) = attachment_scope_test_router(root.path(), "TEST").await;
+        let old_context = config.tracker_context_id();
+        config.tracker = tracker(&mock.endpoint);
+        let storage = issue_attachment_dir(&config, "TEST-1");
+        let (refresh, _receiver) = mpsc::channel(1);
+        let app = router(
+            owner.shared_state(),
+            config,
+            refresh,
+            owner.internal_sender(),
+            owner.meta_runtime_registry(),
+            None,
+        )
+        .await
+        .unwrap();
+        for endpoint in ["attachments", "comments"] {
+            let mut request = attachment_test_request(
+                "POST",
+                &format!("/api/v1/issues/TEST-1/{endpoint}"),
+                attachment_test_body(),
+                Some("multipart/form-data; boundary=fixture"),
+            );
+            request.headers_mut().insert(
+                "x-fugue-tracker-scope",
+                HeaderValue::from_str(&old_context).unwrap(),
+            );
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+        }
+        assert!(mock.requests.lock().unwrap().is_empty());
+        assert!(!storage.exists());
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_jira_json_cannot_upload_host_paths() {
+        use crate::jira::tests::{issue, mock_jira, reply, tracker};
+        use tower::ServiceExt;
+        let mock = mock_jira(vec![reply(
+            "GET",
+            "/rest/api/3/issue/TEST-1",
+            issue("To Do"),
+        )])
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let secret = root.path().join("private.txt");
+        std::fs::write(&secret, "private-file-sentinel").unwrap();
+        let (_, mut config, owner) = attachment_scope_test_router(root.path(), "TEST").await;
+        config.tracker = tracker(&mock.endpoint);
+        let (refresh, _receiver) = mpsc::channel(1);
+        let app = router(
+            owner.shared_state(),
+            config,
+            refresh,
+            owner.internal_sender(),
+            owner.meta_runtime_registry(),
+            None,
+        )
+        .await
+        .unwrap();
+        let body = json!({"body_markdown":"Example", "attachments":[{"title":"private", "url":"https://example.test/file", "path":secret,"byte_len":21}]}).to_string();
+        let response = app
+            .oneshot(attachment_test_request(
+                "POST",
+                "/api/v1/issues/TEST-1/comments",
+                Body::from(body),
+                Some("application/json"),
+            ))
+            .await
+            .unwrap();
+        assert!(!response.status().is_success());
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn tracker_boundary_jira_download_resolves_key_without_comments_or_remote_files() {
         use crate::jira::tests::{issue, mock_jira, reply, tracker};
         use tower::ServiceExt;
@@ -6155,22 +6717,78 @@ mod tests {
     }
 
     #[test]
-    fn tracker_boundary_unmanaged_attachment_roots_are_scope_specific_and_credential_independent() {
-        let mut first = issue_board_config();
-        let root = first.attachment_storage_root();
-        first.tracker.api_key = Some("changed-credential".into());
-        assert_eq!(first.attachment_storage_root(), root);
-        for component in ["provider", "endpoint", "project"] {
-            let mut other = first.clone();
-            match component {
-                "provider" => other.tracker.kind = "jira".into(),
-                "endpoint" => other.tracker.endpoint = "https://other.example.test/graphql".into(),
-                _ => other.tracker.project_slug = Some("other-project".into()),
-            }
-            assert_ne!(root, other.attachment_storage_root(), "{component}");
+    fn tracker_boundary_jira_environment_references_scope_actual_site_and_project() {
+        const MARKER: &str = "FUGUE_TEST_TRACKER_SCOPE_ENV";
+        if std::env::var_os(MARKER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "http::tests::tracker_boundary_jira_environment_references_scope_actual_site_and_project",
+                    "--exact", "--nocapture",
+                ])
+                .env(MARKER, "1")
+                .env("FUGUE_TEST_TRACKER_SITE", "https://jira.example.test")
+                .env("FUGUE_TEST_TRACKER_PROJECT", "TEST")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
         }
-        first.tracker.project_slug = first.tracker.project_slug.map(|scope| format!(" {scope} "));
-        assert_eq!(first.attachment_storage_root(), root);
+        let mut referenced = issue_board_config();
+        referenced.tracker.kind = "jira".into();
+        referenced.tracker.endpoint = "$FUGUE_TEST_TRACKER_SITE".into();
+        referenced.tracker.project_slug = Some("$FUGUE_TEST_TRACKER_PROJECT".into());
+        let mut literal = referenced.clone();
+        literal.tracker.endpoint = "https://jira.example.test".into();
+        literal.tracker.project_slug = Some("TEST".into());
+        assert_eq!(
+            referenced.tracker_context_id(),
+            literal.tracker_context_id()
+        );
+        assert_eq!(
+            referenced.attachment_storage_root(),
+            literal.attachment_storage_root()
+        );
+        literal.tracker.endpoint = "https://other.example.test".into();
+        assert_ne!(
+            referenced.tracker_context_id(),
+            literal.tracker_context_id()
+        );
+    }
+
+    #[test]
+    fn tracker_boundary_attachment_roots_are_scope_specific_and_credential_independent() {
+        for managed in [false, true] {
+            let mut first = issue_board_config();
+            if managed {
+                first.meerkat.repository_runtime = Some(crate::config::RepositoryRuntimeBinding {
+                    repository: crate::ensemble::config::RepoId::try_from("first".to_owned())
+                        .unwrap(),
+                    state_path: PathBuf::from("/tmp/test-repository-state"),
+                });
+            }
+            let root = first.attachment_storage_root();
+            first.tracker.api_key = Some("changed-credential".into());
+            assert_eq!(first.attachment_storage_root(), root);
+            for component in ["provider", "endpoint", "project"] {
+                let mut other = first.clone();
+                match component {
+                    "provider" => other.tracker.kind = "jira".into(),
+                    "endpoint" => {
+                        other.tracker.endpoint = "https://other.example.test/graphql".into()
+                    }
+                    _ => other.tracker.project_slug = Some("other-project".into()),
+                }
+                assert_ne!(root, other.attachment_storage_root(), "{component}");
+            }
+            first.tracker.project_slug =
+                first.tracker.project_slug.map(|scope| format!(" {scope} "));
+            assert_eq!(first.attachment_storage_root(), root);
+        }
     }
 
     fn attachment_test_request(
@@ -6790,6 +7408,7 @@ mod tests {
             content_type: Some("text/plain".to_string()),
             url: url.clone(),
             path: None,
+            bytes: Vec::new(),
         }]);
         assert!(markdown.contains("Attached files:"));
         assert!(markdown.contains("[trace log.txt]"));
@@ -6804,6 +7423,7 @@ mod tests {
                 content_type: Some("text/plain".to_string()),
                 url,
                 path: None,
+                bytes: Vec::new(),
             }],
         );
         assert!(comment.starts_with("Please see the trace.\n\nAttached files:"));

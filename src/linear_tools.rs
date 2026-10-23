@@ -1182,10 +1182,10 @@ where
             None,
         )
     })?;
-    serde_json::from_value(data).map_err(|err| {
+    serde_json::from_value(data).map_err(|_| {
         LinearToolFailure::new(
             FugueToolErrorCode::ExecutionFailed,
-            format!("Linear response did not match expected shape: {err}"),
+            "Linear response did not match expected shape",
             RetryAdvice::DoNotRetry,
             None,
         )
@@ -2314,6 +2314,34 @@ mod tests {
                     .contains("project: { slugId: { eq: $projectSlug } }")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_malformed_linear_success_does_not_disclose_provider_data() {
+        use crate::jira::tests::{mock_jira as mock_http, reply};
+        let mock = mock_http(vec![reply(
+            "POST",
+            "/graphql",
+            json!({"data":{"issue":"private-malformed-success-sentinel"}}),
+        )])
+        .await;
+        let config = scoped_linear_fixture(&format!("{}/graphql", mock.endpoint));
+        let (failed, content) = execute_linear_fugue_tool(
+            &config,
+            "linear_inspect_issue",
+            &json!({"issue":{"kind":"id","id":"issue-1"}}),
+        )
+        .await;
+        assert!(failed);
+        assert!(
+            !content.contains("private-malformed-success-sentinel"),
+            "{content}"
+        );
+        let result: FugueToolResult = serde_json::from_str(&content).unwrap();
+        assert!(matches!(result, FugueToolResult::Err {error,..}
+            if error.code == FugueToolErrorCode::ExecutionFailed
+                && error.retry == RetryAdvice::DoNotRetry));
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

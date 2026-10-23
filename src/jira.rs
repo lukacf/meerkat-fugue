@@ -16,6 +16,19 @@ use crate::domain::{BlockerRef, CreatedIssueReceipt, Issue, IssueAttachment};
 use crate::error::{FugueError, Result};
 use crate::tools::*;
 
+/// Bytes received from a validated browser multipart request. This is deliberately
+/// not deserializable: tool/JSON callers cannot use it to read host-local paths.
+pub(crate) struct JiraUploadFile {
+    pub name: String,
+    pub content_type: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+pub(crate) struct JiraUploadReceipt {
+    pub attachments: Vec<LinearCommentAttachmentInput>,
+    pub complete: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct JiraConfig {
@@ -646,6 +659,80 @@ impl JiraClient {
             comment_id: LinearCommentId(comment.id),
             created: true,
             updated: false,
+        })
+    }
+
+    /// Uses Jira's native multipart attachment contract, not links to host files:
+    /// <https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-attachments/#api-rest-api-3-issue-issueidorkey-attachments-post>
+    pub(crate) async fn upload_browser_files(
+        &self,
+        issue: &LinearIssueRef,
+        files: Vec<JiraUploadFile>,
+    ) -> Result<JiraUploadReceipt> {
+        let issue = self.fetch_issue(issue).await?;
+        let expected = files.len();
+        let mut form = reqwest::multipart::Form::new();
+        for file in files {
+            let mut part = reqwest::multipart::Part::bytes(file.bytes).file_name(file.name);
+            if let Some(content_type) = file.content_type {
+                part = part.mime_str(&content_type).map_err(request_error)?;
+            }
+            form = form.part("file", part);
+        }
+        let response = self
+            .client
+            .post(self.url(&["issue", &issue.key, "attachments"])?)
+            .header("X-Atlassian-Token", "no-check")
+            .multipart(form)
+            .send()
+            .await;
+        // A lost response or server failure cannot prove that Jira rejected the
+        // upload. The caller must retain the issue and ask for reconciliation.
+        let uncertain = || JiraUploadReceipt {
+            attachments: Vec::new(),
+            complete: false,
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(_) => return Ok(uncertain()),
+        };
+        if response.status().is_client_error() {
+            return Err(FugueError::JiraApiStatus {
+                status: response.status().as_u16(),
+            });
+        }
+        if !response.status().is_success() {
+            return Ok(uncertain());
+        }
+        let uploaded: Vec<JiraUploadedFile> = match response.json().await {
+            Ok(uploaded) => uploaded,
+            Err(_) => return Ok(uncertain()),
+        };
+        let mut seen = BTreeSet::new();
+        let mut attachments = Vec::with_capacity(uploaded.len());
+        for file in uploaded {
+            let Ok(url) = Url::parse(&file.content) else {
+                continue;
+            };
+            if file.filename.is_empty()
+                || url.origin() != self.base.origin()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || !seen.insert(url.to_string())
+            {
+                continue;
+            }
+            attachments.push(LinearCommentAttachmentInput {
+                title: Some(file.filename),
+                url: url.to_string(),
+                path: None,
+                content_type: file.mime_type,
+                byte_len: file.size,
+            });
+        }
+        Ok(JiraUploadReceipt {
+            complete: attachments.len() == expected,
+            attachments,
         })
     }
 
@@ -1461,6 +1548,15 @@ struct JiraAttachment {
     id: String,
     filename: String,
     content: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JiraUploadedFile {
+    filename: String,
+    content: String,
+    size: u64,
+    mime_type: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

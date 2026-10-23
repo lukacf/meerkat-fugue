@@ -16,8 +16,8 @@ const html = browserDocument(boardTemplate.replace('__FUGUE_CREATE_EDITOR__', fo
 const receipt = {id:'10001', identifier:'TEST-1', url:'https://jira.example.test/browse/TEST-1'};
 const warning = {code:'issue_created_followup_failed', message:'Created TEST-1. Fugue could not confirm its initial status. Open the existing issue to check it.'};
 
-async function show(page, {partial=false, uploadFailures=0, uploadGate}={}) {
-  const observed = {creates:0, uploads:[], uploadBodies:[]};
+async function show(page, {partial=false, uploadFailures=0, uploadGate, uploadWarning=null, scope=()=>"tracker-a"}={}) {
+  const observed = {creates:0, uploads:[], uploadBodies:[], uploadHeaders:[]};
   await page.route('http://fugue.test/**', async route => {
     const path = new URL(route.request().url()).pathname;
     if (path.endsWith('/api/v1/issues') && route.request().method() === 'POST') {
@@ -28,16 +28,17 @@ async function show(page, {partial=false, uploadFailures=0, uploadGate}={}) {
     }
     if (path.endsWith('/attachments')) {
       observed.uploads.push(path);
+      observed.uploadHeaders.push(route.request().headers());
       observed.uploadBodies.push(route.request().postDataBuffer().toString());
       if (uploadGate) await uploadGate;
       return observed.uploads.length <= uploadFailures
         ? route.fulfill({status:503,json:{error:{message:'Upload unavailable'}}})
-        : route.fulfill({json:{attachments:[{title:'trace.txt'}]}});
+        : route.fulfill({json:{attachments:[{title:'trace.txt'}], ...(uploadWarning ? {warning:uploadWarning} : {})}});
     }
     if (path.endsWith('/api/v1/issues/board')) {
       return route.fulfill({json:{totals:{issues:0,running:0,retrying:0},lanes:[{name:'Open',kind:'intake',issues:[]}]}});
     }
-    return route.fulfill({contentType:'text/html',body:html});
+    return route.fulfill({contentType:'text/html',body:html.replaceAll("__FUGUE_TRACKER_SCOPE__",scope())});
   });
   await page.goto('http://fugue.test/repositories/repository-test/issues');
   await page.getByRole('button',{name:'+ New issue',exact:true}).click();
@@ -142,4 +143,35 @@ test('files selected during an upload remain pending for the same issue', async 
   expect(observed.uploadBodies[0]).not.toContain('second.txt');
   expect(observed.uploadBodies[1]).toContain('second.txt');
   expect(observed.uploadBodies[1]).not.toContain('first.txt');
+});
+
+
+test('a changed tracker configuration cannot restore an old ticket receipt', async ({page}) => {
+  let scope = 'tracker-a';
+  const observed = await show(page,{partial:true,scope:()=>scope});
+  await page.locator('#createSubmit').click();
+  await expect(page.locator('#createError')).toContainText('could not confirm');
+  scope = 'tracker-b';
+  await page.reload();
+  await expect(page.locator('#createPanel')).not.toHaveClass(/open/);
+  await page.getByRole('button',{name:'+ New issue',exact:true}).click();
+  await expect(page.getByLabel('Title',{exact:true})).toBeEnabled();
+  await expect(page.getByLabel('Title',{exact:true})).toHaveValue('');
+  expect(observed.uploads).toHaveLength(0);
+});
+
+test('an uncertain Jira upload preserves the ticket and does not offer blind retry after reload', async ({page}) => {
+  const uploadWarning = {code:'upload_not_confirmed',message:'Some files may already be attached. Check the existing issue before uploading any files again.'};
+  const observed = await show(page,{uploadWarning});
+  await page.locator('#createAttachments').setInputFiles({name:'trace.txt',mimeType:'text/plain',buffer:Buffer.from('trace')});
+  await page.locator('#createSubmit').click();
+  await expect(page.locator('#createError')).toContainText(uploadWarning.message);
+  await expect(page.locator('#createSubmit')).toBeHidden();
+  await page.reload();
+  await expect(page.locator('#createError')).toContainText(uploadWarning.message);
+  await page.locator('#createAttachments').setInputFiles({name:'trace.txt',mimeType:'text/plain',buffer:Buffer.from('trace')});
+  await expect(page.locator('#createSubmit')).toBeHidden();
+  expect(observed.creates).toBe(1);
+  expect(observed.uploads).toHaveLength(1);
+  expect(observed.uploadHeaders[0]['x-fugue-tracker-scope']).toBe('tracker-a');
 });

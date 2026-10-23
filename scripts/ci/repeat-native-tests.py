@@ -122,7 +122,8 @@ def run_phase(command, report_dir, name, timeout, cancelled, env=None):
 def qualify_retirement(executable, report_dir, attempt, cancelled=None, timeout=180):
     # Each trial is already a separate process. Bypass the nested isolation
     # wrapper so successful exits cannot discard the actual runtime diagnostics.
-    env = dict(os.environ, FUGUE_ISOLATED_RUNTIME_TEST='runtime_members_emit_canonical_structural_events')
+    env = dict(os.environ, FUGUE_ISOLATED_RUNTIME_TEST='runtime_members_emit_canonical_structural_events',
+               FUGUE_TEST_EVIDENCE_DIR=str(report_dir.resolve()))
     name = f'attempt-{attempt:02}'
     row = run_phase([executable, RETIREMENT_TEST, '--exact', '--nocapture'], report_dir,
                     name, timeout, cancelled if cancelled is not None else Cancellation(), env)

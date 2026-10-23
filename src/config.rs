@@ -1579,28 +1579,53 @@ impl ServiceConfig {
         self.meerkat
             .repository_runtime
             .as_ref()
-            .map(|binding| binding.state_path.join("files"))
+            .map(|binding| {
+                binding
+                    .state_path
+                    .join("files")
+                    .join("tracker-files")
+                    .join(self.tracker_context_id())
+            })
             .unwrap_or_else(|| {
                 // Explicit workflows may share a directory or database. Keep
                 // their files scoped even when tracker keys overlap.
-                let mut identity = Sha256::new();
-                for component in [
-                    self.tracker.kind.as_str(),
-                    self.tracker.endpoint.as_str(),
-                    self.tracker
-                        .project_slug
-                        .as_deref()
-                        .unwrap_or_default()
-                        .trim(),
-                ] {
-                    identity.update((component.len() as u64).to_le_bytes());
-                    identity.update(component.as_bytes());
-                }
                 self.workflow_dir
                     .join(".fugue")
                     .join("tracker-files")
-                    .join(format!("{:x}", identity.finalize()))
+                    .join(self.tracker_context_id())
             })
+    }
+
+    /// Stable tracker identity, excluding credentials and display settings.
+    pub(crate) fn tracker_context_id(&self) -> String {
+        // Jira also accepts environment references for its site and project.
+        // Scope the effective values so changing a deployment's environment
+        // cannot reuse another tracker's browser receipts or local files.
+        let jira_endpoint = (self.tracker.kind == "jira")
+            .then(|| resolve_env_string(&self.tracker.endpoint))
+            .flatten();
+        let jira_project = (self.tracker.kind == "jira")
+            .then(|| {
+                self.tracker
+                    .project_slug
+                    .as_deref()
+                    .and_then(resolve_env_string)
+            })
+            .flatten();
+        let mut identity = Sha256::new();
+        for component in [
+            self.tracker.kind.as_str(),
+            jira_endpoint.as_deref().unwrap_or(&self.tracker.endpoint),
+            jira_project
+                .as_deref()
+                .or(self.tracker.project_slug.as_deref())
+                .unwrap_or_default()
+                .trim(),
+        ] {
+            identity.update((component.len() as u64).to_le_bytes());
+            identity.update(component.as_bytes());
+        }
+        format!("{:x}", identity.finalize())
     }
 
     fn validate_static(&self) -> Result<()> {

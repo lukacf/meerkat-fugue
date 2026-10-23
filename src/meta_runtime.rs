@@ -5233,7 +5233,28 @@ pub(crate) mod tests {
             return;
         }
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-        let temp = tempfile::tempdir().expect("tempdir");
+        struct RuntimeFailureEvidence(Option<tempfile::TempDir>);
+        impl Drop for RuntimeFailureEvidence {
+            fn drop(&mut self) {
+                if std::thread::panicking()
+                    && let Some(directory) = self.0.take()
+                {
+                    eprintln!(
+                        "Retained failed runtime state: {}",
+                        directory.keep().display()
+                    );
+                }
+            }
+        }
+        let directory = match std::env::var_os("FUGUE_TEST_EVIDENCE_DIR") {
+            Some(parent) => tempfile::Builder::new()
+                .prefix("runtime-")
+                .tempdir_in(parent),
+            None => tempfile::tempdir(),
+        }
+        .expect("runtime evidence directory");
+        let evidence = RuntimeFailureEvidence(Some(directory));
+        let temp = evidence.0.as_ref().expect("runtime evidence owner");
         let registry = MetaRuntimeRegistry::with_templates(
             test_meerkat_config(temp.path().join("state")),
             BTreeMap::new(),

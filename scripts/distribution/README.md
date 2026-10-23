@@ -98,8 +98,8 @@ on the intended gateway before treating a deployment as accepted.
 
 ## Temporary dependency follow-up
 
-The current candidate binds Core `0b6cc66d1a4d3006f43a29380bb335d368a04b7d`
-and Meta `b48e43a4cb2dea2deafc6ed459258e7675999d24`. Core includes the
+The current candidate binds Core `3a57ae76847564288fba92dc0563436509b21265`
+and Meta `c14eb2516451cb449e4c72de08f603220f05bc73`. Core includes the
 checkpoint recovery and durable-tail retirement corrections; Meta includes the console panels and sign-in
 recovery changes. Every Core package, including Meta's transitive dependencies,
 must resolve to that same Core commit in `Cargo.lock`.
@@ -110,12 +110,17 @@ that qualification. Replace the temporary pins when a released pair passes the
 same checks, then verify the new lock and release manifest. A source binding or
 an upstream merge alone is not deployed acceptance.
 
-The current candidate is not qualified for production distribution. The selected
-retirement correction passed twenty consumer trials at concurrency four and
+The current candidate is not qualified for production distribution. The
+previous retirement correction passed twenty consumer trials at concurrency four and
 five native handoff/restart rounds, but a later full-suite run again failed
 retirement because durable-tail recovery was refused. Qualification is reopened;
-retain both the earlier passes and the failure and verify the next correction.
-The final built candidate still needs hosted recovery acceptance. The merge path also needs authoritative, durable review
+retain both the earlier passes and the failure. The new archive-scoped correction
+allows a stopped runtime to settle its tail while ending the session; other
+recovery paths retain their refusal. This candidate must qualify that correction.
+The separate compaction-outbox baseline correction and stream-overflow correction
+are not included in these pins. They still need compatible source uptake and
+consumer qualification. The final built candidate needs hosted recovery acceptance.
+The merge path also needs authoritative, durable review
 results bound to the exact candidate; matching a caller-supplied SHA or a fresh
 PR observation does not establish review acceptance. Keep the release gates open
 until the final candidate passes regression tests and hosted acceptance. Local

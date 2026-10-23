@@ -104,11 +104,36 @@ pub(crate) async fn mock_jira(responses: Vec<MockResponse>) -> MockJira {
             assert_eq!(parts.method.as_str(), response.method);
             assert_eq!(parts.uri.path(), response.path);
             assert!(parts.headers.contains_key("authorization"));
-            let body = to_bytes(body, 1024 * 1024).await.expect("request body");
-            let body = if body.is_empty() {
-                Value::Null
+            let body = if parts
+                .headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("multipart/form-data"))
+            {
+                use axum::extract::FromRequest;
+                assert_eq!(parts.headers["x-atlassian-token"], "no-check");
+                let request = Request::from_parts(parts.clone(), body);
+                let mut multipart = axum::extract::Multipart::from_request(request, &())
+                    .await
+                    .unwrap();
+                let mut files = Vec::new();
+                while let Some(field) = multipart.next_field().await.unwrap() {
+                    assert_eq!(field.name(), Some("file"));
+                    let name = field.file_name().unwrap().to_owned();
+                    let content_type = field.content_type().map(str::to_owned);
+                    let bytes = field.bytes().await.unwrap();
+                    files.push(
+                        json!({"name":name,"content_type":content_type,"bytes":bytes.to_vec()}),
+                    );
+                }
+                json!({"files":files})
             } else {
-                serde_json::from_slice(&body).expect("JSON")
+                let body = to_bytes(body, 1024 * 1024).await.expect("request body");
+                if body.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&body).expect("JSON")
+                }
             };
             observed
                 .lock()
@@ -121,6 +146,7 @@ pub(crate) async fn mock_jira(responses: Vec<MockResponse>) -> MockJira {
                 .expect("response")
         }
     }));
+    let app = app.layer(axum::extract::DefaultBodyLimit::max(101 * 1024 * 1024));
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve");
     });
