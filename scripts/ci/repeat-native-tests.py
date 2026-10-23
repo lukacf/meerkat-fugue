@@ -1,37 +1,119 @@
 #!/usr/bin/env python3
-"""Repeat native restart checks using one Cargo-produced test executable."""
+"""Bound native qualification phases and retain evidence from process startup."""
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import time
 
 
 RETIREMENT_TEST = 'meta_runtime::tests::runtime_members_emit_canonical_structural_events'
 
 
-def qualify_retirement(executable, report_dir, attempt):
+class Cancellation:
+    # Signal handlers must not acquire threading locks. A flag is also visible
+    # to the worker threads, which poll it between bounded waits.
+    def __init__(self):
+        self.requested = False
+
+    def set(self):
+        self.requested = True
+
+    def is_set(self):
+        return self.requested
+
+
+def timestamp():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def record(path, row):
+    temporary = path.with_suffix('.json.tmp')
+    temporary.write_text(json.dumps(row, indent=2) + '\n')
+    temporary.replace(path)
+
+
+def stop_process_group(process):
+    """Stop owned descendants even when their original parent already exited."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        process.wait(timeout=3)
+        return
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        process.poll()  # Reap our direct child while descendants settle.
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    process.wait(timeout=3)
+
+
+def run_phase(command, report_dir, name, timeout, cancelled, env=None):
+    path = report_dir / f'{name}.json'
+    row = {'phase': name, 'status': 'running', 'started_at': timestamp(), 'qualified': False}
+    record(path, row)
+    process = None
+    # Connect stdout/stderr directly to disk. An outer cancellation must not
+    # discard bytes buffered by a parent subprocess.run(capture_output=True).
+    with (report_dir / f'{name}.log').open('wb', buffering=0) as output:
+        try:
+            if not cancelled.is_set():
+                process = subprocess.Popen(command, env=env, stdout=output,
+                                           stderr=subprocess.STDOUT, start_new_session=True)
+                row['pid'] = process.pid
+                record(path, row)
+                deadline = time.monotonic() + timeout
+                while process.poll() is None and not cancelled.is_set():
+                    if time.monotonic() >= deadline:
+                        row['timeout'] = True
+                        break
+                    time.sleep(0.05)
+        except Exception as error:
+            row['error'] = str(error)
+        finally:
+            if process is not None:
+                try:
+                    stop_process_group(process)
+                except Exception as error:
+                    row['cleanup_error'] = str(error)
+                row['exit'] = process.returncode
+    row['cancelled'] = cancelled.is_set()
+    row['qualified'] = (row.get('exit') == 0 and not row.get('timeout')
+                        and not row['cancelled'] and 'error' not in row and 'cleanup_error' not in row)
+    row['status'] = 'cancelled' if row['cancelled'] else ('completed' if row['qualified'] else 'failed')
+    row['finished_at'] = timestamp()
+    record(path, row)
+    return row
+
+
+def qualify_retirement(executable, report_dir, attempt, cancelled=None, timeout=180):
     # Each trial is already a separate process. Bypass the nested isolation
     # wrapper so successful exits cannot discard the actual runtime diagnostics.
     env = dict(os.environ, FUGUE_ISOLATED_RUNTIME_TEST='runtime_members_emit_canonical_structural_events')
-    try:
-        result = subprocess.run([executable, RETIREMENT_TEST, '--exact', '--nocapture'],
-                                env=env, capture_output=True, text=True, timeout=180)
-        output = result.stdout + result.stderr
-        passed = result.returncode == 0 and 'test result: ok. 1 passed;' in output
-        conflict = ('failed to realize committed handoffs' in output
-                    or 'rewrite rejected: previous transcript revision' in output)
-        row = {'attempt': attempt, 'exit': result.returncode, 'one_test_passed': passed,
-               'transcript_conflict': conflict, 'qualified': passed and not conflict}
-    except subprocess.TimeoutExpired as error:
-        def decode(value):
-            return value.decode(errors='replace') if isinstance(value, bytes) else (value or '')
-        output = decode(error.stdout) + decode(error.stderr)
-        row = {'attempt': attempt, 'timeout': True, 'qualified': False}
-    (report_dir / f'attempt-{attempt:02}.log').write_text(output)
-    (report_dir / f'attempt-{attempt:02}.json').write_text(json.dumps(row) + '\n')
+    name = f'attempt-{attempt:02}'
+    row = run_phase([executable, RETIREMENT_TEST, '--exact', '--nocapture'], report_dir,
+                    name, timeout, cancelled if cancelled is not None else Cancellation(), env)
+    output = (report_dir / f'{name}.log').read_text(errors='replace')
+    row.update(attempt=attempt, one_test_passed='test result: ok. 1 passed;' in output,
+               transcript_conflict=('failed to realize committed handoffs' in output
+                                    or 'rewrite rejected: previous transcript revision' in output))
+    row['qualified'] = row['qualified'] and row['one_test_passed'] and not row['transcript_conflict']
+    if not row['qualified'] and row['status'] == 'completed':
+        row['status'] = 'failed'
+    record(report_dir / f'{name}.json', row)
     print(f'Native retirement qualification {attempt}/20: {json.dumps(row)}', flush=True)
     if not row['qualified']:
         print(output, flush=True)
@@ -39,46 +121,67 @@ def qualify_retirement(executable, report_dir, attempt):
 
 
 def main():
-    executables = set()
-    for line in Path(sys.argv[1]).read_text().splitlines():
-        message = json.loads(line)
-        if (message.get('reason') == 'compiler-artifact'
-                and message.get('target', {}).get('name') == 'meerkat_fugue'
-                and message.get('profile', {}).get('test')
-                and message.get('executable')):
-            executables.add(message['executable'])
-    if len(executables) != 1:
-        raise SystemExit('Expected exactly one Fugue library test executable')
-    executable = executables.pop()
-    selection = 'native_flow_delivers_worker'
-    listing = subprocess.check_output([executable, selection, '--list'], text=True)
-    selected = {line.removesuffix(': test') for line in listing.splitlines()
-                if line.endswith(': test')}
-    required = {
-        'ensemble::runtime::tests::native_flow_delivers_worker_final_without_peer_reply',
-        'ensemble::runtime::tests::native_flow_delivers_worker_failure_without_peer_reply',
-    }
-    if not required <= selected:
-        raise SystemExit('The executable is missing required native restart tests')
-    for attempt in range(1, 6):
-        print(f'Native restart qualification {attempt}/5', flush=True)
-        subprocess.run([executable, selection], check=True)
-
-    listing = subprocess.check_output([executable, RETIREMENT_TEST, '--exact', '--list'], text=True)
-    if RETIREMENT_TEST + ': test' not in listing.splitlines():
-        raise SystemExit('The executable is missing the native retirement qualification test')
+    if os.name != 'posix':
+        raise SystemExit('Native qualification requires POSIX process groups')
     report_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(sys.argv[1]).with_suffix('.retirement')
     report_dir.mkdir(parents=True, exist_ok=False)
-    print(f'Retaining all native retirement evidence in {report_dir}', flush=True)
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(lambda attempt: qualify_retirement(executable, report_dir, attempt), range(1, 21)))
-    with Path(executable).open('rb') as stream:
-        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-    summary = {'executable_sha256': digest, 'concurrency': 4, 'trials': results,
-               'qualified': all(row['qualified'] for row in results)}
-    (report_dir / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+    cancelled = Cancellation()
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, lambda _signum, _frame: cancelled.set())
+    summary = {'status': 'running', 'started_at': timestamp(), 'qualified': False,
+               'concurrency': 4, 'phases': [], 'trials': []}
+    record(report_dir / 'summary.json', summary)
+    try:
+        executables = set()
+        for line in Path(sys.argv[1]).read_text().splitlines():
+            message = json.loads(line)
+            if (message.get('reason') == 'compiler-artifact'
+                    and message.get('target', {}).get('name') == 'meerkat_fugue'
+                    and message.get('profile', {}).get('test')
+                    and message.get('executable')):
+                executables.add(message['executable'])
+        if len(executables) != 1:
+            raise RuntimeError('Expected exactly one Fugue library test executable')
+        executable = executables.pop()
+        with Path(executable).open('rb') as stream:
+            summary['executable_sha256'] = hashlib.file_digest(stream, 'sha256').hexdigest()
+        record(report_dir / 'summary.json', summary)
+
+        def phase(name, arguments, timeout):
+            row = run_phase([executable, *arguments], report_dir, name, timeout, cancelled)
+            summary['phases'].append(row)
+            record(report_dir / 'summary.json', summary)
+            if not row['qualified']:
+                raise RuntimeError(f'Native phase {name} failed; see retained evidence')
+            return (report_dir / f'{name}.log').read_text(errors='replace')
+
+        selection = 'native_flow_delivers_worker'
+        listing = phase('handoff-list', [selection, '--list'], 15)
+        selected = {line.removesuffix(': test') for line in listing.splitlines() if line.endswith(': test')}
+        required = {
+            'ensemble::runtime::tests::native_flow_delivers_worker_final_without_peer_reply',
+            'ensemble::runtime::tests::native_flow_delivers_worker_failure_without_peer_reply',
+        }
+        if not required <= selected:
+            raise RuntimeError('The executable is missing required native restart tests')
+        for attempt in range(1, 6):
+            phase(f'handoff-{attempt:02}', [selection], 60)
+        listing = phase('retirement-list', [RETIREMENT_TEST, '--exact', '--list'], 15)
+        if RETIREMENT_TEST + ': test' not in listing.splitlines():
+            raise RuntimeError('The executable is missing the native retirement qualification test')
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            summary['trials'] = list(pool.map(
+                lambda attempt: qualify_retirement(executable, report_dir, attempt, cancelled), range(1, 21)))
+        summary['qualified'] = all(row['qualified'] for row in summary['trials']) and not cancelled.is_set()
+    except Exception as error:
+        summary['error'] = str(error)
+    finally:
+        summary['qualified'] = summary['qualified'] and not cancelled.is_set()
+        summary['status'] = 'cancelled' if cancelled.is_set() else ('completed' if summary['qualified'] else 'failed')
+        summary['finished_at'] = timestamp()
+        record(report_dir / 'summary.json', summary)
     if not summary['qualified']:
-        raise SystemExit('Native retirement qualification failed; all trial logs were retained')
+        raise SystemExit('Native qualification failed; all phase and trial logs were retained')
 
 
 if __name__ == '__main__':

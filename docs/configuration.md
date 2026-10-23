@@ -387,6 +387,11 @@ database does not share queues: issue, comment and attachment reads and writes
 stay within the configured scope. Issue keys cannot be moved to another
 repository by creating or updating an issue with the same key.
 
+For Linear, direct issue lookup verifies project membership before returning
+issue details or changing assignments, states or comments. Bulk status lookup
+and comment feeds carry the configured project filter. An issue moved outside
+the configured project is no longer available through that repository's tools.
+
 Review obligations use the repository mob's native WorkGraph realm and default
 namespace. Independent-review completion rejects other scopes so blockers remain
 visible to terminal and merge checks. Tracker IDs are resolved to canonical issue

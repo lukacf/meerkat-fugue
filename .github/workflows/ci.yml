@@ -73,11 +73,15 @@ jobs:
         timeout-minutes: 45
         run: cargo test --all-targets --locked
 
+      - name: Locate the compiled native test executable
+        timeout-minutes: 5
+        run: cargo test --locked --lib --no-run --message-format=json-render-diagnostics > "$RUNNER_TEMP/fugue-native-tests.jsonl"
+
       - name: Repeat native handoff and restart contracts
-        timeout-minutes: 15
-        run: |
-          cargo test --locked --lib --no-run --message-format=json-render-diagnostics > "$RUNNER_TEMP/fugue-native-tests.jsonl"
-          python3 scripts/ci/repeat-native-tests.py "$RUNNER_TEMP/fugue-native-tests.jsonl" "$RUNNER_TEMP/fugue-retirement"
+        # Internal bounds total 22 minutes including cleanup; leave room for
+        # cancellation, evidence finalization and artifact upload.
+        timeout-minutes: 25
+        run: python3 scripts/ci/repeat-native-tests.py "$RUNNER_TEMP/fugue-native-tests.jsonl" "$RUNNER_TEMP/fugue-retirement"
 
       - name: Retain native retirement evidence
         if: always()

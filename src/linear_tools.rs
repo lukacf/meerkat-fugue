@@ -461,10 +461,17 @@ impl<'a> LinearToolExecutor<'a> {
             Some(issue) => Some(self.resolve_issue_id(issue).await?),
             None => None,
         };
-        let (query, variables) =
-            recent_comments_request(issue_id, limit, input.cursor.map(|cursor| cursor.0));
+        let (query, variables) = recent_comments_request(
+            self.client.project_slug(),
+            issue_id,
+            limit,
+            input.cursor.map(|cursor| cursor.0),
+        );
         let response = self.client.graphql(query, variables).await?;
         let data: CommentsResponse = decode_data(response)?;
+        for comment in &data.comments.nodes {
+            self.guard_project(comment.issue.project.as_ref())?;
+        }
         let changes = data
             .comments
             .nodes
@@ -511,19 +518,30 @@ impl<'a> LinearToolExecutor<'a> {
                 None,
             )
         })?;
+        self.guard_project(issue.project.as_ref())?;
         Ok(IssueWithComments::from(issue))
     }
 
-    async fn resolve_issue_id(&self, issue_ref: &LinearIssueRef) -> LinearToolResultData<String> {
-        match issue_ref {
-            LinearIssueRef::Id { id } => Ok(id.0.clone()),
-            LinearIssueRef::Identifier { .. } => Ok(self
-                .fetch_issue(issue_ref, CommentFetch::None)
-                .await?
-                .issue
-                .id
-                .0),
+    fn guard_project(&self, project: Option<&IssueProjectNode>) -> LinearToolResultData<()> {
+        if project.is_some_and(|project| project.slug_id == self.client.project_slug()) {
+            Ok(())
+        } else {
+            Err(LinearToolFailure::new(
+                FugueToolErrorCode::NotFound,
+                "Linear issue not found in the configured project",
+                RetryAdvice::DoNotRetry,
+                None,
+            ))
         }
+    }
+
+    async fn resolve_issue_id(&self, issue_ref: &LinearIssueRef) -> LinearToolResultData<String> {
+        Ok(self
+            .fetch_issue(issue_ref, CommentFetch::None)
+            .await?
+            .issue
+            .id
+            .0)
     }
 
     async fn resolve_user(
@@ -599,17 +617,16 @@ impl<'a> LinearToolExecutor<'a> {
                 None,
             ));
         }
-        data.issue_update
-            .issue
-            .map(LinearIssueSnapshot::from)
-            .ok_or_else(|| {
-                LinearToolFailure::new(
-                    FugueToolErrorCode::ExecutionFailed,
-                    "issueUpdate returned no issue",
-                    RetryAdvice::RefreshStateThenRetry,
-                    None,
-                )
-            })
+        let issue = data.issue_update.issue.ok_or_else(|| {
+            LinearToolFailure::new(
+                FugueToolErrorCode::ExecutionFailed,
+                "issueUpdate returned no issue",
+                RetryAdvice::RefreshStateThenRetry,
+                None,
+            )
+        })?;
+        self.guard_project(issue.project.as_ref())?;
+        Ok(LinearIssueSnapshot::from(issue))
     }
 
     async fn create_comment(
@@ -1817,11 +1834,18 @@ struct IssueNode {
     updated_at: DateTime<Utc>,
     state: StateNode,
     team: TeamNode,
+    project: Option<IssueProjectNode>,
     assignee: Option<UserNode>,
     labels: Nodes<LabelNode>,
     #[serde(default)]
     attachments: Option<Nodes<AttachmentNode>>,
     comments: Option<Nodes<CommentNode>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueProjectNode {
+    #[serde(rename = "slugId")]
+    slug_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1886,6 +1910,7 @@ struct CommentChangeNode {
 #[derive(Debug, Deserialize)]
 struct CommentIssueNode {
     id: String,
+    project: Option<IssueProjectNode>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1917,6 +1942,7 @@ impl From<IssueNode> for IssueWithComments {
             updated_at,
             state,
             team,
+            project,
             assignee,
             labels,
             attachments,
@@ -1936,6 +1962,7 @@ impl From<IssueNode> for IssueWithComments {
             updated_at,
             state,
             team,
+            project,
             assignee,
             labels,
             attachments: None,
@@ -2036,6 +2063,7 @@ query FugueInspectIssue($id: String!) {
     id identifier title description url branchName updatedAt
     state { id name type }
     team { id }
+    project { slugId }
     assignee { id name }
     labels { nodes { name } }
   }
@@ -2048,6 +2076,7 @@ query FugueInspectIssueWithComments($id: String!) {
     id identifier title description url branchName updatedAt
     state { id name type }
     team { id }
+    project { slugId }
     assignee { id name }
     labels { nodes { name } }
     comments(first: 100) { nodes { id body url } }
@@ -2094,6 +2123,7 @@ mutation FugueUpdateIssue($id: String!, $input: IssueUpdateInput!) {
       id identifier title description url branchName updatedAt
       state { id name type }
       team { id }
+      project { slugId }
       assignee { id name }
       labels { nodes { name } }
     }
@@ -2202,6 +2232,7 @@ fn review_handoff_states_from_env() -> Vec<String> {
 }
 
 fn recent_comments_request(
+    project_slug: &str,
     issue_id: Option<String>,
     limit: i64,
     cursor: Option<String>,
@@ -2211,6 +2242,7 @@ fn recent_comments_request(
             LIST_RECENT_COMMENTS_FOR_ISSUE_QUERY,
             json!({
                 "issueId": issue_id,
+                "projectSlug": project_slug,
                 "first": limit,
                 "after": cursor,
             }),
@@ -2218,6 +2250,7 @@ fn recent_comments_request(
         None => (
             LIST_RECENT_COMMENTS_QUERY,
             json!({
+                "projectSlug": project_slug,
                 "first": limit,
                 "after": cursor,
             }),
@@ -2226,18 +2259,18 @@ fn recent_comments_request(
 }
 
 const LIST_RECENT_COMMENTS_QUERY: &str = r#"
-query FugueRecentComments($first: Int!, $after: String) {
-  comments(first: $first, after: $after) {
-    nodes { id createdAt issue { id } user { id name } }
+query FugueRecentComments($projectSlug: String!, $first: Int!, $after: String) {
+  comments(filter: { issue: { project: { slugId: { eq: $projectSlug } } } }, first: $first, after: $after) {
+    nodes { id createdAt issue { id project { slugId } } user { id name } }
     pageInfo { endCursor }
   }
 }
 "#;
 
 const LIST_RECENT_COMMENTS_FOR_ISSUE_QUERY: &str = r#"
-query FugueRecentCommentsForIssue($issueId: ID!, $first: Int!, $after: String) {
-  comments(filter: { issue: { id: { eq: $issueId } } }, first: $first, after: $after) {
-    nodes { id createdAt issue { id } user { id name } }
+query FugueRecentCommentsForIssue($projectSlug: String!, $issueId: ID!, $first: Int!, $after: String) {
+  comments(filter: { issue: { project: { slugId: { eq: $projectSlug } }, id: { eq: $issueId } } }, first: $first, after: $after) {
+    nodes { id createdAt issue { id project { slugId } } user { id name } }
     pageInfo { endCursor }
   }
 }
@@ -2245,6 +2278,166 @@ query FugueRecentCommentsForIssue($issueId: ID!, $first: Int!, $after: String) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn linear_comment_feed_is_project_filtered_and_refuses_foreign_results() {
+        use crate::jira::tests::{mock_jira as mock_http, reply};
+        for project in [Some("own-project"), Some("foreign-project"), None] {
+            let response = json!({"data":{"comments":{"nodes":[{
+                "id":"comment-1", "createdAt":"2026-01-01T00:00:00Z",
+                "issue":{"id":"issue-1", "project":project.map(|slug|json!({"slugId":slug}))},
+                "user":{"id":"user-1", "name":"Private actor"}
+            }],"pageInfo":{"endCursor":null}}}});
+            let mock = mock_http(vec![reply("POST", "/graphql", response)]).await;
+            let config = scoped_linear_fixture(&format!("{}/graphql", mock.endpoint));
+            let (failed, content) = execute_linear_fugue_tool(
+                &config,
+                "linear_list_recent_issue_changes",
+                &json!({"limit":10}),
+            )
+            .await;
+            assert_eq!(failed, project != Some("own-project"), "{content}");
+            if failed {
+                assert!(!content.contains("Private actor"));
+            }
+            let requests = mock.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].1["variables"]["projectSlug"], "own-project");
+            assert!(
+                requests[0].1["query"]
+                    .as_str()
+                    .unwrap()
+                    .contains("project: { slugId: { eq: $projectSlug } }")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn linear_bulk_issue_lookup_keeps_project_filter_on_wire() {
+        use crate::jira::tests::{mock_jira as mock_http, reply};
+        let mock = mock_http(vec![reply(
+            "POST",
+            "/graphql",
+            json!({"data":{"issues":{"nodes":[]}}}),
+        )])
+        .await;
+        let config = scoped_linear_fixture(&format!("{}/graphql", mock.endpoint));
+        let client = LinearClient::from_config(&config).unwrap();
+        assert!(
+            client
+                .fetch_issue_states_by_ids(&["foreign-issue".into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1["variables"]["projectSlug"], "own-project");
+        assert_eq!(requests[0].1["variables"]["ids"], json!(["foreign-issue"]));
+        assert!(
+            requests[0].1["query"]
+                .as_str()
+                .unwrap()
+                .contains("project: { slugId: { eq: $projectSlug } }")
+        );
+    }
+
+    fn scoped_linear_fixture(endpoint: &str) -> TrackerConfig {
+        let definition = crate::config::WorkflowDefinition {
+            config: json!({"tracker": {"kind":"linear", "endpoint":endpoint,
+                "api_key":"fixture", "project_slug":"own-project"}})
+            .as_object()
+            .unwrap()
+            .clone(),
+            prompt_template: "fixture".into(),
+        };
+        crate::config::ServiceConfig::from_definition(
+            PathBuf::from("/tmp/fugue-scope-fixture.yaml"),
+            &definition,
+        )
+        .unwrap()
+        .tracker
+    }
+
+    fn linear_scope_response(project: Option<&str>) -> Value {
+        json!({"data":{
+            "issue": {"id":"issue-1", "identifier":"TEST-1", "title":"Private issue",
+                "description":null, "url":null, "branchName":null, "updatedAt":"2026-01-01T00:00:00Z",
+                "state":{"id":"active", "name":"Active", "type":"started"},
+                "team":{"id":"team"}, "project":project.map(|slug|json!({"slugId":slug})),
+                "assignee":{"id":"operator", "name":"Operator"}, "labels":{"nodes":[]},
+                "comments":{"nodes":[]}, "attachments":{"nodes":[]}},
+            "commentCreate":{"success":true, "comment":{"id":"comment-1", "body":"note", "url":null}}
+        }})
+    }
+
+    #[tokio::test]
+    async fn linear_project_scope_precedes_inspection_or_comment_mutation_by_key_and_id() {
+        use crate::jira::tests::{mock_jira as mock_http, reply};
+        for project in [Some("other-project"), None] {
+            for issue in [
+                json!({"kind":"id","id":"issue-1"}),
+                json!({"kind":"identifier","identifier":"TEST-1"}),
+            ] {
+                for tool in [
+                    "linear_add_comment",
+                    "linear_inspect_issue",
+                    "linear_claim_issue",
+                    "linear_move_issue",
+                    "linear_upsert_workpad",
+                ] {
+                    let mock = mock_http(vec![
+                        reply("POST", "/graphql", linear_scope_response(project)),
+                        reply("POST", "/graphql", linear_scope_response(project)),
+                    ])
+                    .await;
+                    let config = scoped_linear_fixture(&format!("{}/graphql", mock.endpoint));
+                    let input = json!({"issue":issue, "body_markdown":"note", "heading":"## Fugue Workpad",
+                        "create_if_missing":true, "assignee":{"kind":"id", "id":"operator"},
+                        "state":{"kind":"name","name":"Active"}, "idempotency_key":"scope"});
+                    let (failed, content) = execute_linear_fugue_tool(&config, tool, &input).await;
+                    assert!(failed, "{tool}: {content}");
+                    let result: FugueToolResult = serde_json::from_str(&content).unwrap();
+                    assert!(
+                        matches!(result, FugueToolResult::Err { error, .. } if error.code == FugueToolErrorCode::NotFound),
+                        "{tool}: {content}"
+                    );
+                    let requests = mock.requests.lock().unwrap();
+                    assert_eq!(
+                        requests.len(),
+                        1,
+                        "only the membership lookup may reach Linear"
+                    );
+                    assert!(
+                        requests[0].1["query"]
+                            .as_str()
+                            .unwrap()
+                            .trim_start()
+                            .starts_with("query ")
+                    );
+                }
+            }
+        }
+        let mock = mock_http(
+            (0..3)
+                .map(|_| {
+                    reply(
+                        "POST",
+                        "/graphql",
+                        linear_scope_response(Some("own-project")),
+                    )
+                })
+                .collect(),
+        )
+        .await;
+        let config = scoped_linear_fixture(&format!("{}/graphql", mock.endpoint));
+        let input = json!({"issue":{"kind":"id","id":"issue-1"}, "body_markdown":"note"});
+        for tool in ["linear_inspect_issue", "linear_add_comment"] {
+            let (failed, content) = execute_linear_fugue_tool(&config, tool, &input).await;
+            assert!(!failed, "{content}");
+        }
+        assert!(mock.responses.lock().unwrap().is_empty());
+    }
+
     use super::*;
     use serde_json::json;
     use std::sync::{Mutex, MutexGuard};
@@ -3000,10 +3193,11 @@ mod tests {
     }
 
     #[test]
-    fn recent_comments_query_omits_issue_filter_when_issue_is_absent() {
-        let (query, variables) = recent_comments_request(None, 25, None);
+    fn recent_comments_query_stays_project_scoped_without_an_issue() {
+        let (query, variables) = recent_comments_request("project", None, 25, None);
 
-        assert!(!query.contains("filter:"));
+        assert!(query.contains("project: { slugId: { eq: $projectSlug } }"));
+        assert_eq!(variables["projectSlug"], "project");
         assert_eq!(variables.get("first"), Some(&json!(25)));
         assert_eq!(variables.get("issueId"), None);
     }
@@ -3011,12 +3205,15 @@ mod tests {
     #[test]
     fn recent_comments_query_filters_when_issue_is_present() {
         let (query, variables) = recent_comments_request(
+            "project",
             Some("issue-1".to_string()),
             25,
             Some("cursor-1".to_string()),
         );
 
         assert!(query.contains("filter: { issue:"));
+        assert!(query.contains("project: { slugId: { eq: $projectSlug } }"));
+        assert_eq!(variables["projectSlug"], "project");
         assert_eq!(variables.get("issueId"), Some(&json!("issue-1")));
         assert_eq!(variables.get("after"), Some(&json!("cursor-1")));
     }

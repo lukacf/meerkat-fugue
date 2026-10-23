@@ -58,6 +58,25 @@ test remains ignored. When working alongside another Rust build, give your
 checkout a separate `CARGO_TARGET_DIR`; do not delete another build's target or
 lock files to resolve contention.
 
+### Native qualification evidence
+
+CI separately repeats the native handoff checks five times and the retirement
+check twenty times with four trials in parallel. Every phase writes its log and
+a JSON record from startup. The `native-retirement-evidence` artifact retains
+successful diagnostics, failures and unfinished trials, plus the test
+executable's SHA-256. A zero exit code cannot hide a transcript conflict or an
+empty test selection.
+
+Listings, handoff rounds and retirement trials have individual time limits.
+Timeout or cancellation stops the owned process group, escalating to a kill if
+termination does not finish. The CI step leaves extra time for cleanup and
+artifact upload. A forcibly killed runner can leave `running` records; these
+are incomplete evidence and must never count as qualification.
+
+`npm run test:delivery` includes real subprocess regressions for streamed logs,
+outer cancellation, descendant cleanup and termination escalation. These use
+local fixtures and do not establish native runtime recovery or hosted access.
+
 ### Browser coverage
 
 `npm run test:ui` starts disposable fixture servers. It covers repository setup,
@@ -97,6 +116,20 @@ independent review and the configured merge action. Confirm the actual merged
 PR and terminal tracker state. Test login, streaming and restart through the
 intended hosted gateway. Laptop connectivity and local fixtures do not establish
 that the deployment can reach GHE or Jira.
+
+### Tracker-specific acceptance
+
+Run the journey with the tracker intended for the deployment. For Jira, verify
+the configured project's issue creation, assignment, status transitions,
+Workpad comments and final terminal state. Include issue keys and immutable IDs
+in access-boundary checks, and ensure a stale update cannot overwrite a newer
+operator change.
+
+For the built-in tracker, verify issue creation and the full Board workflow,
+then restart and confirm issues and comments persist. Configure a second
+repository using the same database and verify that its board, lookups, comments
+and mutations remain isolated. A passing journey on one tracker does not
+qualify another backend.
 
 ### Opt-in Linear/GitHub harness
 

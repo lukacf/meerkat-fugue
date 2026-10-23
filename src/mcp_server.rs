@@ -641,8 +641,8 @@ fn apply_linear_mcp_scope(
     if operation == FugueToolOperation::LinearMoveIssue && config.kind != "jira" {
         object.remove("expected_updated_at");
     }
-    normalize_linear_state_argument(config, operation, &mut object, "state")?;
-    normalize_linear_state_argument(config, operation, &mut object, "target_state")?;
+    normalize_linear_state_argument(&mut object, "state");
+    normalize_linear_state_argument(&mut object, "target_state");
     insert_default_linear_idempotency_key(operation, &mut object);
     Ok(Value::Object(object))
 }
@@ -954,29 +954,15 @@ fn insert_default<T: serde::Serialize>(
     }
 }
 
-fn normalize_linear_state_argument(
-    config: &TrackerConfig,
-    operation: FugueToolOperation,
-    object: &mut Map<String, Value>,
-    key: &str,
-) -> std::result::Result<(), String> {
-    let Some(value) = object.get(key) else {
-        return Ok(());
-    };
-    let Some(name) = linear_state_name(value) else {
-        return Ok(());
+// Normalize wire shorthand only. Lane policy belongs to guard_public_lane_move,
+// shared by direct dispatch and MCP, including configured review handoff lanes.
+fn normalize_linear_state_argument(object: &mut Map<String, Value>, key: &str) {
+    let Some(name) = object.get(key).and_then(linear_state_name) else {
+        return;
     };
     let name = name.trim();
     if name.is_empty() {
-        return Ok(());
-    }
-    let configured_lanes = configured_linear_lanes(config);
-    if !configured_lanes.is_empty() && !configured_linear_lanes_contain(&configured_lanes, name) {
-        return Err(format!(
-            "{} rejected unconfigured Linear state name {name:?} for {key}; allowed lanes are: {}",
-            operation.provider_callback_name(),
-            configured_lanes.join(", ")
-        ));
+        return;
     }
     object.insert(
         key.to_string(),
@@ -984,7 +970,6 @@ fn normalize_linear_state_argument(
             name: name.to_string(),
         }),
     );
-    Ok(())
 }
 
 fn linear_state_name(value: &Value) -> Option<&str> {
@@ -1001,36 +986,6 @@ fn linear_state_name(value: &Value) -> Option<&str> {
         }
         _ => None,
     }
-}
-
-fn configured_linear_lanes_contain(lanes: &[String], name: &str) -> bool {
-    let normalized = crate::domain::normalize_state(name);
-    lanes
-        .iter()
-        .any(|candidate| crate::domain::normalize_state(candidate) == normalized)
-}
-
-fn configured_linear_lanes(config: &TrackerConfig) -> Vec<String> {
-    let mut lanes: Vec<String> = Vec::new();
-    for lane in config
-        .intake_states
-        .iter()
-        .chain(config.in_flight_states.iter())
-        .chain(config.active_states.iter())
-        .chain(config.terminal_states.iter())
-    {
-        if lane.trim().is_empty() {
-            continue;
-        }
-        let normalized = crate::domain::normalize_state(lane);
-        if !lanes
-            .iter()
-            .any(|candidate| crate::domain::normalize_state(candidate.as_str()) == normalized)
-        {
-            lanes.push(lane.clone());
-        }
-    }
-    lanes
 }
 
 fn linear_issue_ref_from_env() -> Option<LinearIssueRef> {
@@ -1321,7 +1276,7 @@ mod tests {
                 ),
                 (
                     json!({"kind":"name","name":"Unknown"}),
-                    "unconfigured Linear state name",
+                    "noncanonical_public_lane",
                 ),
                 (
                     json!({"kind":"id","id":"opaque-state"}),
@@ -1345,6 +1300,34 @@ mod tests {
                 "{response}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_admission_accepts_the_same_custom_handoff_lane_as_direct_dispatch() {
+        let config = compact_tracker_config();
+        let mut handler = LinearMcpHandler::projection_for_test(config.clone(), None);
+        handler.review_handoff_states = vec!["Awaiting domain review".into()];
+        let input = json!({"issue":"TEST-1", "state":"Awaiting domain review"});
+        let direct_input: crate::tools::MoveIssueInput = serde_json::from_value(json!({
+            "issue":{"kind":"identifier","identifier":"TEST-1"},
+            "state":{"kind":"name","name":"Awaiting domain review"}, "idempotency_key":"fixture"
+        }))
+        .unwrap();
+        assert!(
+            crate::workgraph_gate::guard_public_lane_move(
+                &config,
+                &handler.review_handoff_states,
+                &[],
+                &direct_input
+            )
+            .is_ok()
+        );
+        let (failed, response) = handler.execute("linear.move_issue", input).await;
+        assert!(failed);
+        assert!(
+            response.contains("workgraph_gate_unconfigured"),
+            "the public lane should pass admission before the required WorkGraph check: {response}"
+        );
     }
 
     #[test]
@@ -1596,40 +1579,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn linear_mcp_scope_rejects_unconfigured_state_name_shorthand() {
-        let scope = LinearMcpScope {
-            issue: Some(LinearIssueRef::Identifier {
-                identifier: LinearIssueIdentifier("LUC-376".to_string()),
-            }),
-        };
-        let config = compact_tracker_config();
-
-        let err = apply_linear_mcp_scope(
-            &config,
-            &scope,
-            "linear_claim_issue",
-            json!({
-                "target_state": "In Progress",
-                "idempotency_key": "claim-unconfigured-lane"
-            }),
-        )
-        .expect_err("unconfigured lanes must not be accepted unless configured");
-        assert!(err.contains("unconfigured Linear state name"));
-        assert!(err.contains("Implementing"));
-        assert!(!err.contains("In Review"));
-
-        let err = apply_linear_mcp_scope(
-            &config,
-            &scope,
-            "linear_move_issue",
-            json!({
-                "state": { "kind": "name", "name": "Human Review" },
-                "idempotency_key": "move-unconfigured-lane"
-            }),
-        )
-        .expect_err("typed unconfigured lane names must not bypass the guard");
-        assert!(err.contains("Human Review"));
+    #[tokio::test]
+    async fn linear_mcp_admission_rejects_unconfigured_state_names_after_normalization() {
+        let handler = LinearMcpHandler::projection_for_test(compact_tracker_config(), None);
+        for (operation, arguments) in [
+            (
+                "linear_claim_issue",
+                json!({"issue":"TEST-1", "target_state":"In Progress"}),
+            ),
+            (
+                "linear_move_issue",
+                json!({"issue":"TEST-1", "state":{"kind":"name", "name":"Human Review"}}),
+            ),
+        ] {
+            let (failed, response) = handler.execute(operation, arguments).await;
+            assert!(failed);
+            assert!(response.contains("noncanonical_public_lane"), "{response}");
+        }
     }
 
     #[test]

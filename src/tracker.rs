@@ -141,6 +141,10 @@ struct LinearIssueCreateContext {
 }
 
 impl LinearClient {
+    pub(crate) fn project_slug(&self) -> &str {
+        &self.project_slug
+    }
+
     pub fn from_config(config: &TrackerConfig) -> Result<Self> {
         let api_key = config
             .api_key
@@ -148,8 +152,11 @@ impl LinearClient {
             .ok_or(FugueError::MissingTrackerApiKey)?;
         let project_slug = config
             .project_slug
-            .clone()
-            .ok_or(FugueError::MissingTrackerProjectSlug)?;
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or(FugueError::MissingTrackerProjectSlug)?
+            .to_owned();
         let mut headers = HeaderMap::new();
         let auth = HeaderValue::from_str(&api_key).map_err(|err| {
             FugueError::InvalidConfig(format!("tracker.api_key cannot be used as a header: {err}"))
@@ -566,7 +573,7 @@ impl IssueTracker for LinearClient {
             return Ok(Vec::new());
         }
         let mut issues = Vec::new();
-        for variables in issue_state_query_variables(issue_ids) {
+        for variables in issue_state_query_variables(&self.project_slug, issue_ids) {
             let response = self.graphql(ISSUE_STATES_QUERY, variables).await?;
             let connection = response
                 .get("data")
@@ -662,10 +669,10 @@ fn parse_linear_graphql_arguments(
     })
 }
 
-fn issue_state_query_variables(issue_ids: &[String]) -> Vec<Value> {
+fn issue_state_query_variables(project_slug: &str, issue_ids: &[String]) -> Vec<Value> {
     issue_ids
         .chunks(LINEAR_ISSUE_STATES_PAGE_SIZE)
-        .map(|ids| json!({ "ids": ids, "first": ids.len() }))
+        .map(|ids| json!({ "ids": ids, "first": ids.len(), "projectSlug": project_slug }))
         .collect()
 }
 
@@ -1110,8 +1117,8 @@ query FugueOpenProjectIssues($projectSlug: String!, $stateTypes: [String!], $fir
 "#;
 
 const ISSUE_STATES_QUERY: &str = r#"
-query FugueIssueStates($ids: [ID!]!, $first: Int!) {
-  issues(filter: { id: { in: $ids } }, first: $first) {
+query FugueIssueStates($projectSlug: String!, $ids: [ID!]!, $first: Int!) {
+  issues(filter: { project: { slugId: { eq: $projectSlug } }, id: { in: $ids } }, first: $first) {
     nodes {
       id
       identifier
@@ -1642,11 +1649,12 @@ mod tests {
             .map(|index| format!("issue-{index}"))
             .collect::<Vec<_>>();
 
-        let batches = issue_state_query_variables(&issue_ids);
+        let batches = issue_state_query_variables("project", &issue_ids);
 
         assert_eq!(batches.len(), 3);
         let mut collected = Vec::new();
         for batch in &batches {
+            assert_eq!(batch["projectSlug"], "project");
             let ids = batch
                 .get("ids")
                 .and_then(Value::as_array)

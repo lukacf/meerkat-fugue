@@ -98,9 +98,9 @@ on the intended gateway before treating a deployment as accepted.
 
 ## Temporary dependency follow-up
 
-The current candidate binds Core `e2e4b8f8bf1a306eb2cb1758ae75aab95a464a62`
+The current candidate binds Core `0b6cc66d1a4d3006f43a29380bb335d368a04b7d`
 and Meta `b48e43a4cb2dea2deafc6ed459258e7675999d24`. Core includes the
-checkpoint-recovery correction; Meta includes the console panels and sign-in
+checkpoint recovery and durable-tail retirement corrections; Meta includes the console panels and sign-in
 recovery changes. Every Core package, including Meta's transitive dependencies,
 must resolve to that same Core commit in `Cargo.lock`.
 
@@ -110,10 +110,11 @@ that qualification. Replace the temporary pins when a released pair passes the
 same checks, then verify the new lock and release manifest. A source binding or
 an upstream merge alone is not deployed acceptance.
 
-The current candidate is not qualified for production distribution. An
-intermittent native retirement conflict remains reproducible during active-turn
-cancellation. The merge path also needs authoritative, durable review results
-bound to the exact candidate; matching a caller-supplied SHA or a fresh PR
-observation does not establish review acceptance. Keep both release gates open
-until their corrections pass regression tests and hosted acceptance. A green
-rerun or a successful bundle build does not clear these findings.
+The current candidate is not qualified for production distribution. The selected
+retirement correction passed twenty consumer trials at concurrency four and
+five native handoff/restart rounds. The final built candidate still needs hosted
+recovery acceptance. The merge path also needs authoritative, durable review
+results bound to the exact candidate; matching a caller-supplied SHA or a fresh
+PR observation does not establish review acceptance. Keep the release gates open
+until the final candidate passes regression tests and hosted acceptance. Local
+qualification or a successful bundle build does not establish that result.
