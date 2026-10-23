@@ -16,7 +16,7 @@ const html = browserDocument(boardTemplate.replace('__FUGUE_CREATE_EDITOR__', fo
 const receipt = {id:'10001', identifier:'TEST-1', url:'https://jira.example.test/browse/TEST-1'};
 const warning = {code:'issue_created_followup_failed', message:'Created TEST-1. Fugue could not confirm its initial status. Open the existing issue to check it.'};
 
-async function show(page, {partial=false, uploadFailures=0, uploadGate, uploadWarning=null, scope=()=>"tracker-a"}={}) {
+async function show(page, {partial=false, uploadFailures=0, uploadGate, uploadWarning=null, uploadReply=null, scope=()=>"tracker-a"}={}) {
   const observed = {creates:0, uploads:[], uploadBodies:[], uploadHeaders:[]};
   await page.route('http://fugue.test/**', async route => {
     const path = new URL(route.request().url()).pathname;
@@ -31,9 +31,10 @@ async function show(page, {partial=false, uploadFailures=0, uploadGate, uploadWa
       observed.uploadHeaders.push(route.request().headers());
       observed.uploadBodies.push(route.request().postDataBuffer().toString());
       if (uploadGate) await uploadGate;
+      if (uploadReply) return route.fulfill(uploadReply);
       return observed.uploads.length <= uploadFailures
-        ? route.fulfill({status:503,json:{error:{message:'Upload unavailable'}}})
-        : route.fulfill({json:{attachments:[{title:'trace.txt'}], ...(uploadWarning ? {warning:uploadWarning} : {})}});
+        ? route.fulfill({status:403,json:{error:{message:'Upload unavailable'}}})
+        : route.fulfill({json:{attachments:[{title:'trace.txt',url:'https://jira.example.test/attachment/1'}], ...(uploadWarning ? {warning:uploadWarning} : {})}});
     }
     if (path.endsWith('/api/v1/issues/board')) {
       return route.fulfill({json:{totals:{issues:0,running:0,retrying:0},lanes:[{name:'Open',kind:'intake',issues:[]}]}});
@@ -60,6 +61,21 @@ test('attachment retry targets the acknowledged issue without creating another',
     '/repositories/repository-test/api/v1/issues/TEST-1/attachments',
   ]);
 });
+
+for (const uploadReply of [{status:502,json:{error:{message:'gateway failure'}}}, {status:200,json:{}}]) {
+  test(`creation upload blocks blind retry after ambiguous response ${uploadReply.status}`, async ({page})=>{
+    const observed=await show(page,{uploadReply});
+    await page.locator('#createAttachments').setInputFiles({name:'trace.txt',mimeType:'text/plain',buffer:Buffer.from('trace')});
+    await page.locator('#createSubmit').click();
+    await expect(page.locator('#createError')).toContainText('Check the existing issue');
+    await expect(page.locator('#createSubmit')).toBeHidden();
+    await page.reload();
+    await expect(page.locator('#createSubmit')).toBeHidden();
+    await expect(page.locator('#createError')).toContainText('Check the existing issue');
+    expect(observed.creates).toBe(1);
+    expect(observed.uploads).toHaveLength(1);
+  });
+}
 
 test('partial Jira creation preserves a scoped link and does not offer creation again', async ({page}) => {
   const observed = await show(page,{partial:true});

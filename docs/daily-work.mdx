@@ -55,6 +55,17 @@ a blind retry. Some files may already be present. If Jira accepts the files but
 the following comment is not confirmed, Fugue keeps your comment draft and tells
 you to check the issue before posting again. Do not re-upload the accepted files.
 
+The warning and your comment draft survive a reload in the same tab, including
+when you refresh while the request is still pending. A gateway error or an
+incomplete success response also requires checking the issue. A confirmed
+rejection permits retry; an unknown result does not.
+
+After checking the issue in your tracker, choose **I've checked the issue** and
+confirm the reconciliation. This enables a new submission without resending
+anything. It removes the pending file selection and keeps your comment draft,
+so remove any text already posted before submitting again. This is a manual
+reconciliation step, not a guarantee that the original request ran only once.
+
 Review and merge controls follow the configured lane actions. Read the action's
 label before saving a lane change: a configured action can start a review or
 merge procedure. Ordinary status changes and procedure triggers are distinct.

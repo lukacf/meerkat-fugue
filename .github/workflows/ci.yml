@@ -71,7 +71,11 @@ jobs:
 
       - name: Test offline contracts and runtime
         timeout-minutes: 45
-        run: cargo test --all-targets --locked
+        env:
+          FUGUE_TEST_EVIDENCE_DIR: ${{ runner.temp }}/fugue-full-suite
+        run: |
+          mkdir -p "$FUGUE_TEST_EVIDENCE_DIR"
+          cargo test --all-targets --locked
 
       - name: Locate the compiled native test executable
         timeout-minutes: 5
@@ -88,7 +92,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: native-retirement-evidence
-          path: ${{ runner.temp }}/fugue-retirement/
+          path: |
+            ${{ runner.temp }}/fugue-retirement/
+            ${{ runner.temp }}/fugue-full-suite/
           if-no-files-found: ignore
 
       - name: Lint

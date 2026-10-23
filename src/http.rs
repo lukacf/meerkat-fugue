@@ -1829,22 +1829,9 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       for (const attachment of attachments) {
         form.append("attachments", attachment.file, attachment.name);
       }
-      let response, payload;
-      try {
-      response = await fugueFetch(`/api/v1/issues/${encodeURIComponent(identifier)}/attachments`, {
-        method: "POST",
-        headers: { "Accept": "application/json", "X-Fugue-Tracker-Scope": trackerScope },
-        body: form,
-      });
-      payload = await response.json();
-      } catch {
-        const error = new Error("The upload result was lost. Check the existing issue before uploading any files again.");
-        error.uploadUncertain = true;
-        throw error;
-      }
-      if (!response.ok) {
-        throw new Error(payload?.error?.message || `Attachment upload failed: ${response.status}`);
-      }
+      const payload = await fugueIssueMutation(`/api/v1/issues/${encodeURIComponent(identifier)}/attachments`, {
+        method: "POST", headers: {"Accept":"application/json", "X-Fugue-Tracker-Scope":trackerScope}, body: form,
+      }, {kind:"upload", fileCount:attachments.length});
       const message = payload.warning?.message || `Attached ${payload.attachments?.length || attachments.length} file(s).`;
       if (errorTarget) errorTarget.textContent = message;
       showNotice(message);
@@ -1957,7 +1944,23 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
         const createdIdentifier = createdIssueReceipt.identifier;
         if (createAttachmentState.length) {
           const pending = createAttachmentState.slice();
-          const upload = await uploadIssueAttachments(createdIdentifier, pending, createError);
+          const previousWarning = creationWarning;
+          creationUploadBlocked = true;
+          creationWarning = "The upload is not confirmed. Check the existing issue before uploading any files again.";
+          if (!saveCreationReceipt()) throw Object.assign(new Error(creationWarning + " Recovery details could not be saved."), {uploadUncertain:true});
+          let upload;
+          try { upload = await uploadIssueAttachments(createdIdentifier, pending, createError); }
+          catch (error) {
+            if (error.confirmedRejected) {
+              creationUploadBlocked = false;
+              creationWarning = previousWarning;
+              saveCreationReceipt();
+            }
+            throw error;
+          }
+          creationUploadBlocked = false;
+          creationWarning = previousWarning;
+          saveCreationReceipt();
           if (upload?.warning) {
             creationWarning = upload.warning.message;
             creationUploadBlocked = true;
@@ -2367,28 +2370,64 @@ const ISSUE_DETAIL_HTML: &str = r#"<!doctype html>
   const dataTransferHasFiles = (event) => Array.from(event.dataTransfer?.types || []).includes("Files");
   const renderIssueAttachments = () => { const list = $("issueAttachmentList"); if (!list) return; const persistedHtml = (detail.attachments || []).map(renderPersistedAttachmentChip).join(""); const pendingHtml = issueAttachmentState.length ? issueAttachmentState.map((attachment) => `<span class="attachment-chip">${escapeHtml(attachment.name)} · ${escapeHtml(formatFileSize(attachment.size))}</span>`).join("") : ""; list.innerHTML = persistedHtml || pendingHtml ? `${persistedHtml}${pendingHtml}` : '<span class="meta">No attachments added for this issue editor.</span>'; };
   const validateIssueAttachment = (file, state = issueAttachmentState) => { if (state.length >= maxAttachmentCount) throw new Error("At most 20 attachments can be added."); if (file.size > maxAttachmentBytes) throw new Error(`${file.name} exceeds the 25 MiB per-file attachment limit.`); const nextTotal = state.reduce((sum, attachment) => sum + attachment.size, 0) + file.size; if (nextTotal > maxAttachmentTotalBytes) throw new Error("Attachments exceed the 100 MiB total attachment limit."); return { name:file.name, size:file.size, content_type:file.type || null, file }; };
+  const recoveryKey = `fugue.issue-mutations:v1:${location.pathname}:${trackerScope}`;
   let issueUploadPending = false;
   let issueUploadWarning = "";
+  let commentSubmissionPending = false;
+  let commentSubmissionUncertain = false;
+  let commentSubmissionWarning = "";
+  let recoveredCommentDraft = "";
+  const uncertainMessage = "The result was not confirmed. Check the existing issue before posting the comment or uploading files again.";
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(recoveryKey) || "null");
+    if (saved) {
+      if (typeof saved.uploadWarning !== "string" || typeof saved.commentWarning !== "string" || typeof saved.commentDraft !== "string") throw new Error("Invalid recovery record");
+      issueUploadWarning = saved.uploadWarning;
+      commentSubmissionWarning = saved.commentWarning;
+      commentSubmissionUncertain = Boolean(commentSubmissionWarning);
+      recoveredCommentDraft = saved.commentDraft;
+    }
+  } catch {
+    issueUploadWarning = commentSubmissionWarning = uncertainMessage;
+    commentSubmissionUncertain = true;
+  }
+  const persistMutationRecovery = () => {
+    sessionStorage.setItem(recoveryKey, JSON.stringify({
+      uploadWarning:issueUploadWarning, commentWarning:commentSubmissionWarning,
+      commentDraft:$("commentEditor")?.value ?? recoveredCommentDraft,
+    }));
+  };
   const renderUploadAvailability = () => {
     $("issueAttachmentInput").disabled = issueUploadPending || Boolean(issueUploadWarning);
     $("issueAttachmentError").textContent = issueUploadWarning;
+    $("resolveIssueUpload").hidden = !issueUploadWarning || issueUploadPending;
+  };
+  const renderCommentAvailability = () => {
+    $("postComment").disabled = commentSubmissionPending || commentSubmissionUncertain;
+    $("commentEditor").disabled = commentSubmissionPending;
+    $("commentAttachmentInput").disabled = commentSubmissionPending || commentSubmissionUncertain;
+    $("commentError").textContent = commentSubmissionWarning;
+    $("resolveComment").hidden = !commentSubmissionUncertain || commentSubmissionPending;
   };
   const uploadIssueAttachments = async (attachments) => {
     const form = new FormData();
     for (const attachment of attachments) form.append("attachments", attachment.file, attachment.name);
-    let response, payload;
+    // Record the in-flight ambiguity before dispatch, including reloads while
+    // the request is pending. A storage failure must prevent dispatch.
+    issueUploadWarning = uncertainMessage;
+    persistMutationRecovery();
     try {
-      response = await fugueFetch(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/attachments`, {
+      const payload = await fugueIssueMutation(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/attachments`, {
         method:"POST", headers:{"Accept":"application/json","X-Fugue-Tracker-Scope":trackerScope}, body:form
-      });
-      payload = await response.json();
-    } catch {
-      issueUploadWarning = "The upload result was lost. Check the existing issue before uploading any files again.";
-      throw new Error(issueUploadWarning);
+      }, {kind:"upload", fileCount:attachments.length});
+      issueUploadWarning = payload.warning?.message || "";
+      persistMutationRecovery();
+      return payload;
+    } catch (error) {
+      issueUploadWarning = error.confirmedRejected ? "" : uncertainMessage;
+      persistMutationRecovery();
+      throw error;
     }
-    if (!response.ok) throw new Error(payload?.error?.message || `Attachment upload failed: ${response.status}`);
-    if (payload.warning) issueUploadWarning = payload.warning.message;
-    return payload;
   };
   const renderCommentAttachments = () => { const list = $("commentAttachmentList"); if (!list) return; list.innerHTML = commentAttachmentState.length ? commentAttachmentState.map((attachment, index) => `<span class="attachment-chip">${escapeHtml(attachment.name)} · ${escapeHtml(formatFileSize(attachment.size))} <button type="button" data-comment-attachment-remove="${index}" aria-label="Remove ${escapeHtml(attachment.name)}">×</button></span>`).join("") : '<span class="meta">No files selected for this comment.</span>'; };
   const installCommentAttachmentInput = () => { const input = $("commentAttachmentInput"); if (!input || input.dataset.attachmentReady === "true") return; input.dataset.attachmentReady = "true"; input.addEventListener("change", () => { const error = $("commentError"); try { for (const file of Array.from(input.files || [])) commentAttachmentState.push(validateIssueAttachment(file, commentAttachmentState)); renderCommentAttachments(); } catch (caught) { if (error) error.textContent = caught.message; showNotice(caught.message); } finally { input.value = ""; } }); };
@@ -2407,6 +2446,7 @@ const ISSUE_DETAIL_HTML: &str = r#"<!doctype html>
     const addFiles = async (files) => {
       if (issueUploadPending || issueUploadWarning) return;
       const added = [];
+      let attemptError = "";
       try {
         for (const file of Array.from(files || [])) added.push(validateIssueAttachment(file, added));
         if (!added.length) return;
@@ -2417,6 +2457,7 @@ const ISSUE_DETAIL_HTML: &str = r#"<!doctype html>
         showNotice(issueUploadWarning || `Attached ${payload.attachments?.length || added.length} file(s).`);
         await load(true);
       } catch (caught) {
+        attemptError = caught.message;
         showNotice(caught.message);
         $("issueAttachmentError").textContent = caught.message;
       } finally {
@@ -2426,8 +2467,8 @@ const ISSUE_DETAIL_HTML: &str = r#"<!doctype html>
         }
         issueUploadPending = false;
         renderIssueAttachments();
-        $("issueAttachmentInput").disabled = Boolean(issueUploadWarning);
-        if (issueUploadWarning) $("issueAttachmentError").textContent = issueUploadWarning;
+        renderUploadAvailability();
+        if (!issueUploadWarning && attemptError) $("issueAttachmentError").textContent = attemptError;
       }
     };
     zone.addEventListener("drop", async (event) => {
@@ -2442,63 +2483,92 @@ const ISSUE_DETAIL_HTML: &str = r#"<!doctype html>
     });
   };
   document.addEventListener("dragover", (event) => { if (dataTransferHasFiles(event)) event.preventDefault(); }, true); document.addEventListener("drop", (event) => { if (dataTransferHasFiles(event)) event.preventDefault(); }, true);
-  const render = () => { const commentDraft = $("commentEditor")?.value || ""; const workpadOpen = $("agentWorkpad")?.open || false; renderKpis(); const issue = detail.issue; const id = newtype(issue.identifier); const current = issue.state.name; targetLane = targetLane || current; $("issueId").textContent = id; $("title").textContent = issue.title; $("stateChip").textContent = `${laneGlyph(current)} ${current.toUpperCase()}`; const dirty = targetLane !== current; $("dirtyFlag").hidden = !dirty; $("save").disabled = !dirty; $("save").innerHTML = dirty && isAction(targetLane) ? `SAVE & RUN ${escapeHtml(isAction(targetLane).toUpperCase())} <span class="meta">⌘S</span>` : `SAVE CHANGES <span class="meta">⌘S</span>`; $("diff").innerHTML = dirty ? `● 1 UNSAVED CHANGE&nbsp;&nbsp; Lane: ${escapeHtml(current)} → ${escapeHtml(targetLane)} ${isAction(targetLane) ? `<span class="trigger">▸ triggers ${escapeHtml(isAction(targetLane))} procedure</span>` : ""}` : "No changes"; $("props").innerHTML = `<div class="field ${dirty ? "dirty" : ""}"><div class="field-head"><span>LANE</span>${dirty ? "<span>● CHANGED</span>" : ""}</div><div class="value">${dirty ? `<del>${escapeHtml(current)}</del> → <strong>${escapeHtml(targetLane)}</strong>` : escapeHtml(current)}</div></div><div class="field"><div class="field-head"><span>LABELS</span></div><div>${issue.labels.map((l) => `<span class="label-chip">${escapeHtml(l)}</span>`).join("")}</div></div><div class="field"><div class="field-head"><span>ASSIGNEE</span></div><div>${escapeHtml(issue.assignee?.name || "Unassigned")}</div></div><div class="field"><div class="field-head"><span>BRANCH</span></div><div>${escapeHtml(newtype(issue.branch_name) || "None")}</div></div>`; $("middle").innerHTML = `<h2 class="section-title mono">DESCRIPTION</h2><div class="description">${escapeHtml(issue.description || "No description")}</div><h2 class="section-title mono">ACTIVITY</h2>${detail.comments.filter(comment => newtype(comment.comment_id) !== newtype(detail.workpad?.comment_id)).map(renderComment).join("") || '<div class="meta">No comments</div>'}<h2 class="section-title mono">ATTACHMENTS</h2><section class="attachment-drop-zone" id="issueAttachmentDropZone" data-attachment-drop-zone aria-label="Drop files to attach them to this issue"><label class="attachment-input-label" for="issueAttachmentInput"><span>Choose files</span><input id="issueAttachmentInput" type="file" multiple></label><div class="attachment-drop-affordance" aria-hidden="true">Drop files here to attach them to this issue</div><div class="attachment-list" id="issueAttachmentList" aria-live="polite"></div><div class="attachment-error meta" id="issueAttachmentError" role="alert"></div></section><h2 class="section-title mono">NEW COMMENT</h2><section class="comment-composer" aria-label="New comment"><textarea id="commentEditor" class="issue-markdown-editor" spellcheck="true" placeholder="Add a comment…"></textarea><label class="attachment-input-label" for="commentAttachmentInput"><span>Attach files to this comment</span><input id="commentAttachmentInput" type="file" multiple></label><div class="attachment-list" id="commentAttachmentList" aria-live="polite"></div><div class="comment-actions"><div class="comment-error meta" id="commentError" role="alert"></div><button class="comment-submit" id="postComment" type="button">POST COMMENT <span class="meta">C</span></button></div></section><details id="agentWorkpad" ${workpadOpen ? "open" : ""}><summary class="section-title mono">AGENT WORKPAD</summary><p class="meta">Execution notes and validation evidence maintained by the agents.</p><textarea id="workpadEditor" class="issue-markdown-editor" aria-label="Agent workpad" readonly>${escapeHtml(detail.workpad?.body_markdown || "No workpad yet.")}</textarea></details>`; $("lanePicker").innerHTML = detail.lanes.map((lane) => `<button class="lane-row ${targetLane === lane ? "target" : ""}" data-lane="${escapeHtml(lane)}" type="button"><span>${laneGlyph(lane)}</span><span>${escapeHtml(lane)}${isAction(lane) ? `<span class="sub">▸ runs ${escapeHtml(isAction(lane))} procedure</span>` : ""}</span><span class="meta">${lane === current ? "FROM" : targetLane === lane ? "NEW LANE" : ""}</span></button>`).join(""); $("commentEditor").value = commentDraft; renderIssueAttachments(); renderCommentAttachments(); installAttachmentDropTarget(); installCommentAttachmentInput(); $("postComment").disabled = commentSubmissionUncertain; $("commentError").textContent = commentSubmissionWarning; renderUploadAvailability(); };
+  const render = () => { const commentDraft = $("commentEditor")?.value ?? recoveredCommentDraft; const workpadOpen = $("agentWorkpad")?.open || false; renderKpis(); const issue = detail.issue; const id = newtype(issue.identifier); const current = issue.state.name; targetLane = targetLane || current; $("issueId").textContent = id; $("title").textContent = issue.title; $("stateChip").textContent = `${laneGlyph(current)} ${current.toUpperCase()}`; const dirty = targetLane !== current; $("dirtyFlag").hidden = !dirty; $("save").disabled = !dirty; $("save").innerHTML = dirty && isAction(targetLane) ? `SAVE & RUN ${escapeHtml(isAction(targetLane).toUpperCase())} <span class="meta">⌘S</span>` : `SAVE CHANGES <span class="meta">⌘S</span>`; $("diff").innerHTML = dirty ? `● 1 UNSAVED CHANGE&nbsp;&nbsp; Lane: ${escapeHtml(current)} → ${escapeHtml(targetLane)} ${isAction(targetLane) ? `<span class="trigger">▸ triggers ${escapeHtml(isAction(targetLane))} procedure</span>` : ""}` : "No changes"; $("props").innerHTML = `<div class="field ${dirty ? "dirty" : ""}"><div class="field-head"><span>LANE</span>${dirty ? "<span>● CHANGED</span>" : ""}</div><div class="value">${dirty ? `<del>${escapeHtml(current)}</del> → <strong>${escapeHtml(targetLane)}</strong>` : escapeHtml(current)}</div></div><div class="field"><div class="field-head"><span>LABELS</span></div><div>${issue.labels.map((l) => `<span class="label-chip">${escapeHtml(l)}</span>`).join("")}</div></div><div class="field"><div class="field-head"><span>ASSIGNEE</span></div><div>${escapeHtml(issue.assignee?.name || "Unassigned")}</div></div><div class="field"><div class="field-head"><span>BRANCH</span></div><div>${escapeHtml(newtype(issue.branch_name) || "None")}</div></div>`; $("middle").innerHTML = `<h2 class="section-title mono">DESCRIPTION</h2><div class="description">${escapeHtml(issue.description || "No description")}</div><h2 class="section-title mono">ACTIVITY</h2>${detail.comments.filter(comment => newtype(comment.comment_id) !== newtype(detail.workpad?.comment_id)).map(renderComment).join("") || '<div class="meta">No comments</div>'}<h2 class="section-title mono">ATTACHMENTS</h2><section class="attachment-drop-zone" id="issueAttachmentDropZone" data-attachment-drop-zone aria-label="Drop files to attach them to this issue"><label class="attachment-input-label" for="issueAttachmentInput"><span>Choose files</span><input id="issueAttachmentInput" type="file" multiple></label><div class="attachment-drop-affordance" aria-hidden="true">Drop files here to attach them to this issue</div><div class="attachment-list" id="issueAttachmentList" aria-live="polite"></div><div class="attachment-error meta" id="issueAttachmentError" role="alert"></div><button id="resolveIssueUpload" type="button" hidden>I've checked the issue</button></section><h2 class="section-title mono">NEW COMMENT</h2><section class="comment-composer" aria-label="New comment"><textarea id="commentEditor" class="issue-markdown-editor" spellcheck="true" placeholder="Add a comment…"></textarea><label class="attachment-input-label" for="commentAttachmentInput"><span>Attach files to this comment</span><input id="commentAttachmentInput" type="file" multiple></label><div class="attachment-list" id="commentAttachmentList" aria-live="polite"></div><div class="comment-actions"><div class="comment-error meta" id="commentError" role="alert"></div><button id="resolveComment" type="button" hidden>I've checked the issue</button><button class="comment-submit" id="postComment" type="button">POST COMMENT <span class="meta">C</span></button></div></section><details id="agentWorkpad" ${workpadOpen ? "open" : ""}><summary class="section-title mono">AGENT WORKPAD</summary><p class="meta">Execution notes and validation evidence maintained by the agents.</p><textarea id="workpadEditor" class="issue-markdown-editor" aria-label="Agent workpad" readonly>${escapeHtml(detail.workpad?.body_markdown || "No workpad yet.")}</textarea></details>`; $("lanePicker").innerHTML = detail.lanes.map((lane) => `<button class="lane-row ${targetLane === lane ? "target" : ""}" data-lane="${escapeHtml(lane)}" type="button"><span>${laneGlyph(lane)}</span><span>${escapeHtml(lane)}${isAction(lane) ? `<span class="sub">▸ runs ${escapeHtml(isAction(lane))} procedure</span>` : ""}</span><span class="meta">${lane === current ? "FROM" : targetLane === lane ? "NEW LANE" : ""}</span></button>`).join(""); $("commentEditor").value = commentDraft; renderIssueAttachments(); renderCommentAttachments(); installAttachmentDropTarget(); installCommentAttachmentInput(); renderCommentAvailability(); renderUploadAvailability(); };
   const load = async (preserveTarget = false) => { const previousTarget = targetLane; try { detail = await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}`); targetLane = preserveTarget && previousTarget ? previousTarget : detail.issue.state.name; render(); } catch (error) { showNotice(error.message); } };
-  let commentSubmissionUncertain = false;
-  let commentSubmissionWarning = "";
   const postComment = async () => {
-    const editor = $("commentEditor"), button = $("postComment"), error = $("commentError");
-    if (!editor || !button || !error || commentSubmissionUncertain || button.disabled) return;
+    const editor = $("commentEditor");
+    if (!editor || commentSubmissionUncertain || commentSubmissionPending) return;
     const body = editor.value.trim();
     clearNotice();
-    error.textContent = "";
     if (!body && commentAttachmentState.length === 0) {
-      error.textContent = "Comment or attachment is required.";
+      $("commentError").textContent = "Comment or attachment is required.";
       editor.focus();
       return;
     }
-    button.disabled = true;
+    const pending = commentAttachmentState.slice();
+    let attemptError = "";
+    commentSubmissionPending = true;
+    commentSubmissionUncertain = true;
+    commentSubmissionWarning = uncertainMessage;
+    renderCommentAvailability();
     try {
-      if (commentAttachmentState.length) {
-        const pending = commentAttachmentState.slice();
+      persistMutationRecovery();
+      let options;
+      if (pending.length) {
         const form = new FormData();
         form.append("body_markdown", body);
         for (const attachment of pending) form.append("attachments", attachment.file, attachment.name);
-        let response, payload;
-        try {
-          response = await fugueFetch(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/comments`, {
-            method:"POST", headers:{"Accept":"application/json","X-Fugue-Tracker-Scope":trackerScope}, body:form
-          });
-          payload = await response.json();
-        } catch {
-          commentSubmissionUncertain = true;
-          throw new Error("The upload result was lost. Check the existing issue before posting the comment or uploading files again.");
-        }
-        if (!response.ok) throw new Error(payload?.error?.message || `Comment failed: ${response.status}`);
-        for (const attachment of pending) {
-          const index = commentAttachmentState.indexOf(attachment);
-          if (index >= 0) commentAttachmentState.splice(index, 1);
-        }
-        renderCommentAttachments();
-        if (payload.warning) {
-          commentSubmissionUncertain = true;
-          throw new Error(payload.warning.message);
-        }
+        options = {method:"POST", headers:{"Accept":"application/json","X-Fugue-Tracker-Scope":trackerScope}, body:form};
       } else {
-        await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/comments`, {
-          method: "POST", body: JSON.stringify({ body_markdown: body })
-        });
+        options = {method:"POST", headers:{"Accept":"application/json","Content-Type":"application/json","X-Fugue-Tracker-Scope":trackerScope}, body:JSON.stringify({body_markdown:body})};
       }
-      editor.value = "";
+      const payload = await fugueIssueMutation(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/comments`, options, {kind:"comment", fileCount:pending.length});
+      for (const attachment of pending) {
+        const index = commentAttachmentState.indexOf(attachment);
+        if (index >= 0) commentAttachmentState.splice(index, 1);
+      }
+      renderCommentAttachments();
+      commentSubmissionWarning = payload.warning?.message || "";
+      commentSubmissionUncertain = Boolean(commentSubmissionWarning);
+      if (!commentSubmissionUncertain) {
+        $("commentEditor").value = "";
+        recoveredCommentDraft = "";
+      }
+      persistMutationRecovery();
+      if (commentSubmissionWarning) showNotice(commentSubmissionWarning);
       await load(true);
     } catch (caught) {
-      if (commentSubmissionUncertain) commentSubmissionWarning = caught.message;
-      error.textContent = caught.message;
+      // Keep the pre-dispatch record on storage failure as well. Only a known
+      // HTTP rejection permits another submission.
+      if (caught.confirmedRejected) {
+        commentSubmissionUncertain = false;
+        commentSubmissionWarning = "";
+      }
+      attemptError = caught.message;
+      try { persistMutationRecovery(); } catch (storageError) {
+        commentSubmissionUncertain = true;
+        commentSubmissionWarning = uncertainMessage;
+        console.warn("Could not save comment recovery state", storageError);
+      }
       showNotice(caught.message);
+      $("commentError").textContent = caught.message;
     } finally {
-      button.disabled = commentSubmissionUncertain;
+      commentSubmissionPending = false;
+      renderCommentAvailability();
+      if (!commentSubmissionUncertain && attemptError) $("commentError").textContent = attemptError;
     }
   };
+  document.addEventListener("click", (event) => {
+    const upload = event.target.id === "resolveIssueUpload";
+    const comment = event.target.id === "resolveComment";
+    if ((!upload && !comment) || issueUploadPending || commentSubmissionPending) return;
+    if (!window.confirm("Have you checked the existing issue for the comment and files? Continue only after reconciling the result. This clears the warning and pending files without resending anything. Your comment draft is kept.")) return;
+    const previousUploadWarning = issueUploadWarning;
+    const previousCommentWarning = commentSubmissionWarning;
+    if (upload) issueUploadWarning = "";
+    if (comment) { commentSubmissionWarning = ""; commentSubmissionUncertain = false; }
+    try {
+      persistMutationRecovery();
+      if (comment) commentAttachmentState.length = 0;
+      renderCommentAttachments(); renderCommentAvailability(); renderUploadAvailability();
+      clearNotice();
+    } catch (error) {
+      issueUploadWarning = previousUploadWarning;
+      commentSubmissionWarning = previousCommentWarning;
+      commentSubmissionUncertain = Boolean(previousCommentWarning);
+      showNotice("The reconciliation could not be saved. " + error.message);
+    }
+  });
   document.addEventListener("click", async (event) => { if (event.target.id === "close" || event.target.id === "cancel" || event.target === document.body) fugueNavigate("/issues"); const row = event.target.closest(".lane-row"); if (row) { targetLane = row.dataset.lane; render(); } if (event.target.dataset.commentAttachmentRemove) { commentAttachmentState.splice(Number(event.target.dataset.commentAttachmentRemove), 1); renderCommentAttachments(); } if (event.target.id === "postComment") { await postComment(); } if (event.target.id === "save" && detail && targetLane !== detail.issue.state.name) { try { await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/state`, { method:"PATCH", body: JSON.stringify({ state: targetLane }) }); fugueNavigate("/issues"); } catch (error) { showNotice(error.message); } } });
   document.addEventListener("keydown", async (event) => { const target = event.target; const editing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement; if (event.key === "Escape") fugueNavigate("/issues"); if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") { event.preventDefault(); $("save").click(); } else if (!editing && event.key.toLowerCase() === "c") { event.preventDefault(); $("commentEditor")?.focus(); } });
   load();
@@ -3177,8 +3247,17 @@ fn validate_browser_tracker_context(
     config: &ServiceConfig,
     headers: &HeaderMap,
 ) -> std::result::Result<(), TrackerContextChanged> {
-    if let Some(scope) = headers.get("x-fugue-tracker-scope")
-        && scope.to_str().ok() != Some(config.tracker_context_id().as_str())
+    let scope = headers.get("x-fugue-tracker-scope");
+    let browser_request = headers.contains_key("origin")
+        || headers
+            .keys()
+            .any(|key| key.as_str().starts_with("sec-fetch-"));
+    // Non-browser API clients retain the existing optional-header contract.
+    // Browsers cannot suppress Origin/Fetch Metadata on these mutations, so
+    // an already-open legacy page must refresh after tracker reconfiguration.
+    if (browser_request && scope.is_none())
+        || scope
+            .is_some_and(|scope| scope.to_str().ok() != Some(config.tracker_context_id().as_str()))
     {
         return Err(TrackerContextChanged);
     }
@@ -3821,6 +3900,21 @@ fn linear_config_error_response(error: crate::error::FugueError) -> axum::respon
 }
 
 fn issue_adapter_error_response(error: crate::error::FugueError) -> axum::response::Response {
+    if let crate::error::FugueError::JiraApiStatus { status } = &error
+        && matches!(
+            status,
+            400 | 401 | 403 | 404 | 405 | 409 | 413 | 415 | 422 | 429
+        )
+        && let Ok(status) = StatusCode::from_u16(*status)
+    {
+        return (
+            status,
+            Json(json!({"error": {
+                "code": "jira_request_rejected", "message": error.to_string()
+            }})),
+        )
+            .into_response();
+    }
     (
         StatusCode::BAD_GATEWAY,
         Json(json!({
@@ -6568,7 +6662,8 @@ mod tests {
             assert!(!String::from_utf8_lossy(&bytes).contains("private-response-sentinel"));
             let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             if scenario == "rejected" {
-                assert_eq!(status, StatusCode::BAD_GATEWAY);
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert_eq!(payload["error"]["code"], "jira_request_rejected");
             } else {
                 assert_eq!(status, StatusCode::OK, "{scenario}: {payload}");
                 assert_eq!(
@@ -6613,19 +6708,26 @@ mod tests {
         )
         .await
         .unwrap();
-        for endpoint in ["attachments", "comments"] {
-            let mut request = attachment_test_request(
-                "POST",
-                &format!("/api/v1/issues/TEST-1/{endpoint}"),
-                attachment_test_body(),
-                Some("multipart/form-data; boundary=fixture"),
-            );
-            request.headers_mut().insert(
-                "x-fugue-tracker-scope",
-                HeaderValue::from_str(&old_context).unwrap(),
-            );
-            let response = app.clone().oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::CONFLICT);
+        for missing in [false, true] {
+            for endpoint in ["attachments", "comments"] {
+                let mut request = attachment_test_request(
+                    "POST",
+                    &format!("/api/v1/issues/TEST-1/{endpoint}"),
+                    attachment_test_body(),
+                    Some("multipart/form-data; boundary=fixture"),
+                );
+                request
+                    .headers_mut()
+                    .insert("origin", HeaderValue::from_static("http://localhost"));
+                if !missing {
+                    request.headers_mut().insert(
+                        "x-fugue-tracker-scope",
+                        HeaderValue::from_str(&old_context).unwrap(),
+                    );
+                }
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+            }
         }
         assert!(mock.requests.lock().unwrap().is_empty());
         assert!(!storage.exists());
@@ -6726,8 +6828,8 @@ mod tests {
                     "--exact", "--nocapture",
                 ])
                 .env(MARKER, "1")
-                .env("FUGUE_TEST_TRACKER_SITE", "https://jira.example.test")
-                .env("FUGUE_TEST_TRACKER_PROJECT", "TEST")
+                .env("FUGUE.TEST.TRACKER.SITE", "https://jira.example.test")
+                .env("FUGUE.TEST.TRACKER.PROJECT", "TEST")
                 .output().unwrap();
             assert!(
                 output.status.success(),
@@ -6740,8 +6842,8 @@ mod tests {
         }
         let mut referenced = issue_board_config();
         referenced.tracker.kind = "jira".into();
-        referenced.tracker.endpoint = "$FUGUE_TEST_TRACKER_SITE".into();
-        referenced.tracker.project_slug = Some("$FUGUE_TEST_TRACKER_PROJECT".into());
+        referenced.tracker.endpoint = "$FUGUE.TEST.TRACKER.SITE".into();
+        referenced.tracker.project_slug = Some("$FUGUE.TEST.TRACKER.PROJECT".into());
         let mut literal = referenced.clone();
         literal.tracker.endpoint = "https://jira.example.test".into();
         literal.tracker.project_slug = Some("TEST".into());

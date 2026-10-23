@@ -40,6 +40,7 @@ elif '--list' in sys.argv:
         print('ensemble::runtime::tests::native_flow_delivers_worker_failure_without_peer_reply: test')
 elif 'runtime_members' in selection:
     assert os.environ['FUGUE_ISOLATED_RUNTIME_TEST'] == 'runtime_members_emit_canonical_structural_events'
+    Path(os.environ['FUGUE_TEST_EVIDENCE_DIR'], 'runtime.sqlite3').write_bytes(b'fixture state')
     print(os.environ.get('FIXTURE_OUTPUT', 'test result: ok. 1 passed;'), flush=True)
 else:
     print('test result: ok. 2 passed;', flush=True)
@@ -134,6 +135,11 @@ class NativeTrialEvidenceTests(unittest.TestCase):
                 self.assertEqual(row['qualified'], qualified)
                 self.assertEqual((self.root / f'attempt-{index:02}.log').read_text(), output + '\n')
                 self.assertEqual(json.loads((self.root / f'attempt-{index:02}.json').read_text()), row)
+                state_dir = self.root / f'attempt-{index:02}-state'
+                self.assertEqual(state_dir.exists(), not qualified)
+                self.assertEqual(row['runtime_state_retained'], not qualified)
+                if not qualified:
+                    self.assertEqual((state_dir / 'runtime.sqlite3').read_bytes(), b'fixture state')
 
     def test_timeout_retains_live_output_and_stops_descendants(self):
         with patch.dict(os.environ, FIXTURE_HANG='retirement'):

@@ -67,6 +67,12 @@ successful diagnostics, failures and unfinished trials, plus the test
 executable's SHA-256. A zero exit code cannot hide a transcript conflict or an
 empty test selection.
 
+The artifact also includes the full suite's retirement-test database and child
+process logs under `fugue-full-suite`. Setting `FUGUE_TEST_EVIDENCE_DIR` transfers
+cleanup responsibility to the caller: the test retains its database even on a
+normal exit. The repeat harness removes only its own successful trial's database
+after checking the transcript. Rejected or unfinished trials keep their state.
+
 Listings, handoff rounds and retirement trials have individual time limits.
 Timeout or cancellation stops the owned process group, escalating to a kill if
 termination does not finish. The CI step leaves extra time for cleanup and

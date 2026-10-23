@@ -1602,14 +1602,14 @@ impl ServiceConfig {
         // Scope the effective values so changing a deployment's environment
         // cannot reuse another tracker's browser receipts or local files.
         let jira_endpoint = (self.tracker.kind == "jira")
-            .then(|| resolve_env_string(&self.tracker.endpoint))
+            .then(|| crate::jira::env_value(&self.tracker.endpoint))
             .flatten();
         let jira_project = (self.tracker.kind == "jira")
             .then(|| {
                 self.tracker
                     .project_slug
                     .as_deref()
-                    .and_then(resolve_env_string)
+                    .and_then(crate::jira::env_value)
             })
             .flatten();
         let mut identity = Sha256::new();

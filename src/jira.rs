@@ -121,7 +121,7 @@ fn request_error(error: reqwest::Error) -> FugueError {
     FugueError::JiraRequest(error.without_url().to_string())
 }
 
-fn env_value(value: &str) -> Option<String> {
+pub(crate) fn env_value(value: &str) -> Option<String> {
     match value.strip_prefix('$') {
         Some(name) => std::env::var(name).ok(),
         None => Some(value.to_string()),

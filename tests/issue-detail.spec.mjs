@@ -76,6 +76,10 @@ for (const lostResponse of [false, true]) {
     await page.getByRole('button',{name:/Review/}).click();
     await expect(page.locator('#postComment')).toBeDisabled();
     await expect(page.locator('#commentError')).toContainText('Check the existing issue');
+    await page.reload();
+    await expect(page.locator('#postComment')).toBeDisabled();
+    await expect(page.locator('#commentError')).toContainText('Check the existing issue');
+    await expect(page.locator('#commentEditor')).toHaveValue('Keep my review notes.');
     expect(posts).toBe(1);
   });
 }
@@ -98,6 +102,9 @@ for (const lostResponse of [false, true]) {
     await expect(page.locator('#issueAttachmentError')).toContainText('Check the existing issue');
     await expect(page.locator('#issueAttachmentInput')).toBeDisabled();
     await page.getByRole('button',{name:/Review/}).click();
+    await expect(page.locator('#issueAttachmentInput')).toBeDisabled();
+    await expect(page.locator('#issueAttachmentError')).toContainText('Check the existing issue');
+    await page.reload();
     await expect(page.locator('#issueAttachmentInput')).toBeDisabled();
     await expect(page.locator('#issueAttachmentError')).toContainText('Check the existing issue');
     expect(posts).toBe(1);
@@ -127,4 +134,114 @@ test('a rejected direct upload can be retried and only accepted files appear as 
   await expect(page.locator('#issueAttachmentList .attachment-chip')).toHaveCount(1);
   await expect(page.locator('#issueAttachmentInput')).toBeEnabled();
   expect(posts).toBe(2);
+});
+
+for (const withFiles of [false, true]) {
+  test(`comment in flight survives rerender without a second POST (${withFiles ? 'files' : 'text'})`, async ({page}) => {
+    const detail={issue:{identifier:'TEST-1',title:'Comment race',state:{name:'Active'},labels:[],description:''},comments:[],attachments:[],workpad:null,runtime:null,lanes:['Active','Review'],lane_actions:{}};
+    let posts=0, release;
+    const gate=new Promise(resolve=>{release=resolve;});
+    await page.route('http://fugue.test/**',async route=>{
+      if(route.request().url().endsWith('/comments') && route.request().method()==='POST') {
+        posts++;
+        await gate;
+        return route.fulfill({json:{result:{comment_id:'comment-1'},attachments:withFiles?[{name:'trace.txt',url:'https://jira.example.test/attachment/1'}]:[]}});
+      }
+      return route.request().url().includes('/api/')?route.fulfill({json:detail}):route.fulfill({contentType:'text/html',body:browserDocument(html)});
+    });
+    await page.goto('http://fugue.test/issues/TEST-1');
+    await page.locator('#commentEditor').fill('Submit only once');
+    if(withFiles) await page.locator('#commentAttachmentInput').setInputFiles({name:'trace.txt',mimeType:'text/plain',buffer:Buffer.from('trace')});
+    await page.locator('#postComment').click();
+    await expect.poll(()=>posts).toBe(1);
+    await page.getByRole('button',{name:/Review/}).click();
+    await expect(page.locator('#postComment')).toBeDisabled();
+    await expect(page.locator('#commentEditor')).toBeDisabled();
+    // Even a programmatic click event on the replacement node must be gated.
+    await page.locator('#postComment').dispatchEvent('click');
+    expect(posts).toBe(1);
+    release();
+    await expect(page.locator('#postComment')).toBeEnabled();
+    await expect(page.locator('#commentEditor')).toHaveValue('');
+    expect(posts).toBe(1);
+  });
+}
+
+for (const kind of ['upload','comment','text-comment']) {
+  for (const reply of [
+    {name:'gateway JSON',status:502,json:{error:{message:'upstream disconnected'}}},
+    {name:'gateway timeout',status:504,json:{error:{message:'upstream timeout'}}},
+    {name:'empty success',status:200,json:{}},
+    {name:'missing acknowledgement',status:200,json:{attachments:[]}},
+  ]) {
+    test(`${kind} preserves uncertainty across reload after ${reply.name}`,async({page})=>{
+      const detail={issue:{identifier:'TEST-1',title:'Unknown outcome',state:{name:'Active'},labels:[],description:''},comments:[],attachments:[],workpad:null,runtime:null,lanes:['Active'],lane_actions:{}};
+      let posts=0;
+      await page.route('http://fugue.test/**',route=>{
+        if(route.request().method()==='POST') {posts++;return route.fulfill({status:reply.status,json:reply.json});}
+        return route.request().url().includes('/api/')?route.fulfill({json:detail}):route.fulfill({contentType:'text/html',body:browserDocument(html)});
+      });
+      await page.goto('http://fugue.test/issues/TEST-1');
+      const file={name:'trace.txt',mimeType:'text/plain',buffer:Buffer.from('trace')};
+      if(kind==='upload') await page.locator('#issueAttachmentInput').setInputFiles(file);
+      else {
+        await page.locator('#commentEditor').fill('Keep the draft');
+        if(kind==='comment') await page.locator('#commentAttachmentInput').setInputFiles(file);
+        await page.locator('#postComment').click();
+      }
+      const control=kind==='upload'?'#issueAttachmentInput':'#postComment';
+      const warning=kind==='upload'?'#issueAttachmentError':'#commentError';
+      await expect(page.locator(warning)).toContainText('Check the existing issue');
+      await page.reload();
+      await expect(page.locator(control)).toBeDisabled();
+      await expect(page.locator(warning)).toContainText('Check the existing issue');
+      if(kind!=='upload') await expect(page.locator('#commentEditor')).toHaveValue('Keep the draft');
+      expect(posts).toBe(1);
+    });
+  }
+}
+
+test('a known rejected text comment stays editable and can be retried',async({page})=>{
+  const detail={issue:{identifier:'TEST-1',title:'Known rejection',state:{name:'Active'},labels:[],description:''},comments:[],attachments:[],workpad:null,runtime:null,lanes:['Active'],lane_actions:{}};
+  let posts=0;
+  await page.route('http://fugue.test/**',route=>{
+    if(route.request().method()==='POST') {
+      posts++;
+      return posts===1?route.fulfill({status:403,json:{error:{code:'jira_request_rejected',message:'Jira rejected this comment.'}}}):route.fulfill({json:{result:{comment_id:'comment-1'},attachments:[]}});
+    }
+    return route.request().url().includes('/api/')?route.fulfill({json:detail}):route.fulfill({contentType:'text/html',body:browserDocument(html)});
+  });
+  await page.goto('http://fugue.test/issues/TEST-1');
+  await page.locator('#commentEditor').fill('Retry after fixing access');
+  await page.locator('#postComment').click();
+  await expect(page.locator('#commentError')).toContainText('Jira rejected');
+  await expect(page.locator('#postComment')).toBeEnabled();
+  await page.locator('#postComment').click();
+  await expect(page.locator('#commentEditor')).toHaveValue('');
+  expect(posts).toBe(2);
+});
+
+test('explicit reconciliation enables a new comment without resending the uncertain one',async({page})=>{
+  const detail={issue:{identifier:'TEST-1',title:'Reconcile',state:{name:'Active'},labels:[],description:''},comments:[],attachments:[],workpad:null,runtime:null,lanes:['Active'],lane_actions:{}};
+  let posts=0;
+  await page.route('http://fugue.test/**',route=>{
+    if(route.request().method()==='POST') {posts++;return route.fulfill({status:504,json:{error:{message:'timeout'}}});}
+    return route.request().url().includes('/api/')?route.fulfill({json:detail}):route.fulfill({contentType:'text/html',body:browserDocument(html)});
+  });
+  await page.goto('http://fugue.test/issues/TEST-1');
+  await page.locator('#commentEditor').fill('Keep for reconciliation');
+  await page.locator('#commentAttachmentInput').setInputFiles({name:'trace.txt',mimeType:'text/plain',buffer:Buffer.from('trace')});
+  await page.locator('#postComment').click();
+  await expect(page.locator('#postComment')).toBeDisabled();
+  page.once('dialog',dialog=>dialog.dismiss());
+  await page.locator('#resolveComment').click();
+  await expect(page.locator('#postComment')).toBeDisabled();
+  page.once('dialog',dialog=>dialog.accept());
+  await page.locator('#resolveComment').click();
+  await expect(page.locator('#postComment')).toBeEnabled();
+  await expect(page.locator('#commentAttachmentList')).not.toContainText('trace.txt');
+  await expect(page.locator('#commentEditor')).toHaveValue('Keep for reconciliation');
+  await page.reload();
+  await expect(page.locator('#postComment')).toBeEnabled();
+  expect(posts).toBe(1);
 });

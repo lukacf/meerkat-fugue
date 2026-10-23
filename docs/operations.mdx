@@ -68,6 +68,10 @@ Managed repositories keep uploaded files under their own state directory's
 `.fugue/tracker-files/<scope-hash>` beside the workflow. The scope includes the
 tracker kind, endpoint and project, so identical issue keys from separate
 trackers do not share files. Include these directories in your backup.
+Jira environment references use the same resolver for access and file scoping.
+Browser mutations require the scope embedded in the current page; after changing
+a repository's tracker, reload any already-open issue forms. Non-browser API
+clients can send `X-Fugue-Tracker-Scope` for the same stale-context protection.
 
 Older explicit workflows may have files under `.fugue/issue-attachments`, and
 older managed repositories may have unscoped files under `files`. Preserve those

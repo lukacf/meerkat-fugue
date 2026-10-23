@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -122,9 +123,11 @@ def run_phase(command, report_dir, name, timeout, cancelled, env=None):
 def qualify_retirement(executable, report_dir, attempt, cancelled=None, timeout=180):
     # Each trial is already a separate process. Bypass the nested isolation
     # wrapper so successful exits cannot discard the actual runtime diagnostics.
-    env = dict(os.environ, FUGUE_ISOLATED_RUNTIME_TEST='runtime_members_emit_canonical_structural_events',
-               FUGUE_TEST_EVIDENCE_DIR=str(report_dir.resolve()))
     name = f'attempt-{attempt:02}'
+    state_dir = report_dir / f'{name}-state'
+    state_dir.mkdir()
+    env = dict(os.environ, FUGUE_ISOLATED_RUNTIME_TEST='runtime_members_emit_canonical_structural_events',
+               FUGUE_TEST_EVIDENCE_DIR=str(state_dir.resolve()))
     row = run_phase([executable, RETIREMENT_TEST, '--exact', '--nocapture'], report_dir,
                     name, timeout, cancelled if cancelled is not None else Cancellation(), env)
     output = (report_dir / f'{name}.log').read_text(errors='replace')
@@ -134,6 +137,11 @@ def qualify_retirement(executable, report_dir, attempt, cancelled=None, timeout=
     row['qualified'] = row['qualified'] and row['one_test_passed'] and not row['transcript_conflict']
     if not row['qualified'] and row['status'] == 'completed':
         row['status'] = 'failed'
+    # Only delete this trial's disposable state after transcript qualification.
+    # Cancellation, timeout, panic and zero-exit conflicts retain it for upload.
+    if row['qualified']:
+        shutil.rmtree(state_dir)
+    row['runtime_state_retained'] = not row['qualified']
     record(report_dir / f'{name}.json', row)
     print(f'Native retirement qualification {attempt}/20: {json.dumps(row)}', flush=True)
     if not row['qualified']:

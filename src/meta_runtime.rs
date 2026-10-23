@@ -3665,6 +3665,21 @@ pub(crate) mod tests {
             .args(["--exact", "--nocapture"])
             .output()
             .expect("isolated runtime test process");
+        if name == "runtime_members_emit_canonical_structural_events"
+            && let Some(directory) = std::env::var_os("FUGUE_TEST_EVIDENCE_DIR")
+        {
+            let directory = PathBuf::from(directory);
+            std::fs::write(
+                directory.join("structural-events.stdout.log"),
+                &output.stdout,
+            )
+            .expect("retain isolated runtime stdout");
+            std::fs::write(
+                directory.join("structural-events.stderr.log"),
+                &output.stderr,
+            )
+            .expect("retain isolated runtime stderr");
+        }
         assert!(
             output.status.success(),
             "isolated {name} failed:\n{}\n{}",
@@ -5236,11 +5251,14 @@ pub(crate) mod tests {
         struct RuntimeFailureEvidence(Option<tempfile::TempDir>);
         impl Drop for RuntimeFailureEvidence {
             fn drop(&mut self) {
-                if std::thread::panicking()
+                // An external qualifier can reject a zero exit after inspecting
+                // its transcript. It owns cleanup when an evidence root is set.
+                if (std::thread::panicking()
+                    || std::env::var_os("FUGUE_TEST_EVIDENCE_DIR").is_some())
                     && let Some(directory) = self.0.take()
                 {
                     eprintln!(
-                        "Retained failed runtime state: {}",
+                        "Retained runtime state for qualification: {}",
                         directory.keep().display()
                     );
                 }
