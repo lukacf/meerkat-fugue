@@ -12,7 +12,7 @@ use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::config::TrackerConfig;
-use crate::domain::{BlockerRef, Issue, IssueAttachment};
+use crate::domain::{BlockerRef, CreatedIssueReceipt, Issue, IssueAttachment};
 use crate::error::{FugueError, Result};
 use crate::tools::*;
 
@@ -834,25 +834,39 @@ impl JiraClient {
                 },
             },
         };
-        let created: JiraId = self
+        let created: JiraCreatedIssue = self
             .send(Method::POST, &["issue"], Some(&payload))
             .await?
             .json()
             .await
             .map_err(request_error)?;
-        let reference = LinearIssueRef::Id {
-            id: LinearIssueId(created.id),
+        let receipt = CreatedIssueReceipt {
+            url: created.key.as_deref().map(|key| self.browse_url(key)),
+            identifier: created.key.unwrap_or_else(|| created.id.clone()),
+            id: created.id,
         };
-        self.move_issue(MoveIssueInput {
-            issue: reference.clone(),
-            state: LinearStateRef::Name {
-                name: lane.to_string(),
-            },
-            expected_updated_at: None,
-            idempotency_key: IdempotencyKey("jira-create-initial-status".to_string()),
+        let reference = LinearIssueRef::Id {
+            id: LinearIssueId(receipt.id.clone()),
+        };
+        // Creation has committed upstream. Every subsequent failure must retain
+        // that acknowledgement so the caller recovers this issue, not a new one.
+        let follow_up = async {
+            self.move_issue(MoveIssueInput {
+                issue: reference.clone(),
+                state: LinearStateRef::Name {
+                    name: lane.to_string(),
+                },
+                expected_updated_at: None,
+                idempotency_key: IdempotencyKey("jira-create-initial-status".to_string()),
+            })
+            .await?;
+            Ok(self.normalize(self.fetch_issue(&reference).await?))
+        }
+        .await;
+        follow_up.map_err(|source| FugueError::IssueCreatedNeedsAttention {
+            created: receipt,
+            source: Box::new(source),
         })
-        .await?;
-        Ok(self.normalize(self.fetch_issue(&reference).await?))
     }
 
     pub async fn materialize_issue_attachments(
@@ -1326,6 +1340,12 @@ struct JiraFields {
     attachment: Vec<JiraAttachment>,
 }
 
+#[derive(Deserialize)]
+struct JiraCreatedIssue {
+    id: String,
+    // Retain an acknowledged ID even if a compatible server omits its key.
+    key: Option<String>,
+}
 #[derive(Serialize, Deserialize)]
 struct JiraId {
     id: String,

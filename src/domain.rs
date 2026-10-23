@@ -10,6 +10,14 @@ pub struct BlockerRef {
     pub state: Option<String>,
 }
 
+/// An upstream creation acknowledgement, independent of later status reads.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CreatedIssueReceipt {
+    pub id: String,
+    pub identifier: String,
+    pub url: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Issue {
     pub id: String,

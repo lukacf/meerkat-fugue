@@ -35,6 +35,19 @@ Use a small, explicit acceptance contract in each issue. State the desired
 behavior, relevant tests and any permitted external effects. Comments let you
 answer the team's questions without rewriting the original request.
 
+If Jira creates the issue but Fugue cannot confirm its initial status, the form
+keeps the issue reference and shows **Open [issue key]**. Check that existing
+issue instead of submitting another one. Its title, description and initial
+lane stay locked in the creation form; edit them from the issue itself.
+
+If an attachment upload fails after creation, use **Retry attachments** to
+upload to the same issue. Refreshing the tab preserves the issue reference and
+draft text for that repository; select the pending files again before retrying.
+Choose **Done** to close this recovery form and start a separate issue. If the
+browser says it could not save recovery details, keep the tab open until finished.
+If creation fails without returning an issue reference, check the tracker before
+trying again: the server may have accepted a request whose response was lost.
+
 Review and merge controls follow the configured lane actions. Read the action's
 label before saving a lane change: a configured action can start a review or
 merge procedure. Ordinary status changes and procedure triggers are distinct.

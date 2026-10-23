@@ -1337,6 +1337,9 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
     const createCancel = document.getElementById("createCancel");
     const createError = document.getElementById("createError");
     const createAttachmentState = [];
+    let createdIssueReceipt = null;
+    let creationWarning = null;
+    const creationReceiptKey = `fugue.created-issue:${location.pathname}`;
     const detailAttachmentState = [];
     const maxCreateAttachmentCount = 20;
     const maxCreateAttachmentBytes = 25 * 1024 * 1024;
@@ -1721,7 +1724,10 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
         : `<span class="updated">${escapeHtml(emptyLabel)}</span>`;
     };
 
-    const renderCreateAttachments = () => renderAttachmentList(createAttachmentList, createAttachmentState, "No attachments selected.");
+    const renderCreateAttachments = () => {
+      renderAttachmentList(createAttachmentList, createAttachmentState, "No attachments selected.");
+      syncCreateControls();
+    };
     const renderDetailAttachments = () => renderAttachmentList(document.getElementById("detailAttachmentList"), detailAttachmentState, "No attachments added for this issue editor.");
 
     const dataTransferHasFiles = (event) => Array.from(event.dataTransfer?.types || []).includes("Files");
@@ -1832,48 +1838,139 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       return payload;
     };
 
+    const syncCreateControls = () => {
+      const created = !!createdIssueReceipt;
+      for (const field of [createTitle, createDescription, createLane]) field.disabled = created;
+      createSubmit.textContent = created ? "Retry attachments" : "Create issue";
+      createSubmit.hidden = created && !createAttachmentState.length;
+      createCancel.textContent = created ? "Done" : "Cancel";
+    };
+
+    const creationReceipt = (issue) => {
+      if (!issue || typeof issue.id !== "string" || !issue.id || typeof issue.identifier !== "string" || !issue.identifier) {
+        throw new Error("Creation returned no usable issue reference. Check your tracker before creating the issue again.");
+      }
+      return {id: issue.id, identifier: issue.identifier};
+    };
+
+    const saveCreationReceipt = () => {
+      try {
+        if (createdIssueReceipt) {
+          sessionStorage.setItem(creationReceiptKey, JSON.stringify({
+            issue: createdIssueReceipt, warning: creationWarning,
+            title: createTitle.value, description: createDescription.value, lane: createLane.value,
+          }));
+        } else {
+          sessionStorage.removeItem(creationReceiptKey);
+        }
+        return true;
+      } catch (error) {
+        console.warn("Could not persist the issue creation receipt", error);
+        return false;
+      }
+    };
+
+    const showCreatedIssue = (message) => {
+      createError.replaceChildren(document.createTextNode(message + " "));
+      const link = document.createElement("a");
+      link.href = fugueUrl(`/issues/${encodeURIComponent(createdIssueReceipt.identifier)}`);
+      link.textContent = `Open ${createdIssueReceipt.identifier}`;
+      createError.append(link);
+      syncCreateControls();
+    };
+
     const resetCreateForm = () => {
+      createdIssueReceipt = null;
+      creationWarning = null;
+      saveCreationReceipt();
       createForm.reset();
       createAttachmentState.length = 0;
       renderCreateAttachments();
     };
 
+    const restoreCreationReceipt = () => {
+      try {
+        const saved = JSON.parse(sessionStorage.getItem(creationReceiptKey) || "null");
+        if (!saved) return;
+        createdIssueReceipt = creationReceipt(saved.issue);
+        creationWarning = typeof saved.warning === "string" ? saved.warning : null;
+        createTitle.value = typeof saved.title === "string" ? saved.title : "";
+        createDescription.value = typeof saved.description === "string" ? saved.description : "";
+        createLane.value = typeof saved.lane === "string" ? saved.lane : createLane.value;
+        createPanel.classList.add("open");
+        showCreatedIssue(creationWarning || `Created ${createdIssueReceipt.identifier}. Re-select any files that still need uploading, or choose Done.`);
+      } catch (error) {
+        console.warn("Could not read the saved issue creation receipt", error);
+        showNotice("Saved creation details could not be read. Check your tracker before creating the issue again.");
+      }
+    };
+
     const createIssue = async () => {
+      if (createSubmit.disabled) return;
       const title = createTitle.value.trim();
-      const lane = createLane.value;
       createError.textContent = "";
-      if (!title) {
+      if (!createdIssueReceipt && !title) {
         createError.textContent = "Title is required.";
         createTitle.focus();
         return;
       }
+      if (createdIssueReceipt && !createAttachmentState.length) {
+        showCreatedIssue(creationWarning || `Created ${createdIssueReceipt.identifier}. Choose Done or open the issue.`);
+        return;
+      }
       createSubmit.disabled = true;
+      createCancel.disabled = true;
+      newIssue.disabled = true;
       try {
-        const payload = await api("/api/v1/issues", {
-          method: "POST",
-          body: JSON.stringify({
-            title,
-            description: createDescription.value,
-            lane,
-            attachments: createAttachmentPayload(),
-          }),
-        });
-        const createdIdentifier = payload.issue?.identifier;
-        if (createdIdentifier && createAttachmentState.length) {
-          await uploadIssueAttachments(createdIdentifier, createAttachmentState, createError);
+        if (!createdIssueReceipt) {
+          const payload = await api("/api/v1/issues", {
+            method: "POST",
+            body: JSON.stringify({
+              title,
+              description: createDescription.value,
+              lane: createLane.value,
+              attachments: createAttachmentPayload(),
+            }),
+          });
+          createdIssueReceipt = creationReceipt(payload.created_issue || payload.issue);
+          creationWarning = typeof payload.warning?.message === "string" ? payload.warning.message : null;
+          if (!saveCreationReceipt()) {
+            creationWarning = `Created ${createdIssueReceipt.identifier}. Keep this tab open until you finish; its recovery details could not be saved.`;
+          }
+          syncCreateControls();
+        }
+        const createdIdentifier = createdIssueReceipt.identifier;
+        if (createAttachmentState.length) {
+          const pending = createAttachmentState.slice();
+          await uploadIssueAttachments(createdIdentifier, pending, createError);
+          for (const attachment of pending) {
+            const index = createAttachmentState.indexOf(attachment);
+            if (index >= 0) createAttachmentState.splice(index, 1);
+          }
+          renderCreateAttachments();
+        }
+        app.selected = createdIdentifier;
+        if (creationWarning || createAttachmentState.length) {
+          showCreatedIssue(creationWarning || `Created ${createdIdentifier}. Upload the remaining attachments or choose Done.`);
+          await loadBoard();
+          return;
         }
         resetCreateForm();
         createPanel.classList.remove("open");
-        if (createdIdentifier) {
-          app.selected = createdIdentifier;
-        }
         await loadBoard();
-        showNotice(`Created ${createdIdentifier || "issue"}.`);
+        showNotice(`Created ${createdIdentifier}.`);
       } catch (error) {
-        createError.textContent = error.message;
+        if (createdIssueReceipt) {
+          showCreatedIssue(`${creationWarning || `Created ${createdIssueReceipt.identifier}.`} ${error.message} Retry attachments here or open the existing issue.`);
+        } else {
+          createError.textContent = error.message;
+        }
         showNotice(error.message);
       } finally {
         createSubmit.disabled = false;
+        createCancel.disabled = false;
+        newIssue.disabled = false;
+        syncCreateControls();
       }
     };
 
@@ -2095,11 +2192,12 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       renderBoard();
     });
     newIssue.addEventListener("click", () => {
-      createError.textContent = "";
+      if (!createdIssueReceipt) createError.textContent = "";
       createPanel.classList.toggle("open");
       if (createPanel.classList.contains("open")) createTitle.focus();
     });
     createCancel.addEventListener("click", () => {
+      if (createdIssueReceipt) resetCreateForm();
       createPanel.classList.remove("open");
       createError.textContent = "";
     });
@@ -2112,6 +2210,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       errorTarget: createError,
     });
     renderCreateAttachments();
+    restoreCreationReceipt();
     createForm.addEventListener("submit", async (event) => {
       event.preventDefault();
       await createIssue();
@@ -2450,6 +2549,24 @@ struct ParsedIssueCommentRequest {
     attachments: Vec<LinearCommentAttachmentInput>,
 }
 
+#[derive(Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum IssueCreateResponse {
+    Created {
+        issue: Box<IssueBoardIssue>,
+    },
+    CreatedWithWarning {
+        created_issue: crate::domain::CreatedIssueReceipt,
+        warning: IssueCreationWarning,
+    },
+}
+
+#[derive(Serialize)]
+struct IssueCreationWarning {
+    code: &'static str,
+    message: String,
+}
+
 async fn api_issue_create(
     State(app): State<AppState>,
     headers: HeaderMap,
@@ -2488,11 +2605,45 @@ async fn api_issue_create(
     {
         Ok(issue) => {
             let lane = canonical_lane_for_state(&app.config, &issue.state);
-            Json(json!({ "issue": issue_board_issue(issue, &lane, &HashMap::new(), &HashMap::new()) }))
+            (
+                StatusCode::CREATED,
+                Json(IssueCreateResponse::Created {
+                    issue: Box::new(issue_board_issue(
+                        issue,
+                        &lane,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                    )),
+                }),
+            )
                 .into_response()
+        }
+        Err(crate::error::FugueError::IssueCreatedNeedsAttention { created, source }) => {
+            tracing::warn!(issue = %created.identifier, error = %source, "created issue needs follow-up");
+            created_issue_attention_response(created)
         }
         Err(error) => issue_adapter_error_response(error),
     }
+}
+
+fn created_issue_attention_response(
+    created: crate::domain::CreatedIssueReceipt,
+) -> axum::response::Response {
+    let message = format!(
+        "Created {}. Fugue could not confirm its initial status. Open the existing issue to check it.",
+        created.identifier,
+    );
+    (
+        StatusCode::CREATED,
+        Json(IssueCreateResponse::CreatedWithWarning {
+            created_issue: created,
+            warning: IssueCreationWarning {
+                code: "issue_created_followup_failed",
+                message,
+            },
+        }),
+    )
+        .into_response()
 }
 
 async fn api_issue_board(
@@ -5619,6 +5770,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jira_create_http_preserves_acknowledgement_when_initial_status_fails() {
+        use crate::jira::tests::{issue, mock_jira, reply, tracker};
+        use tower::ServiceExt;
+
+        for partial in [false, true] {
+            let mut responses = vec![reply(
+                "POST",
+                "/rest/api/3/issue",
+                json!({"id":"10001","key":"TEST-1"}),
+            )];
+            if partial {
+                responses.push(reply(
+                    "GET",
+                    "/rest/api/3/issue/10001",
+                    issue("In Progress"),
+                ));
+                responses.push(reply(
+                    "GET",
+                    "/rest/api/3/issue/TEST-1/transitions",
+                    json!({"transitions":[]}),
+                ));
+            } else {
+                responses.push(reply("GET", "/rest/api/3/issue/10001", issue("To Do")));
+                responses.push(reply("GET", "/rest/api/3/issue/10001", issue("To Do")));
+            }
+            let mock = mock_jira(responses).await;
+            let root = tempfile::tempdir().unwrap();
+            let (_, owner) = managed_test_router(root.path(), None).await;
+            let mut config = owner.config().effective().clone();
+            config.tracker = tracker(&mock.endpoint);
+            config.linear.lanes.parked = "To Do".to_owned();
+            config.linear.lanes.ready = "To Do".to_owned();
+            let (refresh, _receiver) = mpsc::channel(1);
+            let app = router(
+                owner.shared_state(),
+                config,
+                refresh,
+                owner.internal_sender(),
+                owner.meta_runtime_registry(),
+                None,
+            )
+            .await
+            .unwrap();
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/issues")
+                        .header("Host", "127.0.0.1:8788")
+                        .header("Origin", "http://127.0.0.1:8788")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"title":"One issue","lane":"To Do"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if partial {
+                assert_eq!(payload["outcome"], "created_with_warning");
+                assert_eq!(
+                    payload["created_issue"],
+                    json!({
+                        "id":"10001", "identifier":"TEST-1", "url":format!("{}/browse/TEST-1", mock.endpoint),
+                    })
+                );
+                assert_eq!(payload["warning"]["code"], "issue_created_followup_failed");
+                assert!(
+                    payload["warning"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("TEST-1")
+                );
+                assert!(
+                    payload.get("issue").is_none(),
+                    "do not invent confirmed issue state"
+                );
+            } else {
+                assert_eq!(payload["outcome"], "created");
+                assert_eq!(payload["issue"]["identifier"], "TEST-1");
+            }
+            assert!(mock.responses.lock().unwrap().is_empty());
+            assert_eq!(
+                mock.requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(uri, _)| uri == "/rest/api/3/issue")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn managed_queue_guards_direct_child_reads_mutations_and_fallbacks() {
         use tower::ServiceExt;
         let root = tempfile::tempdir().unwrap();
@@ -6168,7 +6415,7 @@ mod tests {
         assert!(source.contains("Multipart"));
         assert!(source.contains("attachment_comment_markdown"));
         assert!(source.contains("/api/v1/issues/{issue_identifier}/attachments"));
-        assert!(source.contains("uploadIssueAttachments(createdIdentifier, createAttachmentState"));
+        assert!(source.contains("uploadIssueAttachments(createdIdentifier, pending"));
         assert!(!source.contains(concat!("issue_create_attachments", "_unsupported")));
         assert!(!source.contains(concat!("readAs", "DataURL")));
         assert!(!source.contains(concat!("File", "Reader")));

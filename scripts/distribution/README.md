@@ -112,8 +112,10 @@ an upstream merge alone is not deployed acceptance.
 
 The current candidate is not qualified for production distribution. The selected
 retirement correction passed twenty consumer trials at concurrency four and
-five native handoff/restart rounds. The final built candidate still needs hosted
-recovery acceptance. The merge path also needs authoritative, durable review
+five native handoff/restart rounds, but a later full-suite run again failed
+retirement because durable-tail recovery was refused. Qualification is reopened;
+retain both the earlier passes and the failure and verify the next correction.
+The final built candidate still needs hosted recovery acceptance. The merge path also needs authoritative, durable review
 results bound to the exact candidate; matching a caller-supplied SHA or a fresh
 PR observation does not establish review acceptance. Keep the release gates open
 until the final candidate passes regression tests and hosted acceptance. Local

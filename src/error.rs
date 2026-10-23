@@ -59,6 +59,13 @@ pub enum FugueError {
     #[error("jira_api_status: {status}")]
     JiraApiStatus { status: u16 },
 
+    #[error("issue_created_needs_attention: {}: {source}", created.identifier)]
+    IssueCreatedNeedsAttention {
+        created: crate::domain::CreatedIssueReceipt,
+        #[source]
+        source: Box<FugueError>,
+    },
+
     #[error("jira_stale_issue: refresh issue state before retrying")]
     JiraStaleIssue,
 

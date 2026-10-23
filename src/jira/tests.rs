@@ -624,3 +624,84 @@ async fn creation_passes_required_custom_fields_without_changing_project() {
     );
     assert_eq!(requests[0].1["fields"]["labels"], json!(["fugue"]));
 }
+
+#[tokio::test]
+async fn creation_receipt_survives_initial_status_and_refresh_failures() {
+    for failure in ["initial_read", "transition", "refresh", "missing_key"] {
+        let failed_read = MockResponse {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            ..reply(
+                "GET",
+                "/rest/api/3/issue/10001",
+                json!({"errorMessages":["temporarily unavailable"]}),
+            )
+        };
+        let mut responses = vec![reply(
+            "POST",
+            "/rest/api/3/issue",
+            if failure == "missing_key" {
+                json!({"id":"10001"})
+            } else {
+                json!({"id":"10001", "key":"TEST-1"})
+            },
+        )];
+        match failure {
+            "initial_read" | "missing_key" => responses.push(failed_read),
+            "transition" => {
+                responses.push(reply(
+                    "GET",
+                    "/rest/api/3/issue/10001",
+                    issue("In Progress"),
+                ));
+                responses.push(reply(
+                    "GET",
+                    "/rest/api/3/issue/TEST-1/transitions",
+                    json!({"transitions":[]}),
+                ));
+            }
+            _ => {
+                responses.push(reply("GET", "/rest/api/3/issue/10001", issue("To Do")));
+                responses.push(failed_read);
+            }
+        }
+        let mock = mock_jira(responses).await;
+        let error = JiraClient::from_config(&tracker(&mock.endpoint))
+            .expect("client")
+            .create_issue("Only one issue", Some("Creation recovery fixture"), "To Do")
+            .await
+            .expect_err("follow-up operation fails");
+        let FugueError::IssueCreatedNeedsAttention { created, source } = error else {
+            panic!("{failure} lost the creation receipt: {error}");
+        };
+        assert_eq!(created.id, "10001");
+        if failure == "missing_key" {
+            assert_eq!(created.identifier, "10001");
+            assert_eq!(created.url, None);
+        } else {
+            assert_eq!(created.identifier, "TEST-1");
+            assert_eq!(
+                created.url,
+                Some(format!("{}/browse/TEST-1", mock.endpoint))
+            );
+        }
+        if failure != "transition" {
+            assert!(matches!(*source, FugueError::JiraApiStatus { status: 503 }));
+        } else {
+            assert!(
+                source
+                    .to_string()
+                    .contains("no currently available transition")
+            );
+        }
+        assert_eq!(
+            mock.requests
+                .lock()
+                .expect("requests")
+                .iter()
+                .filter(|(uri, _)| uri == "/rest/api/3/issue")
+                .count(),
+            1
+        );
+        assert!(mock.responses.lock().expect("responses").is_empty());
+    }
+}

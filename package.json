@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "test:delivery": "python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v && python3 -m unittest discover -s scripts/release -p 'test_*.py' -v && python3 -m unittest discover -s scripts/distribution -p 'test_*.py' -v",
-    "test:ui": "playwright test tests/ensemble-dashboard-search.spec.mjs tests/first-run-setup.spec.mjs tests/issue-detail.spec.mjs tests/queue-directory.spec.mjs tests/navigation.spec.mjs tests/welcome.spec.mjs --project=chromium",
+    "test:ui": "playwright test tests/ensemble-dashboard-search.spec.mjs tests/first-run-setup.spec.mjs tests/issue-detail.spec.mjs tests/issue-create.spec.mjs tests/queue-directory.spec.mjs tests/navigation.spec.mjs tests/welcome.spec.mjs --project=chromium",
     "test:luc654-ui": "playwright test tests/luc654-ui-validation.spec.mjs --project=chromium",
     "test:ensemble-search": "playwright test tests/ensemble-dashboard-search.spec.mjs --project=chromium"
   },
