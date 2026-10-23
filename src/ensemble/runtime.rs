@@ -1384,11 +1384,11 @@ async fn restore_member_transports(repo: &RepoId, entry: &RepositoryRuntime) -> 
             .with_context(|| {
                 let bootstrap = authority.identity_bootstrap_status();
                 format!(
-                    "member runtime alias missing for {identity}: state={:?}, session={:?}, bootstrap={:?}, continuity_unrecoverable={:?}, session_repair_required={:?}, customizer_tools_pending={:?}",
+                    "member runtime alias missing for {identity}: state={:?}, session={:?}, bootstrap={:?}, wake_refusal={:?}, session_repair_required={:?}, customizer_tools_pending={:?}",
                     before.state,
                     before.session_id,
                     bootstrap.identities.get(&identity),
-                    before.continuity_unrecoverable,
+                    before.wake_refusal,
                     before.session_repair_required,
                     before.customizer_tools_pending,
                 )
@@ -2067,7 +2067,7 @@ mod tests {
                 usage: TurnUsage::host_declared(Provider::OpenAI, &request.model, Usage::default()),
             });
             events.push(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success { stop_reason },
+                outcome: LlmDoneOutcome::success(stop_reason),
             });
             Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
         }
@@ -2348,9 +2348,7 @@ mod tests {
                     ),
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ]))
         }
@@ -2561,7 +2559,7 @@ mod tests {
                 usage: TurnUsage::host_declared(Provider::OpenAI, &request.model, Usage::default()),
             });
             events.push(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success { stop_reason },
+                outcome: LlmDoneOutcome::success(stop_reason),
             });
             Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
         }
@@ -2903,7 +2901,7 @@ mod tests {
                 usage: TurnUsage::host_declared(Provider::OpenAI, &request.model, Usage::default()),
             });
             events.push(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success { stop_reason },
+                outcome: LlmDoneOutcome::success(stop_reason),
             });
             Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
         }
@@ -2934,9 +2932,7 @@ mod tests {
                         ),
                     }),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                     }),
                 ]
             } else {
@@ -3551,9 +3547,7 @@ mod tests {
                     ),
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ]))
         }

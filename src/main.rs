@@ -92,6 +92,8 @@ struct Cli {
 enum CliCommand {
     /// Print the immutable build identity as JSON and exit.
     BuildInfo,
+    /// Inspect or migrate one stopped repository runtime to native storage.
+    MigrateStorage(MigrateStorageArgs),
     /// Start Fugue with one browser address for all repositories and their setup.
     Serve(ServeArgs),
     /// Open local first-run setup for credentials, repositories, and tickets.
@@ -125,6 +127,53 @@ struct ServeArgs {
     state_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 8788)]
     port: u16,
+}
+
+#[derive(Debug, Args)]
+struct MigrateStorageArgs {
+    /// Exact repository runtime directory containing runtime.sqlite and mob.sqlite3.
+    #[arg(long)]
+    runtime_dir: PathBuf,
+    /// Apply the native migration after taking a complete stopped-state backup.
+    /// Without this flag, inspect the directory without changing its databases.
+    #[arg(long)]
+    apply: bool,
+    /// Directory for temporary census copies. Defaults to the runtime's parent.
+    #[arg(long)]
+    scratch_dir: Option<PathBuf>,
+}
+
+async fn migrate_storage(args: MigrateStorageArgs) -> anyhow::Result<()> {
+    use meerkat_meta::storage_migrate_native::{NativeMigrateRequest, migrate_state_dir_native};
+
+    let state = fs::canonicalize(&args.runtime_dir)
+        .context("Open the existing repository runtime directory; stop Fugue before migrating")?;
+    for file in ["runtime.sqlite", "mob.sqlite3"] {
+        if !state.join(file).is_file() {
+            anyhow::bail!(
+                "{} does not contain {file}. Select the repository runtime directory, not the application state root. Restore a missing store from a complete backup before migrating.",
+                state.display()
+            );
+        }
+    }
+    let mode = if args.apply {
+        meerkat_meta::MigrateMode::Apply
+    } else {
+        meerkat_meta::MigrateMode::DryRun
+    };
+    let mut request =
+        NativeMigrateRequest::new(&state, mode).with_mob_store(state.join("mob.sqlite3"));
+    if let Some(scratch) = args.scratch_dir {
+        request = request.with_scratch_dir(scratch);
+    }
+    // Meta owns the offline fence, census, migration journal and refusal policy.
+    // Keep its typed result intact for operators and installation tooling.
+    let report = migrate_state_dir_native(&request).await;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if report.has_refusals() {
+        anyhow::bail!("Native storage migration refused; inspect the JSON report above");
+    }
+    Ok(())
 }
 
 fn setup_state_dir(path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
@@ -275,6 +324,7 @@ async fn run() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Some(CliCommand::MigrateStorage(args)) => return migrate_storage(args).await,
         Some(CliCommand::Serve(args)) => {
             return meerkat_fugue::setup::host::serve(setup_state_dir(args.state_dir)?, args.port)
                 .await;
@@ -666,6 +716,7 @@ fn init_logging() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_writer(std::io::stderr)
         .with_target(false)
         .json()
         .init();
@@ -876,6 +927,42 @@ fn print_generated_files(generated: &GeneratedOnboardingFiles) {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn storage_migration_is_read_only_unless_apply_is_explicit() {
+        let cli = Cli::try_parse_from([
+            "meerkat-fugue",
+            "migrate-storage",
+            "--runtime-dir",
+            "/state/team",
+        ])
+        .expect("migration command");
+        let Some(CliCommand::MigrateStorage(args)) = cli.command else {
+            panic!("expected migration command");
+        };
+        assert!(!args.apply);
+        assert_eq!(args.runtime_dir, PathBuf::from("/state/team"));
+        assert!(Cli::try_parse_from(["meerkat-fugue", "migrate-storage", "--apply"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn storage_migration_rejects_application_root_without_creating_stores() {
+        let directory = tempfile::tempdir().expect("temporary state root");
+        let error = migrate_storage(MigrateStorageArgs {
+            runtime_dir: directory.path().to_owned(),
+            apply: true,
+            scratch_dir: None,
+        })
+        .await
+        .expect_err("wrong directory must be refused");
+        assert!(error.to_string().contains("not the application state root"));
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("read untouched root")
+                .count(),
+            0
+        );
+    }
 
     fn top_level_help() -> String {
         Cli::command().render_long_help().to_string()

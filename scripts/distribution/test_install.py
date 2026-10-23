@@ -13,12 +13,13 @@ spec.loader.exec_module(installer)
 
 
 def bundle(root, commit='a', invalid=None):
-    identity = {'version': '0.1.0', 'commit': commit * 40, 'tree': 'c' * 40, 'dirty': False}
-    files = {f'bin/{name}': b'#!/bin/sh\necho rkat 0.9.3\n' for name in installer.BINARIES}
+    identity = {'version': '0.1.0', 'commit': commit * 40, 'tree': 'c' * 40, 'dirty': False,
+                'runtime_storage': 'meta_native_v1'}
+    files = {f'bin/{name}': b'#!/bin/sh\necho rkat 0.9.4\n' for name in installer.BINARIES}
     for name in installer.BINARIES - {'rkat'}:
         files['bin/' + name] = ("#!/bin/sh\nprintf '%s\\n' '" + json.dumps(identity) + "'\n").encode()
     files.update({'LICENSE-MIT': b'license', 'LICENSE-APACHE': b'license'})
-    manifest = {'schema': 1, 'fugue': identity, 'target': installer.target(), 'rkat': {'version': '0.9.3'},
+    manifest = {'schema': 1, 'fugue': identity, 'target': installer.target(), 'rkat': {'version': '0.9.4'},
                 'files': {name: hashlib.sha256(value).hexdigest() for name, value in files.items()}}
     if invalid == 'target':
         manifest['target'] = 'wrong-platform'
@@ -60,6 +61,8 @@ class InstallTests(unittest.TestCase):
         installer.install(*bundle(self.root, 'b'), self.prefix)
         self.assertNotEqual(before, (self.prefix / 'current').readlink())
         self.assertEqual(before, (self.prefix / 'previous').readlink())
+        manifest = json.loads((self.prefix / 'current/manifest.json').read_text())
+        self.assertEqual(manifest['fugue']['runtime_storage'], 'meta_native_v1')
         for name in installer.BINARIES:
             self.assertTrue((self.prefix / 'bin' / name).is_file())
 

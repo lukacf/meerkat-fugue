@@ -21,12 +21,12 @@ chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
 indexmap = { version = "2", features = ["serde"] }
-meerkat-core = "=0.9.3"
-meerkat-models = "=0.9.3"
-meerkat-mob = "=0.9.3"
-meerkat-meta = "=0.9.3"
-meerkat-tools = "=0.9.3"
-meerkat = { version = "=0.9.3", features = ["workgraph"] }
+meerkat-core = "=0.9.4"
+meerkat-models = "=0.9.4"
+meerkat-mob = "=0.9.4"
+meerkat-meta = "=0.9.4"
+meerkat-tools = "=0.9.4"
+meerkat = { version = "=0.9.4", features = ["workgraph"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 schemars = "1.2.1"
@@ -47,15 +47,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
 jsonschema = { version = "0.26.2", default-features = false }
-meerkat-llm-core = "=0.9.3"
-meerkat-providers = { version = "=0.9.3", default-features = false }
+meerkat-llm-core = "=0.9.4"
+meerkat-providers = { version = "=0.9.4", default-features = false }
 
-# Published 0.9.3 omits continuity owner restoration and aggregate peer projection.
-# Pin the upstream compatibility fixes until a released crate includes them.
-# Upstream: https://github.com/lukacf/meerkat-meta/pull/674
+# Published 0.9.4 omits aggregate peer labels and shared Memory/Work Graph panels.
+# Keep the console backport on the same released native storage/lifecycle train.
+# Retire this exact pin when a released crate includes these console fixes.
 # Console: https://github.com/lukacf/meerkat-meta/pull/688
 [patch.crates-io]
-meerkat-meta = { version = "=0.9.3", git = "https://github.com/lukacf/meerkat-meta.git", rev = "79fce40db455a1a539b81f46bc6f0f8689b7cbb3" }
+meerkat-meta = { version = "=0.9.4", git = "https://github.com/lukacf/meerkat-meta.git", rev = "6803745b317445a0964e62065210803942265f31" }
 
 # Keep the large generated platform crates inexpensive to link in the offline suite.
 [profile.test]

@@ -60,12 +60,12 @@ fn meerkat_dependency_train_is_exact_and_unmixed() {
         );
         if trimmed.starts_with("meerkat-meta") {
             assert!(
-                trimmed.contains("=0.9.3"),
+                trimmed.contains("=0.9.4"),
                 "meerkat-meta must be pinned to the companion train: {trimmed}"
             );
         } else if trimmed.starts_with("meerkat") {
             assert!(
-                trimmed.contains("=0.9.3"),
+                trimmed.contains("=0.9.4"),
                 "Meerkat crates must be pinned to one train: {trimmed}"
             );
             meerkat_versions.push(trimmed.to_string());

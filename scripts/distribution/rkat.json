@@ -1,10 +1,10 @@
 {
-  "version": "0.9.3",
+  "version": "0.9.4",
   "repository": "lukacf/meerkat",
   "assets": {
-    "rkat-0.9.3-aarch64-apple-darwin.tar.gz": "c77b057dabd6c5df8d88c7dc466c855bda4d0ca66d8af6c1016a620e108c6f7c",
-    "rkat-0.9.3-aarch64-unknown-linux-gnu.tar.gz": "24d7fd6f430b6169066649b853d1d5b18fa0127a00a66b200dcd6d20d38b3a61",
-    "rkat-0.9.3-x86_64-apple-darwin.tar.gz": "11f662bb488d0b191b93d907d79b74a033e1533590510adf4fb8a80849e03418",
-    "rkat-0.9.3-x86_64-unknown-linux-gnu.tar.gz": "02f47dee7559f6210e0ec497af503b47fe4f0241fc8722daeb2a4a759c0cea63"
+    "rkat-0.9.4-aarch64-apple-darwin.tar.gz": "fe2d99b33bf7c8feb74c07c7032643b15e6648567548fa0a1e2d67b8ac60806d",
+    "rkat-0.9.4-aarch64-unknown-linux-gnu.tar.gz": "8825b3b21bfb4bd95eb326e896fb9638c5ffa0a5ff3a200aa9f8532615f44e76",
+    "rkat-0.9.4-x86_64-apple-darwin.tar.gz": "d867b720f44c27ae8fca43eb47ee9262e202ffb9bab8a2aae6138cfab94735f1",
+    "rkat-0.9.4-x86_64-unknown-linux-gnu.tar.gz": "dfa812a2f5bcfa2223ac5e53e0c9eafbc1da72e96a27024002911a558b3f51b3"
   }
 }

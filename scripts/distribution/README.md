@@ -74,7 +74,7 @@ on the intended gateway before treating a deployment as accepted.
 
 ## Temporary dependency follow-up
 
-The exact public Meta 0.9.3 backport is an intentional release dependency.
+The exact public Meta 0.9.4 console backport is an intentional release dependency.
 Track upstream PRs 674 and 688 and replace the pin only after a published runtime
 passes persisted-session recovery, repository topology, and full ticket-cycle
 acceptance. An upstream merge alone is not an instruction to upgrade a host.

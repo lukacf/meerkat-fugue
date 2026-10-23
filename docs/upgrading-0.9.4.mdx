@@ -1,0 +1,110 @@
+---
+title: "Upgrading native runtime storage"
+description: "A stopped-state migration, verification and rollback procedure for the Meerkat 0.9.4 train."
+---
+
+The 0.9.4 dependency candidate changes how Meta stores sessions and identities.
+Existing repository runtimes need an explicit offline migration. Starting a
+new binary against old state does not perform that migration automatically.
+
+This candidate is still under qualification. In particular, the upstream
+crash-recovery correction for compacted persistent sessions has not yet been
+qualified for Fugue. Passing a normal restart is not evidence that an
+interrupted checkpoint recovers. Keep this limitation visible in release
+acceptance and retain the currently installed release until the required
+recovery proof is complete.
+
+## Before changing anything
+
+1. Finish or explicitly park active issue work. Record the installed build
+   identity with `meerkat-fugue build-info` and retain its complete bundle.
+2. Stop Fugue and all managed child processes gracefully. Wait for shutdown
+   to finish. A forced kill is not a substitute for a completed shutdown.
+3. Back up the **entire application state directory**, its configuration,
+   credentials, and native comms keys, preserving permissions and ownership.
+   Include external runtime directories if your configuration uses them.
+   Keep the backup outside the directory you will migrate.
+4. Rehearse on a copy before applying to the original. Run the migration and
+   later runtime under the same service identity and native auth environment.
+
+The migration's individual database backups are useful diagnostics. They are
+not a replacement for the complete stopped-state backup: starting the new
+runtime also changes its mob store.
+
+## Find the repository runtime
+
+Each repository has its own native runtime. Pass the directory containing
+both `runtime.sqlite` and `mob.sqlite3`, not the application state root or
+source checkout.
+
+- Browser-managed repositories keep teams beneath their private workspace's
+  `repository-teams/<repository-id>` directory. The generated Ensemble
+  configuration records the exact root and repository ID.
+- Standalone Ensemble uses `<state_root>/<repository-id>` from its
+  configuration.
+- A standalone issue queue uses `<meerkat.state_root>/mobkit-runtime`, unless
+  it is bound to a repository team. Keep the historical directory name.
+
+Do not merge directories or infer that one repository's successful migration
+covers another repository. Retain a migration report for every runtime.
+
+## Inspect, then apply
+
+The candidate binary exposes Meta's native census and migration directly.
+Its `build-info` and release manifest declare `runtime_storage: meta_native_v1`,
+so installation tooling can select this migration contract without guessing
+from a CLI help string or the model-authentication CLI's version.
+
+```bash
+meerkat-fugue migrate-storage --runtime-dir /private/state/repository-team
+```
+
+Without `--apply`, this inspects scratch copies and leaves database contents
+unchanged. Native lock or SQLite bookkeeping files may be created. The JSON
+report names each refusal and the relevant state. A nonzero exit means the
+runtime is not ready to migrate. Resolve the reported cause before continuing;
+do not delete sessions or rewrite database rows to bypass it.
+
+After a clean census and a complete backup:
+
+```bash
+meerkat-fugue migrate-storage \
+  --runtime-dir /private/state/repository-team --apply
+```
+
+Fugue supplies its `mob.sqlite3` location to Meta. Meta owns the maintenance
+fence, consistency checks, journal, and migration. The command prints the native
+JSON report and exits nonzero on a refusal. `--scratch-dir` can place temporary
+census copies on a volume with sufficient free space.
+
+If application stops partway through, preserve the report and journal. With
+all runtimes stopped, rerunning the same native `--apply` resumes or restarts
+the migration according to that journal. Never remove the journal to force
+startup.
+
+## Verify the resumed installation
+
+Start the candidate only after every required runtime migrates cleanly.
+Check the installed build identity and all of the following:
+
+- Every repository retains its specialists and active ticket members.
+- Existing conversations survive refresh, and new input and responses stream.
+- Topology peers, Memory, and Work Graph come from the intended native runtime.
+- The board retains the correct issue/run mappings and lifecycle state.
+- A graceful stop and restart preserves the same identities and history.
+
+Keep crash-recovery qualification separate from those ordinary restart checks.
+Use the [upstream upgrade guide](https://github.com/lukacf/meerkat-meta/blob/v0.9.4/docs/guides/upgrading-to-0-9-4.mdx)
+for the full census refusal catalogue and native store details.
+
+## Roll back the complete state
+
+The storage migration is one-way. Stop the candidate, preserve its failed
+state for diagnosis, restore the complete stopped-state backup, and restore
+the matching old binary bundle and service configuration. Do not point the
+old binary at migrated state. Writes made after migration are not carried
+back automatically.
+
+The private deployment installer must restore binaries and their matching
+state snapshot together if upgrade verification fails. Keep its rollback
+receipt with the installation evidence.

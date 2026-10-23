@@ -1,12 +1,20 @@
 //! Read-only identity of the compiled executable, used to verify deployments.
 use serde::Serialize;
 
+/// Storage contract supported by this bundle's offline migration command.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeStorage {
+    MetaNativeV1,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BuildIdentity {
     pub version: &'static str,
     pub commit: &'static str,
     pub tree: &'static str,
     pub dirty: bool,
+    pub runtime_storage: RuntimeStorage,
 }
 
 pub fn current() -> BuildIdentity {
@@ -15,6 +23,7 @@ pub fn current() -> BuildIdentity {
         commit: env!("FUGUE_BUILD_COMMIT"),
         tree: env!("FUGUE_BUILD_TREE"),
         dirty: env!("FUGUE_BUILD_DIRTY") != "false",
+        runtime_storage: RuntimeStorage::MetaNativeV1,
     }
 }
 
