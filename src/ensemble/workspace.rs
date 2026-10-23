@@ -63,7 +63,7 @@ struct Active {
 
 pub struct Workspace {
     path: PathBuf,
-    _config_lock: std::fs::File,
+    _config_lock: crate::file_lease::FileLease,
     queue_enabled: bool,
     configuration: Mutex<Configuration>,
     active: RwLock<Option<Active>>,
@@ -118,8 +118,7 @@ impl Workspace {
             options.mode(0o600);
         }
         let config_lock = options.open(path.with_extension("yaml.lock"))?;
-        config_lock
-            .try_lock()
+        let config_lock = crate::file_lease::FileLease::acquire(config_lock)
             .context("another Fugue instance owns this repository configuration")?;
         let saved = match std::fs::read(&path) {
             Ok(bytes) => Some(bytes),
@@ -593,6 +592,20 @@ mod tests {
         assert!(!path.exists());
         workspace.shutdown().await.unwrap();
         assert!(workspace.start().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn configuration_owner_releases_lock_with_a_fork_style_descriptor_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.yaml");
+        let owner = Workspace::open(path.clone(), true, None, None, None).unwrap();
+        let inherited = owner._config_lock.duplicate_descriptor_for_test().unwrap();
+        drop(owner);
+        let next = Workspace::open(path.clone(), true, None, None, None).unwrap();
+        drop(inherited);
+        assert!(Workspace::open(path.clone(), true, None, None, None).is_err());
+        drop(next);
+        assert!(Workspace::open(path, true, None, None, None).is_ok());
     }
 
     #[test]

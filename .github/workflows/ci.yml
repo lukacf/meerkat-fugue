@@ -77,7 +77,15 @@ jobs:
         timeout-minutes: 15
         run: |
           cargo test --locked --lib --no-run --message-format=json-render-diagnostics > "$RUNNER_TEMP/fugue-native-tests.jsonl"
-          python3 scripts/ci/repeat-native-tests.py "$RUNNER_TEMP/fugue-native-tests.jsonl"
+          python3 scripts/ci/repeat-native-tests.py "$RUNNER_TEMP/fugue-native-tests.jsonl" "$RUNNER_TEMP/fugue-retirement"
+
+      - name: Retain native retirement evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-retirement-evidence
+          path: ${{ runner.temp }}/fugue-retirement/
+          if-no-files-found: ignore
 
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings

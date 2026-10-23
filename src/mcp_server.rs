@@ -5,7 +5,6 @@ use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::agent::{execute_github_fugue_tool, external_tools_for_tracker};
 use crate::config::TrackerConfig;
 use crate::independent_review::independent_review_completion_input_schema;
-use crate::linear_tools::execute_linear_fugue_tool;
 use crate::tools::{
     BranchName, FugueToolOperation, GitHubOwner, GitHubPullRequestNumber, GitHubPullRequestRef,
     GitHubRepoName, GitHubRepoRef, GitRef, LinearIssueId, LinearIssueIdentifier, LinearIssueRef,
@@ -19,74 +18,128 @@ pub async fn run_linear_mcp_server(config: TrackerConfig) -> anyhow::Result<()> 
     }
     let authority = LinearMcpAuthority::from_env();
     let tools = linear_tools(&config, authority);
-    let scope = LinearMcpScope::from_env();
-    let memory = Arc::new(Mutex::new(LinearMcpCallMemory::default()));
-    let server_name = if config.kind == "jira" {
+    let handler = LinearMcpHandler {
+        gate: WorkGraphTerminalGate::from_env(&config),
+        config,
+        authority,
+        scope: LinearMcpScope::from_env(),
+        memory: Arc::new(Mutex::new(LinearMcpCallMemory::default())),
+        review_handoff_states: env_list(crate::linear_tools::LINEAR_REVIEW_HANDOFF_STATES_ENV),
+        action_states: env_list(crate::linear_tools::LINEAR_ACTION_STATES_ENV),
+    };
+    let server_name = if handler.config.kind == "jira" {
         "fugue-jira-mcp"
     } else {
         "fugue-linear-mcp"
     };
     run_stdio_mcp(server_name, tools, move |name, arguments| {
-        let config = config.clone();
-        let scope = scope.clone();
-        let authority = authority;
-        let memory = Arc::clone(&memory);
-        async move {
-            if let Some(operation) = linear_fugue_operation(&name) {
-                if !linear_mcp_authority_allows(authority, operation) {
-                    return (
-                        true,
-                        json!({
-                            "error": format!(
-                                "Linear MCP tool {name} requires projection authority; issue-mob members may write Workpad evidence, while issue leads own per-issue lifecycle state changes"
-                            )
-                        })
-                        .to_string(),
-                    );
-                }
-                let arguments = match apply_linear_mcp_scope(&config, &scope, &name, arguments) {
-                    Ok(arguments) => arguments,
-                    Err(error) => {
-                        return (true, json!({"error": error}).to_string());
-                    }
-                };
-                let arguments = apply_linear_mcp_memory(&memory, &name, arguments);
-                remember_linear_mcp_issue_argument(&memory, &arguments);
-                execute_guarded_linear_mcp_tool(
-                    &config, &name, &arguments,
-                    WorkGraphTerminalGate::from_env(&config).as_ref(),
-                ).await
-            } else {
-                (
-                    true,
-                    json!({"error": format!("unsupported Linear MCP tool {name}")}).to_string(),
-                )
-            }
-        }
+        let handler = handler.clone();
+        async move { handler.execute(&name, arguments).await }
     })
     .await
 }
 
-pub(crate) async fn execute_guarded_linear_mcp_tool(
-    config: &TrackerConfig,
-    name: &str,
-    arguments: &Value,
-    gate: Option<&WorkGraphTerminalGate>,
-) -> (bool, String) {
-    let lane_move = match crate::workgraph_gate::lane_move_for_tool(name, arguments) {
-        Ok(input) => input,
-        Err(error) => return (true, json!({"error": error.to_string()}).to_string()),
-    };
-    if let Some(input) = lane_move
-        && let Some(gate) = gate
-        && let Err(message) = gate.guard_terminal_move(config, &input).await
-    {
-        return (
-            true,
-            json!({"error": "unresolved_workgraph_obligations", "message": message}).to_string(),
-        );
+/// The same admission path serves stdio requests and integration tests.
+#[derive(Clone)]
+pub(crate) struct LinearMcpHandler {
+    config: TrackerConfig,
+    scope: LinearMcpScope,
+    authority: LinearMcpAuthority,
+    memory: Arc<Mutex<LinearMcpCallMemory>>,
+    gate: Option<WorkGraphTerminalGate>,
+    review_handoff_states: Vec<String>,
+    action_states: Vec<String>,
+}
+
+impl LinearMcpHandler {
+    pub(crate) async fn execute(&self, name: &str, arguments: Value) -> (bool, String) {
+        let Some(operation) = linear_fugue_operation(name) else {
+            return (
+                true,
+                json!({"error": format!("unsupported Linear MCP tool {name}")}).to_string(),
+            );
+        };
+        // Scope, policy, memory and execution must agree on the operation for
+        // every accepted spelling. Never dispatch the unnormalized input name.
+        let name = operation.provider_callback_name();
+        if !linear_mcp_authority_allows(self.authority, operation) {
+            return (true, json!({"error": format!(
+                "Linear MCP tool {name} requires projection authority; issue-mob members may write Workpad evidence, while issue leads own per-issue lifecycle state changes"
+            )}).to_string());
+        }
+        let arguments = match apply_linear_mcp_scope(&self.config, &self.scope, name, arguments) {
+            Ok(arguments) => arguments,
+            Err(error) => return (true, json!({"error": error}).to_string()),
+        };
+        let arguments = apply_linear_mcp_memory(&self.memory, name, arguments);
+        remember_linear_mcp_issue_argument(&self.memory, &arguments);
+        let lane_move = match crate::workgraph_gate::lane_move_for_tool(operation, &arguments) {
+            Ok(input) => input,
+            Err(error) => return (true, json!({"error": error.to_string()}).to_string()),
+        };
+        if let Some(input) = lane_move {
+            if let Err(message) = crate::workgraph_gate::guard_public_lane_move(
+                &self.config,
+                &self.review_handoff_states,
+                &self.action_states,
+                &input,
+            ) {
+                return (
+                    true,
+                    json!({"error": "noncanonical_public_lane", "message": message}).to_string(),
+                );
+            }
+            let Some(gate) = &self.gate else {
+                return (true, json!({
+                    "error": "workgraph_gate_unconfigured",
+                    "message": "Issue state changes require the Fugue host's WorkGraph configuration. Start this MCP server through Fugue or configure FUGUE_WORKGRAPH_STATE_PATH and FUGUE_WORKGRAPH_MOB_ID."
+                }).to_string());
+            };
+            if let Err(message) = gate.guard_terminal_move(&self.config, &input).await {
+                return (
+                    true,
+                    json!({"error": "unresolved_workgraph_obligations", "message": message})
+                        .to_string(),
+                );
+            }
+        }
+        crate::linear_tools::execute_linear_fugue_tool_with_review_handoff_states(
+            &self.config,
+            name,
+            &arguments,
+            &self.review_handoff_states,
+        )
+        .await
     }
-    execute_linear_fugue_tool(config, name, arguments).await
+
+    #[cfg(test)]
+    pub(crate) fn projection_for_test(
+        config: TrackerConfig,
+        gate: Option<WorkGraphTerminalGate>,
+    ) -> Self {
+        Self {
+            config,
+            gate,
+            scope: LinearMcpScope::default(),
+            authority: LinearMcpAuthority::Projection,
+            memory: Arc::new(Mutex::new(LinearMcpCallMemory::default())),
+            review_handoff_states: Vec::new(),
+            action_states: Vec::new(),
+        }
+    }
+}
+
+fn env_list(key: &str) -> Vec<String> {
+    env_string(key)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub async fn run_github_mcp_server() -> anyhow::Result<()> {
@@ -1248,6 +1301,52 @@ fn protocol_tool_descriptor(tool: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn admission_applies_role_public_lane_and_required_gate_policy_to_all_spellings() {
+        for (name, state_field) in [
+            ("linear_move_issue", "state"),
+            ("linear.move_issue", "state"),
+            ("linear_claim_issue", "target_state"),
+            ("linear.claim_issue", "target_state"),
+        ] {
+            let mut config = compact_tracker_config();
+            config.active_states = vec!["Active".into(), "Deploy".into()];
+            let mut handler = LinearMcpHandler::projection_for_test(config, None);
+            handler.action_states = vec!["Deploy".into()];
+            let mut input = json!({"issue":"TEST-1"});
+            for (state, expected) in [
+                (
+                    json!({"kind":"name","name":"Deploy"}),
+                    "noncanonical_public_lane",
+                ),
+                (
+                    json!({"kind":"name","name":"Unknown"}),
+                    "unconfigured Linear state name",
+                ),
+                (
+                    json!({"kind":"id","id":"opaque-state"}),
+                    "noncanonical_public_lane",
+                ),
+                (
+                    json!({"kind":"name","name":"Active"}),
+                    "workgraph_gate_unconfigured",
+                ),
+            ] {
+                input[state_field] = state;
+                let (failed, response) = handler.execute(name, input.clone()).await;
+                assert!(failed, "{name}: {response}");
+                assert!(response.contains(expected), "{name}: {response}");
+            }
+            handler.authority = LinearMcpAuthority::Workpad;
+            let (failed, response) = handler.execute(name, input).await;
+            assert!(failed);
+            assert!(
+                response.contains("requires projection authority"),
+                "{response}"
+            );
+        }
+    }
+
     #[test]
     fn enterprise_scope_supplies_missing_host_and_preserves_explicit_host() {
         let scope = GitHubMcpScope {

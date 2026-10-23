@@ -96,6 +96,11 @@ lead or coordinator authority because it can change the lane. If a claim with
 `target_state` is refused for unresolved WorkGraph obligations, resolve the
 findings through review; changing the assignment is not a way to complete them.
 
+For `workgraph_gate_unconfigured`, start the MCP server through Fugue so it
+receives the repository's WorkGraph database path and mob identity. Do not
+remove the guard to make state changes work. For `noncanonical_public_lane`,
+use a configured status name; action lanes such as Deploy are operator inputs.
+
 Check that:
 
 - `mcp_servers` defines the named server;

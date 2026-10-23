@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -20,12 +21,12 @@ pub const FUGUE_WORKGRAPH_BLOCKING_LABEL: &str = "blocking";
 /// Extract the lane change before dispatch, including the optional change in a claim.
 /// Invalid arguments must fail before either assignment or state mutation occurs.
 pub(crate) fn lane_move_for_tool(
-    name: &str,
+    operation: FugueToolOperation,
     arguments: &serde_json::Value,
 ) -> Result<Option<MoveIssueInput>, serde_json::Error> {
-    match name {
-        "linear_move_issue" => serde_json::from_value(arguments.clone()).map(Some),
-        "linear_claim_issue" => {
+    match operation {
+        FugueToolOperation::LinearMoveIssue => serde_json::from_value(arguments.clone()).map(Some),
+        FugueToolOperation::LinearClaimIssue => {
             let input: ClaimIssueInput = serde_json::from_value(arguments.clone())?;
             Ok(input.target_state.map(|state| MoveIssueInput {
                 issue: input.issue,
@@ -35,6 +36,127 @@ pub(crate) fn lane_move_for_tool(
             }))
         }
         _ => Ok(None),
+    }
+}
+
+pub(crate) fn guard_public_lane_move(
+    tracker: &TrackerConfig,
+    review_handoff_states: &[String],
+    action_states: &[String],
+    input: &MoveIssueInput,
+) -> Result<(), String> {
+    let target = match &input.state {
+        LinearStateRef::Name { name } => name.trim(),
+        LinearStateRef::Id { .. } => {
+            return Err(
+                "Issue lane changes require a named Fugue public lane, not an opaque Linear state id"
+                    .to_string(),
+            );
+        }
+    };
+    if target.is_empty() {
+        return Err("Issue lane change target must not be empty".to_string());
+    }
+    if tracker.kind != "jira"
+        && let Some(replacement) = legacy_public_lane_replacement(target)
+    {
+        return Err(format!(
+            "{target:?} is a legacy Fugue/Linear phase lane and must not be written by agents; use {replacement:?} and record phase/detail as labels, WorkGraph, Workpad, or Meta evidence"
+        ));
+    }
+    if direct_public_lane_is_action(action_states, target) {
+        return Err(format!(
+            "{target:?} is a Fugue action lane. Action lanes are operator or host-observed control inputs only; agents must not move issues there with linear_move_issue or linear_claim_issue. Keep ordinary running work on the active projection lane, record PR/review/deploy intent as evidence, or use Blocked/terminal lanes when those facts are true."
+        ));
+    }
+    if direct_public_lane_allowed(tracker, review_handoff_states, target) {
+        return Ok(());
+    }
+    Err(format!(
+        "{target:?} is not a configured Fugue public lane for this queue. Allowed lanes: {}",
+        PublicLaneList::new(tracker, review_handoff_states, action_states)
+    ))
+}
+
+fn direct_public_lane_is_action(action_states: &[String], target: &str) -> bool {
+    let normalized = normalize_state(target);
+    action_states
+        .iter()
+        .any(|candidate| normalize_state(candidate) == normalized)
+}
+
+fn direct_public_lane_allowed(
+    tracker: &TrackerConfig,
+    review_handoff_states: &[String],
+    target: &str,
+) -> bool {
+    let normalized = normalize_state(target);
+    tracker
+        .intake_states
+        .iter()
+        .chain(tracker.in_flight_states.iter())
+        .chain(tracker.active_states.iter())
+        .chain(tracker.terminal_states.iter())
+        .chain(review_handoff_states.iter())
+        .any(|candidate| normalize_state(candidate) == normalized)
+}
+
+fn legacy_public_lane_replacement(target: &str) -> Option<&'static str> {
+    match normalize_state(target).as_str() {
+        "planning" | "implementing" | "reviewing" | "in progress" => Some("Active"),
+        "do review" | "in review" | "ready for review" | "human review" => Some("Review"),
+        "rework" => Some("Active"),
+        "merging" => Some("Deploy"),
+        _ => None,
+    }
+}
+
+struct PublicLaneList<'a> {
+    tracker: &'a TrackerConfig,
+    review_handoff_states: &'a [String],
+    action_states: &'a [String],
+}
+
+impl<'a> PublicLaneList<'a> {
+    fn new(
+        tracker: &'a TrackerConfig,
+        review_handoff_states: &'a [String],
+        action_states: &'a [String],
+    ) -> Self {
+        Self {
+            tracker,
+            review_handoff_states,
+            action_states,
+        }
+    }
+}
+
+impl std::fmt::Display for PublicLaneList<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first = true;
+        let mut seen = BTreeSet::new();
+        for lane in self
+            .tracker
+            .intake_states
+            .iter()
+            .chain(self.tracker.in_flight_states.iter())
+            .chain(self.tracker.active_states.iter())
+            .chain(self.tracker.terminal_states.iter())
+            .chain(self.review_handoff_states.iter())
+        {
+            if direct_public_lane_is_action(self.action_states, lane) {
+                continue;
+            }
+            if !seen.insert(normalize_state(lane)) {
+                continue;
+            }
+            if !first {
+                f.write_str(", ")?;
+            }
+            first = false;
+            f.write_str(lane)?;
+        }
+        Ok(())
     }
 }
 

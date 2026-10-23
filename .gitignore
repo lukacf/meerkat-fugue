@@ -34,6 +34,7 @@ secrets.env
 *.sqlite3-shm
 .DS_Store
 
-# Local release helper bytecode.
+# Local test and release helper bytecode.
 scripts/release/__pycache__/
 scripts/distribution/__pycache__/
+scripts/ci/__pycache__/

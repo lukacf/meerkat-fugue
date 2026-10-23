@@ -570,15 +570,13 @@ impl AgentToolDispatcher for SubscriptionTools {
                             crate::config::absolute_clean_path(&cwd, &self.events.root),
                             self.events.root.canonicalize()?,
                         ];
-                        let exclusions = [
-                            crate::config::absolute_clean_path(&cwd, excluded),
-                            excluded.canonicalize()?,
-                        ];
+                        let exclusions = state_path_spellings(excluded)?;
                         if roots.iter().any(|root| {
                             exclusions.iter().any(|excluded| {
-                                excluded
-                                    .strip_prefix(root)
-                                    .is_ok_and(|relative| path.0.starts_with(relative))
+                                root.starts_with(excluded)
+                                    || excluded
+                                        .strip_prefix(root)
+                                        .is_ok_and(|relative| path.0.starts_with(relative))
                             })
                         }) {
                             bail!("Configured runtime state is not exposed by repository tools");
@@ -611,31 +609,116 @@ impl AgentToolDispatcher for SubscriptionTools {
     }
 }
 
+/// Git addresses names in historical trees, not the current filesystem target.
+/// Retain every spelling encountered while resolving symlinks, including a
+/// symlink followed by `..`. Cleaning before resolution would change its meaning.
+fn state_path_spellings(path: &Path) -> Result<std::collections::BTreeSet<PathBuf>> {
+    let cwd = std::env::current_dir()?;
+    let mut pending = std::path::absolute(path)?;
+    let mut spellings = std::collections::BTreeSet::new();
+    for _ in 0..=40 {
+        spellings.insert(crate::config::absolute_clean_path(&cwd, &pending));
+        let mut resolved = PathBuf::new();
+        let mut components = pending.components();
+        let mut expanded = None;
+        while let Some(component) = components.next() {
+            match component {
+                Component::ParentDir => {
+                    resolved.pop();
+                }
+                Component::CurDir => {}
+                Component::Prefix(_) | Component::RootDir => resolved.push(component),
+                Component::Normal(name) => {
+                    resolved.push(name);
+                    if std::fs::symlink_metadata(&resolved)?
+                        .file_type()
+                        .is_symlink()
+                    {
+                        let target = std::fs::read_link(&resolved)?;
+                        let parent = resolved
+                            .parent()
+                            .context("state symlink requires a parent")?;
+                        expanded = Some(parent.join(target).join(components.as_path()));
+                        break;
+                    }
+                }
+            }
+        }
+        match expanded {
+            Some(path) => pending = path,
+            None => {
+                spellings.insert(resolved);
+                return Ok(spellings);
+            }
+        }
+    }
+    bail!("Configured runtime state has too many symlink indirections")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
     async fn historical_revision_cannot_expose_configured_private_state() {
-        historical_state_exclusion(false, false).await;
+        historical_state_exclusion(StatePathCase::Direct).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn historical_revision_cannot_expose_symlinked_private_state() {
-        historical_state_exclusion(true, false).await;
+        historical_state_exclusion(StatePathCase::LeafLink).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn historical_revision_cannot_expose_config_relative_symlinked_state() {
-        historical_state_exclusion(true, true).await;
+        historical_state_exclusion(StatePathCase::ConfigRelative).await;
     }
 
-    async fn historical_state_exclusion(symlinked: bool, config_relative: bool) {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn historical_revision_excludes_each_intermediate_state_path() {
+        for case in [
+            StatePathCase::AncestorParent,
+            StatePathCase::AncestorLink,
+            StatePathCase::LinkChain,
+        ] {
+            historical_state_exclusion(case).await;
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum StatePathCase {
+        Direct,
+        LeafLink,
+        ConfigRelative,
+        #[cfg(unix)]
+        AncestorParent,
+        #[cfg(unix)]
+        AncestorLink,
+        #[cfg(unix)]
+        LinkChain,
+    }
+
+    async fn historical_state_exclusion(case: StatePathCase) {
         let root = tempfile::tempdir().unwrap();
-        let state = root.path().join("custom-state");
-        std::fs::create_dir(&state).unwrap();
+        let historical_path = match case {
+            #[cfg(unix)]
+            StatePathCase::AncestorParent | StatePathCase::AncestorLink => "other/custom-state",
+            _ => "custom-state",
+        };
+        let state = root.path().join(historical_path);
+        std::fs::create_dir_all(&state).unwrap();
+        #[cfg(unix)]
+        if matches!(case, StatePathCase::LinkChain) {
+            std::fs::create_dir(root.path().join("intermediate-state")).unwrap();
+            std::fs::write(
+                root.path().join("intermediate-state/private.txt"),
+                "private-sentinel",
+            )
+            .unwrap();
+        }
         std::fs::write(state.join("private.txt"), "private-sentinel").unwrap();
         std::fs::write(root.path().join("public.txt"), "public source").unwrap();
         let git = |args: &[&str]| {
@@ -664,29 +747,53 @@ mod tests {
         ]);
         let revision = git(&["rev-parse", "HEAD"]);
         std::fs::remove_file(state.join("private.txt")).unwrap();
-        if symlinked {
-            #[cfg(unix)]
-            {
-                let target = root.path().join("real-state");
-                std::fs::rename(&state, &target).unwrap();
-                std::os::unix::fs::symlink(&target, &state).unwrap();
+        let mut configured_state = state.clone();
+        #[cfg(unix)]
+        if !matches!(case, StatePathCase::Direct) {
+            use std::os::unix::fs::symlink;
+            let target = root.path().join("real-state");
+            std::fs::rename(&state, &target).unwrap();
+            if matches!(case, StatePathCase::LinkChain) {
+                let intermediate = root.path().join("intermediate-state");
+                std::fs::remove_file(intermediate.join("private.txt")).unwrap();
+                std::fs::remove_dir(&intermediate).unwrap();
+                symlink(&target, &intermediate).unwrap();
+                symlink(&intermediate, &state).unwrap();
+            } else {
+                symlink(&target, &state).unwrap();
+            }
+            match case {
+                StatePathCase::AncestorParent => {
+                    std::fs::create_dir(root.path().join("other/leaf")).unwrap();
+                    symlink("other/leaf", root.path().join("hop")).unwrap();
+                    configured_state = root.path().join("hop/../custom-state");
+                }
+                StatePathCase::AncestorLink => {
+                    symlink("other", root.path().join("hop")).unwrap();
+                    configured_state = root.path().join("hop/custom-state");
+                }
+                _ => {}
             }
         }
-        let state = if config_relative {
-            let config_dir = root.path().join("config");
-            std::fs::create_dir(&config_dir).unwrap();
-            let config_path = config_dir.join("ensemble.yaml");
-            std::fs::write(
-                &config_path,
-                "state_root: ../custom-state\nrepositories: {}\n",
-            )
-            .unwrap();
-            super::super::config::EnsembleConfig::load(&config_path)
-                .unwrap()
-                .state_root
+        let config_dir = root.path().join("config");
+        std::fs::create_dir(&config_dir).unwrap();
+        let config_path = config_dir.join("ensemble.yaml");
+        let configured_state = if matches!(case, StatePathCase::ConfigRelative) {
+            PathBuf::from("../custom-state")
         } else {
-            state
+            configured_state
         };
+        std::fs::write(
+            &config_path,
+            format!(
+                "state_root: {}\nrepositories: {{}}\n",
+                configured_state.display()
+            ),
+        )
+        .unwrap();
+        let state = super::super::config::EnsembleConfig::load(&config_path)
+            .unwrap()
+            .state_root;
         let events = RepositoryEvents::open(
             super::super::config::RepoId::try_from("test".to_owned()).unwrap(),
             root.path().to_path_buf(),
@@ -700,7 +807,15 @@ mod tests {
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
         )
         .with_excluded_state_root(state);
-        for (path, denied) in [("custom-state/private.txt", true), ("public.txt", false)] {
+        let mut reads = vec![
+            (format!("{historical_path}/private.txt"), true),
+            ("public.txt".to_owned(), false),
+        ];
+        #[cfg(unix)]
+        if matches!(case, StatePathCase::LinkChain) {
+            reads.push(("intermediate-state/private.txt".to_owned(), true));
+        }
+        for (path, denied) in reads {
             let args = serde_json::value::RawValue::from_string(
                 json!({"revision":revision,"path":path}).to_string(),
             )

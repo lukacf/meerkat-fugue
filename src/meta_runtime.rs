@@ -37,7 +37,6 @@ use crate::config::{
     TrackerConfig, default_agent_model, is_native_linear_mcp_server,
 };
 use crate::deploy_gate::DeployStartRequest;
-use crate::domain::normalize_state;
 use crate::final_pr_gate::FinalPrGateStartRequest;
 use crate::independent_review::{
     IndependentReviewCompletionRequest, IndependentReviewStartRequest,
@@ -51,11 +50,17 @@ use crate::mob_tools::{NativeMobExecutionHost, NativeMobLaunchPlan, ObserveStruc
 use crate::tools::{
     CancelExecutionInput, Cursor, FugueToolErrorCode, FugueToolOperation, FugueToolOutput,
     FugueToolResult, GitHubOwner, GitHubRepoName, GitHubRepoRef, InspectRunInput, LinearIssueRef,
-    LinearStateRef, ListRunsInput, ListRunsOutput, MobEventKind, MobEventSnapshot, MobRunId,
-    MobRunSnapshot, MobRunStatus, MoveIssueInput, RetryAdvice, SpawnOrResumeExecutionInput,
-    SpawnOrResumeExecutionOutput, ToolExecutionMetadata,
+    ListRunsInput, ListRunsOutput, MobEventKind, MobEventSnapshot, MobRunId, MobRunSnapshot,
+    MobRunStatus, RetryAdvice, SpawnOrResumeExecutionInput, SpawnOrResumeExecutionOutput,
+    ToolExecutionMetadata,
 };
-use crate::workgraph_gate::{WORKGRAPH_BLOCKED_STATES_ENV, WorkGraphTerminalGate};
+use crate::workgraph_gate::{
+    WORKGRAPH_BLOCKED_STATES_ENV, WorkGraphTerminalGate,
+    guard_public_lane_move as guard_direct_public_lane_move,
+};
+
+#[cfg(test)]
+use crate::tools::{LinearStateRef, MoveIssueInput};
 
 const RUNTIME_KEY: &str = "fugue";
 const MOB_ID: &str = crate::native_mob_contract::FUGUE_MOB_ID;
@@ -1033,11 +1038,19 @@ impl AgentToolDispatcher for FugueDirectToolDispatcher {
                 )
                 .into());
             }
-            let lane_move = crate::workgraph_gate::lane_move_for_tool(call.name, &arguments)
-                .map_err(|error| meerkat_core::error::ToolError::InvalidArguments {
-                    name: call.name.to_string(),
-                    reason: error.to_string(),
-                })?;
+            let lane_move = crate::workgraph_gate::lane_move_for_tool(
+                call.name.parse::<FugueToolOperation>().map_err(|error| {
+                    meerkat_core::error::ToolError::InvalidArguments {
+                        name: call.name.to_owned(),
+                        reason: error.to_string(),
+                    }
+                })?,
+                &arguments,
+            )
+            .map_err(|error| meerkat_core::error::ToolError::InvalidArguments {
+                name: call.name.to_string(),
+                reason: error.to_string(),
+            })?;
             if let Some(input) = lane_move {
                 if let Err(message) = guard_direct_public_lane_move(
                     &self.tracker,
@@ -1299,127 +1312,6 @@ fn linear_tool_mutates_issue_lane(name: &str) -> bool {
         name,
         "linear_move_issue" | "linear_claim_issue" | "linear_delete_issue"
     )
-}
-
-fn guard_direct_public_lane_move(
-    tracker: &TrackerConfig,
-    review_handoff_states: &[String],
-    action_states: &[String],
-    input: &MoveIssueInput,
-) -> Result<(), String> {
-    let target = match &input.state {
-        LinearStateRef::Name { name } => name.trim(),
-        LinearStateRef::Id { .. } => {
-            return Err(
-                "Issue lane changes require a named Fugue public lane, not an opaque Linear state id"
-                    .to_string(),
-            );
-        }
-    };
-    if target.is_empty() {
-        return Err("Issue lane change target must not be empty".to_string());
-    }
-    if tracker.kind != "jira"
-        && let Some(replacement) = legacy_public_lane_replacement(target)
-    {
-        return Err(format!(
-            "{target:?} is a legacy Fugue/Linear phase lane and must not be written by agents; use {replacement:?} and record phase/detail as labels, WorkGraph, Workpad, or Meta evidence"
-        ));
-    }
-    if direct_public_lane_is_action(action_states, target) {
-        return Err(format!(
-            "{target:?} is a Fugue action lane. Action lanes are operator or host-observed control inputs only; agents must not move issues there with linear_move_issue or linear_claim_issue. Keep ordinary running work on the active projection lane, record PR/review/deploy intent as evidence, or use Blocked/terminal lanes when those facts are true."
-        ));
-    }
-    if direct_public_lane_allowed(tracker, review_handoff_states, target) {
-        return Ok(());
-    }
-    Err(format!(
-        "{target:?} is not a configured Fugue public lane for this queue. Allowed lanes: {}",
-        PublicLaneList::new(tracker, review_handoff_states, action_states)
-    ))
-}
-
-fn direct_public_lane_is_action(action_states: &[String], target: &str) -> bool {
-    let normalized = normalize_state(target);
-    action_states
-        .iter()
-        .any(|candidate| normalize_state(candidate) == normalized)
-}
-
-fn direct_public_lane_allowed(
-    tracker: &TrackerConfig,
-    review_handoff_states: &[String],
-    target: &str,
-) -> bool {
-    let normalized = normalize_state(target);
-    tracker
-        .intake_states
-        .iter()
-        .chain(tracker.in_flight_states.iter())
-        .chain(tracker.active_states.iter())
-        .chain(tracker.terminal_states.iter())
-        .chain(review_handoff_states.iter())
-        .any(|candidate| normalize_state(candidate) == normalized)
-}
-
-fn legacy_public_lane_replacement(target: &str) -> Option<&'static str> {
-    match normalize_state(target).as_str() {
-        "planning" | "implementing" | "reviewing" | "in progress" => Some("Active"),
-        "do review" | "in review" | "ready for review" | "human review" => Some("Review"),
-        "rework" => Some("Active"),
-        "merging" => Some("Deploy"),
-        _ => None,
-    }
-}
-
-struct PublicLaneList<'a> {
-    tracker: &'a TrackerConfig,
-    review_handoff_states: &'a [String],
-    action_states: &'a [String],
-}
-
-impl<'a> PublicLaneList<'a> {
-    fn new(
-        tracker: &'a TrackerConfig,
-        review_handoff_states: &'a [String],
-        action_states: &'a [String],
-    ) -> Self {
-        Self {
-            tracker,
-            review_handoff_states,
-            action_states,
-        }
-    }
-}
-
-impl std::fmt::Display for PublicLaneList<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut first = true;
-        let mut seen = BTreeSet::new();
-        for lane in self
-            .tracker
-            .intake_states
-            .iter()
-            .chain(self.tracker.in_flight_states.iter())
-            .chain(self.tracker.active_states.iter())
-            .chain(self.tracker.terminal_states.iter())
-            .chain(self.review_handoff_states.iter())
-        {
-            if direct_public_lane_is_action(self.action_states, lane) {
-                continue;
-            }
-            if !seen.insert(normalize_state(lane)) {
-                continue;
-            }
-            if !first {
-                f.write_str(", ")?;
-            }
-            first = false;
-            f.write_str(lane)?;
-        }
-        Ok(())
-    }
 }
 
 fn tool_def_from_value(value: Value) -> Option<ToolDef> {
@@ -4190,7 +4082,16 @@ pub(crate) mod tests {
             })
             .await
             .unwrap();
-        for use_mcp in [false, true] {
+        for (use_mcp, tool_name) in [
+            (false, "linear_claim_issue"),
+            (true, "linear_claim_issue"),
+            (true, "linear.claim_issue"),
+            (true, "linear_move_issue"),
+            (true, "linear.move_issue"),
+        ] {
+            let is_claim = tool_name.parse::<FugueToolOperation>().unwrap()
+                == FugueToolOperation::LinearClaimIssue;
+            let state_field = if is_claim { "target_state" } else { "state" };
             for issue_ref in [
                 json!({"kind":"identifier", "identifier":"TEST-1"}),
                 json!({"kind":"id", "id":"10001"}),
@@ -4214,6 +4115,10 @@ pub(crate) mod tests {
                 let tracker = tracker(&mock.endpoint);
                 let gate = WorkGraphTerminalGate::new(&path, vec!["Done".into()], Vec::new())
                     .for_mob("claim-test");
+                let mcp = crate::mcp_server::LinearMcpHandler::projection_for_test(
+                    tracker.clone(),
+                    Some(gate.clone()),
+                );
                 let dispatcher = direct_tool_dispatcher(
                     &tracker,
                     None,
@@ -4239,21 +4144,11 @@ pub(crate) mod tests {
                     ),
                     (json!({"kind":"id", "id":"3"}), "noncanonical_public_lane"),
                 ] {
-                    input["target_state"] = state;
+                    input[state_field] = state;
                     if use_mcp {
-                        let (failed, response) =
-                            crate::mcp_server::execute_guarded_linear_mcp_tool(
-                                &tracker,
-                                "linear_claim_issue",
-                                &input,
-                                Some(&gate),
-                            )
-                            .await;
+                        let (failed, response) = mcp.execute(tool_name, input.clone()).await;
                         assert!(failed);
-                        assert!(
-                            response.contains("unresolved_workgraph_obligations"),
-                            "{response}"
-                        );
+                        assert!(response.contains(expected), "{response}");
                     } else {
                         let args = serde_json::value::to_raw_value(&input).unwrap();
                         let outcome = dispatcher
@@ -4278,6 +4173,9 @@ pub(crate) mod tests {
                     2,
                     "only inspection may reach Jira"
                 );
+                if !is_claim {
+                    continue;
+                }
                 // An assignment without a lane change remains usable even with an open obligation.
                 mock.responses.lock().unwrap().extend([
                     reply("GET", lookup_path, issue("In Progress")),
@@ -4286,13 +4184,7 @@ pub(crate) mod tests {
                 ]);
                 input["target_state"] = Value::Null;
                 if use_mcp {
-                    let (failed, response) = crate::mcp_server::execute_guarded_linear_mcp_tool(
-                        &tracker,
-                        "linear_claim_issue",
-                        &input,
-                        Some(&gate),
-                    )
-                    .await;
+                    let (failed, response) = mcp.execute(tool_name, input.clone()).await;
                     assert!(!failed, "{response}");
                 } else {
                     let args = serde_json::value::to_raw_value(&input).unwrap();

@@ -1,10 +1,41 @@
 #!/usr/bin/env python3
 """Repeat native restart checks using one Cargo-produced test executable."""
+import hashlib
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import subprocess
 import sys
+
+
+RETIREMENT_TEST = 'meta_runtime::tests::runtime_members_emit_canonical_structural_events'
+
+
+def qualify_retirement(executable, report_dir, attempt):
+    # Each trial is already a separate process. Bypass the nested isolation
+    # wrapper so successful exits cannot discard the actual runtime diagnostics.
+    env = dict(os.environ, FUGUE_ISOLATED_RUNTIME_TEST='runtime_members_emit_canonical_structural_events')
+    try:
+        result = subprocess.run([executable, RETIREMENT_TEST, '--exact', '--nocapture'],
+                                env=env, capture_output=True, text=True, timeout=180)
+        output = result.stdout + result.stderr
+        passed = result.returncode == 0 and 'test result: ok. 1 passed;' in output
+        conflict = ('failed to realize committed handoffs' in output
+                    or 'rewrite rejected: previous transcript revision' in output)
+        row = {'attempt': attempt, 'exit': result.returncode, 'one_test_passed': passed,
+               'transcript_conflict': conflict, 'qualified': passed and not conflict}
+    except subprocess.TimeoutExpired as error:
+        def decode(value):
+            return value.decode(errors='replace') if isinstance(value, bytes) else (value or '')
+        output = decode(error.stdout) + decode(error.stderr)
+        row = {'attempt': attempt, 'timeout': True, 'qualified': False}
+    (report_dir / f'attempt-{attempt:02}.log').write_text(output)
+    (report_dir / f'attempt-{attempt:02}.json').write_text(json.dumps(row) + '\n')
+    print(f'Native retirement qualification {attempt}/20: {json.dumps(row)}', flush=True)
+    if not row['qualified']:
+        print(output, flush=True)
+    return row
 
 
 def main():
@@ -33,25 +64,21 @@ def main():
         print(f'Native restart qualification {attempt}/5', flush=True)
         subprocess.run([executable, selection], check=True)
 
-    retirement = 'meta_runtime::tests::runtime_members_emit_canonical_structural_events'
-    listing = subprocess.check_output([executable, retirement, '--exact', '--list'], text=True)
-    if retirement + ': test' not in listing.splitlines():
+    listing = subprocess.check_output([executable, RETIREMENT_TEST, '--exact', '--list'], text=True)
+    if RETIREMENT_TEST + ': test' not in listing.splitlines():
         raise SystemExit('The executable is missing the native retirement qualification test')
-
-    def qualify_retirement(attempt):
-        # These are separate processes, each with its own native state. Parallel
-        # load exposed a retirement/transcript race that serial repeats missed.
-        result = subprocess.run([executable, retirement, '--exact', '--nocapture'],
-                                capture_output=True, text=True)
-        print(f'Native retirement qualification {attempt}/20: exit {result.returncode}', flush=True)
-        if result.returncode:
-            print(result.stdout + result.stderr, flush=True)
-        return result.returncode
-
+    report_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(sys.argv[1]).with_suffix('.retirement')
+    report_dir.mkdir(parents=True, exist_ok=False)
+    print(f'Retaining all native retirement evidence in {report_dir}', flush=True)
     with ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(qualify_retirement, range(1, 21)))
-    if any(results):
-        raise SystemExit('Native retirement qualification failed; no retries were discarded')
+        results = list(pool.map(lambda attempt: qualify_retirement(executable, report_dir, attempt), range(1, 21)))
+    with Path(executable).open('rb') as stream:
+        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    summary = {'executable_sha256': digest, 'concurrency': 4, 'trials': results,
+               'qualified': all(row['qualified'] for row in results)}
+    (report_dir / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+    if not summary['qualified']:
+        raise SystemExit('Native retirement qualification failed; all trial logs were retained')
 
 
 if __name__ == '__main__':

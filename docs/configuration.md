@@ -392,6 +392,11 @@ That change receives the terminal-obligation check before either assignment or
 transition. Claiming is restricted to issue leads and repository coordinators;
 workers report ownership and lifecycle needs to their lead. An assignment-only
 claim does not complete the issue or clear review obligations.
+Both direct tools and MCP calls apply the same public-lane and action-lane
+policy, including accepted dotted tool names. MCP state changes also require
+Fugue's WorkGraph configuration; a standalone server without that configuration
+refuses the change before contacting the tracker. Read-only calls and
+assignment-only claims remain available to authorized callers.
 
 ```yaml
 independent_review:
