@@ -81,3 +81,11 @@ test('mobile attention rows do not overlap or overflow their container', async (
   expect(second.y).toBeGreaterThanOrEqual(first.y + first.height - 1);
   expect(first.x + first.width).toBeLessThanOrEqual(390);
 });
+
+test('home lists unfinished configuration once, outside active work', async ({page}) => {
+  await show(page,{view:'home',listing:[workspaces[2]]});
+  await expect(page.locator('#portfolioProblems')).toContainText('example/draft');
+  await expect(page.locator('#portfolioRepositories')).not.toContainText('example/draft');
+  await expect(page.locator('#portfolioRepositories')).toContainText('Prepare your team');
+  await expect(page.getByRole('link',{name:'Add repository',exact:true})).toBeVisible();
+});

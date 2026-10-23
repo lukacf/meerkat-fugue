@@ -391,8 +391,9 @@ pub(crate) fn inject_app_chrome(
     } else {
         ""
     };
+    let brand = include_str!("ui/brand.svg");
     let chrome = format!(
-        r#"<div class="fugue-console-rail" data-fugue-console-chrome data-area="{area}"><a class="fugue-console-brand" href="/overview" aria-label="Fugue home"><span class="fugue-console-mark" aria-hidden="true">≋</span><span>Fugue</span></a><div class="fugue-scope"><label for="fugueScope">Repository</label><select id="fugueScope" aria-label="Repository scope"><option value="">All repositories</option></select></div><nav class="fugue-console-tabs" aria-label="Primary app navigation">{nav}</nav><div class="fugue-console-spacer"></div><a id="fugueRepositories" href="/ensemble"{repositories_selected}>Repositories</a><details class="fugue-account"><summary>Session</summary><div class="fugue-account-menu"><strong>Browser session</strong><p>Signing out leaves your teams running. Repository and AI credentials are managed in Repositories.</p>{account}</div></details></div><div class="fugue-breadcrumb"><a id="fugueScopeCrumb" href="/overview">All repositories</a><span aria-hidden="true">/</span><span>{title}</span><a id="fugueRepoSettings" href="./settings" hidden>Repository settings</a></div>"#
+        r#"<div class="fugue-console-rail" data-fugue-console-chrome data-area="{area}"><a class="fugue-console-brand" href="/overview" aria-label="Meerkat Fugue home"><span class="fugue-console-mark">{brand}</span><span class="fugue-wordmark"><small>Meerkat</small><span>Fugue</span></span></a><div class="fugue-scope"><label for="fugueScope">Repository</label><select id="fugueScope" aria-label="Repository scope"><option value="">All repositories</option></select></div><nav class="fugue-console-tabs" aria-label="Primary app navigation">{nav}</nav><div class="fugue-console-spacer"></div><a id="fugueRepositories" href="/ensemble"{repositories_selected}>Repositories</a><details class="fugue-account"><summary>Session</summary><div class="fugue-account-menu"><strong>Browser session</strong><p>Signing out leaves your teams running. Repository and AI credentials are managed in Repositories.</p><button class="fugue-button quiet" data-fugue-welcome>Getting started</button>{account}</div></details></div><div class="fugue-breadcrumb"><a id="fugueScopeCrumb" href="/overview">All repositories</a><span aria-hidden="true">/</span><span>{title}</span><a id="fugueRepoSettings" href="./settings" hidden>Repository settings</a></div>"#
     );
 
     if html.contains(MARKER) {
@@ -402,7 +403,12 @@ pub(crate) fn inject_app_chrome(
     // Scope page-owned links before adding the origin-wide primary navigation.
     let mut patched =
         browser_document(html).replace("__PORTFOLIO_JS__", include_str!("ui/portfolio.js"));
-    let context_script = format!("<script>{}</script>", include_str!("ui/navigation.js"));
+    let context_script = format!(
+        "<script>{}</script>{}<script>{}</script>",
+        include_str!("ui/navigation.js"),
+        include_str!("ui/welcome.html"),
+        include_str!("ui/welcome.js")
+    );
     patched = patched.replace("</body>", &format!("{context_script}</body>"));
     if active == AppPage::Work {
         let script = format!("<script>{}</script>", include_str!("ui/work-context.js"));
@@ -6654,6 +6660,10 @@ mod tests {
                 assert!(!primary.contains("Settings"));
                 assert!(!page.contains("nav.prepend"));
                 assert!(!page.contains("nav.append"));
+                assert!(page.contains("Meerkat Fugue home"));
+                assert_eq!(page.matches("id=\"fugueWelcome\"").count(), 1);
+                assert!(page.contains("meerkat-fugue.welcome.v1"));
+                assert!(!page.contains("{brand}"));
             }
         }
     }

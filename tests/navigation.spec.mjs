@@ -5,7 +5,7 @@ const navigation = await readFile(new URL('../src/ui/navigation.js', import.meta
 const css = await readFile(new URL('../src/ui/app.css', import.meta.url), 'utf8');
 const frame = source.split('let chrome = format!(')[1].match(/r#"([\s\S]*?)"#/)[1];
 const document = '<html><head><style>' + css + '</style></head><body class="fugue-console-embedded">' + frame
-  .replace('{area}', 'agents').replace('{title}', 'Agents').replace('{repositories_selected}', '')
+  .replace('{brand}', await readFile(new URL('../src/ui/brand.svg', import.meta.url), 'utf8')).replace('{area}', 'agents').replace('{title}', 'Agents').replace('{repositories_selected}', '')
   .replace('{account}', '<a href="/auth/sign-out">Sign out of this browser</a>')
   .replace('{nav}', '<a href="/overview">Home</a><a href="/queues">Board</a><a href="/console">Agents</a>')
   + '<script>' + navigation + '</script></body></html>';

@@ -36,6 +36,16 @@
     if (action) empty.append(document.createElement('br'), action);
     return empty;
   }
+  function quietState(title, text, kind = '') {
+    const state = make('div', `portfolio-quiet ${kind}`, '');
+    const motif = make('span', 'portfolio-quiet-mark', '');
+    motif.setAttribute('aria-hidden', 'true');
+    for (let i = 0; i < 3; i++) motif.append(make('i', '', ''));
+    const copy = make('div', '', '');
+    copy.append(make('strong', '', title), make('p', '', text));
+    state.append(motif, copy);
+    return state;
+  }
   function repoCard(workspace) {
     const card = make('section', 'fugue-panel portfolio-repository', '');
     const header = make('div', 'fugue-panel-head', '');
@@ -103,9 +113,11 @@
       }
       // Bound tracker requests on hosts with many repositories.
       for (let offset = 0; offset < workspaces.length; offset += 4) await Promise.all(workspaces.slice(offset, offset + 4).map(loadWorkspace));
-      const cards = workspaces.map(repoCard);
+      const cards = workspaces.filter(workspace => mode === 'board' || (workspace.running && workspace.configured)).map(repoCard);
       nodes('portfolioRepositories').replaceChildren(...cards);
-      if (!cards.length) nodes('portfolioRepositories').append(message('Connect a GitHub or GitHub Enterprise repository to give it a tracker, a board and a team.', link('Add your first repository', '/ensemble#add', 'fugue-button primary')));
+      if (!cards.length) nodes('portfolioRepositories').append(workspaces.length
+        ? quietState('Prepare your team', 'Finish repository setup to see its board and active work here.', 'waiting')
+        : message('Connect a GitHub or GitHub Enterprise repository to give it a tracker, a board and a team.', link('Add your first repository', '/ensemble#add', 'fugue-button primary')));
       if (mode === 'home') {
         const attention = [], recent = [], problems = [];
         for (const workspace of workspaces) {
@@ -121,13 +133,15 @@
           }
         }
         nodes('portfolioAttention').replaceChildren(...attention.map(({workspace,issue,lane}) => issueLink(workspace,issue,lane)));
-        if (!attention.length) nodes('portfolioAttention').append(message(workspaces.some(w => w.error) ? 'Some boards could not be loaded. Check the repository errors below.' : workspaces.length ? 'No issues in attention lanes or awaiting retry.' : 'Your first step is to connect a repository.'));
-        nodes('portfolioTitle').textContent = !workspaces.length ? 'Welcome to Fugue.' : attention.length ? `${attention.length} ${attention.length === 1 ? 'issue needs' : 'issues need'} attention.` : 'Your work at a glance.';
+        if (!attention.length) nodes('portfolioAttention').append(workspaces.some(w => w.error)
+          ? message('Some boards could not be loaded. Check the repository errors below.')
+          : quietState(cards.length ? 'Nothing waiting on you' : 'A clear place to begin', cards.length ? 'No issues need attention or are awaiting retry.' : 'Connect a repository and prepare its team to start working.', cards.length ? 'clear' : 'waiting'));
+        nodes('portfolioTitle').textContent = !workspaces.length ? 'Welcome to Meerkat Fugue.' : attention.length ? `${attention.length} ${attention.length === 1 ? 'issue needs' : 'issues need'} attention.` : 'Your work at a glance.';
         nodes('portfolioProblems').replaceChildren(...problems);
         if (!problems.length) nodes('portfolioProblems').append(message('No setup problems reported.'));
         recent.sort((a,b) => Date.parse(b.issue.updated_at || 0) - Date.parse(a.issue.updated_at || 0));
         nodes('portfolioRecent').replaceChildren(...recent.slice(0,5).map(({workspace,issue,lane}) => issueLink(workspace,issue,lane)));
-        if (!recent.length) nodes('portfolioRecent').append(message('Completed and canceled issues will appear here.'));
+        if (!recent.length) nodes('portfolioRecent').append(quietState('Room for your next improvement', 'Completed and canceled issues will appear here.', 'recent'));
       }
       hasSnapshot = true;
       nodes('portfolioError').hidden = true;

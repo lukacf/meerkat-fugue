@@ -29,6 +29,10 @@ Open **[http://127.0.0.1:8788/](http://127.0.0.1:8788/)** and choose
 **Repositories > Add repository**. Paste its URL, save repository and tracker
 access, select a native rkat model account and prepare the team.
 
+Home opens a short animated welcome guide on the first visit. Reopen it with
+**Getting started** on Home or in the **Session** menu. It covers connecting
+tools, preparing specialists, working an issue and reviewing a pull request.
+
 The [first-repository guide](docs/getting-started.mdx) walks through every step.
 For packaged installation, the [bundle guide](scripts/distribution/README.md)
 covers all five cooperating Fugue executables, pinned rkat, checksums and upgrades.
@@ -85,8 +89,9 @@ See [SECURITY.md](SECURITY.md).
 This branch uses Meerkat/Meta 0.9.4 with an exact public Meta backport for
 shared-console identities, peer links, Memory and Work Graph. Upgrading an
 existing 0.9.3 installation requires an offline native storage migration.
-The candidate is still undergoing migration and crash-recovery qualification;
-do not treat a successful build as upgrade acceptance. Follow the
+The first release targets fresh installations and still requires crash-recovery
+and hosted acceptance. Legacy migration is a separate, unqualified upgrade path;
+it is not a prerequisite for a fresh installation. Follow the
 [native storage upgrade guide](docs/upgrading-0.9.4.mdx) and
 [operations guide](docs/operations.mdx) for census, backup and complete rollback.
 
