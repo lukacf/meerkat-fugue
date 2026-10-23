@@ -56,6 +56,7 @@ already loaded binary until you restart it.
 | Executable identity or rkat version differs | Obtain a complete matching bundle; do not combine executables from different releases. |
 | Unmanaged executable or release link | Inspect the named path and choose a separate installation prefix if it belongs to another installation. Do not delete it to force an upgrade. |
 | Another process holds the installation lock | Let the other installer finish, then retry. Removing the lock file does not release that process's lock. |
+| Existing release files or executable permissions changed | Restore the verified current release and its executable permissions before upgrading. The installer preserves the previous rollback target. |
 | Activation fails | Resolve the reported filesystem error, inspect `current` and `previous`, and retry the same archive. A verified staged release can be reused. |
 
 An installer error does not require deleting application state, model accounts
@@ -108,3 +109,11 @@ and hosted ticket-cycle checks. Upstream CI and publication do not block startin
 that qualification. Replace the temporary pins when a released pair passes the
 same checks, then verify the new lock and release manifest. A source binding or
 an upstream merge alone is not deployed acceptance.
+
+The current candidate is not qualified for production distribution. An
+intermittent native retirement conflict remains reproducible during active-turn
+cancellation. The merge path also needs authoritative, durable review results
+bound to the exact candidate; matching a caller-supplied SHA or a fresh PR
+observation does not establish review acceptance. Keep both release gates open
+until their corrections pass regression tests and hosted acceptance. A green
+rerun or a successful bundle build does not clear these findings.

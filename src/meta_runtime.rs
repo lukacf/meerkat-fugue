@@ -1054,7 +1054,11 @@ impl AgentToolDispatcher for FugueDirectToolDispatcher {
                     )
                     .into());
                 }
-                if let Err(message) = self.workgraph_gate.guard_terminal_move(&input).await {
+                if let Err(message) = self
+                    .workgraph_gate
+                    .guard_terminal_move(&self.tracker, &input)
+                    .await
+                {
                     return Ok(ToolResult::new(
                         call.id.to_string(),
                         json!({

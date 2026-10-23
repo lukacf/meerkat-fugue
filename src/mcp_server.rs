@@ -56,7 +56,7 @@ pub async fn run_linear_mcp_server(config: TrackerConfig) -> anyhow::Result<()> 
                     && let Ok(input) =
                         serde_json::from_value::<crate::tools::MoveIssueInput>(arguments.clone())
                     && let Some(gate) = WorkGraphTerminalGate::from_env(&config)
-                    && let Err(message) = gate.guard_terminal_move(&input).await
+                    && let Err(message) = gate.guard_terminal_move(&config, &input).await
                 {
                     return (
                         true,

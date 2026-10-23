@@ -576,7 +576,7 @@ impl KapellmeisterHostToolExecutor for FinalPrGateProjectionExecutor {
             native_workgraph_blocked_states(&self.config),
         )
         .for_mob(self.config.meerkat.mob_id().into_owned());
-        if let Err(message) = gate.guard_terminal_move(&input).await {
+        if let Err(message) = gate.guard_terminal_move(&self.config.tracker, &input).await {
             return FugueToolResult::Err {
                 error: FugueToolError {
                     operation: FugueToolOperation::LinearMoveIssue,
@@ -666,7 +666,7 @@ impl KapellmeisterHostToolExecutor for FinalPrGateProjectionExecutor {
 
     async fn merge_pr(&mut self, input: MergePrInput) -> FugueToolResult {
         crate::workgraph_gate::WorkGraphTerminalGate::for_service(&self.config)
-            .merge_pr_with(&self.issue, input, |input| {
+            .merge_pr_with(&self.config.tracker, &self.issue, input, |input| {
                 GitHubToolHost::with_connections(self.config.meerkat.runtime_connections.clone())
                     .merge_pr(input)
             })

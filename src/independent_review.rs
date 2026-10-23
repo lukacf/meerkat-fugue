@@ -68,6 +68,22 @@ pub struct IndependentReviewWorkGraphScope {
 }
 
 impl IndependentReviewWorkGraphScope {
+    pub fn validate_for_mob(&self, mob_id: &str) -> Result<(), IndependentReviewVerdictError> {
+        self.validate()?;
+        let realm = meerkat_core::mob_realm_id(mob_id)
+            .map_err(|error| IndependentReviewVerdictError::InvalidScope(error.to_string()))?;
+        if self.realm_id != realm.as_str()
+            || self.namespace != meerkat::WorkNamespace::default().as_str()
+        {
+            return Err(IndependentReviewVerdictError::InvalidScope(
+                "review obligations must belong to the repository's native mob realm and default namespace".into(),
+            ));
+        }
+        meerkat::WorkNamespace::new(self.namespace.clone())
+            .map_err(|error| IndependentReviewVerdictError::InvalidScope(error.to_string()))?;
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), IndependentReviewVerdictError> {
         if self.realm_id.trim().is_empty() {
             return Err(IndependentReviewVerdictError::MissingField(
@@ -174,11 +190,13 @@ pub enum IndependentReviewVerdictError {
     GreenWithFindings,
     RedWithoutFindings,
     MismatchedHead,
+    InvalidScope(String),
 }
 
 impl std::fmt::Display for IndependentReviewVerdictError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidScope(message) => write!(formatter, "invalid WorkGraph scope: {message}"),
             Self::UnsupportedSchema { schema_version } => write!(
                 formatter,
                 "unsupported schema_version {schema_version:?}; expected {INDEPENDENT_REVIEW_SCHEMA_VERSION:?}"
@@ -218,7 +236,7 @@ pub fn independent_review_completion_input_schema() -> Value {
             },
             "workgraph_scope": {
                 "type": "object",
-                "description": "The exact WorkGraph scope used by the independent review mob. Copy realm_id and namespace from the reviewer obligation items you created; Fugue will create red-review blockers in this same scope.",
+                "description": "The repository's native mob WorkGraph scope. Copy realm_id and namespace from its reviewer obligation items. Only this repository's native realm and default namespace are accepted so every blocker remains visible to merge and terminal checks.",
                 "properties": {
                     "realm_id": {
                         "type": "string",

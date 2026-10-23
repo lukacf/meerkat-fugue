@@ -381,6 +381,12 @@ Review and Deploy are action lanes: an operator or meta-agent moves an issue to
 one of these lanes to request the configured procedure. They are not passive
 phase projections from planner/coder/reviewer execution.
 
+Review obligations use the repository mob's native WorkGraph realm and default
+namespace. Independent-review completion rejects other scopes so blockers remain
+visible to terminal and merge checks. Tracker IDs are resolved to canonical issue
+keys before those checks. Lifecycle tool calls must use tracker state names so
+the configured terminal policy can be evaluated.
+
 ```yaml
 independent_review:
   enabled: true

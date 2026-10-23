@@ -105,6 +105,9 @@ def verify_installed_release(prefix, relative):
         path = release / name
         if path.is_symlink() or not path.is_file() or digest(path) != checksum:
             raise ValueError('Existing release files have changed; installation stopped. Restore the verified current release before upgrading; the previous release is preserved.')
+        if name.startswith('bin/') and ((path.stat().st_mode & 0o111) != 0o111
+                                        or not os.access(path, os.R_OK | os.X_OK)):
+            raise ValueError('Existing release binary is not executable; installation stopped. Restore its permissions before upgrading; the previous release is preserved.')
 
 
 def install(archive, expected, prefix):

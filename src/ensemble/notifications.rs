@@ -563,12 +563,20 @@ impl AgentToolDispatcher for SubscriptionTools {
                         );
                     }
                     if let Some(excluded) = &self.excluded_state_root {
-                        let root = self.events.root.canonicalize()?;
-                        let excluded = excluded.canonicalize()?;
-                        if excluded
-                            .strip_prefix(&root)
-                            .is_ok_and(|relative| path.0.starts_with(relative))
-                        {
+                        // Git reads historical tree paths, including the former
+                        // contents of directories which are now symlinks.
+                        let roots = [
+                            std::path::absolute(&self.events.root)?,
+                            self.events.root.canonicalize()?,
+                        ];
+                        let exclusions = [std::path::absolute(excluded)?, excluded.canonicalize()?];
+                        if roots.iter().any(|root| {
+                            exclusions.iter().any(|excluded| {
+                                excluded
+                                    .strip_prefix(root)
+                                    .is_ok_and(|relative| path.0.starts_with(relative))
+                            })
+                        }) {
                             bail!("Configured runtime state is not exposed by repository tools");
                         }
                     }
@@ -605,6 +613,16 @@ mod tests {
 
     #[tokio::test]
     async fn historical_revision_cannot_expose_configured_private_state() {
+        historical_state_exclusion(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn historical_revision_cannot_expose_symlinked_private_state() {
+        historical_state_exclusion(true).await;
+    }
+
+    async fn historical_state_exclusion(symlinked: bool) {
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("custom-state");
         std::fs::create_dir(&state).unwrap();
@@ -636,6 +654,14 @@ mod tests {
         ]);
         let revision = git(&["rev-parse", "HEAD"]);
         std::fs::remove_file(state.join("private.txt")).unwrap();
+        if symlinked {
+            #[cfg(unix)]
+            {
+                let target = root.path().join("real-state");
+                std::fs::rename(&state, &target).unwrap();
+                std::os::unix::fs::symlink(&target, &state).unwrap();
+            }
+        }
         let events = RepositoryEvents::open(
             super::super::config::RepoId::try_from("test".to_owned()).unwrap(),
             root.path().to_path_buf(),

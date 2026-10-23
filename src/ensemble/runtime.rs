@@ -268,9 +268,10 @@ impl EnsembleRuntime {
         if let Err(error) = result {
             return match this.shutdown().await {
                 Ok(()) => Err(error),
-                Err(cleanup) => {
-                    Err(error.context(format!("partial build cleanup failed: {cleanup:#}")))
-                }
+                Err(cleanup) => Err(anyhow::Error::new(crate::error::NativeCleanupIncomplete(
+                    cleanup,
+                ))
+                .context(format!("repository initialization failed: {error:#}"))),
             };
         }
         Ok(this)
@@ -1187,10 +1188,10 @@ impl EnsembleRuntime {
         let mut stopping = self.lifecycle.write().await;
         match &*stopping {
             ShutdownState::Complete => return Ok(()),
-            ShutdownState::Failed(detail) => bail!("{detail}"),
-            ShutdownState::Closing => bail!(
+            ShutdownState::Failed(detail) => return Err(crate::error::NativeCleanupIncomplete(anyhow::anyhow!("{detail}")).into()),
+            ShutdownState::Closing => return Err(crate::error::NativeCleanupIncomplete(anyhow::anyhow!(
                 "Ensemble shutdown was interrupted; restart the host process before reopening its repositories"
-            ),
+            )).into()),
             ShutdownState::Running => {}
         }
         *stopping = ShutdownState::Closing;
@@ -1245,7 +1246,7 @@ impl EnsembleRuntime {
                 "Ensemble shutdown failed; restart the host process before reopening its repositories: {errors:?}"
             );
             *stopping = ShutdownState::Failed(detail.clone());
-            bail!("{detail}");
+            return Err(crate::error::NativeCleanupIncomplete(anyhow::anyhow!(detail)).into());
         }
         *stopping = ShutdownState::Complete;
         Ok(())

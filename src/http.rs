@@ -4012,7 +4012,11 @@ async fn api_kapellmeister_complete_independent_review(
         )
             .into_response();
     }
-    if let Err(error) = request.validate() {
+    if let Err(error) = request.validate().and_then(|()| {
+        request
+            .workgraph_scope
+            .validate_for_mob(&app.config.meerkat.mob_id())
+    }) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -4025,6 +4029,15 @@ async fn api_kapellmeister_complete_independent_review(
         )
             .into_response();
     }
+    let issue_identifier = match crate::workgraph_gate::canonical_issue_identifier(
+        &app.config.tracker,
+        &request.issue,
+    )
+    .await
+    {
+        Ok(identifier) => identifier,
+        Err(error) => return bad_request("issue_not_resolved", &error),
+    };
     let plan = aggregate_independent_review(IndependentReviewAggregationInput {
         config: app.config.independent_review.clone(),
         issue_identifier: issue_identifier.clone(),
@@ -4220,7 +4233,7 @@ pub async fn execute_deploy_transaction(
         };
     };
     let merge_result = crate::workgraph_gate::WorkGraphTerminalGate::for_service(&config)
-        .merge_pr_with(&request.issue, merge_input, |input| {
+        .merge_pr_with(&config.tracker, &request.issue, merge_input, |input| {
             GitHubToolHost::with_connections(config.meerkat.runtime_connections.clone())
                 .merge_pr(input)
         })
@@ -4771,11 +4784,22 @@ async fn record_independent_review_projection(
     plan: &crate::independent_review::IndependentReviewAggregationPlan,
 ) -> anyhow::Result<IndependentReviewProjectionResult> {
     request.validate()?;
+    request
+        .workgraph_scope
+        .validate_for_mob(&config.meerkat.mob_id())?;
     let target_lane = plan
         .target_lane
         .clone()
         .ok_or_else(|| anyhow::anyhow!("independent review projection has no target lane"))?;
     let adapter = IssueAdapter::from_config(&config.tracker)?;
+    let canonical = adapter
+        .inspect_issue(InspectIssueInput {
+            issue: request.issue.clone(),
+        })
+        .await?;
+    if canonical.issue.identifier.0 != issue_identifier {
+        anyhow::bail!("review obligation labels must use the tracker's canonical issue identifier");
+    }
     let review_summary = serde_json::to_string_pretty(&json!({
         "schema_version": crate::independent_review::INDEPENDENT_REVIEW_SCHEMA_VERSION,
         "issue_identifier": issue_identifier,
@@ -7537,8 +7561,10 @@ mod tests {
             },
             head_sha: GitSha("abc123".to_string()),
             workgraph_scope: crate::independent_review::IndependentReviewWorkGraphScope {
-                realm_id: "fugue-review-realm".to_string(),
-                namespace: "fugue".to_string(),
+                realm_id: meerkat_core::mob_realm_id(&config.meerkat.mob_id())
+                    .unwrap()
+                    .to_string(),
+                namespace: WorkNamespace::default().as_str().to_string(),
             },
             verdicts: vec![
                 test_review_verdict(
@@ -7574,6 +7600,24 @@ mod tests {
             "a PR snapshot and review must name the same head before any projection"
         );
 
+        let mut foreign_scope = request.clone();
+        foreign_scope.workgraph_scope.realm_id = "another-repository".into();
+        assert!(
+            record_independent_review_projection(&config, &foreign_scope, "LUC-633", &plan)
+                .await
+                .is_err(),
+            "review obligations must not escape the repository's native realm"
+        );
+
+        let mut foreign_namespace = request.clone();
+        foreign_namespace.workgraph_scope.namespace = "hidden-review".into();
+        assert!(
+            record_independent_review_projection(&config, &foreign_namespace, "LUC-633", &plan)
+                .await
+                .is_err(),
+            "review blockers must use the namespace granted to repository agents and merge guards"
+        );
+
         let projection = record_independent_review_projection(&config, &request, "LUC-633", &plan)
             .await
             .expect("review projection");
@@ -7581,8 +7625,16 @@ mod tests {
         assert_eq!(projection.target_lane, "Rework");
         assert!(projection.findings_comment_id.is_some());
         assert_eq!(projection.workgraph_items.len(), 1);
-        assert_eq!(projection.workgraph_items[0].realm_id, "fugue-review-realm");
-        assert_eq!(projection.workgraph_items[0].namespace, "fugue");
+        assert_eq!(
+            projection.workgraph_items[0].realm_id,
+            meerkat_core::mob_realm_id(&config.meerkat.mob_id())
+                .unwrap()
+                .as_str()
+        );
+        assert_eq!(
+            projection.workgraph_items[0].namespace,
+            WorkNamespace::default().as_str()
+        );
         let repeated_projection =
             record_independent_review_projection(&config, &request, "LUC-633", &plan)
                 .await
@@ -7615,13 +7667,19 @@ mod tests {
         .expect("workgraph store");
         let service = WorkGraphService::with_scope(
             Arc::new(store),
-            "fugue-review-realm",
-            WorkNamespace::new("fugue").expect("namespace"),
+            meerkat_core::mob_realm_id(&config.meerkat.mob_id())
+                .unwrap()
+                .as_str(),
+            WorkNamespace::default(),
         );
         let items = service
             .list(WorkItemFilter {
-                realm_id: Some("fugue-review-realm".to_string()),
-                namespace: Some(WorkNamespace::new("fugue").expect("namespace")),
+                realm_id: Some(
+                    meerkat_core::mob_realm_id(&config.meerkat.mob_id())
+                        .unwrap()
+                        .to_string(),
+                ),
+                namespace: Some(WorkNamespace::default()),
                 all_namespaces: false,
                 statuses: Vec::new(),
                 labels: vec![
@@ -7636,6 +7694,15 @@ mod tests {
             .await
             .expect("workgraph items");
         assert_eq!(items.len(), 1);
+        let gate = crate::workgraph_gate::WorkGraphTerminalGate::for_service(&config);
+        assert_eq!(
+            gate.unresolved_blocking_items("LUC-633")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "merge and terminal guards must see blockers created by independent review"
+        );
     }
 
     fn test_review_verdict(

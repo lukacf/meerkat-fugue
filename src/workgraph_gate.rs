@@ -55,18 +55,21 @@ impl WorkGraphTerminalGate {
     /// Check native obligations immediately before the irreversible GitHub action.
     pub async fn merge_pr_with(
         &self,
+        tracker: &TrackerConfig,
         issue: &LinearIssueRef,
         input: MergePrInput,
         merge: impl FnOnce(MergePrInput) -> FugueToolResult,
     ) -> FugueToolResult {
-        let issue = issue_label_value(issue);
-        let reason = match self.unresolved_blocking_items(&issue).await {
-            Ok(items) if items.is_empty() => return merge(input),
-            Ok(items) => format!(
-                "Cannot merge {issue}: {} unresolved blocking WorkGraph items remain",
-                items.len()
-            ),
-            Err(error) => format!("Cannot verify WorkGraph obligations before merge: {error}"),
+        let reason = match canonical_issue_identifier(tracker, issue).await {
+            Ok(issue) => match self.unresolved_blocking_items(&issue).await {
+                Ok(items) if items.is_empty() => return merge(input),
+                Ok(items) => format!(
+                    "Cannot merge {issue}: {} unresolved blocking WorkGraph items remain",
+                    items.len()
+                ),
+                Err(error) => format!("Cannot verify WorkGraph obligations before merge: {error}"),
+            },
+            Err(error) => format!("Cannot resolve the issue before merge: {error}"),
         };
         FugueToolResult::Err {
             error: FugueToolError {
@@ -98,14 +101,16 @@ impl WorkGraphTerminalGate {
         )
     }
 
-    pub async fn guard_terminal_move(&self, input: &MoveIssueInput) -> Result<(), String> {
-        let Some(target_state) = target_state_name(input) else {
-            return Ok(());
-        };
+    pub async fn guard_terminal_move(
+        &self,
+        tracker: &TrackerConfig,
+        input: &MoveIssueInput,
+    ) -> Result<(), String> {
+        let target_state = target_state_name(input)?;
         if !self.blocks_target_state(target_state) {
             return Ok(());
         }
-        let issue = issue_label_value(&input.issue);
+        let issue = canonical_issue_identifier(tracker, &input.issue).await?;
         let unresolved = self.unresolved_blocking_items(&issue).await?;
         if unresolved.is_empty() {
             return Ok(());
@@ -172,18 +177,32 @@ fn workgraph_service_for_mob(path: &Path, mob_id: &str) -> Result<WorkGraphServi
     ))
 }
 
-fn target_state_name(input: &MoveIssueInput) -> Option<&str> {
+fn target_state_name(input: &MoveIssueInput) -> Result<&str, String> {
     match &input.state {
-        LinearStateRef::Name { name } => Some(name.as_str()),
-        LinearStateRef::Id { .. } => None,
+        LinearStateRef::Name { name } if !name.trim().is_empty() => Ok(name.as_str()),
+        _ => Err(
+            "Use a nonempty tracker state name so terminal WorkGraph policy can be verified".into(),
+        ),
     }
 }
 
-fn issue_label_value(issue: &LinearIssueRef) -> String {
-    match issue {
-        LinearIssueRef::Identifier { identifier } => identifier.0.clone(),
-        LinearIssueRef::Id { id } => id.0.clone(),
+pub(crate) async fn canonical_issue_identifier(
+    tracker: &TrackerConfig,
+    issue: &LinearIssueRef,
+) -> Result<String, String> {
+    let adapter = crate::linear_adapter::IssueAdapter::from_config(tracker)
+        .map_err(|error| error.to_string())?;
+    let inspected = adapter
+        .inspect_issue(crate::tools::InspectIssueInput {
+            issue: issue.clone(),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let identifier = inspected.issue.identifier.0;
+    if identifier.trim().is_empty() {
+        return Err("tracker returned an empty issue identifier".into());
     }
+    Ok(identifier)
 }
 
 fn unresolved_terminal_move_message(issue: &str, target_state: &str, items: &[WorkItem]) -> String {
@@ -222,10 +241,46 @@ mod tests {
     use super::*;
     use crate::tools::{IdempotencyKey, LinearIssueIdentifier};
 
+    fn test_tracker(path: &Path, key: &str) -> (TrackerConfig, LinearIssueRef) {
+        let definition = crate::config::WorkflowDefinition {
+            config: serde_json::json!({"tracker": {
+                "kind": "fugue-ims", "endpoint": path.display().to_string(),
+                "project_slug": "example/api", "terminal_states": ["Done"]
+            }})
+            .as_object()
+            .unwrap()
+            .clone(),
+            prompt_template: "test".into(),
+        };
+        let tracker =
+            crate::config::ServiceConfig::from_definition(path.with_extension("yaml"), &definition)
+                .unwrap()
+                .tracker;
+        let issue = crate::fugue_ims::create_issue_for_config(
+            &tracker,
+            crate::fugue_ims::CreateFugueIssue {
+                key: crate::ims::ImsIssueKey(key.into()),
+                repo: "example/api".into(),
+                title: "Gate fixture".into(),
+                description: None,
+                stage: crate::ims::ImsStageName("Active".into()),
+                labels: Vec::new(),
+            },
+        )
+        .unwrap();
+        (
+            tracker,
+            LinearIssueRef::Id {
+                id: crate::tools::LinearIssueId(issue.id.0),
+            },
+        )
+    }
+
     #[tokio::test]
     async fn repository_gate_reads_its_native_mob_scope_without_cross_repository_leakage() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("workgraph.sqlite3");
+        let (tracker, issue_id) = test_tracker(&temp.path().join("issues.sqlite3"), "DEMO-1");
         let store = SqliteWorkGraphStore::open(&path).unwrap();
         let realm = meerkat_core::mob_realm_id("ensemble-api").unwrap();
         let service = WorkGraphService::with_scope(
@@ -259,7 +314,7 @@ mod tests {
             .unwrap();
         let gate = WorkGraphTerminalGate::new(&path, vec!["Done".into()], Vec::new())
             .for_mob("ensemble-api");
-        let merge = serde_json::from_value(serde_json::json!({
+        let merge: MergePrInput = serde_json::from_value(serde_json::json!({
             "repo": {"owner":"example", "name":"api"},
             "pull_request": {"kind":"number", "number":1},
             "method":"squash", "expected_head_sha":"reviewed-head",
@@ -268,16 +323,34 @@ mod tests {
         .unwrap();
         let result = gate
             .merge_pr_with(
+                &tracker,
                 &LinearIssueRef::Identifier {
                     identifier: LinearIssueIdentifier("DEMO-1".into()),
                 },
-                merge,
+                merge.clone(),
                 |_| panic!("GitHub must not be called before native obligations are clear"),
             )
             .await;
         assert!(
             matches!(result, FugueToolResult::Err {error, ..} if error.message.contains("unresolved blocking"))
         );
+        let id_result = gate
+            .merge_pr_with(&tracker, &issue_id, merge.clone(), |_| {
+                panic!("an immutable issue ID must resolve to the same blocking issue key")
+            })
+            .await;
+        assert!(
+            matches!(id_result, FugueToolResult::Err {error, ..} if error.message.contains("unresolved blocking"))
+        );
+        let unresolved_id = LinearIssueRef::Id {
+            id: crate::tools::LinearIssueId("opaque-tracker-id".into()),
+        };
+        let result = gate
+            .merge_pr_with(&tracker, &unresolved_id, merge, |_| {
+                panic!("an unresolved tracker ID must never bypass issue-key obligations")
+            })
+            .await;
+        assert!(matches!(result, FugueToolResult::Err { .. }));
         assert_eq!(
             gate.unresolved_blocking_items("DEMO-1")
                 .await
@@ -298,6 +371,7 @@ mod tests {
     async fn terminal_gate_blocks_success_with_open_fugue_issue_obligation() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("workgraph.sqlite3");
+        let (tracker, _) = test_tracker(&temp.path().join("issues.sqlite3"), "LUC-1");
         // Create through the native mob scope, independently of the gate helper.
         let store = SqliteWorkGraphStore::open(&path).expect("store");
         let native_realm = meerkat_core::mob_realm_id(crate::native_mob_contract::FUGUE_MOB_ID)
@@ -342,16 +416,19 @@ mod tests {
         );
 
         let error = gate
-            .guard_terminal_move(&MoveIssueInput {
-                issue: LinearIssueRef::Identifier {
-                    identifier: LinearIssueIdentifier("LUC-1".to_string()),
+            .guard_terminal_move(
+                &tracker,
+                &MoveIssueInput {
+                    issue: LinearIssueRef::Identifier {
+                        identifier: LinearIssueIdentifier("LUC-1".to_string()),
+                    },
+                    state: LinearStateRef::Name {
+                        name: "Done".to_string(),
+                    },
+                    expected_updated_at: None,
+                    idempotency_key: IdempotencyKey("move-1".to_string()),
                 },
-                state: LinearStateRef::Name {
-                    name: "Done".to_string(),
-                },
-                expected_updated_at: None,
-                idempotency_key: IdempotencyKey("move-1".to_string()),
-            })
+            )
             .await
             .unwrap_err();
 
@@ -362,22 +439,26 @@ mod tests {
     async fn terminal_gate_allows_blocked_lane_with_open_obligation() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("workgraph.sqlite3");
+        let (tracker, _) = test_tracker(&temp.path().join("issues.sqlite3"), "LUC-1");
         let gate = WorkGraphTerminalGate::new(
             &path,
             vec!["Done".to_string(), "Blocked".to_string()],
             vec!["Blocked".to_string()],
         );
 
-        gate.guard_terminal_move(&MoveIssueInput {
-            issue: LinearIssueRef::Identifier {
-                identifier: LinearIssueIdentifier("LUC-1".to_string()),
+        gate.guard_terminal_move(
+            &tracker,
+            &MoveIssueInput {
+                issue: LinearIssueRef::Identifier {
+                    identifier: LinearIssueIdentifier("LUC-1".to_string()),
+                },
+                state: LinearStateRef::Name {
+                    name: "Blocked".to_string(),
+                },
+                expected_updated_at: None,
+                idempotency_key: IdempotencyKey("move-1".to_string()),
             },
-            state: LinearStateRef::Name {
-                name: "Blocked".to_string(),
-            },
-            expected_updated_at: None,
-            idempotency_key: IdempotencyKey("move-1".to_string()),
-        })
+        )
         .await
         .expect("blocked is allowed for human intervention");
     }

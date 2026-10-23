@@ -30,8 +30,24 @@ pub enum SetupState {
     Empty,
     Preparing,
     Ready,
-    Failed { error: String },
+    Failed {
+        error: String,
+        restart_required: bool,
+    },
     Stopped,
+}
+
+impl SetupState {
+    fn ensure_cleanup_complete(&self) -> Result<()> {
+        if let Self::Failed {
+            error,
+            restart_required: true,
+        } = self
+        {
+            return Err(crate::error::NativeCleanupIncomplete(anyhow::anyhow!("{error}")).into());
+        }
+        Ok(())
+    }
 }
 
 struct Configuration {
@@ -162,6 +178,7 @@ impl Workspace {
             bail!("Repository teams are still being prepared. Please wait for setup to finish.");
         }
         let mut state = self.configuration.lock().await;
+        state.setup.ensure_cleanup_complete()?;
         if state.setup == SetupState::Stopped {
             bail!("Workspace is shutting down");
         }
@@ -206,7 +223,19 @@ impl Workspace {
         loop {
             match &self.configuration.lock().await.setup {
                 SetupState::Ready => return Ok(()),
-                SetupState::Failed { error } => bail!("repository formation failed: {error}"),
+                SetupState::Failed {
+                    error,
+                    restart_required: true,
+                } => {
+                    return Err(crate::error::NativeCleanupIncomplete(anyhow::anyhow!(
+                        "repository formation failed: {error}"
+                    ))
+                    .into());
+                }
+                SetupState::Failed {
+                    error,
+                    restart_required: false,
+                } => bail!("repository formation failed: {error}"),
                 SetupState::Preparing => {}
                 _ => bail!("repository formation did not produce a ready mob"),
             }
@@ -216,12 +245,17 @@ impl Workspace {
 
     async fn prepare(&self, config: EnsembleConfig, previous: Option<Active>) {
         let result = self.replace_runtime(config, previous).await;
+        self.complete_preparation(result).await;
+    }
+
+    pub(crate) async fn complete_preparation(&self, result: Result<()>) {
         self.configuration.lock().await.setup = match result {
             Ok(()) => SetupState::Ready,
             Err(error) => {
                 tracing::error!(error = %error, "repository setup failed");
                 SetupState::Failed {
                     error: format!("{error:#}"),
+                    restart_required: error.is::<crate::error::NativeCleanupIncomplete>(),
                 }
             }
         };
@@ -294,6 +328,7 @@ impl Workspace {
             bail!("Repository teams are still being prepared. Please wait for setup to finish.");
         }
         let mut state = self.configuration.lock().await;
+        state.setup.ensure_cleanup_complete()?;
         if state.setup == SetupState::Stopped {
             bail!("Workspace is shutting down");
         }
@@ -344,7 +379,11 @@ impl Workspace {
         if let Some(task) = operation.take() {
             task.await.context("join repository setup")?;
         }
-        self.configuration.lock().await.setup = SetupState::Stopped;
+        {
+            let mut configuration = self.configuration.lock().await;
+            configuration.setup.ensure_cleanup_complete()?;
+            configuration.setup = SetupState::Stopped;
+        }
         let mut owned = self.active.write().await;
         if let Some(active) = owned.as_ref() {
             active.runtime.shutdown().await?;

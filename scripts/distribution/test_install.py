@@ -129,6 +129,15 @@ class InstallTests(unittest.TestCase):
             installer.install(*bundle(self.root, 'c'), self.prefix)
         self.assertEqual({name: (self.prefix / name).readlink() for name in links}, links)
 
+    def test_nonexecutable_current_cannot_replace_the_known_good_rollback(self):
+        installer.install(*bundle(self.root), self.prefix)
+        installer.install(*bundle(self.root, 'b'), self.prefix)
+        links = {name: (self.prefix / name).readlink() for name in ('current', 'previous')}
+        (self.prefix / 'current/bin/meerkat-fugue').chmod(0o644)
+        with self.assertRaisesRegex(ValueError, 'not executable'):
+            installer.install(*bundle(self.root, 'c'), self.prefix)
+        self.assertEqual({name: (self.prefix / name).readlink() for name in links}, links)
+
     def test_unmanaged_release_links_are_rejected_before_candidate_execution(self):
         for link_name in ('current', 'previous'):
             for index, value in enumerate(('user file', '../outside', 'versions/..', 'versions/not-a-release')):

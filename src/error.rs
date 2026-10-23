@@ -3,6 +3,10 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[error("Native cleanup is incomplete; host restart required: {0}")]
+pub(crate) struct NativeCleanupIncomplete(#[source] pub(crate) anyhow::Error);
+
+#[derive(Debug, Error)]
 pub enum FugueError {
     #[error("missing_workflow_file: {0}")]
     MissingWorkflowFile(PathBuf),

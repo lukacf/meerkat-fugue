@@ -1,5 +1,6 @@
 //! Repository services share the native console host while retaining their own
 //! tracker configuration, credentials, HTTP tools, state, and shutdown scope.
+use crate::error::NativeCleanupIncomplete as HostRestartRequired;
 use anyhow::{Context, Result};
 use std::{path::Path, sync::Arc};
 use tokio_util::sync::CancellationToken;
@@ -22,10 +23,6 @@ impl HostLifecycle {
         Ok(())
     }
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error("Native cleanup is incomplete; host restart required: {0}")]
-struct HostRestartRequired(#[source] anyhow::Error);
 
 fn finish_run(result: Result<()>, settled: Result<()>, cleanup: Result<()>) -> Result<()> {
     cleanup.map_err(HostRestartRequired)?;
@@ -205,6 +202,49 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_preparation_cleanup_survives_workspace_readiness_and_host_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = crate::ensemble::workspace::Workspace::open(
+            root.path().join("ensemble.yaml"),
+            true,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // Inject a failed native build cleanup at the preparation completion
+        // boundary. No Active runtime exists, which previously erased the fault.
+        workspace
+            .complete_preparation(Err(anyhow::Error::new(HostRestartRequired(
+                anyhow::anyhow!("injected partial-build native cleanup refusal"),
+            ))
+            .context("repository initialization failed")))
+            .await;
+        let readiness = workspace.await_ready().await;
+        assert!(readiness.as_ref().unwrap_err().is::<HostRestartRequired>());
+        assert!(
+            workspace
+                .start()
+                .await
+                .unwrap_err()
+                .is::<HostRestartRequired>()
+        );
+        let cleanup = workspace.shutdown().await;
+        assert!(cleanup.as_ref().unwrap_err().is::<HostRestartRequired>());
+        let host = HostLifecycle::default();
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let result = finish_run(readiness, Ok(()), cleanup);
+        assert!(finish_attempt(root.path(), &host, &stop, result).is_err());
+        assert!(host.ensure_can_start().is_err());
+        assert!(
+            std::fs::read_to_string(root.path().join("startup-error.txt"))
+                .unwrap()
+                .contains("Restart the Fugue host")
+        );
+    }
 
     #[test]
     fn cleanup_failure_survives_cancellation_and_disables_same_host_reopen() {
