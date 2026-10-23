@@ -34,10 +34,33 @@ Repository and tracker credentials are entered through Fugue's setup page.
 The installer verifies the complete archive before executing any candidate
 binary, checks every binary's build identity, and then atomically switches the
 `current` link. A repeated install verifies and reuses the exact same release.
-An upgrade retains the earlier release as `previous`. It never modifies the
+An upgrade retains the earlier release as `previous`. If activating `current`
+fails, the installer restores the prior `previous` link before reporting the
+error. It refuses unmanaged `current`, `previous` and executable paths before
+running candidate binaries. It never modifies the
 application state directory. Stop the service and back up its state before an
 upgrade; changing the executable link alone does not restart a running process
 or roll back state migrations. Retain the matching state snapshot for rollback.
+
+## If installation stops
+
+Keep the error and the release checksum. Inspect the executable selections with
+`readlink /opt/fugue/current` and `readlink /opt/fugue/previous`; `previous` does
+not exist before the first successful upgrade. The running service keeps its
+already loaded binary until you restart it.
+
+| Error | Next step |
+| --- | --- |
+| Download or file checksum mismatch | Download the archive again and compare it with the checksum for that exact release. |
+| Release is not compatible | Select the bundle for this host's OS and architecture. |
+| Executable identity or rkat version differs | Obtain a complete matching bundle; do not combine executables from different releases. |
+| Unmanaged executable or release link | Inspect the named path and choose a separate installation prefix if it belongs to another installation. Do not delete it to force an upgrade. |
+| Another process holds the installation lock | Let the other installer finish, then retry. Removing the lock file does not release that process's lock. |
+| Activation fails | Resolve the reported filesystem error, inspect `current` and `previous`, and retry the same archive. A verified staged release can be reused. |
+
+An installer error does not require deleting application state, model accounts
+or repository checkouts. If the service was already stopped for an upgrade,
+verify the release and state snapshot before starting it again.
 
 ## Authenticated remote access
 

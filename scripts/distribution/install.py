@@ -8,6 +8,7 @@ import os
 from pathlib import Path, PurePosixPath
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -69,7 +70,21 @@ def replace_link(link, value):
     if pending.exists() or pending.is_symlink():
         pending.unlink()
     pending.symlink_to(value)
-    os.replace(pending, link)
+    try:
+        os.replace(pending, link)
+    finally:
+        pending.unlink(missing_ok=True)
+
+
+def managed_link(link):
+    if not link.is_symlink():
+        if link.exists():
+            raise ValueError(f'Existing {link.name} path is not a managed release link.')
+        return None
+    value = os.readlink(link)
+    if not re.fullmatch(r'versions/[0-9a-f]{40}-[0-9a-f]{16}', value):
+        raise ValueError(f'Existing {link.name} path is not a managed release link.')
+    return value
 
 
 def install(archive, expected, prefix):
@@ -84,8 +99,9 @@ def install(archive, expected, prefix):
         versions = prefix / 'versions'
         versions.mkdir(exist_ok=True)
         current = prefix / 'current'
-        if current.exists() and not current.is_symlink():
-            raise ValueError('Existing current path is not a managed release link.')
+        previous = prefix / 'previous'
+        old = managed_link(current)
+        prior = managed_link(previous)
         for name in BINARIES:
             link = prefix / 'bin' / name
             if link.exists() or link.is_symlink():
@@ -116,17 +132,25 @@ def install(archive, expected, prefix):
             # must be able to traverse the verified release after root installs.
             release.chmod(0o755)
             (release / 'bin').chmod(0o755)
-            old = os.readlink(current) if current.is_symlink() else None
-            if old and old != f'versions/{name}':
-                if PurePosixPath(old).parent != PurePosixPath('versions'):
-                    raise ValueError('Current release link is outside the managed layout.')
-                replace_link(prefix / 'previous', old)
             (prefix / 'bin').mkdir(exist_ok=True)
             for binary in BINARIES:
                 link = prefix / 'bin' / binary
                 if not link.is_symlink():
                     link.symlink_to(f'../current/bin/{binary}')
-            replace_link(current, f'versions/{name}')
+            changing_previous = old is not None and old != f'versions/{name}'
+            if changing_previous:
+                replace_link(previous, old)
+            try:
+                replace_link(current, f'versions/{name}')
+            except OSError:
+                # A failed activation must not erase the earlier rollback
+                # target or suggest that the still-current release is previous.
+                if changing_previous:
+                    if prior is None:
+                        previous.unlink()
+                    else:
+                        replace_link(previous, prior)
+                raise
     return manifest
 
 
@@ -144,8 +168,8 @@ def main():
     missing = [name for name in ('git', 'gh', 'node', 'npx') if not shutil.which(name)]
     if missing:
         print('Before connecting a repository, install: ' + ', '.join(missing))
-    print(f"Start: {args.prefix / 'bin/meerkat-fugue'} serve")
-    print('Then open http://127.0.0.1:8788/ensemble')
+    print('Start: ' + shlex.join([str(args.prefix / 'bin/meerkat-fugue'), 'serve']))
+    print('Then open http://127.0.0.1:8788/')
 
 
 if __name__ == '__main__':

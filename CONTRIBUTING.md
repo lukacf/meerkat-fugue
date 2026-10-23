@@ -20,7 +20,8 @@ Add a focused regression test when it demonstrates a behavior change. Include
 the commands and results in your PR, along with any checks you could not run.
 The normal suite needs no provider or Linear credentials. Live E2E tests are
 opt-in and create real resources; use only an authorized disposable environment.
-Browser-test setup is documented in [tests/luc654-ui-validation.md](tests/luc654-ui-validation.md).
+The [development guide](docs/development.mdx) includes the browser and installer
+checks used in CI, and explains what still needs hosted acceptance.
 
 ## Keep changes reviewable
 

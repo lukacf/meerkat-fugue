@@ -35,14 +35,13 @@ jobs:
       - name: Test release safeguards
         run: |
           command -v lsof
-          python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
-          python3 -m unittest discover -s scripts/distribution -p 'test_*.py' -v
+          npm run test:delivery
 
       - name: Install browser dependencies
         run: npm ci && npx playwright install --with-deps chromium
 
       - name: Test Ensemble browser behavior
-        run: npx playwright test tests/ensemble-dashboard-search.spec.mjs tests/first-run-setup.spec.mjs tests/issue-detail.spec.mjs tests/queue-directory.spec.mjs tests/navigation.spec.mjs tests/welcome.spec.mjs --project=chromium
+        run: npm run test:ui
 
   rust:
     name: Rust

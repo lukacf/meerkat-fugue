@@ -1,13 +1,51 @@
-# Development guide
+---
+title: "Development and testing"
+description: "Run the right local checks, test upgrade failures, and distinguish fixture coverage from hosted acceptance."
+---
 
-This guide covers local validation, coding rules, documentation changes, and the
-ignored real E2E suite.
+# Development and testing
 
-## Safe validation
+Use the smallest relevant test while fixing a bug, then run the checks for the
+surfaces you changed. Keep the regression focused on the failed behavior.
+Do not rerun an unchanged release build to obtain a second copy of its result.
 
-Run before opening a PR:
+## Local setup
 
-```bash
+The checkout pins Rust in `rust-toolchain.toml`. Browser tests use Node.js 22,
+the locked npm dependencies and Playwright Chromium. Release and installer
+tests use Python 3 on Linux or macOS, plus `lsof` for the release safeguards.
+
+```sh
+npm ci
+npx playwright install chromium
+```
+
+On a Linux CI host, use `npx playwright install --with-deps chromium` to also
+install browser system dependencies. No repository, tracker or model credentials
+are needed for the default checks. Keep local state and credentials outside the
+checkout.
+
+## Choose the checks
+
+| Change | Checks |
+| --- | --- |
+| Rust logic, configuration or native runtime integration | Focused Rust regression, then the Rust checks below. |
+| Home, Board, repository setup or navigation | `npm run test:ui`, then inspect the changed screen in a real Fugue instance. |
+| Release tooling or bundle installation | `npm run test:delivery`. Add a failure-injection regression if rollback or validation changed. |
+| Documentation | Verify commands against their implementations, check local links and inspect the rendered Markdown/MDX. |
+| Runtime versions or shipped binaries | Locked build, complete release manifest, matching executable identities, restart checks and fresh hosted acceptance. |
+
+The browser and delivery commands are the same entry points used by
+[CI](../.github/workflows/ci.yml). To run one regression while iterating:
+
+```sh
+python3 -m unittest discover -s scripts/distribution -p 'test_install.py' -v
+npx playwright test tests/welcome.spec.mjs --project=chromium
+```
+
+### Rust checks
+
+```sh
 cargo fmt --check
 cargo check --all-targets --locked
 cargo test --all-targets --locked
@@ -15,76 +53,100 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo run --locked -- --help
 ```
 
-These checks do not create live Linear, GitHub, or Meta resources.
+The normal suite uses temporary local state and fixtures. The destructive live
+test remains ignored. When working alongside another Rust build, give your
+checkout a separate `CARGO_TARGET_DIR`; do not delete another build's target or
+lock files to resolve contention.
 
-## Real E2E suite
+### Browser coverage
 
-`tests/real_e2e.rs` is ignored by default because it creates live Linear and
-GitHub resources and runs real Meerkat sessions. Do not run it casually.
+`npm run test:ui` starts disposable fixture servers. It covers repository setup,
+search, issue detail, queue selection, navigation and the welcome guide. The
+tests exercise responsive layouts, keyboard behavior and reload state without
+changing a real repository or tracker. Playwright retains traces on failure in
+`test-results/`.
 
-Run it only in an operator-approved disposable environment:
+A fixture pass does not establish native streaming, authentication, repository
+cloning or model access. For a console change, also check the real runtime's
+conversation ordering and sends, live updates, team selection, topology, Memory
+and Work Graph. Reload the page and verify that the same state remains visible.
 
-```bash
-set -a
-source ~/.zshrc
-set +a
+### Installer coverage
 
+`npm run test:delivery` tests release safeguards and installation into temporary
+directories. Test bundles contain small executable fixtures that report build
+identity; they do not start Fugue or contact a cloud service.
+
+Installation tests cover successful install/retry/upgrade, complete checksums,
+archive path and file validation, executable identity, rkat version, concurrent
+install refusal, candidate timeout and failed activation. Failure assertions
+check that both `current` and `previous` remain correct and that a subsequent
+retry succeeds. Keep the existing installation and state as the test's observable
+contract; a mocked successful return alone is not rollback evidence.
+
+## Live acceptance
+
+Use a fresh issue and an explicitly authorized disposable repository/tracker
+scope. Keep a private record of the exact binary and dependency revisions,
+resources created, issue, PR, checks, merge, restart outcome and cleanup. Never
+commit credentials, private hostnames or organization-specific evidence here.
+
+For the browser journey, start from repository onboarding and verify mapping
+creates specialists. Follow a small issue through planning, code, testing,
+independent review and the configured merge action. Confirm the actual merged
+PR and terminal tracker state. Test login, streaming and restart through the
+intended hosted gateway. Laptop connectivity and local fixtures do not establish
+that the deployment can reach GHE or Jira.
+
+### Opt-in Linear/GitHub harness
+
+`tests/real_e2e.rs` is a separate automated harness. It creates an external Linear
+project and GitHub repository, spends model tokens, opens PRs and merges them
+from the test. It does not verify the UI-only onboarding journey or Jira.
+
+Provide `LINEAR_API_KEY` securely in the process environment, authenticate `gh`
+for the intended account and configure native model access. Set the destination
+explicitly instead of relying on the harness's historical defaults:
+
+```sh
 MEERKAT_FUGUE_REAL_E2E=1 \
+MEERKAT_FUGUE_E2E_LINEAR_TEAM_KEY=YOUR_TEST_TEAM \
+MEERKAT_FUGUE_E2E_GITHUB_OWNER=your-test-account \
 MEERKAT_FUGUE_E2E_POLICY_MODE=native_only \
-MEERKAT_FUGUE_E2E_KEEP_RESOURCES=1 \
-cargo test --test real_e2e -- --ignored --nocapture
+MEERKAT_FUGUE_E2E_CREATE_MISSING_LINEAR_STATES=0 \
+MEERKAT_FUGUE_E2E_KEEP_RESOURCES=0 \
+cargo test --locked --test real_e2e -- --ignored --nocapture
 ```
 
-Useful controls include:
+Use an existing dedicated test team with the required lanes, or explicitly
+authorize creating missing states there. The harness can delete its project
+and repository during cleanup; team workflow states are shared and must be
+reviewed separately. `KEEP_RESOURCES=1` retains resources for investigation and
+requires later manual cleanup. Check cleanup errors even when the main test
+also failed. Do not source an entire interactive shell startup file to load one
+credential.
 
-- `MEERKAT_FUGUE_E2E_LINEAR_TEAM_KEY`
-- `MEERKAT_FUGUE_E2E_GITHUB_OWNER`
-- `MEERKAT_FUGUE_E2E_ISSUE_COUNT`
-- `MEERKAT_FUGUE_E2E_POLICY_MODE`
-- `MEERKAT_FUGUE_E2E_MERGING_STATE`
-- `MEERKAT_FUGUE_E2E_IN_REVIEW_STATE`
-- `MEERKAT_FUGUE_E2E_CREATE_MISSING_LINEAR_STATES`
-- `MEERKAT_FUGUE_E2E_KEEP_RESOURCES`
+Other controls include `MEERKAT_FUGUE_E2E_ISSUE_COUNT`,
+`MEERKAT_FUGUE_E2E_PRIVATE_REPO`, `MEERKAT_FUGUE_E2E_REPO_PREFIX` and
+`MEERKAT_FUGUE_E2E_RKAT_COMMAND`. See
+[the harness](../tests/real_e2e.rs) for lane and timeout overrides.
 
-## Code style
+## Review and documentation
 
-Follow `AGENTS.md`:
+Follow [AGENTS.md](../AGENTS.md): use typed boundaries, explicit errors and native
+runtime authority. Review the behavior at its boundary, including failure,
+retry, cancellation and restart. Keep test outputs tied to the source revision
+that produced them; distinguish skipped, failed and unexecuted checks.
 
-- prefer typed structs and enums over carrying `serde_json::Value` through the
-  system;
-- return `Result` instead of swallowing mechanism errors;
-- avoid `unwrap()` and `expect()` in library code;
-- prefer allocation-conscious iterators and display helpers;
-- use `slab` for stable keys that survive collection mutation;
-- keep domain models separate from billing and usage metadata;
-- use `IndexMap` when iteration order matters.
+Update affected examples and the [configuration reference](./configuration.mdx)
+when changing configuration. Keep one maintained guide for each task and link to
+it from older entry points. Documentation should identify the required access,
+the expected result and how to recover if a step fails.
 
-## Documentation changes
+For optimization, first record a reproducible workload and its timing or
+allocation profile. Compare the same workload before and after the change while
+preserving correctness checks. A smaller function or fewer lines alone does not
+demonstrate a performance improvement.
 
-Documentation should be operator-actionable:
-
-- state whether commands are safe or destructive;
-- name required credentials and external resources;
-- include rollback or handoff guidance for live operations;
-- keep examples aligned with `fugue.example.yaml`, backend onboarding docs, and CLI help;
-- preserve the native Meta execution model.
-
-When changing config fields, update:
-
-- `fugue.example.yaml`;
-- `docs/configuration.mdx` and `docs/configuration.md` if the Markdown contract
-  is still referenced by tests;
-- backend/onboarding docs when generated queue shape changes;
-- relevant operator/development docs;
-- tests that assert parsing/default behavior.
-
-## Branch and PR hygiene
-
-Keep changes focused on the Linear issue. For documentation-only work, prefer a
-single commit that updates MDX docs, README links, and any doc reference tests.
-Run the safe validation set before requesting review.
-
-## Related docs
-
-- [Configuration](./configuration.mdx)
-- [Operations](./operations.mdx)
+See [operations](./operations.mdx) for complete state backup and recovery, and
+[release bundles](../scripts/distribution/README.md) for installation behavior.

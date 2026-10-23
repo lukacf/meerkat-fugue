@@ -2,10 +2,15 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import shlex
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('fugue_install', Path(__file__).with_name('install.py'))
 installer = importlib.util.module_from_spec(spec)
@@ -25,6 +30,10 @@ def bundle(root, commit='a', invalid=None):
         manifest['target'] = 'wrong-platform'
     if invalid == 'checksum':
         manifest['files']['bin/rkat'] = '0' * 64
+    if invalid in ('identity', 'rkat-version'):
+        name = 'fugue-jira-mcp' if invalid == 'identity' else 'rkat'
+        files['bin/' + name] = b'#!/bin/sh\necho "{}"\n'
+        manifest['files']['bin/' + name] = hashlib.sha256(files['bin/' + name]).hexdigest()
     files['manifest.json'] = json.dumps(manifest).encode()
     if invalid == 'path':
         files['../../outside'] = b'bad'
@@ -110,6 +119,108 @@ class InstallTests(unittest.TestCase):
         (self.prefix / 'current/bin/rkat').write_text('modified')
         with self.assertRaisesRegex(ValueError, 'files have changed'):
             installer.install(*first, self.prefix)
+
+    def test_unmanaged_release_links_are_rejected_before_candidate_execution(self):
+        for link_name in ('current', 'previous'):
+            for index, value in enumerate(('user file', '../outside', 'versions/..', 'versions/not-a-release')):
+                with self.subTest(link=link_name, value=value):
+                    prefix = self.root / f'layout-{link_name}-{index}'
+                    installer.install(*bundle(self.root), prefix)
+                    before = (prefix / 'current').readlink()
+                    link = prefix / link_name
+                    if link.is_symlink() or link.exists():
+                        link.unlink()
+                    if value == 'user file':
+                        link.write_text('user-owned rollback notes')
+                    else:
+                        link.symlink_to(value)
+                    with mock.patch.object(installer.subprocess, 'check_output',
+                                           side_effect=AssertionError('candidate ran before layout validation')) as execute:
+                        with self.assertRaisesRegex(ValueError, 'managed release link'):
+                            installer.install(*bundle(self.root, 'b'), prefix)
+                        execute.assert_not_called()
+                    if value == 'user file':
+                        self.assertEqual(link.read_text(), 'user-owned rollback notes')
+                    else:
+                        self.assertEqual(os.readlink(link), value)
+                    if link_name == 'previous':
+                        self.assertEqual((prefix / 'current').readlink(), before)
+
+    def test_failed_activation_preserves_current_and_previous_then_retry_succeeds(self):
+        installer.install(*bundle(self.root), self.prefix)
+        installer.install(*bundle(self.root, 'b'), self.prefix)
+        current = (self.prefix / 'current').readlink()
+        previous = (self.prefix / 'previous').readlink()
+        candidate = bundle(self.root, 'c')
+        replace = os.replace
+
+        def fail_current(source, destination):
+            if destination == self.prefix / 'current':
+                raise OSError('simulated activation failure')
+            return replace(source, destination)
+
+        with mock.patch.object(installer.os, 'replace', side_effect=fail_current):
+            with self.assertRaisesRegex(OSError, 'simulated activation failure'):
+                installer.install(*candidate, self.prefix)
+        self.assertEqual((self.prefix / 'current').readlink(), current)
+        self.assertEqual((self.prefix / 'previous').readlink(), previous)
+        self.assertEqual(list(self.prefix.glob('*.pending')), [])
+        self.assertEqual(list(self.prefix.glob('.unpack-*')), [])
+        installer.install(*candidate, self.prefix)
+        self.assertEqual((self.prefix / 'previous').readlink(), current)
+        self.assertNotEqual((self.prefix / 'current').readlink(), current)
+
+    def test_failed_first_upgrade_does_not_create_a_false_previous_release(self):
+        installer.install(*bundle(self.root), self.prefix)
+        current = (self.prefix / 'current').readlink()
+        replace = os.replace
+
+        def fail_current(source, destination):
+            if destination == self.prefix / 'current':
+                raise OSError('simulated activation failure')
+            return replace(source, destination)
+
+        with mock.patch.object(installer.os, 'replace', side_effect=fail_current):
+            with self.assertRaises(OSError):
+                installer.install(*bundle(self.root, 'b'), self.prefix)
+        self.assertEqual((self.prefix / 'current').readlink(), current)
+        self.assertFalse((self.prefix / 'previous').is_symlink())
+
+    def test_candidate_identity_and_timeout_failures_leave_both_releases_untouched(self):
+        installer.install(*bundle(self.root), self.prefix)
+        installer.install(*bundle(self.root, 'b'), self.prefix)
+        links = {name: (self.prefix / name).readlink() for name in ('current', 'previous')}
+        for invalid in ('identity', 'rkat-version'):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                installer.install(*bundle(self.root, 'c', invalid), self.prefix)
+        with mock.patch.object(installer.subprocess, 'check_output',
+                               side_effect=subprocess.TimeoutExpired('build-info', 30)):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                installer.install(*bundle(self.root, 'c'), self.prefix)
+        self.assertEqual({name: (self.prefix / name).readlink() for name in links}, links)
+        self.assertEqual(list(self.prefix.glob('.unpack-*')), [])
+
+    def test_concurrent_installer_refuses_before_executing_or_switching(self):
+        installer.install(*bundle(self.root), self.prefix)
+        before = (self.prefix / 'current').readlink()
+        with (self.prefix / '.install.lock').open('a') as lock:
+            installer.fcntl.flock(lock, installer.fcntl.LOCK_EX | installer.fcntl.LOCK_NB)
+            with mock.patch.object(installer.subprocess, 'check_output') as execute:
+                with self.assertRaises(BlockingIOError):
+                    installer.install(*bundle(self.root, 'b'), self.prefix)
+                execute.assert_not_called()
+        self.assertEqual((self.prefix / 'current').readlink(), before)
+
+    def test_cli_start_command_handles_spaces_and_opens_the_welcome_page(self):
+        archive, checksum = bundle(self.root)
+        prefix = self.root / 'my installation'
+        result = subprocess.run([sys.executable, str(Path(installer.__file__)),
+                                 '--archive', str(archive), '--sha256', checksum,
+                                 '--prefix', str(prefix)], text=True, capture_output=True, check=True)
+        command = next(line.removeprefix('Start: ') for line in result.stdout.splitlines()
+                       if line.startswith('Start: '))
+        self.assertEqual(shlex.split(command), [str(prefix / 'bin/meerkat-fugue'), 'serve'])
+        self.assertIn('Then open http://127.0.0.1:8788/\n', result.stdout)
 
 
 if __name__ == '__main__':
