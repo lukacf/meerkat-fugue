@@ -15,6 +15,11 @@
   function remember() {
     try { localStorage.setItem(key, 'seen'); } catch { /* The guide still works when browser storage is disabled. */ }
   }
+  function dismiss() {
+    // close is queued by the browser; a fast reload can discard its handler.
+    remember();
+    dialog.close();
+  }
   function render() {
     const current = steps[step];
     node('welcomeStage').textContent = `0${step + 1} / ${current.stage}`;
@@ -35,9 +40,9 @@
     dialog.showModal();
   }
   document.querySelectorAll('[data-fugue-welcome]').forEach(button => button.addEventListener('click', () => open(button)));
-  node('welcomeClose').addEventListener('click', () => dialog.close());
+  node('welcomeClose').addEventListener('click', dismiss);
+  dialog.addEventListener('cancel', remember);
   dialog.addEventListener('close', () => {
-    remember();
     // A launch button inside a closed Session menu cannot receive focus.
     const target = returnFocus?.closest('.fugue-account')?.querySelector('summary') || returnFocus;
     target?.focus();
@@ -49,7 +54,7 @@
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
   });
   node('welcomeNext').addEventListener('click', () => {
-    if (step === steps.length - 1) dialog.close();
+    if (step === steps.length - 1) dismiss();
     else { step += 1; render(); }
   });
   node('welcomeBack').addEventListener('click', () => {

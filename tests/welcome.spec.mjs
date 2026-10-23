@@ -56,6 +56,17 @@ test('guide does not interrupt operational pages and traps focus when opened', a
   await expect(guide.getByRole('button',{name:'Close guide'})).toBeFocused();
 });
 
+test('dismissal is persisted before navigation can discard the queued close event', async ({page}) => {
+  await open(page);
+  const saved = await page.getByRole('button',{name:'Close guide'}).evaluate(button => {
+    button.click();
+    // The browser dispatches dialog's close event on a later task. Navigation
+    // can discard that task, so the preference must already exist here.
+    return localStorage.getItem('meerkat-fugue.welcome.v1');
+  });
+  expect(saved).toBe('seen');
+});
+
 test('small screens and reduced motion retain every guide control', async ({page}, testInfo) => {
   await page.setViewportSize({width:390,height:700});
   await page.emulateMedia({reducedMotion:'reduce'});
