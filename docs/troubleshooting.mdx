@@ -15,6 +15,7 @@ handoff evidence is inconsistent.
 | Add repository fails before configuration opens | Service logs and the saved private draft. Fix startup before adding a duplicate. |
 | Setup cannot clone or read the project | Connectivity and saved credentials on the execution host. |
 | Jira status transition fails | Actual available transitions, required fields and configured project scope. |
+| An issue attachment cannot be opened or uploaded | Selected repository, current tracker credentials and whether the issue belongs to that configured project. |
 | Browser asks you to sign in again | Host gateway session, separate from repository and model credentials. |
 | Agents cannot call the model | Native rkat binding under the service user's persistent HOME. |
 | Git reports `Author identity unknown` | Repository settings, then **Commit author**. Save and prepare the configuration before retrying. |
@@ -29,6 +30,17 @@ If Fugue reports that native cleanup is incomplete, restart the whole Fugue host
 before resuming repositories. Retained native owners cannot safely be reopened
 in the same process. Keep the private state and service logs for diagnosis;
 repeated preparation or deleting state is not a recovery procedure.
+
+Attachment access checks issue membership with the tracker before reading or
+writing files. A tracker outage or permission failure can therefore prevent
+opening a locally stored attachment. Restore tracker access and retry the
+existing issue. For older explicit workflow file locations, see
+[preserving state](./operations.mdx#preserve-the-right-state).
+
+Linear errors show a safe failure category instead of the raw provider response,
+which can include partial issue data. For authentication or permission failures,
+check the saved account and project scope. Rate limits retain retry advice;
+conflicts require refreshing state before retrying.
 
 ## No issues are picked up
 

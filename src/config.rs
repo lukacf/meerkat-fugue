@@ -7,6 +7,7 @@ use std::time::SystemTime;
 use minijinja::{Environment, UndefinedBehavior, context};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::domain::{Issue, normalize_state, sanitize_workspace_key};
 use crate::error::{FugueError, Result};
@@ -1579,7 +1580,27 @@ impl ServiceConfig {
             .repository_runtime
             .as_ref()
             .map(|binding| binding.state_path.join("files"))
-            .unwrap_or_else(|| self.workflow_dir.join(".fugue"))
+            .unwrap_or_else(|| {
+                // Explicit workflows may share a directory or database. Keep
+                // their files scoped even when tracker keys overlap.
+                let mut identity = Sha256::new();
+                for component in [
+                    self.tracker.kind.as_str(),
+                    self.tracker.endpoint.as_str(),
+                    self.tracker
+                        .project_slug
+                        .as_deref()
+                        .unwrap_or_default()
+                        .trim(),
+                ] {
+                    identity.update((component.len() as u64).to_le_bytes());
+                    identity.update(component.as_bytes());
+                }
+                self.workflow_dir
+                    .join(".fugue")
+                    .join("tracker-files")
+                    .join(format!("{:x}", identity.finalize()))
+            })
     }
 
     fn validate_static(&self) -> Result<()> {
@@ -1846,7 +1867,7 @@ impl TrackerConfig {
                 .map(|value| serde_json::from_value(value.clone()))
                 .transpose()
                 .map_err(|err| FugueError::InvalidConfig(format!("tracker.jira: {err}")))?,
-            project_slug: opt_string(raw, "project_slug")?,
+            project_slug: opt_string(raw, "project_slug")?.map(|scope| scope.trim().to_owned()),
             intake_states,
             in_flight_states,
             active_states,

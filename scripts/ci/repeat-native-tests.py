@@ -38,27 +38,47 @@ def record(path, row):
     temporary.replace(path)
 
 
-def stop_process_group(process):
-    """Stop owned descendants even when their original parent already exited."""
+def child_exited(process):
+    """Observe exit without reaping the leader that reserves the group ID."""
+    if process.returncode is not None:
+        raise RuntimeError('Process-group ownership was lost: leader already reaped')
+    status = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    return status is not None and status.si_pid == process.pid
+
+
+def signal_owned_group(process, signum):
+    child_exited(process)  # Fail before signalling if another waiter reaped it.
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process.pid, signum)
     except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Darwin reports EPERM for a group containing only zombies. Confirm
+        # that no live member remains instead of masking a real denied signal.
+        # The leader is still waitable, so its group ID cannot be recycled.
+        if sys.platform != 'darwin':
+            raise
+        result = subprocess.run(['/bin/ps', '-ax', '-o', 'pgid=,stat='],
+                                capture_output=True, text=True, check=True, timeout=3)
+        for line in result.stdout.splitlines():
+            group, state = line.split()
+            if int(group) == process.pid and not state.startswith('Z'):
+                raise
+        return False
+    return True
+
+
+def stop_process_group(process):
+    """Finish all group signals before releasing the owned leader's PID."""
+    try:
+        if signal_owned_group(process, signal.SIGTERM):
+            # The unreaped leader can keep the group observable after all its
+            # descendants exit. Allow bounded grace, then finish cleanup.
+            # Neither poll() nor wait() is safe before the last signal.
+            time.sleep(3)
+            signal_owned_group(process, signal.SIGKILL)
+    finally:
         process.wait(timeout=3)
-        return
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline:
-        process.poll()  # Reap our direct child while descendants settle.
-        try:
-            os.killpg(process.pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.05)
-    else:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    process.wait(timeout=3)
 
 
 def run_phase(command, report_dir, name, timeout, cancelled, env=None):
@@ -76,7 +96,7 @@ def run_phase(command, report_dir, name, timeout, cancelled, env=None):
                 row['pid'] = process.pid
                 record(path, row)
                 deadline = time.monotonic() + timeout
-                while process.poll() is None and not cancelled.is_set():
+                while not cancelled.is_set() and not child_exited(process):
                     if time.monotonic() >= deadline:
                         row['timeout'] = True
                         break
@@ -121,8 +141,8 @@ def qualify_retirement(executable, report_dir, attempt, cancelled=None, timeout=
 
 
 def main():
-    if os.name != 'posix':
-        raise SystemExit('Native qualification requires POSIX process groups')
+    if os.name != 'posix' or not hasattr(os, 'WNOWAIT') or not hasattr(os, 'waitid'):
+        raise SystemExit('Native qualification requires POSIX waitid with WNOWAIT')
     report_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(sys.argv[1]).with_suffix('.retirement')
     report_dir.mkdir(parents=True, exist_ok=False)
     cancelled = Cancellation()

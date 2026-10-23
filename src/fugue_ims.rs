@@ -74,6 +74,18 @@ impl FugueImsStore {
         &self.path
     }
 
+    pub(crate) fn repository_scope(&self) -> &str {
+        &self.repo.0
+    }
+
+    pub(crate) fn resolve_issue_identifier(
+        &self,
+        issue: &LinearIssueRef,
+    ) -> Result<LinearIssueIdentifier> {
+        self.resolve_linear_issue_ref(issue)
+            .map(|issue| LinearIssueIdentifier(issue.identifier))
+    }
+
     pub fn allocate_issue_key(&self, prefix: &str) -> Result<ImsIssueKey> {
         let sanitized_prefix = sanitize_issue_key_prefix(prefix);
         let now = Utc::now().to_rfc3339();

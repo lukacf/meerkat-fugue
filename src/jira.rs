@@ -542,6 +542,15 @@ impl JiraClient {
             .collect())
     }
 
+    pub(crate) async fn resolve_issue_identifier(
+        &self,
+        issue: &LinearIssueRef,
+    ) -> Result<LinearIssueIdentifier> {
+        self.fetch_issue(issue)
+            .await
+            .map(|issue| LinearIssueIdentifier(issue.key))
+    }
+
     pub async fn inspect_issue(&self, input: InspectIssueInput) -> Result<InspectIssueOutput> {
         let issue = self.fetch_issue(&input.issue).await?;
         let comments = self.comments_for_key(&issue.key).await?;

@@ -6,6 +6,24 @@ use thiserror::Error;
 #[error("Native cleanup is incomplete; host restart required: {0}")]
 pub(crate) struct NativeCleanupIncomplete(#[source] pub(crate) anyhow::Error);
 
+/// Safe provider failure categories. Raw GraphQL messages, paths, extensions and
+/// partial data must not leave the provider boundary in diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum LinearGraphqlFailure {
+    #[error("Linear authentication failed")]
+    Authentication,
+    #[error("Linear permission denied")]
+    Permission,
+    #[error("Linear issue not found")]
+    NotFound,
+    #[error("Linear rate limit exceeded")]
+    RateLimited,
+    #[error("Linear operation conflicts with current state")]
+    Conflict,
+    #[error("Linear rejected the operation")]
+    Other,
+}
+
 #[derive(Debug, Error)]
 pub enum FugueError {
     #[error("missing_workflow_file: {0}")]
@@ -48,7 +66,7 @@ pub enum FugueError {
     LinearApiStatus(String),
 
     #[error("linear_graphql_errors: {0}")]
-    LinearGraphqlErrors(String),
+    LinearGraphqlErrors(LinearGraphqlFailure),
 
     #[error("linear_unknown_payload: {0}")]
     LinearUnknownPayload(String),

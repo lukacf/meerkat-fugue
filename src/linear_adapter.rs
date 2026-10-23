@@ -488,10 +488,7 @@ impl IssueAdapter {
                 let key = store.allocate_issue_key(&fugue_ims_issue_key_prefix(tracker_config))?;
                 let snapshot = store.create_issue(CreateFugueIssue {
                     key,
-                    repo: tracker_config
-                        .project_slug
-                        .clone()
-                        .unwrap_or_else(|| "fugue-ims".to_string()),
+                    repo: store.repository_scope().to_owned(),
                     title: title.to_string(),
                     description: description.map(ToString::to_string),
                     stage: ImsStageName(lane.to_string()),
@@ -513,6 +510,24 @@ impl IssueAdapter {
                     updated_at: Some(Utc::now()),
                 })
             }
+        }
+    }
+
+    /// Resolve a reference within this tracker scope without fetching comments
+    /// or downloading attachments as a side effect of the access check.
+    pub(crate) async fn resolve_issue_identifier(
+        &self,
+        issue: &LinearIssueRef,
+    ) -> Result<LinearIssueIdentifier> {
+        match self {
+            Self::Jira(client) => client.resolve_issue_identifier(issue).await,
+            Self::FugueIms(store) => store.resolve_issue_identifier(issue),
+            Self::Linear(client) => LinearToolExecutor::new(client)
+                .resolve_issue_identifier(issue)
+                .await
+                .map_err(|err| {
+                    linear_tool_error(err.into_error(FugueToolOperation::LinearInspectIssue))
+                }),
         }
     }
 
@@ -922,6 +937,35 @@ mod issue_creation_tests {
         ServiceConfig::from_definition(std::path::PathBuf::from("/tmp/WORKFLOW.md"), &definition)
             .unwrap()
             .tracker
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_padded_builtin_scope_can_create_and_read_its_issue() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = fugue_ims_config(&temp.path().join("ims.sqlite"));
+        config.project_slug = Some("  owner/repo  ".into());
+        let adapter = IssueAdapter::from_config(&config).unwrap();
+        let issue = adapter
+            .create_issue(&config, "Normalized scope", None, "Ready Queue")
+            .await
+            .unwrap();
+        let read = adapter
+            .inspect_issue(InspectIssueInput {
+                issue: issue_ref_for_identifier(&issue.identifier),
+            })
+            .await
+            .unwrap();
+        assert_eq!(read.issue.title, "Normalized scope");
+        config.project_slug = Some("owner/other".into());
+        assert!(
+            IssueAdapter::from_config(&config)
+                .unwrap()
+                .inspect_issue(InspectIssueInput {
+                    issue: issue_ref_for_identifier(&issue.identifier)
+                })
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

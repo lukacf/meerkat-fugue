@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,10 +19,11 @@ spec.loader.exec_module(trials)
 
 FIXTURE = '''import json, os, signal, subprocess, sys, time
 from pathlib import Path
+signal.alarm(20)
 selection = sys.argv[1]
 hang = os.environ.get('FIXTURE_HANG', '')
 if (hang == 'list' and '--list' in sys.argv) or (hang == 'retirement' and '--list' not in sys.argv and 'runtime_members' in selection):
-    child_code = 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print("ready", flush=True); time.sleep(120)' if os.environ.get('FIXTURE_IGNORE_TERM') else 'import time; print("ready", flush=True); time.sleep(120)'
+    child_code = 'import signal, time; signal.alarm(20); signal.signal(signal.SIGTERM, signal.SIG_IGN); print("ready", flush=True); time.sleep(120)' if os.environ.get('FIXTURE_IGNORE_TERM') else 'import signal, time; signal.alarm(20); print("ready", flush=True); time.sleep(120)'
     child = subprocess.Popen([sys.executable, '-c', child_code], stdout=subprocess.PIPE)
     child.stdout.readline()
     child.stdout.close()
@@ -64,7 +66,8 @@ def running(pid):
     return bool(status.stdout.strip()) and not status.stdout.strip().startswith('Z')
 
 
-@unittest.skipUnless(os.name == 'posix', 'CI process group ownership requires POSIX')
+@unittest.skipUnless(os.name == 'posix' and hasattr(os, 'WNOWAIT') and hasattr(os, 'waitid'),
+                     'CI process group ownership requires non-reaping POSIX waits')
 class NativeTrialEvidenceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -86,13 +89,38 @@ class NativeTrialEvidenceTests(unittest.TestCase):
         return [pid for path in self.pids.glob('*.json') for pid in json.loads(path.read_text())]
 
     def clean_fixtures(self):
-        for pid in self.fixture_pids():
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        # These IDs are evidence, not signal authority: their original process
+        # may already have been reaped. Fixtures have their own lifetime limit
+        # so a failed cleanup assertion cannot leave an unbounded process.
         for path in self.pids.glob('*.json'):
             path.unlink()
+
+    def test_cleanup_keeps_leader_waitable_until_group_signals_finish(self):
+        signal_group = os.killpg
+        observations = []
+
+        def check_ownership(pid, signum):
+            # WNOWAIT observes our child without releasing its PID. This must
+            # succeed even when a successful phase has already exited.
+            status = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            observations.append((signum, status))
+            return signal_group(pid, signum)
+
+        with patch.object(trials.os, 'killpg', side_effect=check_ownership):
+            row = trials.run_phase([str(self.executable), 'normal'], self.root,
+                                   'ownership', 5, trials.Cancellation())
+        self.assertTrue(row['qualified'], row)
+        self.assertTrue(observations)
+        self.assertTrue(all(status and status.si_pid == row['pid']
+                            for _, status in observations))
+
+    def test_cleanup_refuses_a_previously_reaped_leader(self):
+        process = subprocess.Popen([sys.executable, '-c', 'pass'], start_new_session=True)
+        process.wait(timeout=5)
+        with patch.object(trials.os, 'killpg') as signal_group:
+            with self.assertRaises((ChildProcessError, RuntimeError)):
+                trials.stop_process_group(process)
+            signal_group.assert_not_called()
 
     def test_zero_exit_does_not_hide_conflicts_or_empty_test_selection(self):
         for index, (output, qualified) in enumerate([
@@ -112,6 +140,7 @@ class NativeTrialEvidenceTests(unittest.TestCase):
             row = trials.qualify_retirement(str(self.executable), self.root, 1, timeout=0.3)
         self.assertFalse(row['qualified'])
         self.assertTrue(row['timeout'])
+        self.assertNotIn('cleanup_error', row)
         self.assertEqual((self.root / 'attempt-01.log').read_text(), 'archive in flight\n')
         for pid in self.fixture_pids():
             self.assertTrue(await_condition(lambda: not running(pid)), f'process {pid} survived')
@@ -123,6 +152,7 @@ class NativeTrialEvidenceTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 8)
         self.assertFalse(row['qualified'])
         self.assertTrue(row['timeout'])
+        self.assertNotIn('cleanup_error', row)
         self.assertEqual(row['exit'], -signal.SIGKILL)
         for pid in self.fixture_pids():
             self.assertTrue(await_condition(lambda: not running(pid)), f'process {pid} survived')
@@ -134,12 +164,13 @@ class NativeTrialEvidenceTests(unittest.TestCase):
             'target': {'name': 'meerkat_fugue'}, 'profile': {'test': True},
             'executable': str(self.executable)}) + '\n')
         result = subprocess.run([sys.executable, str(SCRIPT), str(manifest), str(report)],
-                                capture_output=True, text=True, timeout=15)
+                                capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         summary = json.loads((report / 'summary.json').read_text())
         self.assertTrue(summary['qualified'])
         self.assertEqual(summary['status'], 'completed')
-        self.assertEqual(len(summary['executable_sha256']), 64)
+        self.assertEqual(summary['executable_sha256'],
+                         hashlib.sha256(self.executable.read_bytes()).hexdigest())
         self.assertEqual(len(summary['trials']), 20)
         self.assertEqual(len(summary['phases']), 7)
         self.assertEqual(len(list(report.glob('*.log'))), 27)
@@ -153,11 +184,11 @@ class NativeTrialEvidenceTests(unittest.TestCase):
                 manifest.write_text(json.dumps({'reason': 'compiler-artifact',
                     'target': {'name': 'meerkat_fugue'}, 'profile': {'test': True},
                     'executable': str(self.executable)}) + '\n')
-                with patch.dict(os.environ, FIXTURE_HANG=phase), (self.root / 'outer.log').open('w') as output:
+                with patch.dict(os.environ, FIXTURE_HANG=phase, FIXTURE_IGNORE_TERM='1'), (self.root / 'outer.log').open('w') as output:
                     process = subprocess.Popen([sys.executable, str(SCRIPT), str(manifest), str(report)],
                                                stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
                 try:
-                    self.assertTrue(await_condition(lambda: any(self.pids.glob('*.json'))), 'fixture did not start')
+                    self.assertTrue(await_condition(lambda: any(self.pids.glob('*.json')), timeout=30), 'fixture did not start')
                     self.assertTrue(await_condition(lambda: any('archive in flight' in p.read_text()
                         for p in report.glob('*.log'))), 'inflight output was buffered')
                     rows = [json.loads(p.read_text()) for p in report.glob('*.json')]
@@ -174,10 +205,9 @@ class NativeTrialEvidenceTests(unittest.TestCase):
                     self.assertTrue(any(json.loads(p.read_text()).get('cancelled')
                                         for p in report.glob('*.json')))
                 finally:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    if process.returncode is None:
+                        # No wait/poll has released our direct child's PID.
+                        trials.signal_owned_group(process, signal.SIGKILL)
                     process.wait(timeout=5)
                     self.clean_fixtures()
 

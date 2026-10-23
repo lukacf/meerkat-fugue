@@ -7,14 +7,64 @@ use futures::StreamExt;
 use reqwest::header::{
     AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION,
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
 use crate::config::TrackerConfig;
 use crate::domain::{BlockerRef, Issue, IssueAttachment};
-use crate::error::{FugueError, Result};
+use crate::error::{FugueError, LinearGraphqlFailure, Result};
 
 const LINEAR_ISSUE_STATES_PAGE_SIZE: usize = 50;
+
+#[derive(Deserialize)]
+struct GraphqlProviderError {
+    message: Option<String>,
+    extensions: Option<GraphqlErrorExtensions>,
+}
+
+#[derive(Deserialize)]
+struct GraphqlErrorExtensions {
+    code: Option<String>,
+}
+
+impl GraphqlProviderError {
+    fn kind(&self) -> LinearGraphqlFailure {
+        use LinearGraphqlFailure as Kind;
+        let code = self
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.code.as_deref());
+        match code {
+            Some("RATELIMITED") => return Kind::RateLimited,
+            Some("UNAUTHENTICATED" | "AUTHENTICATION_ERROR") => return Kind::Authentication,
+            Some("FORBIDDEN") => return Kind::Permission,
+            Some("ENTITY_NOT_FOUND") => return Kind::NotFound,
+            Some("CONFLICT") => return Kind::Conflict,
+            _ => {}
+        }
+        // Preserve compatibility with message-only provider errors while
+        // discarding the text immediately after classification.
+        let message = self
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if message.contains("unauthorized") || message.contains("authentication") {
+            Kind::Authentication
+        } else if message.contains("permission") || message.contains("forbidden") {
+            Kind::Permission
+        } else if message.contains("not found") {
+            Kind::NotFound
+        } else if message.contains("rate limit") || message.contains("too many requests") {
+            Kind::RateLimited
+        } else if message.contains("conflict") {
+            Kind::Conflict
+        } else {
+            Kind::Other
+        }
+    }
+}
 
 #[async_trait]
 pub trait IssueTracker: Send + Sync {
@@ -602,8 +652,16 @@ impl IssueTracker for LinearClient {
         let body: Value = serde_json::from_str(&text)
             .map_err(|err| FugueError::LinearUnknownPayload(err.to_string()))?;
         if let Some(errors) = body.get("errors") {
-            let _ = errors;
-            return Err(FugueError::LinearGraphqlErrors(body.to_string()));
+            let errors: Vec<GraphqlProviderError> = serde_json::from_value(errors.clone())
+                .map_err(|_| {
+                    FugueError::LinearUnknownPayload("invalid GraphQL error envelope".to_owned())
+                })?;
+            let kind = errors
+                .iter()
+                .map(GraphqlProviderError::kind)
+                .find(|kind| *kind != LinearGraphqlFailure::Other)
+                .unwrap_or(LinearGraphqlFailure::Other);
+            return Err(FugueError::LinearGraphqlErrors(kind));
         }
         if !status.is_success() {
             return Err(FugueError::LinearApiStatus(status.to_string()));
@@ -626,7 +684,6 @@ pub async fn execute_linear_graphql_tool(
     };
     match client.graphql(&parsed.query, parsed.variables).await {
         Ok(value) => (false, value.to_string()),
-        Err(FugueError::LinearGraphqlErrors(body)) => (true, body),
         Err(err) => (true, json!({"error": err.to_string()}).to_string()),
     }
 }

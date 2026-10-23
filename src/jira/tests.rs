@@ -54,6 +54,13 @@ pub(crate) struct MockResponse {
     body: Value,
 }
 
+impl MockResponse {
+    pub(crate) fn with_status(mut self, status: StatusCode) -> Self {
+        self.status = status;
+        self
+    }
+}
+
 pub(crate) fn reply(method: &'static str, path: &'static str, body: Value) -> MockResponse {
     MockResponse {
         method,

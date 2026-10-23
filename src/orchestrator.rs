@@ -7417,15 +7417,10 @@ fn native_issue_review_handoff_states(config: &ServiceConfig, issue: &Issue) -> 
 }
 
 fn linear_error_is_rate_limited(error: &FugueError) -> bool {
-    match error {
-        FugueError::LinearGraphqlErrors(body) => {
-            let lower = body.to_ascii_lowercase();
-            lower.contains("ratelimited")
-                || lower.contains("rate limit")
-                || lower.contains("too many requests")
-        }
-        _ => false,
-    }
+    matches!(
+        error,
+        FugueError::LinearGraphqlErrors(crate::error::LinearGraphqlFailure::RateLimited)
+    )
 }
 
 fn native_host_mcp_command(base: &BTreeMap<String, NativeMcpServerConfig>) -> Vec<String> {

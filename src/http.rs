@@ -2770,6 +2770,12 @@ async fn api_issue_upload_attachments(
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
+    let (adapter, issue_identifier) =
+        match attachment_issue_access(&app.config, &issue_identifier).await {
+            Ok(access) => access,
+            Err(response) => return response,
+        };
+    let issue_identifier = issue_identifier.0;
     let mut uploaded = Vec::new();
     let upload_dir = issue_attachment_dir(&app.config, &issue_identifier);
     if let Err(error) = tokio::fs::create_dir_all(&upload_dir).await {
@@ -2778,7 +2784,17 @@ async fn api_issue_upload_attachments(
             &format!("failed to prepare attachment storage: {error}"),
         );
     }
-    while let Ok(Some(field)) = multipart.next_field().await {
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => {
+                return bad_request(
+                    "invalid_attachment_upload",
+                    &format!("failed to read multipart upload: {error}"),
+                );
+            }
+        };
         if field.name() != Some("attachments") {
             continue;
         }
@@ -2851,10 +2867,6 @@ async fn api_issue_upload_attachments(
             byte_len: attachment.size,
         })
         .collect();
-    let adapter = match IssueAdapter::from_config(&app.config.tracker) {
-        Ok(adapter) => adapter,
-        Err(error) => return linear_config_error_response(error),
-    };
     let comment_id = match adapter
         .add_comment(AddCommentInput {
             issue: issue_ref_for_identifier(&issue_identifier),
@@ -2884,7 +2896,12 @@ async fn api_issue_attachment_download(
     if file_name != sanitize_attachment_component(&file_name) {
         return bad_request("invalid_attachment_path", "attachment file name is invalid");
     }
-    let path = issue_attachment_dir(&app.config, &issue_identifier).join(&file_name);
+    let (_, issue_identifier) = match attachment_issue_access(&app.config, &issue_identifier).await
+    {
+        Ok(access) => access,
+        Err(response) => return response,
+    };
+    let path = issue_attachment_dir(&app.config, &issue_identifier.0).join(&file_name);
     match tokio::fs::read(&path).await {
         Ok(bytes) => (
             StatusCode::OK,
@@ -2905,6 +2922,19 @@ async fn api_issue_attachment_download(
             &format!("failed to read attachment: {error}"),
         ),
     }
+}
+
+async fn attachment_issue_access(
+    config: &ServiceConfig,
+    identifier: &str,
+) -> std::result::Result<(IssueAdapter, LinearIssueIdentifier), Response> {
+    let adapter =
+        IssueAdapter::from_config(&config.tracker).map_err(linear_config_error_response)?;
+    let identifier = adapter
+        .resolve_issue_identifier(&issue_ref_for_identifier(identifier))
+        .await
+        .map_err(issue_adapter_error_response)?;
+    Ok((adapter, identifier))
 }
 
 fn issue_attachment_dir(config: &ServiceConfig, issue_identifier: &str) -> PathBuf {
@@ -3030,7 +3060,12 @@ async fn parse_multipart_issue_comment_request(
     let mut body_markdown = String::new();
     let mut uploaded = Vec::new();
     let upload_dir = issue_attachment_dir(&app.config, issue_identifier);
-    while let Ok(Some(field)) = multipart.next_field().await {
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        bad_request(
+            "invalid_comment_multipart",
+            &format!("failed to read multipart comment: {error}"),
+        )
+    })? {
         match field.name() {
             Some("body_markdown") => {
                 body_markdown = field.text().await.map_err(|error| {
@@ -3178,6 +3213,12 @@ async fn api_issue_add_comment(
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
+    let (adapter, issue_identifier) =
+        match attachment_issue_access(&app.config, &issue_identifier).await {
+            Ok(access) => access,
+            Err(response) => return response,
+        };
+    let issue_identifier = issue_identifier.0;
     let parsed = match parse_issue_comment_request(&app, &issue_identifier, &headers, request).await
     {
         Ok(parsed) => parsed,
@@ -3189,10 +3230,6 @@ async fn api_issue_add_comment(
             "body_markdown or at least one attachment must be provided",
         );
     }
-    let adapter = match IssueAdapter::from_config(&app.config.tracker) {
-        Ok(adapter) => adapter,
-        Err(error) => return linear_config_error_response(error),
-    };
     match adapter
         .add_comment(AddCommentInput {
             issue: issue_ref_for_identifier(&issue_identifier),
@@ -5866,6 +5903,300 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tracker_boundary_attachment_download_requires_issue_membership() {
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let (own, own_config, _owner) =
+            attachment_scope_test_router(root.path(), "owner/one").await;
+        let (foreign, foreign_config, _other) =
+            attachment_scope_test_router(root.path(), "owner/two").await;
+        crate::fugue_ims::create_issue_for_config(
+            &own_config.tracker,
+            CreateFugueIssue {
+                key: ImsIssueKey("TEST-1".into()),
+                repo: "owner/one".into(),
+                title: "Private issue".into(),
+                description: None,
+                stage: ImsStageName("Todo".into()),
+                labels: vec![],
+            },
+        )
+        .unwrap();
+        // Deliberately share physical storage to exercise the ownership check,
+        // even for an operator who points two bindings at one file directory.
+        assert_eq!(
+            own_config.attachment_storage_root(),
+            foreign_config.attachment_storage_root()
+        );
+        let files = issue_attachment_dir(&own_config, "TEST-1");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::write(files.join("trace.txt"), "private file contents").unwrap();
+        for (app, allowed) in [(foreign, false), (own, true)] {
+            let response = app
+                .oneshot(attachment_test_request(
+                    "GET",
+                    "/api/v1/issues/TEST-1/attachments/trace.txt",
+                    Body::empty(),
+                    None,
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+            if allowed {
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(bytes.as_ref(), b"private file contents");
+            } else {
+                assert!(!status.is_success(), "foreign project read the file");
+                assert!(!String::from_utf8_lossy(&bytes).contains("private file contents"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_attachment_upload_denies_before_filesystem_writes() {
+        use tower::ServiceExt;
+        for endpoint in ["attachments", "comments"] {
+            let root = tempfile::tempdir().unwrap();
+            let (_, own_config, _owner) =
+                attachment_scope_test_router(root.path(), "owner/one").await;
+            let (foreign, foreign_config, _other) =
+                attachment_scope_test_router(root.path(), "owner/two").await;
+            crate::fugue_ims::create_issue_for_config(
+                &own_config.tracker,
+                CreateFugueIssue {
+                    key: ImsIssueKey("TEST-1".into()),
+                    repo: "owner/one".into(),
+                    title: "Private issue".into(),
+                    description: None,
+                    stage: ImsStageName("Todo".into()),
+                    labels: vec![],
+                },
+            )
+            .unwrap();
+            let directory = issue_attachment_dir(&foreign_config, "TEST-1");
+            assert!(!directory.exists());
+            let response = foreign
+                .oneshot(attachment_test_request(
+                    "POST",
+                    &format!("/api/v1/issues/TEST-1/{endpoint}"),
+                    attachment_test_body(),
+                    Some("multipart/form-data; boundary=fixture"),
+                ))
+                .await
+                .unwrap();
+            assert!(!response.status().is_success());
+            assert!(
+                !directory.exists(),
+                "{endpoint} wrote to a foreign issue before refusing it"
+            );
+        }
+    }
+
+    async fn attachment_scope_test_router(
+        root: &Path,
+        project: &str,
+    ) -> (Router, ServiceConfig, crate::orchestrator::Orchestrator) {
+        let (_, owner) = managed_test_router(root, None).await;
+        let mut config = owner.config().effective().clone();
+        config.tracker.project_slug = Some(project.to_owned());
+        let (refresh, _receiver) = mpsc::channel(1);
+        let app = router(
+            owner.shared_state(),
+            config.clone(),
+            refresh,
+            owner.internal_sender(),
+            owner.meta_runtime_registry(),
+            None,
+        )
+        .await
+        .unwrap();
+        (app, config, owner)
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_owned_attachment_uploads_and_downloads_still_work() {
+        use tower::ServiceExt;
+        for endpoint in ["attachments", "comments"] {
+            let root = tempfile::tempdir().unwrap();
+            let (app, config, _owner) =
+                attachment_scope_test_router(root.path(), "owner/one").await;
+            crate::fugue_ims::create_issue_for_config(
+                &config.tracker,
+                CreateFugueIssue {
+                    key: ImsIssueKey("TEST-1".into()),
+                    repo: "owner/one".into(),
+                    title: "Owned issue".into(),
+                    description: None,
+                    stage: ImsStageName("Todo".into()),
+                    labels: vec![],
+                },
+            )
+            .unwrap();
+            let response = app
+                .clone()
+                .oneshot(attachment_test_request(
+                    "POST",
+                    &format!("/api/v1/issues/TEST-1/{endpoint}"),
+                    attachment_test_body(),
+                    Some("multipart/form-data; boundary=fixture"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let url = payload["attachments"][0]["url"].as_str().unwrap();
+            let response = app
+                .oneshot(attachment_test_request("GET", url, Body::empty(), None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(response.into_body(), 8192).await.unwrap().as_ref(),
+                b"attachment contents"
+            );
+            assert_eq!(
+                IssueAdapter::from_config(&config.tracker)
+                    .unwrap()
+                    .issue_comments(&issue_ref_for_identifier("TEST-1"))
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_malformed_multipart_never_posts_partial_comment() {
+        use tower::ServiceExt;
+        for endpoint in ["attachments", "comments"] {
+            let root = tempfile::tempdir().unwrap();
+            let (app, config, _owner) =
+                attachment_scope_test_router(root.path(), "owner/one").await;
+            crate::fugue_ims::create_issue_for_config(
+                &config.tracker,
+                CreateFugueIssue {
+                    key: ImsIssueKey("TEST-1".into()),
+                    repo: "owner/one".into(),
+                    title: "Owned issue".into(),
+                    description: None,
+                    stage: ImsStageName("Todo".into()),
+                    labels: vec![],
+                },
+            )
+            .unwrap();
+            let response = app
+                .oneshot(attachment_test_request(
+                    "POST",
+                    &format!("/api/v1/issues/TEST-1/{endpoint}"),
+                    Body::from("--fixture\r\nContent-Disposition: form-data; name=\"attachments\"; filename=\"trace.txt\"\r\nContent-Type: text/plain\r\n\r\nvalid first file\r\n--fixture\r\nInvalid header without a colon\r\n\r\npartial second file\r\n--fixture--\r\n"),
+                    Some("multipart/form-data; boundary=fixture"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{endpoint}");
+            assert!(
+                IssueAdapter::from_config(&config.tracker)
+                    .unwrap()
+                    .issue_comments(&issue_ref_for_identifier("TEST-1"))
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{endpoint} posted a comment from an incomplete request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_jira_download_resolves_key_without_comments_or_remote_files() {
+        use crate::jira::tests::{issue, mock_jira, reply, tracker};
+        use tower::ServiceExt;
+        let mock = mock_jira(vec![reply(
+            "GET",
+            "/rest/api/3/issue/10001",
+            issue("To Do"),
+        )])
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let (_, mut config, owner) = attachment_scope_test_router(root.path(), "TEST").await;
+        config.tracker = tracker(&mock.endpoint);
+        let files = issue_attachment_dir(&config, "TEST-1");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::write(files.join("trace.txt"), "owned Jira attachment").unwrap();
+        let (refresh, _receiver) = mpsc::channel(1);
+        let app = router(
+            owner.shared_state(),
+            config,
+            refresh,
+            owner.internal_sender(),
+            owner.meta_runtime_registry(),
+            None,
+        )
+        .await
+        .unwrap();
+        let response = app
+            .oneshot(attachment_test_request(
+                "GET",
+                "/api/v1/issues/10001/attachments/trace.txt",
+                Body::empty(),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), 8192).await.unwrap().as_ref(),
+            b"owned Jira attachment"
+        );
+        assert!(mock.responses.lock().unwrap().is_empty());
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tracker_boundary_unmanaged_attachment_roots_are_scope_specific_and_credential_independent() {
+        let mut first = issue_board_config();
+        let root = first.attachment_storage_root();
+        first.tracker.api_key = Some("changed-credential".into());
+        assert_eq!(first.attachment_storage_root(), root);
+        for component in ["provider", "endpoint", "project"] {
+            let mut other = first.clone();
+            match component {
+                "provider" => other.tracker.kind = "jira".into(),
+                "endpoint" => other.tracker.endpoint = "https://other.example.test/graphql".into(),
+                _ => other.tracker.project_slug = Some("other-project".into()),
+            }
+            assert_ne!(root, other.attachment_storage_root(), "{component}");
+        }
+        first.tracker.project_slug = first.tracker.project_slug.map(|scope| format!(" {scope} "));
+        assert_eq!(first.attachment_storage_root(), root);
+    }
+
+    fn attachment_test_request(
+        method: &str,
+        path: &str,
+        body: Body,
+        content_type: Option<&str>,
+    ) -> Request {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("Host", "127.0.0.1:8788")
+            .header("Origin", "http://127.0.0.1:8788");
+        if let Some(value) = content_type {
+            request = request.header(CONTENT_TYPE, value);
+        }
+        request.body(body).unwrap()
+    }
+
+    fn attachment_test_body() -> Body {
+        Body::from(
+            "--fixture\r\nContent-Disposition: form-data; name=\"attachments\"; filename=\"trace.txt\"\r\nContent-Type: text/plain\r\n\r\nattachment contents\r\n--fixture--\r\n",
+        )
+    }
+
+    #[tokio::test]
     async fn managed_queue_guards_direct_child_reads_mutations_and_fallbacks() {
         use tower::ServiceExt;
         let root = tempfile::tempdir().unwrap();
@@ -6440,7 +6771,13 @@ mod tests {
         let path = dir.join(&stored);
         std::fs::write(&path, bytes).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        assert!(path.starts_with(workspace.path().join(".fugue/issue-attachments/LUC-649")));
+        assert!(
+            path.starts_with(
+                config
+                    .attachment_storage_root()
+                    .join("issue-attachments/LUC-649")
+            )
+        );
 
         let url = format!(
             "/api/v1/issues/{}/attachments/{}",

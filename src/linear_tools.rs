@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::config::TrackerConfig;
-use crate::error::{FugueError, Result};
+use crate::error::{FugueError, LinearGraphqlFailure, Result};
 use crate::fugue_ims::FugueImsStore;
 use crate::ims::{
     ImsCommentAttachmentSnapshot, ImsCommentId, ImsCommentSnapshot, ImsIssueId, ImsIssueKey,
@@ -100,6 +100,15 @@ impl<'a> LinearToolExecutor<'a> {
             workpad,
             attachments,
         })
+    }
+
+    pub(crate) async fn resolve_issue_identifier(
+        &self,
+        issue: &LinearIssueRef,
+    ) -> LinearToolResultData<LinearIssueIdentifier> {
+        self.fetch_issue(issue, CommentFetch::None)
+            .await
+            .map(|issue| issue.issue.identifier)
     }
 
     pub async fn issue_comment_snapshots(
@@ -858,7 +867,7 @@ impl From<FugueError> for LinearToolFailure {
                 FugueToolErrorCode::BackendUnavailable,
                 RetryAdvice::SafeToRetry,
             ),
-            FugueError::LinearGraphqlErrors(body) => classify_graphql_errors(body),
+            FugueError::LinearGraphqlErrors(kind) => classify_graphql_errors(*kind),
             FugueError::LinearUnknownPayload(_) => {
                 (FugueToolErrorCode::ExecutionFailed, RetryAdvice::DoNotRetry)
             }
@@ -1183,32 +1192,28 @@ where
     })
 }
 
-fn classify_graphql_errors(body: &str) -> (FugueToolErrorCode, RetryAdvice) {
-    let lower = body.to_ascii_lowercase();
-    if lower.contains("unauthorized") || lower.contains("authentication") {
-        (
+fn classify_graphql_errors(kind: LinearGraphqlFailure) -> (FugueToolErrorCode, RetryAdvice) {
+    match kind {
+        LinearGraphqlFailure::Authentication => (
             FugueToolErrorCode::AuthenticationFailed,
             RetryAdvice::DoNotRetry,
-        )
-    } else if lower.contains("permission") || lower.contains("forbidden") {
-        (
+        ),
+        LinearGraphqlFailure::Permission => (
             FugueToolErrorCode::PermissionDenied,
             RetryAdvice::DoNotRetry,
-        )
-    } else if lower.contains("not found") {
-        (FugueToolErrorCode::NotFound, RetryAdvice::DoNotRetry)
-    } else if lower.contains("rate limit") || lower.contains("too many requests") {
-        (
+        ),
+        LinearGraphqlFailure::NotFound => (FugueToolErrorCode::NotFound, RetryAdvice::DoNotRetry),
+        LinearGraphqlFailure::RateLimited => (
             FugueToolErrorCode::RateLimited,
             RetryAdvice::RetryAfter { seconds: 60 },
-        )
-    } else if lower.contains("conflict") {
-        (
+        ),
+        LinearGraphqlFailure::Conflict => (
             FugueToolErrorCode::Conflict,
             RetryAdvice::RefreshStateThenRetry,
-        )
-    } else {
-        (FugueToolErrorCode::ExecutionFailed, RetryAdvice::DoNotRetry)
+        ),
+        LinearGraphqlFailure::Other => {
+            (FugueToolErrorCode::ExecutionFailed, RetryAdvice::DoNotRetry)
+        }
     }
 }
 
@@ -2312,6 +2317,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tracker_boundary_partial_linear_errors_do_not_disclose_provider_data() {
+        use crate::jira::tests::{mock_jira as mock_http, reply};
+        let mut partial = linear_scope_response(Some("other-project"));
+        partial["errors"] = json!([{"message":"Issue not found: private-message-sentinel", "path":["private-path-sentinel"], "extensions":{"code":"ENTITY_NOT_FOUND","private":"private-extension-sentinel"}}]);
+        let mock = mock_http(vec![reply("POST", "/graphql", partial)]).await;
+        let config = scoped_linear_fixture(&format!("{}/graphql", mock.endpoint));
+        let (failed, content) = execute_linear_fugue_tool(
+            &config,
+            "linear_inspect_issue",
+            &json!({"issue":{"kind":"id","id":"issue-1"}}),
+        )
+        .await;
+        assert!(failed);
+        for private in [
+            "Private issue",
+            "other-project",
+            "private-message-sentinel",
+            "private-path-sentinel",
+            "private-extension-sentinel",
+        ] {
+            assert!(
+                !content.contains(private),
+                "error exposed {private}: {content}"
+            );
+        }
+        let result: FugueToolResult = serde_json::from_str(&content).unwrap();
+        assert!(
+            matches!(result, FugueToolResult::Err {error,..} if error.code == FugueToolErrorCode::NotFound)
+        );
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_linear_error_categories_survive_without_raw_provider_messages() {
+        use crate::jira::tests::{mock_jira as mock_http, reply};
+        for (error, expected, retry) in [
+            (
+                json!({"message":"private provider details", "extensions":{"code":"RATELIMITED"}}),
+                FugueToolErrorCode::RateLimited,
+                RetryAdvice::RetryAfter { seconds: 60 },
+            ),
+            (
+                json!({"message":"Authentication failed for private user"}),
+                FugueToolErrorCode::AuthenticationFailed,
+                RetryAdvice::DoNotRetry,
+            ),
+            (
+                json!({"message":"Permission missing on private team"}),
+                FugueToolErrorCode::PermissionDenied,
+                RetryAdvice::DoNotRetry,
+            ),
+            (
+                json!({"message":"Conflict with private issue"}),
+                FugueToolErrorCode::Conflict,
+                RetryAdvice::RefreshStateThenRetry,
+            ),
+            (
+                json!({"message":"private unrecognized failure"}),
+                FugueToolErrorCode::ExecutionFailed,
+                RetryAdvice::DoNotRetry,
+            ),
+        ] {
+            let status = if expected == FugueToolErrorCode::RateLimited {
+                axum::http::StatusCode::BAD_REQUEST
+            } else {
+                axum::http::StatusCode::OK
+            };
+            let mock =
+                mock_http(vec![reply(
+                "POST",
+                "/graphql",
+                json!({"errors":[error],"data":{"issue":{"title":"private foreign title"}}}),
+            ).with_status(status)])
+                .await;
+            let config = scoped_linear_fixture(&format!("{}/graphql", mock.endpoint));
+            let (failed, content) = execute_linear_fugue_tool(
+                &config,
+                "linear_inspect_issue",
+                &json!({"issue":{"kind":"id","id":"issue-1"}}),
+            )
+            .await;
+            assert!(failed);
+            assert!(!content.contains("private"), "{content}");
+            let result: FugueToolResult = serde_json::from_str(&content).unwrap();
+            let FugueToolResult::Err { error, .. } = result else {
+                panic!("expected failure")
+            };
+            assert_eq!(error.code, expected);
+            assert_eq!(error.retry, retry);
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_raw_graphql_errors_are_safe_json() {
+        use crate::jira::tests::{mock_jira as mock_http, reply};
+        let mock = mock_http(vec![reply("POST", "/graphql", json!({"errors":[{"message":"private diagnostic", "extensions":{"code":"RATELIMITED"}}],"data":{"viewer":{"email":"private contact"}}}))]).await;
+        let config = scoped_linear_fixture(&format!("{}/graphql", mock.endpoint));
+        let (failed, content) = crate::tracker::execute_linear_graphql_tool(
+            &config,
+            &json!({"query":"query { viewer { id } }"}),
+        )
+        .await;
+        assert!(failed);
+        assert!(!content.contains("private"));
+        let payload: Value = serde_json::from_str(&content).unwrap();
+        assert!(payload["error"].as_str().unwrap().contains("rate limit"));
+    }
+
+    #[tokio::test]
     async fn linear_bulk_issue_lookup_keeps_project_filter_on_wire() {
         use crate::jira::tests::{mock_jira as mock_http, reply};
         let mock = mock_http(vec![reply(
@@ -3220,8 +3334,7 @@ mod tests {
 
     #[test]
     fn structured_linear_errors_are_classified() {
-        let body = r#"{"errors":[{"message":"Issue not found"}]}"#;
-        let (code, retry) = classify_graphql_errors(body);
+        let (code, retry) = classify_graphql_errors(LinearGraphqlFailure::NotFound);
         assert_eq!(code, FugueToolErrorCode::NotFound);
         assert_eq!(retry, RetryAdvice::DoNotRetry);
     }
