@@ -107,12 +107,10 @@ fn locked_native_graph_uses_the_selected_recovery_commits() {
     let lock: Lock = toml::from_str(include_str!("../Cargo.lock")).expect("valid lockfile");
     let core = &manifest.patch.crates["meerkat"];
     let meta = &manifest.patch.crates["meerkat-meta"];
-    for package in lock
-        .package
-        .iter()
-        .filter(|p| p.name.starts_with("meerkat") && p.name != "meerkat-fugue")
-    {
-        let pin = if package.name == "meerkat-meta" {
+    for package in lock.package.iter().filter(|p| {
+        (p.name.starts_with("meerkat") || p.name.starts_with("meta-")) && p.name != "meerkat-fugue"
+    }) {
+        let pin = if package.name == "meerkat-meta" || package.name.starts_with("meta-") {
             meta
         } else {
             core

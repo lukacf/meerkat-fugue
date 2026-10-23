@@ -97,8 +97,8 @@ on the intended gateway before treating a deployment as accepted.
 
 ## Temporary dependency follow-up
 
-The current candidate binds Core `79eae05d740fc4b60cc80f48d21b3dcd77a99916`
-and Meta `ba44bcb8cb03d0f9f04b4d17c46e3de04b1c46df`. Core includes the
+The current candidate binds Core `e2e4b8f8bf1a306eb2cb1758ae75aab95a464a62`
+and Meta `661025cb89ca4554beb1b248a9d59c1133ce9697`. Core includes the
 checkpoint-recovery correction; Meta includes the console panels and sign-in
 recovery changes. Every Core package, including Meta's transitive dependencies,
 must resolve to that same Core commit in `Cargo.lock`.
