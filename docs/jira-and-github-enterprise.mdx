@@ -53,6 +53,18 @@ Every issue search is restricted to `project_slug`. Optional `jira.jql` adds a
 parenthesized filter inside that scope; omit `ORDER BY` from this extra filter.
 Direct issue reads and mutations also check the configured project.
 
+In browser setup, set **Labels for new issues** to the labels that Board-created
+tickets need, for example `fugue` for `labels = "fugue"`. Separate multiple labels
+with commas. Fugue saves these creation defaults in private workspace state.
+Changing or clearing them requires checking and preparing the repository again.
+Existing Jira tickets are not relabeled.
+
+A filter selects tickets; it does not set arbitrary issue fields. If your JQL
+also requires a component, assignee or custom field, configure matching creation
+fields below or create the ticket in Jira with those fields. If a ticket does
+not appear, open that ticket in Jira and check its project and filter fields
+before creating another one.
+
 Map `tracker.lanes` and `linear_projections` to the project's existing Jira
 statuses. Jira transitions are resolved by their destination status, which
 can differ from the transition's name. Fugue requires an available, unambiguous

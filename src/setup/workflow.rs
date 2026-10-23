@@ -31,6 +31,9 @@ pub struct WorkflowSetup {
     pub tracker_team: Option<String>,
     pub jira_issue_type: Option<String>,
     pub jira_jql: Option<String>,
+    /// Labels applied to issues created through this repository's board.
+    #[serde(default)]
+    pub jira_issue_labels: Vec<String>,
     /// Optional Jira transition fields, retained only in private workspace state.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub jira_transition_fields:
@@ -71,6 +74,15 @@ impl WorkflowSetup {
             .is_some_and(|path| !path.is_absolute())
         {
             bail!("The checkout must be an absolute path");
+        }
+        for label in &self.jira_issue_labels {
+            if label.is_empty()
+                || label
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control() || c == ',')
+            {
+                bail!("Use single-word Jira labels separated by commas");
+            }
         }
         for value in [
             &self.lanes.parked,
@@ -395,6 +407,7 @@ mod tests {
             tracker_team: None,
             jira_issue_type: Some("Task".into()),
             jira_jql: Some("reporter = currentUser()".into()),
+            jira_issue_labels: Vec::new(),
             jira_transition_fields: BTreeMap::new(),
             lanes: TrackerLaneRoles {
                 parked: "Open".into(),
@@ -475,6 +488,7 @@ mod tests {
             tracker_team: None,
             jira_issue_type: None,
             jira_jql: None,
+            jira_issue_labels: Vec::new(),
             jira_transition_fields: BTreeMap::new(),
             lanes: TrackerLaneRoles::default(),
         };

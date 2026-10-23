@@ -9,6 +9,7 @@ const html = (await readFile(new URL('../src/setup/setup.html',import.meta.url),
 async function setup(page, initial={}, prefix='') {
   const state={model:null,github:null,tracker:null,environment_providers:['openai'],...initial};
   const writes=[];
+  let workflow=null;
   let preparation={phase:'draft'};
   await page.route('http://fugue.test/**',async route=>{
     const url=new URL(route.request().url());
@@ -26,9 +27,9 @@ async function setup(page, initial={}, prefix='') {
       }
       return route.fulfill({json:state});
     }
-    if(url.pathname==='/api/setup/workflow') return route.fulfill({body:'null',contentType:'application/json'});
+    if(url.pathname==='/api/setup/workflow') return route.fulfill({body:JSON.stringify(workflow),contentType:'application/json'});
     if(url.pathname==='/api/setup/preparation') {
-      if(route.request().method()==='POST') {writes.push({connection:'workflow',value:route.request().postDataJSON()});preparation={phase:'ready'};}
+      if(route.request().method()==='POST') {workflow=route.request().postDataJSON();writes.push({connection:'workflow',value:workflow});preparation={phase:'ready'};}
       return route.fulfill({json:preparation});
     }
     if(url.pathname==='/api/setup/check/jira-states') return route.fulfill({json:{states:[{name:'Open'},{name:'In Progress'},{name:'Resolved'},{name:'Reopened'},{name:'Closed'}]}});
@@ -178,6 +179,31 @@ test('new setup uses recommended models and preserves explicit selections',async
   await expect(page.getByLabel('Model',{exact:true})).toHaveValue('gpt-6-astra');
   await page.getByLabel('Provider',{exact:true}).selectOption('anthropic');
   await expect(page.getByLabel('Model',{exact:true})).toHaveValue('claude-test');
+});
+
+test('Jira creation labels survive reload and require preparation after changing',async({page})=>{
+  const {writes}=await setup(page,{...connected,tracker:{kind:'jira',site:'https://example.atlassian.net',email:'test@example.com'}});
+  await page.getByLabel('Repository URL',{exact:true}).fill('https://github.com/example/application');
+  await page.getByLabel('Tracker project',{exact:true}).fill('EXAMPLE');
+  await page.getByLabel('Jira ticket filter',{exact:true}).fill('labels = "fugue-app"');
+  await page.getByLabel('Labels for new issues',{exact:true}).fill(' fugue-app, regression ');
+  await page.getByRole('button',{name:'Check and prepare repository'}).click();
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeEnabled();
+  expect(writes.at(-1).value.jira_issue_labels).toEqual(['fugue-app','regression']);
+  await page.reload();
+  await expect(page.getByLabel('Labels for new issues',{exact:true})).toHaveValue('fugue-app, regression');
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeEnabled();
+  await page.getByLabel('Labels for new issues',{exact:true}).fill('replacement');
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeDisabled();
+  await page.getByRole('button',{name:'Check and prepare repository'}).click();
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeEnabled();
+  expect(writes.at(-1).value.jira_issue_labels).toEqual(['replacement']);
+  await page.getByLabel('Labels for new issues',{exact:true}).fill('');
+  await page.getByRole('button',{name:'Check and prepare repository'}).click();
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeEnabled();
+  expect(writes.at(-1).value.jira_issue_labels).toEqual([]);
+  await page.reload();
+  await expect(page.getByLabel('Labels for new issues',{exact:true})).toHaveValue('');
 });
 
 

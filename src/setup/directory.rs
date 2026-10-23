@@ -218,6 +218,7 @@ impl Directory {
             tracker_team: None,
             jira_issue_type: Some("Task".into()),
             jira_jql: None,
+            jira_issue_labels: Vec::new(),
             lanes: crate::config::TrackerLaneRoles::default(),
         };
         std::fs::write(

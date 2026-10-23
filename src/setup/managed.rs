@@ -268,22 +268,8 @@ pub async fn prepare(
     );
     let directory = root.join(&generation);
     std::fs::create_dir(&directory)?;
-    if !setup.jira_transition_fields.is_empty()
-        && let Some(jira) = &mut generated.workflow.linear.jira
-    {
-        use std::io::Write;
-        let path = directory.join("jira-transition-fields.json");
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&path)?;
-        file.write_all(&serde_json::to_vec_pretty(&setup.jira_transition_fields)?)?;
-        file.sync_all()?;
-        jira.transition_fields_file = Some(path.display().to_string());
+    if let Some(jira) = &mut generated.workflow.linear.jira {
+        write_jira_fields(&directory, setup, jira)?;
     }
     std::fs::write(
         directory.join("fugue.yaml"),
@@ -318,6 +304,52 @@ pub async fn prepare(
         );
     }
     Ok(manifest)
+}
+
+/// Keep project-specific issue defaults in this immutable private generation.
+fn write_jira_fields(
+    directory: &Path,
+    setup: &WorkflowSetup,
+    jira: &mut crate::jira::JiraConfig,
+) -> Result<()> {
+    #[derive(Serialize)]
+    struct CreateFields<'a> {
+        labels: &'a [String],
+    }
+    jira.create_fields_file = if setup.jira_issue_labels.is_empty() {
+        None
+    } else {
+        Some(write_private_json(
+            directory.join("jira-create-fields.json"),
+            &CreateFields {
+                labels: &setup.jira_issue_labels,
+            },
+        )?)
+    };
+    jira.transition_fields_file = if setup.jira_transition_fields.is_empty() {
+        None
+    } else {
+        Some(write_private_json(
+            directory.join("jira-transition-fields.json"),
+            &setup.jira_transition_fields,
+        )?)
+    };
+    Ok(())
+}
+
+fn write_private_json(path: PathBuf, value: &impl Serialize) -> Result<String> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(&serde_json::to_vec_pretty(value)?)?;
+    file.sync_all()?;
+    Ok(path.display().to_string())
 }
 
 pub async fn supervise(root: &Path, port: u16, mut open_setup: bool) -> Result<()> {
@@ -409,4 +441,99 @@ pub async fn shutdown_signal() -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jira_setup() -> WorkflowSetup {
+        serde_json::from_str(
+            r#"{
+            "owner":"example", "repository":"app", "lanes":{},
+            "jira_jql":"labels = fugue-app",
+            "jira_issue_labels":["fugue-app","regression"],
+            "jira_transition_fields":{"Closed":{"resolution":{"name":"Done"}}}
+        }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn jira_defaults_are_private_and_clearing_them_keeps_old_generation_intact() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let mut setup = jira_setup();
+        setup.validate().unwrap();
+        let mut jira = crate::jira::JiraConfig::default();
+        write_jira_fields(first.path(), &setup, &mut jira).unwrap();
+        let create_path = jira.create_fields_file.clone().unwrap();
+        let transition_path = jira.transition_fields_file.clone().unwrap();
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CreateFields {
+            labels: Vec<String>,
+        }
+        let created: CreateFields =
+            serde_json::from_slice(&std::fs::read(&create_path).unwrap()).unwrap();
+        assert_eq!(created.labels, setup.jira_issue_labels);
+        assert_eq!(
+            std::fs::read_to_string(&transition_path).unwrap(),
+            serde_json::to_string_pretty(&setup.jira_transition_fields).unwrap()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&create_path, &transition_path] {
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+        setup.jira_issue_labels.clear();
+        setup.jira_transition_fields.clear();
+        write_jira_fields(second.path(), &setup, &mut jira).unwrap();
+        assert!(jira.create_fields_file.is_none());
+        assert!(jira.transition_fields_file.is_none());
+        assert_eq!(std::fs::read_dir(second.path()).unwrap().count(), 0);
+        assert!(Path::new(&create_path).is_file());
+        assert!(Path::new(&transition_path).is_file());
+    }
+
+    #[test]
+    fn jira_defaults_never_overwrite_existing_generation_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jira-create-fields.json");
+        std::fs::write(&path, "preserved").unwrap();
+        assert!(
+            write_jira_fields(
+                directory.path(),
+                &jira_setup(),
+                &mut crate::jira::JiraConfig::default()
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "preserved");
+    }
+
+    #[test]
+    fn jira_labels_validate_before_generation_and_old_drafts_default_to_empty() {
+        let mut setup = jira_setup();
+        for invalid in [
+            "",
+            "two words",
+            "comma,label",
+            "line\nbreak",
+            "control\0",
+            "tab\tlabel",
+        ] {
+            setup.jira_issue_labels = vec![invalid.into()];
+            assert!(setup.validate().is_err(), "accepted {invalid:?}");
+        }
+        let old: WorkflowSetup =
+            serde_json::from_str(r#"{"owner":"example","repository":"app","lanes":{}}"#).unwrap();
+        assert!(old.jira_issue_labels.is_empty());
+        old.validate().unwrap();
+    }
 }

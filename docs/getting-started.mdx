@@ -60,7 +60,10 @@ For Jira, supply the site, account email and API token, then select the project
 key and issue type. Load its available statuses and map intake, active, review,
 merge and terminal work to the project's existing workflow. Fugue validates
 transitions; it does not alter a shared Jira workflow. A selective JQL filter
-can isolate Fugue issues inside a larger project.
+isolates Fugue issues inside a larger project and is required in browser setup.
+For a filter such as `labels = "fugue-app"`, enter `fugue-app` in **Labels for new
+issues**. The Board applies these labels when creating Jira tickets, so they
+appear in this repository's queue. Separate multiple labels with commas.
 
 For Linear, supply the API key and project/team selection. Ensure the selected
 account can read and update issues, comments and the configured workflow states.
