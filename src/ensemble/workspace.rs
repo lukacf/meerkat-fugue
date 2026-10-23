@@ -345,7 +345,8 @@ impl Workspace {
             task.await.context("join repository setup")?;
         }
         self.configuration.lock().await.setup = SetupState::Stopped;
-        if let Some(active) = self.active.write().await.take() {
+        let mut owned = self.active.write().await;
+        if let Some(active) = owned.as_ref() {
             active.runtime.shutdown().await?;
             if let Some(console) = self.console.get() {
                 for repo in active.runtime.config().repositories.keys() {
@@ -353,6 +354,7 @@ impl Workspace {
                 }
             }
         }
+        owned.take();
         Ok(())
     }
 }
@@ -391,30 +393,14 @@ fn save_config(path: &Path, expected: Option<&[u8]>, config: &EnsembleConfig) ->
         .context("repository configuration needs a parent directory")?;
     std::fs::create_dir_all(parent)?;
     let bytes = serde_yaml::to_string(config)?.into_bytes();
-    let temporary = path.with_extension("yaml.pending");
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    let mut pending = tempfile::Builder::new()
+        .prefix(".fugue-ensemble-")
+        .tempfile_in(parent)?;
+    pending.write_all(&bytes)?;
+    pending.as_file().sync_all()?;
+    pending.persist(path)?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&temporary)
-        .context("create repository configuration transaction")?;
-    let result = (|| -> Result<()> {
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        #[cfg(unix)]
-        std::fs::File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if let Err(error) = result {
-        std::fs::remove_file(&temporary)
-            .context("clean up failed repository configuration transaction")?;
-        return Err(error);
-    }
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(bytes)
 }
 
@@ -568,5 +554,17 @@ mod tests {
         assert!(!path.exists());
         workspace.shutdown().await.unwrap();
         assert!(workspace.start().await.is_err());
+    }
+
+    #[test]
+    fn crashed_configuration_writer_does_not_block_next_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ensemble.yaml");
+        let mut config = EnsembleConfig::for_repositories(&[], "Original".into()).unwrap();
+        let original = save_config(&path, None, &config).unwrap();
+        std::fs::write(path.with_extension("yaml.pending"), "interrupted write").unwrap();
+        config.name = "Retry".into();
+        save_config(&path, Some(&original), &config).unwrap();
+        assert_eq!(EnsembleConfig::load(&path).unwrap().name, "Retry");
     }
 }

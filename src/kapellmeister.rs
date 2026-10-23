@@ -3979,6 +3979,7 @@ for line in sys.stdin:
             intake_states: vec![],
             in_flight_states: vec!["In Progress".to_string()],
             active_states: vec!["Todo".to_string(), "In Progress".to_string()],
+            attachment_root: None,
             max_attachment_files: 20,
             max_attachment_bytes: 25 * 1024 * 1024,
             max_attachment_total_bytes: 100 * 1024 * 1024,

@@ -1075,6 +1075,7 @@ pub fn fugue_ims_tracker_config(path: &Path) -> TrackerConfig {
             "Reviewing".to_string(),
             "Rework".to_string(),
         ],
+        attachment_root: None,
         max_attachment_files: 20,
         max_attachment_bytes: 25 * 1024 * 1024,
         max_attachment_total_bytes: 100 * 1024 * 1024,

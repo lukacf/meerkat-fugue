@@ -14,6 +14,10 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
+  qualification:
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/ci.yml
+
   bundle:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -52,7 +56,7 @@ jobs:
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: bundle
+    needs: [bundle, qualification]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

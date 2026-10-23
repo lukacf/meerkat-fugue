@@ -32,6 +32,7 @@ pub struct LinearClient {
     client: reqwest::Client,
     download_client: reqwest::Client,
     attachment_limits: AttachmentDownloadLimits,
+    attachment_root: Option<PathBuf>,
 }
 
 pub struct LinearDownloadedFile {
@@ -173,6 +174,7 @@ impl LinearClient {
             client,
             download_client,
             attachment_limits: AttachmentDownloadLimits::from_config(config),
+            attachment_root: config.attachment_root.clone(),
         })
     }
 
@@ -182,6 +184,10 @@ impl LinearClient {
 
     pub fn states_query() -> &'static str {
         ISSUE_STATES_QUERY
+    }
+
+    pub(crate) fn attachment_root(&self) -> Option<&Path> {
+        self.attachment_root.as_deref()
     }
 
     pub fn attachment_download_limits(&self) -> AttachmentDownloadLimits {
@@ -256,44 +262,36 @@ impl LinearClient {
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
 
-        let tmp_path = path.with_extension(format!(
-            "{}.part",
-            path.extension()
-                .and_then(|extension| extension.to_str())
-                .unwrap_or("download")
-        ));
-        let mut file = tokio::fs::File::create(&tmp_path)
-            .await
-            .map_err(|err| FugueError::Workspace(err.to_string()))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| FugueError::Workspace("attachment path has no parent".into()))?;
+        let pending = tempfile::Builder::new()
+            .prefix(".fugue-download-")
+            .tempfile_in(parent)
+            .map_err(|error| FugueError::Workspace(error.to_string()))?;
+        let mut file = tokio::fs::File::from_std(
+            pending
+                .reopen()
+                .map_err(|error| FugueError::Workspace(error.to_string()))?,
+        );
         let mut byte_len = 0u64;
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(err) => {
-                    let _ = tokio::fs::remove_file(&tmp_path).await;
-                    return Err(FugueError::LinearUnknownPayload(err.to_string()));
-                }
-            };
+            let chunk =
+                chunk.map_err(|error| FugueError::LinearUnknownPayload(error.to_string()))?;
             byte_len = byte_len.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-            if let Err(err) = budget.check_streamed_len(url, byte_len) {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                return Err(err);
-            }
-            if let Err(err) = file.write_all(&chunk).await {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                return Err(FugueError::Workspace(err.to_string()));
-            }
+            budget.check_streamed_len(url, byte_len)?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| FugueError::Workspace(error.to_string()))?;
         }
-        if let Err(err) = file.flush().await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(FugueError::Workspace(err.to_string()));
-        }
+        file.sync_all()
+            .await
+            .map_err(|error| FugueError::Workspace(error.to_string()))?;
         drop(file);
-        if let Err(err) = tokio::fs::rename(&tmp_path, path).await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(FugueError::Workspace(err.to_string()));
-        }
+        pending
+            .persist(path)
+            .map_err(|error| FugueError::Workspace(error.to_string()))?;
         budget.record_success(byte_len);
         Ok(LinearDownloadedFile {
             content_type,
@@ -1161,6 +1159,7 @@ mod tests {
             intake_states: vec![],
             in_flight_states: vec![],
             active_states: vec![],
+            attachment_root: None,
             max_attachment_files,
             max_attachment_bytes,
             max_attachment_total_bytes,

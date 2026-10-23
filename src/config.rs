@@ -56,6 +56,9 @@ pub struct ServiceConfig {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TrackerConfig {
+    /// Host-owned storage scope; never shared through process CWD or environment.
+    #[serde(skip)]
+    pub attachment_root: Option<PathBuf>,
     pub kind: String,
     pub endpoint: String,
     #[serde(skip_serializing)]
@@ -1546,7 +1549,7 @@ impl ServiceConfig {
             section_object(&definition.config, "ota_update")?,
             &workflow_dir,
         )?;
-        let config = Self {
+        let mut config = Self {
             workflow_path: path,
             workflow_dir,
             prompt_template: definition.prompt_template.clone(),
@@ -1566,8 +1569,17 @@ impl ServiceConfig {
             server,
             ota_update,
         };
+        config.tracker.attachment_root = Some(config.attachment_storage_root());
         config.validate_static()?;
         Ok(config)
+    }
+
+    pub(crate) fn attachment_storage_root(&self) -> PathBuf {
+        self.meerkat
+            .repository_runtime
+            .as_ref()
+            .map(|binding| binding.state_path.join("files"))
+            .unwrap_or_else(|| self.workflow_dir.join(".fugue"))
     }
 
     fn validate_static(&self) -> Result<()> {
@@ -1830,6 +1842,7 @@ impl TrackerConfig {
             intake_states,
             in_flight_states,
             active_states,
+            attachment_root: None,
             max_attachment_files: opt_usize(raw, "max_attachment_files")?.unwrap_or(20),
             max_attachment_bytes: opt_u64(raw, "max_attachment_bytes")?.unwrap_or(25 * 1024 * 1024),
             max_attachment_total_bytes: opt_u64(raw, "max_attachment_total_bytes")?

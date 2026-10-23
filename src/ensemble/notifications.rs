@@ -440,6 +440,7 @@ pub(crate) struct SubscriptionTools {
     pub member: MemberId,
     pub studied: Arc<std::sync::atomic::AtomicBool>,
     tools: Arc<[Arc<ToolDef>]>,
+    excluded_state_root: Option<PathBuf>,
 }
 impl SubscriptionTools {
     pub(crate) fn new(
@@ -461,7 +462,13 @@ impl SubscriptionTools {
             member,
             studied,
             tools: tools.into(),
+            excluded_state_root: None,
         }
+    }
+
+    pub(crate) fn with_excluded_state_root(mut self, root: PathBuf) -> Self {
+        self.excluded_state_root = Some(root);
+        self
     }
 }
 #[derive(Deserialize)]
@@ -555,6 +562,16 @@ impl AgentToolDispatcher for SubscriptionTools {
                             "Credential files and runtime state are not exposed by repository tools"
                         );
                     }
+                    if let Some(excluded) = &self.excluded_state_root {
+                        let root = self.events.root.canonicalize()?;
+                        let excluded = excluded.canonicalize()?;
+                        if excluded
+                            .strip_prefix(&root)
+                            .is_ok_and(|relative| path.0.starts_with(relative))
+                        {
+                            bail!("Configured runtime state is not exposed by repository tools");
+                        }
+                    }
                     let object = format!("{}:{}", input.revision, path.0.display());
                     let size =
                         String::from_utf8(self.events.git(&["cat-file", "-s", &object]).await?)?
@@ -585,6 +602,73 @@ impl AgentToolDispatcher for SubscriptionTools {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn historical_revision_cannot_expose_configured_private_state() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("custom-state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(state.join("private.txt"), "private-sentinel").unwrap();
+        std::fs::write(root.path().join("public.txt"), "public source").unwrap();
+        let git = |args: &[&str]| {
+            let result = std::process::Command::new("git")
+                .current_dir(root.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            String::from_utf8(result.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "fixture",
+        ]);
+        let revision = git(&["rev-parse", "HEAD"]);
+        std::fs::remove_file(state.join("private.txt")).unwrap();
+        let events = RepositoryEvents::open(
+            super::super::config::RepoId::try_from("test".to_owned()).unwrap(),
+            root.path().to_path_buf(),
+            &state,
+            None,
+        )
+        .unwrap();
+        let tools = SubscriptionTools::new(
+            events,
+            MemberId::try_from("reader".to_owned()).unwrap(),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+        .with_excluded_state_root(state);
+        for (path, denied) in [("custom-state/private.txt", true), ("public.txt", false)] {
+            let args = serde_json::value::RawValue::from_string(
+                json!({"revision":revision,"path":path}).to_string(),
+            )
+            .unwrap();
+            let outcome = tools
+                .dispatch(ToolCallView {
+                    id: "read",
+                    name: "repository_read_revision",
+                    args: &args,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome.result.is_error, denied,
+                "{path}: {:?}",
+                outcome.result.content
+            );
+        }
+    }
     #[test]
     fn revision_pages_preserve_utf8_without_replacement_characters() {
         let bytes = "Aå界B".as_bytes();

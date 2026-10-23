@@ -20,6 +20,8 @@ use crate::{
 #[serde(deny_unknown_fields)]
 pub struct WorkflowSetup {
     #[serde(default)]
+    pub commit_identity: CommitIdentity,
+    #[serde(default)]
     pub repository_url: Option<String>,
     #[serde(default)]
     pub allow_no_ci_checks: bool,
@@ -41,6 +43,54 @@ pub struct WorkflowSetup {
     pub lanes: TrackerLaneRoles,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitIdentity {
+    pub name: String,
+    pub email: String,
+}
+
+impl Default for CommitIdentity {
+    fn default() -> Self {
+        Self {
+            name: "Meerkat Fugue".into(),
+            email: "fugue@localhost".into(),
+        }
+    }
+}
+
+impl CommitIdentity {
+    fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty()
+            || self.name.len() > 200
+            || self
+                .name
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '<' | '>'))
+            || self.email.len() > 254
+            || self
+                .email
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '<' | '>'))
+            || self.email.split_once('@').is_none_or(|(local, domain)| {
+                local.is_empty() || domain.is_empty() || domain.contains('@')
+            })
+        {
+            bail!("Enter a commit author name and email address");
+        }
+        Ok(())
+    }
+
+    fn hook(&self) -> String {
+        let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+        format!(
+            "git config --local user.name {} && git config --local user.email {}",
+            quote(&self.name),
+            quote(&self.email)
+        )
+    }
+}
+
 pub struct GeneratedWorkspace {
     pub workflow: NativeFugueConfig,
     pub ensemble: EnsembleConfig,
@@ -50,6 +100,7 @@ pub struct GeneratedWorkspace {
 
 impl WorkflowSetup {
     pub fn validate(&self) -> Result<()> {
+        self.commit_identity.validate()?;
         if let Some(url) = &self.repository_url {
             let parsed = super::repository::RepositoryAddress::parse(url)?;
             if parsed.owner != self.owner || parsed.repository != self.repository {
@@ -118,6 +169,7 @@ impl WorkflowSetup {
             .github
             .as_ref()
             .context("Connect GitHub first")?;
+        super::directory::validate_selection(root, self, Some(&github.host))?;
         if let Some(url) = &self.repository_url {
             let parsed = super::repository::RepositoryAddress::parse(url)?;
             if !parsed.host.eq_ignore_ascii_case(&github.host) {
@@ -133,6 +185,17 @@ impl WorkflowSetup {
             bail!("Draft and ready statuses must differ");
         }
         let root = std::path::absolute(root)?;
+        // Native names are independent of GitHub naming rules and include the
+        // complete remote scope so equal basenames cannot share participants.
+        use sha2::Digest;
+        let address = super::repository::RepositoryAddress {
+            host: github.host.to_ascii_lowercase(),
+            owner: self.owner.to_ascii_lowercase(),
+            repository: self.repository.to_ascii_lowercase(),
+        };
+        let digest = sha2::Sha256::digest(address.https_url().as_bytes());
+        let repository_id = RepoId::try_from(format!("repo-{:x}", digest)[..64].to_owned())
+            .map_err(anyhow::Error::msg)?;
         let repository = GitHubRepoRef {
             host: Some(GitHubHost::try_from(github.host.clone()).map_err(anyhow::Error::msg)?),
             owner: GitHubOwner(self.owner.clone()),
@@ -296,10 +359,18 @@ impl WorkflowSetup {
         // Repository identity is validated above; no user-authored shell is accepted.
         config.hooks = Some(NativeHooksConfig {
             after_create: Some(format!(
-                "git -c credential.helper= -c 'credential.https://{}.helper=!gh auth git-credential' clone https://{}/{}/{}.git .\ngit config credential.https://{}.helper '!gh auth git-credential'",
-                github.host, github.host, self.owner, self.repository, github.host
+                "git -c credential.helper= -c 'credential.https://{}.helper=!gh auth git-credential' clone https://{}/{}/{}.git . && git config credential.https://{}.helper '!gh auth git-credential' && {}",
+                github.host,
+                github.host,
+                self.owner,
+                self.repository,
+                github.host,
+                self.commit_identity.hook()
             )),
-            before_run: Some("git fetch --all --prune".into()),
+            before_run: Some(format!(
+                "{} && git fetch --all --prune",
+                self.commit_identity.hook()
+            )),
             after_run: None,
             before_remove: None,
             timeout_ms: Some(120000),
@@ -321,9 +392,8 @@ impl WorkflowSetup {
         config.worker.prompt_template = Some(include_str!("worker.md").into());
         config.meerkat = Some(NativeMeerkatConfig {
             repository_runtime: Some(crate::config::RepositoryRuntimeBinding {
-                repository: RepoId::try_from(self.repository.clone())
-                    .map_err(anyhow::Error::msg)?,
-                state_path: root.join("repository-teams").join(&self.repository),
+                repository: repository_id.clone(),
+                state_path: root.join("repository-teams").join(repository_id.as_str()),
             }),
             model: Some(model.model.clone()),
             provider: Some(provider.into()),
@@ -360,7 +430,7 @@ impl WorkflowSetup {
         ensemble.model = model.model.clone();
         ensemble.auth_binding = binding;
         ensemble.state_root = root.join("repository-teams");
-        let id = RepoId::try_from(self.repository.clone()).map_err(anyhow::Error::msg)?;
+        let id = repository_id;
         ensemble.repositories.insert(
             id,
             RepositoryConfig {
@@ -380,6 +450,181 @@ impl WorkflowSetup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_fixture(owner: &str, repository: &str) -> (Connections, WorkflowSetup) {
+        let connections = Connections {
+            model: Some(ModelConnection {
+                provider: ModelProvider::Openai,
+                model: crate::config::default_agent_model().into(),
+                credential: ModelCredential::Environment,
+            }),
+            github: Some(GitHubConnection {
+                host: "github.com".into(),
+                credential: GitHubCredential::GhCli,
+            }),
+            tracker: Some(TrackerConnection::Local),
+        };
+        let request = serde_json::from_value(serde_json::json!({
+            "owner": owner, "repository": repository, "lanes": TrackerLaneRoles::default()
+        }))
+        .unwrap();
+        (connections, request)
+    }
+
+    #[test]
+    fn same_basename_repositories_get_distinct_stable_native_identities() {
+        let root = tempfile::tempdir().unwrap();
+        let render = |owner| {
+            let (connections, request) = local_fixture(owner, "app");
+            request
+                .render(&connections, root.path(), 8788, Path::new("/opt/fugue/bin"))
+                .unwrap()
+        };
+        let first = render("team-one");
+        let second = render("team-two");
+        let binding = |workspace: &GeneratedWorkspace| {
+            workspace
+                .workflow
+                .meerkat
+                .as_ref()
+                .unwrap()
+                .repository_runtime
+                .as_ref()
+                .unwrap()
+                .clone()
+        };
+        assert_ne!(binding(&first).mob_id(), binding(&second).mob_id());
+        assert_ne!(binding(&first).state_path, binding(&second).state_path);
+        assert_eq!(binding(&first), binding(&render("team-one")));
+        assert!(
+            first
+                .ensemble
+                .repositories
+                .contains_key(&binding(&first).repository)
+        );
+    }
+
+    #[test]
+    fn valid_remote_names_do_not_need_to_be_native_identifiers() {
+        let root = tempfile::tempdir().unwrap();
+        for name in [
+            "app.js".to_owned(),
+            "MyApp".into(),
+            "123app".into(),
+            "a".repeat(100),
+        ] {
+            let (connections, request) = local_fixture("example", &name);
+            let rendered = request
+                .render(&connections, root.path(), 8788, Path::new("/opt/fugue/bin"))
+                .unwrap();
+            assert_eq!(rendered.repository.name.0, name);
+            assert_eq!(
+                rendered.checkout.file_name().unwrap().to_str().unwrap(),
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn failed_clone_cannot_be_masked_by_successful_credential_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let (connections, request) = local_fixture("example", "app");
+        let rendered = request
+            .render(&connections, root.path(), 8788, Path::new("/opt/fugue/bin"))
+            .unwrap();
+        let hook = rendered.workflow.hooks.unwrap().after_create.unwrap();
+        let script =
+            format!("git() {{ case \"$*\" in *clone*) return 17;; *) return 0;; esac; }}; {hook}");
+        let status = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .status()
+            .unwrap();
+        assert!(
+            !status.success(),
+            "clone failure must abort workspace creation"
+        );
+    }
+
+    #[test]
+    fn commit_identity_shell_metacharacters_are_literal_repository_config() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = CommitIdentity {
+            name: "O'Neil $(touch injected) `touch injected2`".into(),
+            email: "test@example.com".into(),
+        };
+        identity.validate().unwrap();
+        let script = format!(
+            "git init -q . && {} && git config --local user.name",
+            identity.hook()
+        );
+        let result = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .current_dir(root.path())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path())
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap().trim(),
+            identity.name
+        );
+        assert!(!root.path().join("injected").exists());
+        assert!(!root.path().join("injected2").exists());
+        assert!(!root.path().join(".gitconfig").exists());
+        for (name, email) in [
+            ("", "test@example.com"),
+            ("Bot\nOther", "test@example.com"),
+            ("Bot", "missing-domain"),
+            ("Bot", "a@b@c"),
+            ("Bot", "a@b\n"),
+        ] {
+            assert!(
+                CommitIdentity {
+                    name: name.into(),
+                    email: email.into()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_worktree_can_commit_without_a_global_git_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let (connections, request) = local_fixture("example", "app");
+        let rendered = request
+            .render(&connections, root.path(), 8788, Path::new("/opt/fugue/bin"))
+            .unwrap();
+        let hook = rendered.workflow.hooks.unwrap().after_create.unwrap();
+        let script = format!(
+            "git() {{ case \"$*\" in *' clone '*) command git init -q .;; *) command git \"$@\";; esac; }}; {hook} && echo source > sample.txt && git add sample.txt && git commit -qm example && git log -1 --format='%an <%ae>'"
+        );
+        let result = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .current_dir(root.path())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "user.useConfigOnly")
+            .env("GIT_CONFIG_VALUE_0", "true")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap().trim(),
+            "Meerkat Fugue <fugue@localhost>"
+        );
+        assert!(!root.path().join(".gitconfig").exists());
+    }
     use crate::setup::connections::{GitHubConnection, GitHubCredential, ModelConnection};
 
     #[test]
@@ -398,6 +643,7 @@ mod tests {
             tracker: Some(serde_json::from_str(r#"{"kind":"jira","site":"https://example.atlassian.net","email":"test@example.com","api_token":"test-token"}"#).unwrap()),
         };
         let request = WorkflowSetup {
+            commit_identity: Default::default(),
             allow_no_ci_checks: false,
             repository_url: None,
             owner: "example".into(),
@@ -479,6 +725,7 @@ mod tests {
             tracker: Some(TrackerConnection::Local),
         };
         let request = WorkflowSetup {
+            commit_identity: Default::default(),
             allow_no_ci_checks: false,
             repository_url: None,
             owner: "example".into(),

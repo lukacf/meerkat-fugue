@@ -4,15 +4,89 @@ use anyhow::{Context, Result};
 use std::{path::Path, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
+#[derive(Default)]
+pub(crate) struct HostLifecycle {
+    restart_required: std::sync::atomic::AtomicBool,
+}
+
+impl HostLifecycle {
+    pub(crate) fn ensure_can_start(&self) -> Result<()> {
+        if self
+            .restart_required
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            anyhow::bail!(
+                "Native cleanup is incomplete. Restart the Fugue host before resuming repositories."
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Native cleanup is incomplete; host restart required: {0}")]
+struct HostRestartRequired(#[source] anyhow::Error);
+
+fn finish_run(result: Result<()>, settled: Result<()>, cleanup: Result<()>) -> Result<()> {
+    cleanup.map_err(HostRestartRequired)?;
+    settled.map_err(HostRestartRequired)?;
+    result
+}
+
+fn record_failure(root: &Path, host: &HostLifecycle, error: anyhow::Error) -> Result<()> {
+    tracing::error!(workspace = %root.display(), error = %error, "repository workspace failed");
+    let fatal = error.is::<HostRestartRequired>();
+    if fatal {
+        host.restart_required
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    // Only operator-safe diagnostics reach the setup page.
+    std::fs::write(
+        root.join("startup-error.txt"),
+        if fatal {
+            "Native cleanup is incomplete. Restart the Fugue host before resuming this repository."
+        } else {
+            "The repository runtime could not start. Check the host log, then prepare the saved settings and start again."
+        },
+    )?;
+    if fatal {
+        return Err(error);
+    }
+    Ok(())
+}
+
+enum RunDisposition {
+    Stopped,
+    Configure,
+}
+
+fn finish_attempt(
+    root: &Path,
+    host: &HostLifecycle,
+    stop: &CancellationToken,
+    result: Result<()>,
+) -> Result<RunDisposition> {
+    if let Err(error) = result {
+        record_failure(root, host, error)?;
+    }
+    Ok(if stop.is_cancelled() {
+        RunDisposition::Stopped
+    } else {
+        RunDisposition::Configure
+    })
+}
+
 pub(crate) async fn serve(
     root: &Path,
     port: u16,
     hub_url: String,
     console: Arc<crate::console::ConsoleHub>,
     stop: CancellationToken,
+    host: Arc<HostLifecycle>,
 ) -> Result<()> {
     let mut configure = false;
     loop {
+        host.ensure_can_start()?;
         if stop.is_cancelled() {
             return Ok(());
         }
@@ -26,19 +100,10 @@ pub(crate) async fn serve(
             configure = false;
             continue;
         };
-        match run(root, port, &hub_url, &active, console.clone(), stop.clone()).await {
-            Ok(()) if stop.is_cancelled() => return Ok(()),
-            Ok(()) => configure = true,
-            Err(error) => {
-                tracing::error!(workspace = %root.display(), error = %error, "repository workspace failed");
-                // Keep detailed diagnostics in the host log. The setup page must
-                // never reflect upstream response bodies or secret config values.
-                std::fs::write(
-                    root.join("startup-error.txt"),
-                    "The repository runtime could not start. Check the host log, then prepare the saved settings and start again.",
-                )?;
-                configure = true;
-            }
+        let result = run(root, port, &hub_url, &active, console.clone(), stop.clone()).await;
+        match finish_attempt(root, &host, &stop, result)? {
+            RunDisposition::Stopped => return Ok(()),
+            RunDisposition::Configure => configure = true,
         }
     }
 }
@@ -116,16 +181,17 @@ async fn run(
         }
         orchestrator.run_until_shutdown(run_stop).await
     });
+    let mut joined = false;
     let result = tokio::select! {
         _ = stop.cancelled() => Ok(()),
         _ = reconfigure.cancelled() => Ok(()),
         result = &mut server => result.context("serve repository HTTP"),
-        result = &mut work => result.context("repository task failed").and_then(|result| result),
+        result = &mut work => { joined = true; result.context("repository task failed").and_then(|result| result) },
     };
     work_stop.cancel();
     server_stop.cancel();
     // Native producers settle before their runtime/state ownership is released.
-    let settled = if !work.is_finished() {
+    let settled = if !joined {
         work.await
             .context("settle repository task")
             .and_then(|result| result)
@@ -133,5 +199,51 @@ async fn run(
         Ok(())
     };
     let cleanup = workspace.shutdown().await;
-    result.and(settled).and(cleanup)
+    finish_run(result, settled, cleanup)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_failure_survives_cancellation_and_disables_same_host_reopen() {
+        for stopped in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let host = HostLifecycle::default();
+            let stop = CancellationToken::new();
+            if stopped {
+                stop.cancel();
+            }
+            let error = finish_run(
+                Ok(()),
+                Ok(()),
+                Err(anyhow::anyhow!("retained native owner")),
+            )
+            .unwrap_err();
+            assert!(finish_attempt(root.path(), &host, &stop, Err(error)).is_err());
+            assert!(host.ensure_can_start().is_err());
+            assert_eq!(stop.is_cancelled(), stopped);
+            assert!(
+                !std::fs::read_to_string(root.path().join("startup-error.txt"))
+                    .unwrap()
+                    .contains("retained native owner")
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_failure_takes_precedence_over_recoverable_run_error() {
+        let result = finish_run(
+            Err(anyhow::anyhow!("startup")),
+            Ok(()),
+            Err(anyhow::anyhow!("cleanup")),
+        );
+        assert!(result.unwrap_err().is::<HostRestartRequired>());
+        let root = tempfile::tempdir().unwrap();
+        let host = HostLifecycle::default();
+        let result = finish_run(Err(anyhow::anyhow!("startup")), Ok(()), Ok(()));
+        record_failure(root.path(), &host, result.unwrap_err()).unwrap();
+        host.ensure_can_start().unwrap();
+    }
 }

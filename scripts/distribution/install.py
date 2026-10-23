@@ -87,6 +87,26 @@ def managed_link(link):
     return value
 
 
+def verify_installed_release(prefix, relative):
+    """Do not promote a damaged current release to the rollback target."""
+    release = prefix / relative
+    if release.is_symlink() or not release.is_dir() or (release / 'bin').is_symlink():
+        raise ValueError('Existing release layout has changed; installation stopped.')
+    manifest_path = release / 'manifest.json'
+    if manifest_path.is_symlink():
+        raise ValueError('Existing release manifest has changed; installation stopped.')
+    manifest = json.loads(manifest_path.read_text())
+    expected_names = {'LICENSE-MIT', 'LICENSE-APACHE'} | {'bin/' + name for name in BINARIES}
+    if (manifest.get('schema') != 1 or manifest.get('target') != target()
+            or set(manifest.get('files', {})) != expected_names
+            or manifest.get('fugue', {}).get('commit') != release.name.split('-')[0]):
+        raise ValueError('Existing release manifest has changed; installation stopped.')
+    for name, checksum in manifest['files'].items():
+        path = release / name
+        if path.is_symlink() or not path.is_file() or digest(path) != checksum:
+            raise ValueError('Existing release files have changed; installation stopped. Restore the verified current release before upgrading; the previous release is preserved.')
+
+
 def install(archive, expected, prefix):
     if prefix.is_symlink():
         raise ValueError('The installation directory must not be a symbolic link.')
@@ -102,6 +122,8 @@ def install(archive, expected, prefix):
         previous = prefix / 'previous'
         old = managed_link(current)
         prior = managed_link(previous)
+        if old is not None:
+            verify_installed_release(prefix, old)
         for name in BINARIES:
             link = prefix / 'bin' / name
             if link.exists() or link.is_symlink():

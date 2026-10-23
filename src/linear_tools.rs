@@ -1253,8 +1253,12 @@ async fn download_issue_file_attachments(
         return Ok(Vec::new());
     }
 
-    let root =
-        linear_attachment_root_dir()?.join(sanitize_path_component(&issue.issue.identifier.0));
+    let storage = client.attachment_root();
+    let root = match storage {
+        Some(root) => root.join("attachments"),
+        None => linear_attachment_root_dir()?,
+    }
+    .join(sanitize_path_component(&issue.issue.identifier.0));
     tokio::fs::create_dir_all(&root).await.map_err(|err| {
         LinearToolFailure::new(
             FugueToolErrorCode::ExecutionFailed,
@@ -1271,7 +1275,7 @@ async fn download_issue_file_attachments(
     let mut budget = client.attachment_download_limits().budget();
     for (index, candidate) in candidates.into_iter().enumerate() {
         if let Some(snapshot) =
-            fugue_hosted_attachment_snapshot(&issue.issue.identifier.0, &candidate)
+            fugue_hosted_attachment_snapshot(storage, &issue.issue.identifier.0, &candidate)
         {
             snapshots.push(snapshot);
             continue;
@@ -1428,13 +1432,16 @@ fn is_linear_file_url(url: &str) -> bool {
 }
 
 fn fugue_hosted_attachment_snapshot(
+    storage: Option<&Path>,
     issue_identifier: &str,
     candidate: &AttachmentCandidate,
 ) -> Option<LinearFileAttachmentSnapshot> {
     let (_url_issue_identifier, file_name) = parse_fugue_hosted_attachment_url(&candidate.url)?;
-    let path = std::env::current_dir()
-        .ok()?
-        .join(".fugue")
+    let root = match storage {
+        Some(root) => root.to_path_buf(),
+        None => std::env::current_dir().ok()?.join(".fugue"),
+    };
+    let path = root
         .join("issue-attachments")
         .join(sanitize_path_component(issue_identifier))
         .join(file_name);
@@ -2327,6 +2334,7 @@ mod tests {
             intake_states: vec![],
             in_flight_states: vec![],
             active_states: vec![],
+            attachment_root: None,
             max_attachment_files: 20,
             max_attachment_bytes: 25 * 1024 * 1024,
             max_attachment_total_bytes: 100 * 1024 * 1024,
@@ -2793,9 +2801,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn issue_file_attachment_candidates_include_fugue_hosted_comment_links() {
-        let issue = IssueWithComments {
+    fn hosted_attachment_issue() -> IssueWithComments {
+        IssueWithComments {
             issue: LinearIssueSnapshot {
                 id: LinearIssueId("issue-1".to_string()),
                 identifier: LinearIssueIdentifier("LUC-653".to_string()),
@@ -2819,7 +2826,12 @@ mod tests {
                 url: None,
             }],
             attachments: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn issue_file_attachment_candidates_include_fugue_hosted_comment_links() {
+        let issue = hosted_attachment_issue();
 
         let candidates = issue_file_attachment_candidates(&issue);
 
@@ -2835,6 +2847,43 @@ mod tests {
                 if comment_id.0 == "comment-1"
         ));
         assert!(parse_fugue_hosted_attachment_url(&candidates[0].url).is_some());
+    }
+
+    #[tokio::test]
+    async fn managed_linear_attachments_use_each_repositorys_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for name in ["first", "second"] {
+            let state = root.path().join(name);
+            let definition = crate::config::WorkflowDefinition {
+                config: json!({
+                    "tracker": {"kind":"linear", "api_key":"test-token", "project_slug":"test"},
+                    "meerkat": {"repository_runtime":{"repository":name, "state_path":state}}
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+                prompt_template: "test".into(),
+            };
+            let config = crate::config::ServiceConfig::from_definition(
+                state.join("generation/fugue.yaml"),
+                &definition,
+            )
+            .unwrap();
+            let expected = config
+                .attachment_storage_root()
+                .join("issue-attachments/LUC-653/001-trace.txt");
+            std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+            std::fs::write(&expected, name).unwrap();
+            let client = LinearClient::from_config(&config.tracker).unwrap();
+            let attachments = download_issue_file_attachments(&client, &hosted_attachment_issue())
+                .await
+                .unwrap();
+            assert_eq!(Path::new(&attachments[0].path), expected);
+            assert_eq!(std::fs::read_to_string(&attachments[0].path).unwrap(), name);
+            paths.push(attachments[0].path.clone());
+        }
+        assert_ne!(paths[0], paths[1]);
     }
 
     #[test]

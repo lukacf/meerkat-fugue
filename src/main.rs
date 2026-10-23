@@ -575,7 +575,7 @@ async fn run() -> anyhow::Result<()> {
         .transpose()?;
     if let Some(directory) = &directory {
         ensemble_routes = Some(ensemble_routes.unwrap_or_default().merge(
-            meerkat_fugue::setup::directory::router(Arc::clone(directory)),
+            meerkat_fugue::setup::directory::api_router(Arc::clone(directory)),
         ));
     } else if let Ok(hub) = std::env::var("FUGUE_HUB_URL") {
         ensemble_routes = Some(

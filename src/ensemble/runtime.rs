@@ -1864,11 +1864,14 @@ impl SessionHook for RepositorySessionHook {
                 .and_then(|binding| MemberId::try_from(binding.role.clone()).ok())
         {
             meerkat_meta::tool_compose::ComposedExternalTools::over(
-                Arc::new(super::notifications::SubscriptionTools::new(
-                    self.events.clone(),
-                    member,
-                    grant.studied.clone(),
-                )),
+                Arc::new(
+                    super::notifications::SubscriptionTools::new(
+                        self.events.clone(),
+                        member,
+                        grant.studied.clone(),
+                    )
+                    .with_excluded_state_root(self.state_root.clone()),
+                ),
                 Some(owned),
             )
         } else {

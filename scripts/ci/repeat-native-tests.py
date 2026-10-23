@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Repeat native restart checks using one Cargo-produced test executable."""
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import subprocess
 import sys
@@ -31,6 +32,26 @@ def main():
     for attempt in range(1, 6):
         print(f'Native restart qualification {attempt}/5', flush=True)
         subprocess.run([executable, selection], check=True)
+
+    retirement = 'meta_runtime::tests::runtime_members_emit_canonical_structural_events'
+    listing = subprocess.check_output([executable, retirement, '--exact', '--list'], text=True)
+    if retirement + ': test' not in listing.splitlines():
+        raise SystemExit('The executable is missing the native retirement qualification test')
+
+    def qualify_retirement(attempt):
+        # These are separate processes, each with its own native state. Parallel
+        # load exposed a retirement/transcript race that serial repeats missed.
+        result = subprocess.run([executable, retirement, '--exact', '--nocapture'],
+                                capture_output=True, text=True)
+        print(f'Native retirement qualification {attempt}/20: exit {result.returncode}', flush=True)
+        if result.returncode:
+            print(result.stdout + result.stderr, flush=True)
+        return result.returncode
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(qualify_retirement, range(1, 21)))
+    if any(results):
+        raise SystemExit('Native retirement qualification failed; no retries were discarded')
 
 
 if __name__ == '__main__':

@@ -1443,6 +1443,7 @@ fn default_tracker_config() -> TrackerConfig {
         intake_states: env_list("FUGUE_LINEAR_INTAKE_STATES"),
         in_flight_states: env_list("FUGUE_LINEAR_IN_FLIGHT_STATES"),
         active_states: env_list("FUGUE_LINEAR_ACTIVE_STATES"),
+        attachment_root: None,
         max_attachment_files: env_u64("FUGUE_LINEAR_MAX_ATTACHMENT_FILES")
             .and_then(|value| usize::try_from(value).ok())
             .unwrap_or(20),
@@ -3832,6 +3833,7 @@ pub(crate) mod tests {
             intake_states: vec!["Todo".to_string()],
             in_flight_states: vec!["Planning".to_string(), "Implementing".to_string()],
             active_states: vec!["Todo".to_string(), "Planning".to_string()],
+            attachment_root: None,
             max_attachment_files: 20,
             max_attachment_bytes: 25 * 1024 * 1024,
             max_attachment_total_bytes: 100 * 1024 * 1024,

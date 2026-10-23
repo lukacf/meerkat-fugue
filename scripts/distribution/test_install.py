@@ -120,6 +120,15 @@ class InstallTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'files have changed'):
             installer.install(*first, self.prefix)
 
+    def test_corrupt_current_cannot_replace_the_known_good_rollback(self):
+        installer.install(*bundle(self.root), self.prefix)
+        installer.install(*bundle(self.root, 'b'), self.prefix)
+        links = {name: (self.prefix / name).readlink() for name in ('current', 'previous')}
+        (self.prefix / 'current/bin/rkat').write_text('modified')
+        with self.assertRaisesRegex(ValueError, 'files have changed'):
+            installer.install(*bundle(self.root, 'c'), self.prefix)
+        self.assertEqual({name: (self.prefix / name).readlink() for name in links}, links)
+
     def test_unmanaged_release_links_are_rejected_before_candidate_execution(self):
         for link_name in ('current', 'previous'):
             for index, value in enumerate(('user file', '../outside', 'versions/..', 'versions/not-a-release')):

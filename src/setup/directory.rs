@@ -24,6 +24,39 @@ struct Entry {
     port: u16,
 }
 
+pub(super) fn validate_selection(
+    root: &std::path::Path,
+    setup: &super::workflow::WorkflowSetup,
+    github_host: Option<&str>,
+) -> Result<()> {
+    let bytes = match std::fs::read(root.join("entry.json")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let entry: Entry = serde_json::from_slice(&bytes)?;
+    let selected = setup
+        .repository_url
+        .as_deref()
+        .map(RepositoryAddress::parse)
+        .transpose()?;
+    if !entry.repository.owner.eq_ignore_ascii_case(&setup.owner)
+        || !entry
+            .repository
+            .repository
+            .eq_ignore_ascii_case(&setup.repository)
+        || selected
+            .as_ref()
+            .is_some_and(|repo| !entry.repository.host.eq_ignore_ascii_case(&repo.host))
+        || github_host.is_some_and(|host| !entry.repository.host.eq_ignore_ascii_case(host))
+    {
+        bail!(
+            "This workspace belongs to its registered repository. Add a new repository from Repositories to use a different address."
+        );
+    }
+    Ok(())
+}
+
 struct Running {
     task: tokio::task::JoinHandle<Result<()>>,
     stop: tokio_util::sync::CancellationToken,
@@ -36,6 +69,7 @@ pub struct Directory {
     _lock: std::fs::File,
     children: Mutex<BTreeMap<String, Running>>,
     browser_client: reqwest::Client,
+    lifecycle: Arc<super::runtime_host::HostLifecycle>,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +114,7 @@ impl Directory {
             _lock: lock,
             children: Mutex::new(BTreeMap::new()),
             browser_client: super::proxy::client()?,
+            lifecycle: Arc::default(),
         }))
     }
 
@@ -107,14 +142,16 @@ impl Directory {
     }
 
     async fn spawn(&self, id: &str, entry: &Entry) -> Result<Running> {
+        self.lifecycle.ensure_can_start()?;
         let root = self.root.join(id);
         let stop = tokio_util::sync::CancellationToken::new();
         let run_stop = stop.clone();
         let hub = self.hub.clone();
         let console = self.console.clone();
         let port = entry.port;
+        let lifecycle = self.lifecycle.clone();
         let task = tokio::spawn(async move {
-            super::runtime_host::serve(&root, port, hub, console, run_stop).await
+            super::runtime_host::serve(&root, port, hub, console, run_stop, lifecycle).await
         });
         Ok(Running { task, stop })
     }
@@ -157,6 +194,7 @@ impl Directory {
     }
 
     async fn resume(&self, id: &str) -> Result<()> {
+        self.lifecycle.ensure_can_start()?;
         let mut children = self.children.lock().await;
         let entry = self
             .entries()?
@@ -178,12 +216,13 @@ impl Directory {
     }
 
     async fn add(&self, request: Add) -> Result<Workspace> {
+        self.lifecycle.ensure_can_start()?;
         let repository = RepositoryAddress::parse(&request.repository_url)?;
         let mut children = self.children.lock().await;
         if self
             .entries()?
             .values()
-            .any(|entry| entry.repository == repository)
+            .any(|entry| entry.repository.same_repository(&repository))
         {
             bail!("This repository already has a workspace. Continue its setup below.");
         }
@@ -205,6 +244,7 @@ impl Directory {
             port,
         };
         let draft = super::workflow::WorkflowSetup {
+            commit_identity: Default::default(),
             allow_no_ci_checks: false,
             jira_transition_fields: BTreeMap::new(),
             repository_url: Some(repository.https_url()),
@@ -297,6 +337,29 @@ fn failure(error: anyhow::Error) -> Response {
 }
 
 pub fn router(directory: Arc<Directory>) -> Router {
+    Router::new()
+        .route(
+            "/overview",
+            get(|| async { Html(crate::http::render_home_html(false)) }),
+        )
+        .route(
+            "/queues",
+            get(|State(directory): State<Arc<Directory>>| async move {
+                match directory.list().await {
+                    Ok(list) => queue_directory(list),
+                    Err(error) => failure(error),
+                }
+            }),
+        )
+        .with_state(directory.clone())
+        .merge(api_router(directory))
+        .layer(middleware::from_fn(
+            crate::ensemble::http::local_origin_guard,
+        ))
+}
+
+/// Compose with an existing queue that already owns its Home and Board pages.
+pub fn api_router(directory: Arc<Directory>) -> Router {
     let proxy = Router::new()
         .route(
             "/repositories/{id}/{*path}",
@@ -329,19 +392,6 @@ pub fn router(directory: Arc<Directory>) -> Router {
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(directory.clone());
     Router::new()
-        .route(
-            "/overview",
-            get(|| async { Html(crate::http::render_home_html(false)) }),
-        )
-        .route(
-            "/queues",
-            get(|State(directory): State<Arc<Directory>>| async move {
-                match directory.list().await {
-                    Ok(list) => queue_directory(list),
-                    Err(error) => failure(error),
-                }
-            }),
-        )
         .route(
             "/api/workspaces/{id}/resume",
             post(
@@ -565,6 +615,30 @@ mod tests {
                 .all(|workspace| !workspace.configured && !workspace.running)
         );
         assert!(directory.resume("../outside").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn case_variants_cannot_register_the_same_repository_twice() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = Directory::open(temp.path().to_owned(), 8788).unwrap();
+        let root = temp.path().join("repository-existing");
+        std::fs::create_dir(&root).unwrap();
+        let entry = Entry {
+            repository: RepositoryAddress::parse("https://github.com/Example/App").unwrap(),
+            port: 9001,
+        };
+        super::super::save_json(&root.join("entry.json"), &entry).unwrap();
+        let result = directory
+            .add(Add {
+                repository_url: "https://github.com/example/app".into(),
+            })
+            .await;
+        directory.shutdown().await.unwrap();
+        assert!(
+            result.is_err(),
+            "case variants must not create another native mob"
+        );
+        assert_eq!(directory.entries().unwrap().len(), 1);
     }
 
     #[tokio::test]

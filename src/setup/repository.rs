@@ -75,6 +75,12 @@ impl RepositoryAddress {
     pub fn https_url(&self) -> String {
         format!("https://{}/{}/{}", self.host, self.owner, self.repository)
     }
+
+    pub fn same_repository(&self, other: &Self) -> bool {
+        self.host.eq_ignore_ascii_case(&other.host)
+            && self.owner.eq_ignore_ascii_case(&other.owner)
+            && self.repository.eq_ignore_ascii_case(&other.repository)
+    }
 }
 
 #[cfg(test)]

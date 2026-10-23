@@ -51,6 +51,12 @@ be able to clone the repository and, for delivery, push a branch and open a PR.
 An existing checkout is an advanced option; its origin must match the selected
 repository. Fugue normally clones it for you.
 
+Expand **Commit author** to choose the name and email recorded on Fugue's
+commits. The default is `Meerkat Fugue <fugue@localhost>`, which identifies the
+automated author without borrowing a personal identity. To attribute commits to
+an account, enter its chosen commit email. Fugue configures each managed issue
+checkout; it does not change the machine's global Git identity.
+
 ## 2. Choose the issue tracker
 
 Use built-in tickets to try Fugue without a tracker account, or connect an

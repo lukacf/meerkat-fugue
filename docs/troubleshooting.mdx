@@ -17,12 +17,18 @@ handoff evidence is inconsistent.
 | Jira status transition fails | Actual available transitions, required fields and configured project scope. |
 | Browser asks you to sign in again | Host gateway session, separate from repository and model credentials. |
 | Agents cannot call the model | Native rkat binding under the service user's persistent HOME. |
+| Git reports `Author identity unknown` | Repository settings, then **Commit author**. Save and prepare the configuration before retrying. |
 | Memory or Work Graph is unavailable | Selected native runtime, its capabilities and the installed Meta bundle version. |
 | Board or console stops updating | Connection state and service health; preserve the last error before retrying. |
 
 For managed workspaces, open Repository settings to stop and reconfigure that
 repository. Use the host's private deployment guide for gateway, DNS and network
 problems. A working connection on a laptop does not prove access from the host.
+
+If Fugue reports that native cleanup is incomplete, restart the whole Fugue host
+before resuming repositories. Retained native owners cannot safely be reopened
+in the same process. Keep the private state and service logs for diagnosis;
+repeated preparation or deleting state is not a recovery procedure.
 
 ## No issues are picked up
 

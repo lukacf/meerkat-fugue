@@ -556,6 +556,7 @@ fn unsupported_final_gate_operation(
 
 pub struct FinalPrGateProjectionExecutor {
     config: ServiceConfig,
+    issue: LinearIssueRef,
 }
 
 #[async_trait]
@@ -664,8 +665,12 @@ impl KapellmeisterHostToolExecutor for FinalPrGateProjectionExecutor {
     }
 
     async fn merge_pr(&mut self, input: MergePrInput) -> FugueToolResult {
-        GitHubToolHost::with_connections(self.config.meerkat.runtime_connections.clone())
-            .merge_pr(input)
+        crate::workgraph_gate::WorkGraphTerminalGate::for_service(&self.config)
+            .merge_pr_with(&self.issue, input, |input| {
+                GitHubToolHost::with_connections(self.config.meerkat.runtime_connections.clone())
+                    .merge_pr(input)
+            })
+            .await
     }
 }
 
@@ -1423,8 +1428,12 @@ impl Orchestrator {
             .await?
             .unwrap_or_else(|| "## Fugue Workpad".to_string());
         let linear = recover_native_linear_evidence(issue, Some(&workpad_body));
-        let recorded =
-            recover_recorded_native_pr_handoff(self.config.effective(), issue, github_host)?;
+        let recorded = recover_recorded_native_pr_handoff(
+            self.config.effective(),
+            issue,
+            Some(&linear),
+            github_host,
+        )?;
         let Some(handoff) = recorded.or_else(|| {
             recover_existing_native_pr_monitor_handoff_for_issue(
                 self.config.effective(),
@@ -2617,6 +2626,7 @@ impl Orchestrator {
                     } else {
                         let mut executor = FinalPrGateProjectionExecutor {
                             config: self.config.effective().clone(),
+                            issue: gate.start_request.issue.clone(),
                         };
                         execute_final_pr_gate_projection_with_executor(
                             &self.config.effective().kapellmeister.shadow_mode.authority,
@@ -3664,7 +3674,9 @@ impl Orchestrator {
         action: &NativePrHandoffMonitorAction,
         final_gate_start: Option<&FinalPrGateStartRequest>,
     ) -> Result<bool> {
-        crate::pr_handoff::record(self.config.effective(), issue, &github.pull_request)?;
+        if github.rejected_pull_requests.is_empty() {
+            crate::pr_handoff::record(self.config.effective(), issue, &github.pull_request)?;
+        }
         let body = append_native_pr_handoff_monitor_evidence(
             workpad_body,
             github,
@@ -4695,6 +4707,7 @@ impl Orchestrator {
                 };
                 let mut executor = FinalPrGateProjectionExecutor {
                     config: self.config.effective().clone(),
+                    issue: start_request.issue.clone(),
                 };
                 execute_final_pr_gate_projection_with_executor(
                     &self.config.effective().kapellmeister.shadow_mode.authority,
@@ -7578,6 +7591,7 @@ fn recover_existing_native_pr_handoff_for_issue(
 fn recover_recorded_native_pr_handoff(
     config: &ServiceConfig,
     issue: &Issue,
+    linear: Option<&RecoveredLinearEvidence>,
     github: &dyn NativeStatusGitHubInspector,
 ) -> Result<Option<RecoveredGitHubEvidence>> {
     let Some(repo) = repository_scope_from_config(config) else {
@@ -7586,6 +7600,33 @@ fn recover_recorded_native_pr_handoff(
     let Some(record) = crate::pr_handoff::load(config, issue, &repo)? else {
         return Ok(None);
     };
+    if issue
+        .branch_name
+        .as_deref()
+        .is_some_and(|branch| branch != record.head_branch.0)
+    {
+        return Err(FugueError::ResponseError(
+            "Recorded PR association conflicts with the current issue branch".into(),
+        ));
+    }
+    if linear
+        .and_then(|evidence| evidence.workpad_pr_number)
+        .is_some_and(|number| number != record.number)
+    {
+        return Err(FugueError::ResponseError(
+            "Recorded PR association conflicts with current issue PR evidence".into(),
+        ));
+    }
+    let workspace = WorkspaceManager::for_service(config)
+        .inspect_workspace_key(&workspace_key_for_identifier(&issue.identifier).0)?
+        .map(|inspection| recover_native_workspace_evidence(&inspection));
+    if native_pr_lookup_branch(linear, workspace.as_ref())
+        .is_some_and(|branch| *branch != record.head_branch)
+    {
+        return Err(FugueError::ResponseError(
+            "Recorded PR association conflicts with the current workspace branch".into(),
+        ));
+    }
     let result = github.inspect_pr(crate::tools::InspectPrInput {
         repo: repo.clone(),
         pull_request: GitHubPullRequestRef::Number {
@@ -9853,6 +9894,7 @@ mod tests {
                     intake_states: Vec::new(),
                     in_flight_states: Vec::new(),
                     active_states: Vec::new(),
+                    attachment_root: None,
                     max_attachment_files: 0,
                     max_attachment_bytes: 0,
                     max_attachment_total_bytes: 0,
@@ -10441,6 +10483,7 @@ mod tests {
         let recovered = recover_recorded_native_pr_handoff(
             &config,
             &issue,
+            None,
             &StaticGitHubInspector::ok(current.clone()),
         )
         .unwrap()
@@ -10450,6 +10493,7 @@ mod tests {
             recover_recorded_native_pr_handoff(
                 &config,
                 &issue,
+                None,
                 &StaticGitHubInspector::err("GitHub unavailable")
             )
             .is_err()
@@ -10457,14 +10501,36 @@ mod tests {
         let mut wrong = current;
         wrong.head_branch = BranchName("unrelated-branch".into());
         assert!(
-            recover_recorded_native_pr_handoff(&config, &issue, &StaticGitHubInspector::ok(wrong))
-                .is_err()
+            recover_recorded_native_pr_handoff(
+                &config,
+                &issue,
+                None,
+                &StaticGitHubInspector::ok(wrong)
+            )
+            .is_err()
+        );
+        let mut reworked = issue.clone();
+        reworked.branch_name = Some("feature/replacement".into());
+        assert!(
+            recover_recorded_native_pr_handoff(
+                &config,
+                &reworked,
+                None,
+                &StaticGitHubInspector::ok(pr.clone())
+            )
+            .is_err(),
+            "a durable association must not override the current issue branch"
         );
         config.tracker.project_slug = Some("another-project".into());
         assert!(
-            recover_recorded_native_pr_handoff(&config, &issue, &StaticGitHubInspector::ok(pr))
-                .unwrap()
-                .is_none()
+            recover_recorded_native_pr_handoff(
+                &config,
+                &issue,
+                None,
+                &StaticGitHubInspector::ok(pr)
+            )
+            .unwrap()
+            .is_none()
         );
     }
 

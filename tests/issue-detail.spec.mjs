@@ -35,3 +35,17 @@ test('Jira statuses remain literal and the configured merge action stays availab
   await page.getByRole('button',{name:/Reopened/}).click();
   await expect(page.locator('#save')).toContainText('SAVE & RUN MERGE');
 });
+
+test('saved attachments keep their repository scope after reload',async({page})=>{
+  const prefix='/repositories/repository-test';
+  const local='/api/v1/issues/TEST-1/attachments/trace.txt';
+  const external='https://example.com/evidence.txt';
+  const detail={issue:{identifier:'TEST-1',title:'Attachment scope',state:{name:'Active'},labels:[],description:''},comments:[],attachments:[{title:'Trace',url:local},{title:'External',url:external}],workpad:null,runtime:null,lanes:['Active'],lane_actions:{}};
+  await page.route('http://fugue.test/**',route=>route.request().url().includes('/api/')?route.fulfill({json:detail}):route.fulfill({contentType:'text/html',body:browserDocument(html)}));
+  await page.goto(`http://fugue.test${prefix}/issues/TEST-1`);
+  for(let attempt=0;attempt<2;attempt++){
+    await expect(page.getByRole('link',{name:'Trace',exact:true})).toHaveAttribute('href',prefix+local);
+    await expect(page.getByRole('link',{name:'External',exact:true})).toHaveAttribute('href',external);
+    if(attempt===0)await page.reload();
+  }
+});

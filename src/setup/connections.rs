@@ -286,6 +286,7 @@ impl Connections {
             in_flight_states: vec![],
             active_states: vec![],
             terminal_states: vec![],
+            attachment_root: None,
             max_attachment_files: 0,
             max_attachment_bytes: 0,
             max_attachment_total_bytes: 0,

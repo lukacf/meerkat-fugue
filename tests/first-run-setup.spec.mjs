@@ -217,3 +217,22 @@ test('remote repository setup keeps checks and navigation on its own path',async
   await expect(page).toHaveURL('http://fugue.test'+prefix+'/issues');
   expect(writes.some(write=>write.connection==='start')).toBeTruthy();
 });
+
+test('commit identity is explicit, saved per repository and invalidates preparation',async({page})=>{
+  const {writes}=await setup(page,connected);
+  await page.getByLabel('Repository URL',{exact:true}).fill('https://github.com/example/application');
+  await page.getByText('Commit author',{exact:true}).click();
+  await expect(page.getByLabel('Commit author name',{exact:true})).toHaveValue('Meerkat Fugue');
+  await expect(page.getByLabel('Commit author email',{exact:true})).toHaveValue('fugue@localhost');
+  await page.getByRole('button',{name:'Check and prepare repository'}).click();
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeEnabled();
+  expect(writes.at(-1).value.commit_identity).toEqual({name:'Meerkat Fugue',email:'fugue@localhost'});
+  await page.getByLabel('Commit author name',{exact:true}).fill('Example Automation');
+  await page.getByLabel('Commit author email',{exact:true}).fill('automation@example.com');
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeDisabled();
+  await page.getByRole('button',{name:'Check and prepare repository'}).click();
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeEnabled();
+  await page.reload();
+  await expect(page.getByLabel('Commit author name',{exact:true})).toHaveValue('Example Automation');
+  await expect(page.getByLabel('Commit author email',{exact:true})).toHaveValue('automation@example.com');
+});

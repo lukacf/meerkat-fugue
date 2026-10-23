@@ -121,6 +121,16 @@ async fn prepare(
         return error(StatusCode::CONFLICT, "Preparation is already running");
     }
     let connections = setup.connections.lock().await.value.clone();
+    if let Err(cause) = super::directory::validate_selection(
+        &setup.root,
+        &request,
+        connections
+            .github
+            .as_ref()
+            .map(|github| github.host.as_str()),
+    ) {
+        return error(StatusCode::BAD_REQUEST, cause);
+    }
     let saved = super::save_json(&setup.root.join("workflow-draft.json"), &request);
     if saved.is_err() {
         return error(
@@ -464,6 +474,33 @@ mod tests {
         http::Request,
     };
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn registered_repository_cannot_be_retargeted_by_preparation() {
+        let directory = tempfile::tempdir().unwrap();
+        let setup = Setup::open(directory.path(), 8788).unwrap();
+        std::fs::write(directory.path().join("entry.json"),
+            r#"{"repository":{"host":"github.com","owner":"example","repository":"service"},"port":8788}"#).unwrap();
+        let draft = directory.path().join("workflow-draft.json");
+        std::fs::write(&draft, "original draft").unwrap();
+        let request = serde_json::json!({
+            "repository_url": "https://github.com/example/web",
+            "owner": "example", "repository": "web", "lanes": crate::config::TrackerLaneRoles::default()
+        });
+        let response = router(setup.clone())
+            .oneshot(
+                Request::post("/api/setup/preparation")
+                    .header("Host", "127.0.0.1:8788")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read_to_string(draft).unwrap(), "original draft");
+        assert!(setup.operation.lock().await.is_none());
+    }
 
     #[tokio::test]
     async fn managed_setup_composes_directory_routes_without_duplicates() {

@@ -44,6 +44,22 @@ pub struct IndependentReviewCompletionRequest {
     pub idempotency_key: IdempotencyKey,
 }
 
+impl IndependentReviewCompletionRequest {
+    pub fn validate(&self) -> Result<(), IndependentReviewVerdictError> {
+        self.workgraph_scope.validate()?;
+        if self.head_sha.0.trim().is_empty() || self.pull_request.head_sha != self.head_sha {
+            return Err(IndependentReviewVerdictError::MismatchedHead);
+        }
+        for verdict in &self.verdicts {
+            verdict.validate()?;
+            if verdict.evidence.head_sha != self.head_sha {
+                return Err(IndependentReviewVerdictError::MismatchedHead);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndependentReviewWorkGraphScope {
@@ -157,6 +173,7 @@ pub enum IndependentReviewVerdictError {
     MissingField(&'static str),
     GreenWithFindings,
     RedWithoutFindings,
+    MismatchedHead,
 }
 
 impl std::fmt::Display for IndependentReviewVerdictError {
@@ -171,6 +188,8 @@ impl std::fmt::Display for IndependentReviewVerdictError {
                 formatter.write_str("green verdict must not include findings")
             }
             Self::RedWithoutFindings => formatter.write_str("red verdict must include findings"),
+            Self::MismatchedHead => formatter
+                .write_str("PR snapshot and every verdict must match the reviewed head SHA"),
         }
     }
 }
@@ -331,6 +350,24 @@ pub fn aggregate_independent_review(
     input: IndependentReviewAggregationInput,
 ) -> IndependentReviewAggregationPlan {
     let required = usize::from(input.config.reviewer_count);
+    if let Some(reason) = input.verdicts.iter().find_map(|verdict| {
+        verdict
+            .validate()
+            .err()
+            .map(|error| error.to_string())
+            .or_else(|| {
+                (verdict.evidence.head_sha != input.head_sha)
+                    .then(|| IndependentReviewVerdictError::MismatchedHead.to_string())
+            })
+    }) {
+        return IndependentReviewAggregationPlan {
+            decision: IndependentReviewDecision::Blocked,
+            target_lane: Some(input.config.blocked_lane),
+            consolidated_comment: None,
+            workgraph_items: Vec::new(),
+            reasons: vec![reason],
+        };
+    }
     let distinct_reviewer_ids = distinct_reviewer_ids(&input.verdicts);
     if distinct_reviewer_ids.len() < input.verdicts.len() {
         return IndependentReviewAggregationPlan {
@@ -615,6 +652,19 @@ mod tests {
 
         assert_eq!(plan.decision, IndependentReviewDecision::Success);
         assert_eq!(plan.target_lane.as_deref(), Some("Ready for review"));
+    }
+
+    #[test]
+    fn independent_review_cannot_approve_a_different_commit() {
+        let mut second = green_verdict();
+        second.reviewer_id = "product".into();
+        second.evidence.head_sha = GitSha("previous-head".into());
+        let mut third = green_verdict();
+        third.reviewer_id = "ops".into();
+        let plan =
+            aggregate_independent_review(aggregation_input(vec![green_verdict(), second, third]));
+        assert_eq!(plan.decision, IndependentReviewDecision::Blocked);
+        assert!(plan.reasons.iter().any(|reason| reason.contains("head")));
     }
 
     #[test]

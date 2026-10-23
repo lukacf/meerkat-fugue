@@ -5,7 +5,10 @@ use meerkat::{SqliteWorkGraphStore, WorkGraphService, WorkItem, WorkItemFilter, 
 
 use crate::config::TrackerConfig;
 use crate::domain::normalize_state;
-use crate::tools::{LinearIssueRef, LinearStateRef, MoveIssueInput};
+use crate::tools::{
+    FugueToolError, FugueToolErrorCode, FugueToolOperation, FugueToolResult, LinearIssueRef,
+    LinearStateRef, MergePrInput, MoveIssueInput, RetryAdvice, ToolExecutionMetadata,
+};
 
 pub const WORKGRAPH_STATE_PATH_ENV: &str = "FUGUE_WORKGRAPH_STATE_PATH";
 pub const WORKGRAPH_BLOCKED_STATES_ENV: &str = "FUGUE_WORKGRAPH_BLOCKED_STATES";
@@ -38,6 +41,43 @@ impl WorkGraphTerminalGate {
     pub fn for_mob(mut self, mob_id: impl Into<String>) -> Self {
         self.mob_id = mob_id.into();
         self
+    }
+
+    pub fn for_service(config: &crate::config::ServiceConfig) -> Self {
+        Self::new(
+            crate::meta_runtime::meta_runtime_state_path(&config.meerkat).join("workgraph.sqlite3"),
+            config.tracker.terminal_states.clone(),
+            Vec::new(),
+        )
+        .for_mob(config.meerkat.mob_id().into_owned())
+    }
+
+    /// Check native obligations immediately before the irreversible GitHub action.
+    pub async fn merge_pr_with(
+        &self,
+        issue: &LinearIssueRef,
+        input: MergePrInput,
+        merge: impl FnOnce(MergePrInput) -> FugueToolResult,
+    ) -> FugueToolResult {
+        let issue = issue_label_value(issue);
+        let reason = match self.unresolved_blocking_items(&issue).await {
+            Ok(items) if items.is_empty() => return merge(input),
+            Ok(items) => format!(
+                "Cannot merge {issue}: {} unresolved blocking WorkGraph items remain",
+                items.len()
+            ),
+            Err(error) => format!("Cannot verify WorkGraph obligations before merge: {error}"),
+        };
+        FugueToolResult::Err {
+            error: FugueToolError {
+                operation: FugueToolOperation::GitHubMergePr,
+                code: FugueToolErrorCode::InvalidInput,
+                message: reason,
+                retry: RetryAdvice::DoNotRetry,
+                idempotency_key: Some(input.idempotency_key),
+            },
+            metadata: ToolExecutionMetadata::default(),
+        }
     }
 
     pub fn from_env(config: &TrackerConfig) -> Option<Self> {
@@ -219,6 +259,25 @@ mod tests {
             .unwrap();
         let gate = WorkGraphTerminalGate::new(&path, vec!["Done".into()], Vec::new())
             .for_mob("ensemble-api");
+        let merge = serde_json::from_value(serde_json::json!({
+            "repo": {"owner":"example", "name":"api"},
+            "pull_request": {"kind":"number", "number":1},
+            "method":"squash", "expected_head_sha":"reviewed-head",
+            "idempotency_key":"merge:DEMO-1"
+        }))
+        .unwrap();
+        let result = gate
+            .merge_pr_with(
+                &LinearIssueRef::Identifier {
+                    identifier: LinearIssueIdentifier("DEMO-1".into()),
+                },
+                merge,
+                |_| panic!("GitHub must not be called before native obligations are clear"),
+            )
+            .await;
+        assert!(
+            matches!(result, FugueToolResult::Err {error, ..} if error.message.contains("unresolved blocking"))
+        );
         assert_eq!(
             gate.unresolved_blocking_items("DEMO-1")
                 .await

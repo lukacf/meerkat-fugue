@@ -139,6 +139,7 @@ fn tracker(endpoint: &str) -> TrackerConfig {
         in_flight_states: vec!["In Progress".to_string()],
         active_states: vec!["To Do".to_string(), "In Progress".to_string()],
         terminal_states: vec!["Done".to_string()],
+        attachment_root: None,
         max_attachment_files: 2,
         max_attachment_bytes: 1024,
         max_attachment_total_bytes: 2048,

@@ -125,6 +125,13 @@ pub async fn serve_on_listener(
         ensemble,
     )
     .await?;
+    let app = if local_addr.ip().is_loopback() {
+        app.layer(middleware::from_fn(
+            crate::ensemble::http::local_origin_guard,
+        ))
+    } else {
+        app
+    };
     tracing::info!(address = %local_addr, "http_status listening");
     axum::serve(listener, app).await?;
     Ok(())
@@ -138,6 +145,7 @@ pub(crate) async fn router(
     meta_runtime_registry: MetaRuntimeRegistry,
     ensemble: Option<Router>,
 ) -> anyhow::Result<Router> {
+    let managed_repository = config.meerkat.repository_runtime.is_some();
     let app_state = AppState {
         state,
         config: config.clone(),
@@ -237,6 +245,11 @@ pub(crate) async fn router(
                 }
             })),
         );
+    }
+    if managed_repository {
+        app = app.layer(middleware::from_fn(
+            crate::ensemble::http::local_origin_guard,
+        ));
     }
     Ok(app)
 }
@@ -2224,7 +2237,7 @@ const ISSUE_DETAIL_HTML: &str = r#"<!doctype html>
   const formatFileSize = (bytes) => bytes < 1024 ? `${bytes} B` : bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KiB` : `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
   const attachmentCommentId = (attachment) => newtype(attachment?.source?.Comment?.comment_id ?? attachment?.source?.comment?.comment_id ?? attachment?.source?.comment_id ?? null);
   const persistedCommentAttachments = (commentId) => (detail.attachments || []).filter((attachment) => attachmentCommentId(attachment) === commentId);
-  const renderPersistedAttachmentChip = (attachment) => { const label = attachment.title || attachment.url || "attachment"; const size = attachment.byte_len ? ` · ${escapeHtml(formatFileSize(attachment.byte_len))}` : ""; return `<a class="attachment-chip" href="${escapeHtml(attachment.url)}" target="_blank" rel="noopener">${escapeHtml(label)}${size}</a>`; };
+  const renderPersistedAttachmentChip = (attachment) => { const label = attachment.title || attachment.url || "attachment"; const size = attachment.byte_len ? ` · ${escapeHtml(formatFileSize(attachment.byte_len))}` : ""; return `<a class="attachment-chip" href="${escapeHtml(fugueUrl(attachment.url))}" target="_blank" rel="noopener">${escapeHtml(label)}${size}</a>`; };
   const renderComment = (comment) => { const attachments = persistedCommentAttachments(newtype(comment.comment_id)); const chips = attachments.length ? `<div class="attachment-list comment-attachments" aria-label="Comment attachments">${attachments.map(renderPersistedAttachmentChip).join("")}</div>` : ""; return `<article class="comment"><span class="meta">${escapeHtml(newtype(comment.comment_id))}</span><br>${escapeHtml(comment.body_markdown)}${chips}</article>`; };
   const dataTransferHasFiles = (event) => Array.from(event.dataTransfer?.types || []).includes("Files");
   const renderIssueAttachments = () => { const list = $("issueAttachmentList"); if (!list) return; const persistedHtml = (detail.attachments || []).map(renderPersistedAttachmentChip).join(""); const pendingHtml = issueAttachmentState.length ? issueAttachmentState.map((attachment) => `<span class="attachment-chip">${escapeHtml(attachment.name)} · ${escapeHtml(formatFileSize(attachment.size))}</span>`).join("") : ""; list.innerHTML = persistedHtml || pendingHtml ? `${persistedHtml}${pendingHtml}` : '<span class="meta">No attachments added for this issue editor.</span>'; };
@@ -2745,8 +2758,7 @@ async fn api_issue_attachment_download(
 
 fn issue_attachment_dir(config: &ServiceConfig, issue_identifier: &str) -> PathBuf {
     config
-        .workflow_dir
-        .join(".fugue")
+        .attachment_storage_root()
         .join("issue-attachments")
         .join(sanitize_attachment_component(issue_identifier))
 }
@@ -4000,33 +4012,18 @@ async fn api_kapellmeister_complete_independent_review(
         )
             .into_response();
     }
-    if let Err(error) = request.workgraph_scope.validate() {
+    if let Err(error) = request.validate() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "result": {
                     "accepted": false,
                     "issue_identifier": issue_identifier,
-                    "message": format!("invalid independent review WorkGraph scope: {error}")
+                    "message": format!("invalid independent review completion: {error}")
                 }
             })),
         )
             .into_response();
-    }
-    for verdict in &request.verdicts {
-        if let Err(error) = verdict.validate() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "result": {
-                        "accepted": false,
-                        "issue_identifier": issue_identifier,
-                        "message": format!("invalid independent review verdict: {error}")
-                    }
-                })),
-            )
-                .into_response();
-        }
     }
     let plan = aggregate_independent_review(IndependentReviewAggregationInput {
         config: app.config.independent_review.clone(),
@@ -4222,8 +4219,12 @@ pub async fn execute_deploy_transaction(
             ota: None,
         };
     };
-    let merge_result = GitHubToolHost::with_connections(config.meerkat.runtime_connections.clone())
-        .merge_pr(merge_input);
+    let merge_result = crate::workgraph_gate::WorkGraphTerminalGate::for_service(&config)
+        .merge_pr_with(&request.issue, merge_input, |input| {
+            GitHubToolHost::with_connections(config.meerkat.runtime_connections.clone())
+                .merge_pr(input)
+        })
+        .await;
     let merge_output = match merge_result {
         crate::tools::FugueToolResult::Ok {
             output: FugueToolOutput::GitHubMergePr(output),
@@ -4769,6 +4770,7 @@ async fn record_independent_review_projection(
     issue_identifier: &str,
     plan: &crate::independent_review::IndependentReviewAggregationPlan,
 ) -> anyhow::Result<IndependentReviewProjectionResult> {
+    request.validate()?;
     let target_lane = plan
         .target_lane
         .clone()
@@ -5555,6 +5557,125 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
 
+    async fn managed_test_router(
+        root: &std::path::Path,
+        extra: Option<Router>,
+    ) -> (Router, crate::orchestrator::Orchestrator) {
+        let definition = WorkflowDefinition {
+            config: json!({
+                "tracker": {"kind": "fugue-ims", "endpoint": root.join("ims.sqlite")},
+                "meerkat": {"repository_runtime": {
+                    "repository": "test-repository", "state_path": root.join("team")
+                }},
+                "server": {"meta_console": {"enabled": false}}
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            prompt_template: "test".into(),
+        };
+        let manager = crate::config::WorkflowConfigManager::from_definition_for_test(
+            root.join("fugue.yaml"),
+            definition,
+        )
+        .unwrap();
+        let (refresh, receiver) = mpsc::channel(8);
+        let owner = crate::orchestrator::Orchestrator::new(manager, receiver);
+        let app = router(
+            owner.shared_state(),
+            owner.config().effective().clone(),
+            refresh,
+            owner.internal_sender(),
+            owner.meta_runtime_registry(),
+            extra,
+        )
+        .await
+        .unwrap();
+        (app, owner)
+    }
+
+    #[tokio::test]
+    async fn managed_queue_guards_direct_child_reads_mutations_and_fallbacks() {
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let (app, _owner) = managed_test_router(
+            root.path(),
+            Some(Router::new().fallback(|| async { "console" })),
+        )
+        .await;
+        for (method, path) in [
+            ("GET", "/api/v1/state"),
+            ("POST", "/api/v1/refresh"),
+            ("GET", "/console"),
+        ] {
+            for (host, origin, expected) in [
+                (
+                    "untrusted.example",
+                    "https://untrusted.example",
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    "127.0.0.1:8788",
+                    "https://untrusted.example",
+                    StatusCode::FORBIDDEN,
+                ),
+                ("127.0.0.1:8788", "http://127.0.0.1:8788", StatusCode::OK),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method(method)
+                            .uri(path)
+                            .header("Host", host)
+                            .header("Origin", origin)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                if expected == StatusCode::OK {
+                    assert!(
+                        response.status().is_success(),
+                        "{method} {path}: {}",
+                        response.status()
+                    );
+                } else {
+                    assert_eq!(response.status(), expected, "{method} {path}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_with_repository_directory_has_one_owner_per_page() {
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let directory =
+            crate::setup::directory::Directory::open(root.path().join("directory"), 8788).unwrap();
+        let (app, _owner) = managed_test_router(
+            root.path(),
+            Some(crate::setup::directory::api_router(directory)),
+        )
+        .await;
+        for path in ["/overview", "/queues", "/api/workspaces"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(path)
+                        .header("Host", "127.0.0.1:8788")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                response.status().is_success() || response.status().is_redirection(),
+                "{path}"
+            );
+        }
+    }
+
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     const CONSOLE_TEST_USER_ENV: &str = "FUGUE_TEST_CONSOLE_USER";
     const CONSOLE_TEST_PASSWORD_ENV: &str = "FUGUE_TEST_CONSOLE_PASSWORD";
@@ -6253,6 +6374,33 @@ mod tests {
         };
         ServiceConfig::from_definition(std::path::PathBuf::from("/tmp/WORKFLOW.md"), &definition)
             .unwrap()
+    }
+
+    #[test]
+    fn managed_attachments_survive_configuration_generations_and_remain_repository_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = issue_board_config();
+        config.workflow_dir = root.path().join("generation-one");
+        config.meerkat.repository_runtime = Some(crate::config::RepositoryRuntimeBinding {
+            repository: crate::ensemble::config::RepoId::try_from("first".to_owned()).unwrap(),
+            state_path: root.path().join("teams/first"),
+        });
+        let path = issue_attachment_dir(&config, "TEST-1");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("trace.txt"), "first repository").unwrap();
+        config.workflow_dir = root.path().join("generation-two");
+        assert_eq!(
+            std::fs::read_to_string(issue_attachment_dir(&config, "TEST-1").join("trace.txt"))
+                .unwrap(),
+            "first repository"
+        );
+        config
+            .meerkat
+            .repository_runtime
+            .as_mut()
+            .unwrap()
+            .state_path = root.path().join("teams/second");
+        assert_ne!(issue_attachment_dir(&config, "TEST-1"), path);
     }
 
     #[test]
@@ -7416,6 +7564,15 @@ mod tests {
             verdicts: request.verdicts.clone(),
             timed_out: false,
         });
+
+        let mut mismatched = request.clone();
+        mismatched.pull_request.head_sha = GitSha("new-unreviewed-head".into());
+        assert!(
+            record_independent_review_projection(&config, &mismatched, "LUC-633", &plan)
+                .await
+                .is_err(),
+            "a PR snapshot and review must name the same head before any projection"
+        );
 
         let projection = record_independent_review_projection(&config, &request, "LUC-633", &plan)
             .await
