@@ -9,6 +9,7 @@ pub mod deploy_gate;
 pub mod domain;
 pub mod ensemble;
 pub mod error;
+mod file_lease;
 pub mod final_pr_gate;
 pub mod fugue_ims;
 pub mod github_tools;

@@ -1610,4 +1610,4 @@ impl std::fmt::Display for AdfNode {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

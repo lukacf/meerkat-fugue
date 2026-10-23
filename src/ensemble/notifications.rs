@@ -565,11 +565,15 @@ impl AgentToolDispatcher for SubscriptionTools {
                     if let Some(excluded) = &self.excluded_state_root {
                         // Git reads historical tree paths, including the former
                         // contents of directories which are now symlinks.
+                        let cwd = std::env::current_dir()?;
                         let roots = [
-                            std::path::absolute(&self.events.root)?,
+                            crate::config::absolute_clean_path(&cwd, &self.events.root),
                             self.events.root.canonicalize()?,
                         ];
-                        let exclusions = [std::path::absolute(excluded)?, excluded.canonicalize()?];
+                        let exclusions = [
+                            crate::config::absolute_clean_path(&cwd, excluded),
+                            excluded.canonicalize()?,
+                        ];
                         if roots.iter().any(|root| {
                             exclusions.iter().any(|excluded| {
                                 excluded
@@ -613,16 +617,22 @@ mod tests {
 
     #[tokio::test]
     async fn historical_revision_cannot_expose_configured_private_state() {
-        historical_state_exclusion(false).await;
+        historical_state_exclusion(false, false).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn historical_revision_cannot_expose_symlinked_private_state() {
-        historical_state_exclusion(true).await;
+        historical_state_exclusion(true, false).await;
     }
 
-    async fn historical_state_exclusion(symlinked: bool) {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn historical_revision_cannot_expose_config_relative_symlinked_state() {
+        historical_state_exclusion(true, true).await;
+    }
+
+    async fn historical_state_exclusion(symlinked: bool, config_relative: bool) {
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("custom-state");
         std::fs::create_dir(&state).unwrap();
@@ -662,6 +672,21 @@ mod tests {
                 std::os::unix::fs::symlink(&target, &state).unwrap();
             }
         }
+        let state = if config_relative {
+            let config_dir = root.path().join("config");
+            std::fs::create_dir(&config_dir).unwrap();
+            let config_path = config_dir.join("ensemble.yaml");
+            std::fs::write(
+                &config_path,
+                "state_root: ../custom-state\nrepositories: {}\n",
+            )
+            .unwrap();
+            super::super::config::EnsembleConfig::load(&config_path)
+                .unwrap()
+                .state_root
+        } else {
+            state
+        };
         let events = RepositoryEvents::open(
             super::super::config::RepoId::try_from("test".to_owned()).unwrap(),
             root.path().to_path_buf(),

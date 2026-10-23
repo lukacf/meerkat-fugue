@@ -493,7 +493,7 @@ fn validate_jira_site(site: &str) -> Result<reqwest::Url> {
 /// An explicit private file, separate from portable workflow and repository files.
 pub struct ConnectionStore {
     directory: PathBuf,
-    _lock: std::fs::File,
+    _lock: crate::file_lease::FileLease,
 }
 
 impl ConnectionStore {
@@ -511,7 +511,7 @@ impl ConnectionStore {
         reject_repository_storage(&directory)?;
         check_private_permissions(&directory)?;
         let lock = private_options().open(directory.join("connections.lock"))?;
-        lock.try_lock()
+        let lock = crate::file_lease::FileLease::acquire(lock)
             .context("another setup process owns these connections")?;
         Ok(Self {
             directory,
@@ -846,6 +846,27 @@ mod tests {
         let updated = Connections::default();
         reopened.save(&updated).unwrap();
         assert!(reopened.load().unwrap().environment().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connection_owner_releases_lock_even_with_a_fork_style_descriptor_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ConnectionStore::open(root.path()).unwrap();
+        // Like the fork-to-exec window in concurrent child spawning, a duplicate
+        // descriptor keeps the same open-file description alive after parent close.
+        let inherited = store._lock.duplicate_descriptor_for_test().unwrap();
+        assert!(ConnectionStore::open(root.path()).is_err());
+        drop(store);
+        let reopened =
+            ConnectionStore::open(root.path()).expect("previous owner relinquished lease");
+        drop(inherited);
+        assert!(
+            ConnectionStore::open(root.path()).is_err(),
+            "new owner remains exclusive"
+        );
+        drop(reopened);
+        ConnectionStore::open(root.path()).expect("new owner also released its lease");
     }
 
     #[test]

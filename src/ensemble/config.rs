@@ -101,7 +101,7 @@ pub struct PeerConfig {
 /// let another process lock a new inode while an existing owner remains alive.
 #[derive(Debug)]
 pub struct EnsembleStateGuard {
-    _lock: fs::File,
+    _lock: crate::file_lease::FileLease,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -184,7 +184,7 @@ impl EnsembleConfig {
             .write(true)
             .open(root.join("ensemble.lock"))
             .context("open Ensemble ownership lock")?;
-        lock.try_lock().with_context(|| {
+        let lock = crate::file_lease::FileLease::acquire(lock).with_context(|| {
             format!(
                 "cannot claim Ensemble state {}; another daemon may already own it",
                 root.display()

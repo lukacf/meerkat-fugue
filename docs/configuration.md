@@ -387,6 +387,12 @@ visible to terminal and merge checks. Tracker IDs are resolved to canonical issu
 keys before those checks. Lifecycle tool calls must use tracker state names so
 the configured terminal policy can be evaluated.
 
+`linear_claim_issue` can also request a lane change through `target_state`.
+That change receives the terminal-obligation check before either assignment or
+transition. Claiming is restricted to issue leads and repository coordinators;
+workers report ownership and lifecycle needs to their lead. An assignment-only
+claim does not complete the issue or clear review obligations.
+
 ```yaml
 independent_review:
   enabled: true

@@ -47,14 +47,14 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-struct MockResponse {
+pub(crate) struct MockResponse {
     method: &'static str,
     path: &'static str,
     status: StatusCode,
     body: Value,
 }
 
-fn reply(method: &'static str, path: &'static str, body: Value) -> MockResponse {
+pub(crate) fn reply(method: &'static str, path: &'static str, body: Value) -> MockResponse {
     MockResponse {
         method,
         path,
@@ -63,10 +63,10 @@ fn reply(method: &'static str, path: &'static str, body: Value) -> MockResponse 
     }
 }
 
-struct MockJira {
-    endpoint: String,
-    requests: Arc<Mutex<Vec<(String, Value)>>>,
-    responses: Arc<Mutex<VecDeque<MockResponse>>>,
+pub(crate) struct MockJira {
+    pub(crate) endpoint: String,
+    pub(crate) requests: Arc<Mutex<Vec<(String, Value)>>>,
+    pub(crate) responses: Arc<Mutex<VecDeque<MockResponse>>>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for MockJira {
@@ -75,7 +75,7 @@ impl Drop for MockJira {
     }
 }
 
-async fn mock_jira(responses: Vec<MockResponse>) -> MockJira {
+pub(crate) async fn mock_jira(responses: Vec<MockResponse>) -> MockJira {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -125,7 +125,7 @@ async fn mock_jira(responses: Vec<MockResponse>) -> MockJira {
     }
 }
 
-fn tracker(endpoint: &str) -> TrackerConfig {
+pub(crate) fn tracker(endpoint: &str) -> TrackerConfig {
     TrackerConfig {
         kind: "jira".to_string(),
         endpoint: endpoint.to_string(),
@@ -146,7 +146,7 @@ fn tracker(endpoint: &str) -> TrackerConfig {
     }
 }
 
-fn issue(status: &str) -> Value {
+pub(crate) fn issue(status: &str) -> Value {
     json!({"id":"10001","key":"TEST-1","fields":{"summary":"Integration fixture","description":null,"project":{"id":"10","key":"TEST"},"updated":"2026-01-01T00:00:00.000+0000","status":{"id":if status == "Done" { "3" } else { "2" },"name":status,"statusCategory":{"key":if status == "Done" { "done" } else { "indeterminate" }}}}})
 }
 

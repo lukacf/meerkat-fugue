@@ -66,7 +66,7 @@ pub struct Directory {
     root: PathBuf,
     hub: String,
     console: Arc<crate::console::ConsoleHub>,
-    _lock: std::fs::File,
+    _lock: crate::file_lease::FileLease,
     children: Mutex<BTreeMap<String, Running>>,
     browser_client: reqwest::Client,
     lifecycle: Arc<super::runtime_host::HostLifecycle>,
@@ -104,7 +104,7 @@ impl Directory {
             .read(true)
             .write(true)
             .open(root.join("directory.lock"))?;
-        lock.try_lock()
+        let lock = crate::file_lease::FileLease::acquire(lock)
             .context("Another Fugue directory owns these workspaces")?;
         let console = crate::console::ConsoleHub::open(&root.join("console.sqlite3"))?;
         Ok(Arc::new(Self {

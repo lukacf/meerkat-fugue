@@ -91,7 +91,10 @@ Symptoms can include empty tool catalogs, `Unexpected response type`, missing
 Workpad updates, or member tooling notes about attempted lifecycle lane
 mutations. Planner/coder/reviewer members should report lifecycle facts to the
 issue lead; the issue lead owns per-issue `linear_move_issue` movement while
-Fugue observes Linear for external lane drift.
+Fugue observes Linear for external lane drift. `linear_claim_issue` also requires
+lead or coordinator authority because it can change the lane. If a claim with
+`target_state` is refused for unresolved WorkGraph obligations, resolve the
+findings through review; changing the assignment is not a way to complete them.
 
 Check that:
 

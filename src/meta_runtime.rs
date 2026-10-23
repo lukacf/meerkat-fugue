@@ -1033,10 +1033,12 @@ impl AgentToolDispatcher for FugueDirectToolDispatcher {
                 )
                 .into());
             }
-            if call.name == "linear_move_issue"
-                && let Ok(input) =
-                    serde_json::from_value::<crate::tools::MoveIssueInput>(arguments.clone())
-            {
+            let lane_move = crate::workgraph_gate::lane_move_for_tool(call.name, &arguments)
+                .map_err(|error| meerkat_core::error::ToolError::InvalidArguments {
+                    name: call.name.to_string(),
+                    reason: error.to_string(),
+                })?;
+            if let Some(input) = lane_move {
                 if let Err(message) = guard_direct_public_lane_move(
                     &self.tracker,
                     &self.review_handoff_states,
@@ -1293,7 +1295,10 @@ fn fugue_tool_defs(config: &TrackerConfig, allow_issue_mutation: bool) -> Vec<Ar
 }
 
 fn linear_tool_mutates_issue_lane(name: &str) -> bool {
-    matches!(name, "linear_move_issue" | "linear_delete_issue")
+    matches!(
+        name,
+        "linear_move_issue" | "linear_claim_issue" | "linear_delete_issue"
+    )
 }
 
 fn guard_direct_public_lane_move(
@@ -1306,13 +1311,13 @@ fn guard_direct_public_lane_move(
         LinearStateRef::Name { name } => name.trim(),
         LinearStateRef::Id { .. } => {
             return Err(
-                "linear_move_issue requires a named Fugue public lane, not an opaque Linear state id"
+                "Issue lane changes require a named Fugue public lane, not an opaque Linear state id"
                     .to_string(),
             );
         }
     };
     if target.is_empty() {
-        return Err("linear_move_issue target lane must not be empty".to_string());
+        return Err("Issue lane change target must not be empty".to_string());
     }
     if tracker.kind != "jira"
         && let Some(replacement) = legacy_public_lane_replacement(target)
@@ -1323,7 +1328,7 @@ fn guard_direct_public_lane_move(
     }
     if direct_public_lane_is_action(action_states, target) {
         return Err(format!(
-            "{target:?} is a Fugue action lane. Action lanes are operator or host-observed control inputs only; agents must not move issues there with linear_move_issue. Keep ordinary running work on the active projection lane, record PR/review/deploy intent as evidence, or use Blocked/terminal lanes when those facts are true."
+            "{target:?} is a Fugue action lane. Action lanes are operator or host-observed control inputs only; agents must not move issues there with linear_move_issue or linear_claim_issue. Keep ordinary running work on the active projection lane, record PR/review/deploy intent as evidence, or use Blocked/terminal lanes when those facts are true."
         ));
     }
     if direct_public_lane_allowed(tracker, review_handoff_states, target) {
@@ -4145,6 +4150,166 @@ pub(crate) mod tests {
             !tool_names.iter().any(|name| name == "linear_move_issue"),
             "worker sessions can inspect/update evidence but must not own lane mutation"
         );
+        assert!(
+            !tool_names.iter().any(|name| name == "linear_claim_issue"),
+            "claim can assign a terminal state and requires the same lifecycle authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_checks_obligations_before_jira_assignment_or_transition() {
+        use crate::jira::tests::{issue, mock_jira, reply, tracker};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workgraph.sqlite3");
+        let realm = meerkat_core::mob_realm_id("claim-test").unwrap();
+        let graph = meerkat::WorkGraphService::with_scope(
+            Arc::new(meerkat::SqliteWorkGraphStore::open(&path).unwrap()),
+            realm.as_str(),
+            meerkat::WorkNamespace::default(),
+        );
+        graph
+            .create(meerkat::CreateWorkItemRequest {
+                realm_id: None,
+                namespace: None,
+                title: "Unresolved review".into(),
+                description: None,
+                priority: meerkat::WorkPriority::High,
+                completion_policy: meerkat::WorkCompletionPolicy::SelfAttest,
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                labels: ["fugue", "blocking", "issue:TEST-1"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: Some(meerkat::WorkStatus::Open),
+            })
+            .await
+            .unwrap();
+        for use_mcp in [false, true] {
+            for issue_ref in [
+                json!({"kind":"identifier", "identifier":"TEST-1"}),
+                json!({"kind":"id", "id":"10001"}),
+            ] {
+                let lookup_path = if issue_ref["kind"] == "id" {
+                    "/rest/api/3/issue/10001"
+                } else {
+                    "/rest/api/3/issue/TEST-1"
+                };
+                let mock = mock_jira(vec![
+                    reply("GET", lookup_path, issue("In Progress")),
+                    reply(
+                        "GET",
+                        "/rest/api/3/issue/TEST-1/comment",
+                        json!({
+                            "comments": [], "total": 0, "startAt": 0, "maxResults": 100
+                        }),
+                    ),
+                ])
+                .await;
+                let tracker = tracker(&mock.endpoint);
+                let gate = WorkGraphTerminalGate::new(&path, vec!["Done".into()], Vec::new())
+                    .for_mob("claim-test");
+                let dispatcher = direct_tool_dispatcher(
+                    &tracker,
+                    None,
+                    None,
+                    HostToolAuthority::IssueLead,
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    gate.clone(),
+                    false,
+                    None,
+                );
+                let mut input = json!({
+                    "issue": issue_ref, "assignee": {"kind":"id", "id":"operator"},
+                    "target_state": {"kind":"name", "name":"Done"},
+                    "idempotency_key":"claim-test"
+                });
+                for (state, expected) in [
+                    (
+                        json!({"kind":"name", "name":"Done"}),
+                        "unresolved_workgraph_obligations",
+                    ),
+                    (json!({"kind":"id", "id":"3"}), "noncanonical_public_lane"),
+                ] {
+                    input["target_state"] = state;
+                    if use_mcp {
+                        let (failed, response) =
+                            crate::mcp_server::execute_guarded_linear_mcp_tool(
+                                &tracker,
+                                "linear_claim_issue",
+                                &input,
+                                Some(&gate),
+                            )
+                            .await;
+                        assert!(failed);
+                        assert!(
+                            response.contains("unresolved_workgraph_obligations"),
+                            "{response}"
+                        );
+                    } else {
+                        let args = serde_json::value::to_raw_value(&input).unwrap();
+                        let outcome = dispatcher
+                            .dispatch(ToolCallView {
+                                id: "claim",
+                                name: "linear_claim_issue",
+                                args: &args,
+                            })
+                            .await
+                            .unwrap();
+                        assert!(outcome.result.is_error);
+                        assert!(
+                            serde_json::to_string(&outcome.result.content)
+                                .unwrap()
+                                .contains(expected)
+                        );
+                    }
+                }
+                assert!(mock.responses.lock().unwrap().is_empty());
+                assert_eq!(
+                    mock.requests.lock().unwrap().len(),
+                    2,
+                    "only inspection may reach Jira"
+                );
+                // An assignment without a lane change remains usable even with an open obligation.
+                mock.responses.lock().unwrap().extend([
+                    reply("GET", lookup_path, issue("In Progress")),
+                    reply("PUT", "/rest/api/3/issue/TEST-1/assignee", json!({})),
+                    reply("GET", lookup_path, issue("In Progress")),
+                ]);
+                input["target_state"] = Value::Null;
+                if use_mcp {
+                    let (failed, response) = crate::mcp_server::execute_guarded_linear_mcp_tool(
+                        &tracker,
+                        "linear_claim_issue",
+                        &input,
+                        Some(&gate),
+                    )
+                    .await;
+                    assert!(!failed, "{response}");
+                } else {
+                    let args = serde_json::value::to_raw_value(&input).unwrap();
+                    let outcome = dispatcher
+                        .dispatch(ToolCallView {
+                            id: "assign",
+                            name: "linear_claim_issue",
+                            args: &args,
+                        })
+                        .await
+                        .unwrap();
+                    assert!(!outcome.result.is_error, "{:?}", outcome.result.content);
+                }
+                assert!(mock.responses.lock().unwrap().is_empty());
+                assert_eq!(mock.requests.lock().unwrap().len(), 5);
+            }
+        }
     }
 
     #[test]

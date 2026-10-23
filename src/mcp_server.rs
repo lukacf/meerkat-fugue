@@ -52,22 +52,10 @@ pub async fn run_linear_mcp_server(config: TrackerConfig) -> anyhow::Result<()> 
                 };
                 let arguments = apply_linear_mcp_memory(&memory, &name, arguments);
                 remember_linear_mcp_issue_argument(&memory, &arguments);
-                if operation == FugueToolOperation::LinearMoveIssue
-                    && let Ok(input) =
-                        serde_json::from_value::<crate::tools::MoveIssueInput>(arguments.clone())
-                    && let Some(gate) = WorkGraphTerminalGate::from_env(&config)
-                    && let Err(message) = gate.guard_terminal_move(&config, &input).await
-                {
-                    return (
-                        true,
-                        json!({
-                            "error": "unresolved_workgraph_obligations",
-                            "message": message
-                        })
-                        .to_string(),
-                    );
-                }
-                execute_linear_fugue_tool(&config, &name, &arguments).await
+                execute_guarded_linear_mcp_tool(
+                    &config, &name, &arguments,
+                    WorkGraphTerminalGate::from_env(&config).as_ref(),
+                ).await
             } else {
                 (
                     true,
@@ -77,6 +65,28 @@ pub async fn run_linear_mcp_server(config: TrackerConfig) -> anyhow::Result<()> 
         }
     })
     .await
+}
+
+pub(crate) async fn execute_guarded_linear_mcp_tool(
+    config: &TrackerConfig,
+    name: &str,
+    arguments: &Value,
+    gate: Option<&WorkGraphTerminalGate>,
+) -> (bool, String) {
+    let lane_move = match crate::workgraph_gate::lane_move_for_tool(name, arguments) {
+        Ok(input) => input,
+        Err(error) => return (true, json!({"error": error.to_string()}).to_string()),
+    };
+    if let Some(input) = lane_move
+        && let Some(gate) = gate
+        && let Err(message) = gate.guard_terminal_move(config, &input).await
+    {
+        return (
+            true,
+            json!({"error": "unresolved_workgraph_obligations", "message": message}).to_string(),
+        );
+    }
+    execute_linear_fugue_tool(config, name, arguments).await
 }
 
 pub async fn run_github_mcp_server() -> anyhow::Result<()> {

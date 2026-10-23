@@ -6,8 +6,9 @@ use meerkat::{SqliteWorkGraphStore, WorkGraphService, WorkItem, WorkItemFilter, 
 use crate::config::TrackerConfig;
 use crate::domain::normalize_state;
 use crate::tools::{
-    FugueToolError, FugueToolErrorCode, FugueToolOperation, FugueToolResult, LinearIssueRef,
-    LinearStateRef, MergePrInput, MoveIssueInput, RetryAdvice, ToolExecutionMetadata,
+    ClaimIssueInput, FugueToolError, FugueToolErrorCode, FugueToolOperation, FugueToolResult,
+    LinearIssueRef, LinearStateRef, MergePrInput, MoveIssueInput, RetryAdvice,
+    ToolExecutionMetadata,
 };
 
 pub const WORKGRAPH_STATE_PATH_ENV: &str = "FUGUE_WORKGRAPH_STATE_PATH";
@@ -15,6 +16,27 @@ pub const WORKGRAPH_BLOCKED_STATES_ENV: &str = "FUGUE_WORKGRAPH_BLOCKED_STATES";
 pub const WORKGRAPH_MOB_ID_ENV: &str = "FUGUE_WORKGRAPH_MOB_ID";
 pub const FUGUE_WORKGRAPH_LABEL: &str = "fugue";
 pub const FUGUE_WORKGRAPH_BLOCKING_LABEL: &str = "blocking";
+
+/// Extract the lane change before dispatch, including the optional change in a claim.
+/// Invalid arguments must fail before either assignment or state mutation occurs.
+pub(crate) fn lane_move_for_tool(
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Result<Option<MoveIssueInput>, serde_json::Error> {
+    match name {
+        "linear_move_issue" => serde_json::from_value(arguments.clone()).map(Some),
+        "linear_claim_issue" => {
+            let input: ClaimIssueInput = serde_json::from_value(arguments.clone())?;
+            Ok(input.target_state.map(|state| MoveIssueInput {
+                issue: input.issue,
+                state,
+                expected_updated_at: None,
+                idempotency_key: input.idempotency_key,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkGraphTerminalGate {
