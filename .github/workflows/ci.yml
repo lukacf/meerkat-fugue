@@ -75,10 +75,8 @@ jobs:
       - name: Repeat native handoff and restart contracts
         timeout-minutes: 15
         run: |
-          for attempt in 1 2 3 4 5; do
-            echo "Native restart qualification $attempt/5"
-            cargo test --locked --lib native_flow_delivers_worker
-          done
+          cargo test --locked --lib --no-run --message-format=json-render-diagnostics > "$RUNNER_TEMP/fugue-native-tests.jsonl"
+          python3 scripts/ci/repeat-native-tests.py "$RUNNER_TEMP/fugue-native-tests.jsonl"
 
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings
