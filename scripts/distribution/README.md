@@ -97,7 +97,14 @@ on the intended gateway before treating a deployment as accepted.
 
 ## Temporary dependency follow-up
 
-The exact public Meta 0.9.4 console backport is an intentional release dependency.
-Track upstream PRs 674 and 688 and replace the pin only after a published runtime
-passes persisted-session recovery, repository topology, and full ticket-cycle
-acceptance. An upstream merge alone is not an instruction to upgrade a host.
+The current candidate binds Core `79eae05d740fc4b60cc80f48d21b3dcd77a99916`
+and Meta `ba44bcb8cb03d0f9f04b4d17c46e3de04b1c46df`. Core includes the
+checkpoint-recovery correction; Meta includes the console panels and sign-in
+recovery changes. Every Core package, including Meta's transitive dependencies,
+must resolve to that same Core commit in `Cargo.lock`.
+
+Fugue qualifies these source bindings through its own build, native recovery
+and hosted ticket-cycle checks. Upstream CI and publication do not block starting
+that qualification. Replace the temporary pins when a released pair passes the
+same checks, then verify the new lock and release manifest. A source binding or
+an upstream merge alone is not deployed acceptance.

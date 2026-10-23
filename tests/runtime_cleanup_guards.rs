@@ -76,3 +76,57 @@ fn meerkat_dependency_train_is_exact_and_unmixed() {
         "metadata guard should see at least one Meerkat dependency"
     );
 }
+
+#[test]
+fn locked_native_graph_uses_the_selected_recovery_commits() {
+    #[derive(serde::Deserialize)]
+    struct Lock {
+        package: Vec<Package>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Package {
+        name: String,
+        version: String,
+        source: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Manifest {
+        patch: Patches,
+    }
+    #[derive(serde::Deserialize)]
+    struct Patches {
+        #[serde(rename = "crates-io")]
+        crates: std::collections::BTreeMap<String, Pin>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Pin {
+        git: String,
+        rev: String,
+    }
+    let manifest: Manifest = toml::from_str(include_str!("../Cargo.toml")).expect("valid manifest");
+    let lock: Lock = toml::from_str(include_str!("../Cargo.lock")).expect("valid lockfile");
+    let core = &manifest.patch.crates["meerkat"];
+    let meta = &manifest.patch.crates["meerkat-meta"];
+    for package in lock
+        .package
+        .iter()
+        .filter(|p| p.name.starts_with("meerkat") && p.name != "meerkat-fugue")
+    {
+        let pin = if package.name == "meerkat-meta" {
+            meta
+        } else {
+            core
+        };
+        assert_eq!(
+            package.version, "0.9.4",
+            "mixed native train: {}",
+            package.name
+        );
+        assert_eq!(
+            package.source.as_deref(),
+            Some(format!("git+{}?rev={}#{}", pin.git, pin.rev, pin.rev).as_str()),
+            "{} must use the selected commit, including transitive Meta dependencies",
+            package.name
+        );
+    }
+}
