@@ -82,10 +82,13 @@ operator has access to the instance's repositories and controls. Keep deployment
 configuration, credentials, databases and transcripts outside this public repo.
 See [SECURITY.md](SECURITY.md).
 
-Fugue uses Meerkat/Meta 0.9.3 with an exact public Meta backport for persistence,
-shared-console identities, peer links, Memory and Work Graph. The
-[upgrade guide](docs/upgrading-0.9.3.mdx) and
-[operations guide](docs/operations.mdx) explain durable state and rollback.
+This branch uses Meerkat/Meta 0.9.4 with an exact public Meta backport for
+shared-console identities, peer links, Memory and Work Graph. Upgrading an
+existing 0.9.3 installation requires an offline native storage migration.
+The candidate is still undergoing migration and crash-recovery qualification;
+do not treat a successful build as upgrade acceptance. Follow the
+[native storage upgrade guide](docs/upgrading-0.9.4.mdx) and
+[operations guide](docs/operations.mdx) for census, backup and complete rollback.
 
 ## Documentation
 
