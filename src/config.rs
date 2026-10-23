@@ -1632,6 +1632,14 @@ impl ServiceConfig {
             ));
         }
         if self.tracker.kind == "fugue-ims" {
+            if self
+                .tracker
+                .project_slug
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(FugueError::MissingTrackerProjectSlug);
+            }
             if self.tracker.endpoint.trim().is_empty() {
                 return Err(FugueError::InvalidConfig(
                     "tracker.endpoint must point at a fugue-ims sqlite database".to_string(),

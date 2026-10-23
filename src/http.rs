@@ -5587,7 +5587,7 @@ mod tests {
     ) -> (Router, crate::orchestrator::Orchestrator) {
         let definition = WorkflowDefinition {
             config: json!({
-                "tracker": {"kind": "fugue-ims", "endpoint": root.join("ims.sqlite")},
+                "tracker": {"kind": "fugue-ims", "endpoint": root.join("ims.sqlite"), "project_slug": "test/repository"},
                 "meerkat": {"repository_runtime": {
                     "repository": "test-repository", "state_path": root.join("team")
                 }},
@@ -7009,7 +7009,7 @@ mod tests {
                 "tracker": {
                     "kind": "fugue-ims",
                     "endpoint": ims_path.display().to_string(),
-                    "project_slug": "fugue-ims",
+                    "project_slug": "lukacf/meerkat-fugue",
                     "active_states": ["Todo", "Deploy", "Done"],
                     "terminal_states": ["Done"]
                 },
@@ -7154,7 +7154,7 @@ mod tests {
                 "tracker": {
                     "kind": "fugue-ims",
                     "endpoint": ims_path.display().to_string(),
-                    "project_slug": "fugue-ims",
+                    "project_slug": "lukacf/meerkat-fugue",
                     "active_states": ["Todo", "Deploy", "Rework", "Blocked", "Ready for review"],
                     "terminal_states": ["Done"]
                 },
@@ -7505,7 +7505,7 @@ mod tests {
                 "tracker": {
                     "kind": "fugue-ims",
                     "endpoint": ims_path.display().to_string(),
-                    "project_slug": "fugue-ims",
+                    "project_slug": "lukacf/meerkat-fugue",
                     "active_states": ["Todo", "Do Review", "Ready for review", "Rework", "Blocked"],
                     "terminal_states": ["Done"]
                 },

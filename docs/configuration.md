@@ -381,6 +381,12 @@ Review and Deploy are action lanes: an operator or meta-agent moves an issue to
 one of these lanes to request the configured procedure. They are not passive
 phase projections from planner/coder/reviewer execution.
 
+For the built-in tracker, `tracker.project_slug` is the repository scope and is
+required even when the SQLite database contains only one repository. A shared
+database does not share queues: issue, comment and attachment reads and writes
+stay within the configured scope. Issue keys cannot be moved to another
+repository by creating or updating an issue with the same key.
+
 Review obligations use the repository mob's native WorkGraph realm and default
 namespace. Independent-review completion rejects other scopes so blockers remain
 visible to terminal and merge checks. Tracker IDs are resolved to canonical issue

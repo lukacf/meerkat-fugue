@@ -11390,7 +11390,8 @@ mod tests {
     async fn fugue_ims_kapellmeister_start_issue_uses_sqlite_issue_source() {
         let temp = tempfile::tempdir().unwrap();
         let ims_path = temp.path().join("fugue-ims.sqlite");
-        let tracker = crate::fugue_ims::fugue_ims_tracker_config(&ims_path);
+        let mut tracker = crate::fugue_ims::fugue_ims_tracker_config(&ims_path);
+        tracker.project_slug = Some("lukacf/meerkat-fugue".into());
         crate::fugue_ims::create_issue_for_config(
             &tracker,
             crate::fugue_ims::CreateFugueIssue {
@@ -11410,7 +11411,7 @@ mod tests {
             json!({
                 "kind": "fugue-ims",
                 "endpoint": ims_path.display().to_string(),
-                "project_slug": "fugue-ims",
+                "project_slug": "lukacf/meerkat-fugue",
                 "intake_states": ["Todo"],
                 "active_states": ["Todo", "Rework", "Planning", "Implementing", "Reviewing"],
                 "terminal_states": ["Done", "Canceled", "Duplicate"]
@@ -11434,7 +11435,8 @@ mod tests {
     async fn kapellmeister_start_issue_allows_configured_review_ready_rework_resume() {
         let temp = tempfile::tempdir().unwrap();
         let ims_path = temp.path().join("fugue-ims.sqlite");
-        let tracker = crate::fugue_ims::fugue_ims_tracker_config(&ims_path);
+        let mut tracker = crate::fugue_ims::fugue_ims_tracker_config(&ims_path);
+        tracker.project_slug = Some("lukacf/meerkat-fugue".into());
         crate::fugue_ims::create_issue_for_config(
             &tracker,
             crate::fugue_ims::CreateFugueIssue {
@@ -11470,7 +11472,7 @@ mod tests {
             json!({
                 "kind": "fugue-ims",
                 "endpoint": ims_path.display().to_string(),
-                "project_slug": "fugue-ims",
+                "project_slug": "lukacf/meerkat-fugue",
                 "intake_states": ["Todo"],
                 "active_states": ["Todo", "Rework", "Planning", "Implementing", "Reviewing"],
                 "terminal_states": ["Ready for review", "Blocked", "Done", "Canceled", "Duplicate"]
@@ -15859,7 +15861,8 @@ worker:
     async fn kapellmeister_native_reconcile_refreshes_recovery_without_host_projection() {
         let temp = tempfile::tempdir().unwrap();
         let ims_path = temp.path().join("fugue-ims.sqlite");
-        let tracker = crate::fugue_ims::fugue_ims_tracker_config(&ims_path);
+        let mut tracker = crate::fugue_ims::fugue_ims_tracker_config(&ims_path);
+        tracker.project_slug = Some("lukacf/meerkat-fugue".into());
         crate::fugue_ims::create_issue_for_config(
             &tracker,
             crate::fugue_ims::CreateFugueIssue {
@@ -15880,7 +15883,7 @@ worker:
             json!({
                 "kind": "fugue-ims",
                 "endpoint": ims_path.display().to_string(),
-                "project_slug": "fugue-ims",
+                "project_slug": "lukacf/meerkat-fugue",
                 "intake_states": ["Todo"],
                 "active_states": ["Todo", "Rework", "Planning", "Implementing", "Reviewing"],
                 "terminal_states": ["Ready for review", "Done", "Canceled", "Duplicate"]
@@ -15985,7 +15988,7 @@ worker:
             json!({
                 "kind": "fugue-ims",
                 "endpoint": workspace.path().join("issues.sqlite"),
-                "project_slug": "fixture",
+                "project_slug": "fixture/repository",
                 "active_states": ["Todo", "In Progress"],
                 "terminal_states": ["Done", "Canceled"]
             }),
