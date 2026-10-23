@@ -204,9 +204,6 @@ impl Directory {
             repository: repository.clone(),
             port,
         };
-        // The metadata is non-secret. A port collision causes the child to
-        // refuse startup; it cannot attach to an existing workspace process.
-        std::fs::write(root.join("entry.json"), serde_json::to_vec_pretty(&entry)?)?;
         let draft = super::workflow::WorkflowSetup {
             allow_no_ci_checks: false,
             jira_transition_fields: BTreeMap::new(),
@@ -221,10 +218,13 @@ impl Directory {
             jira_issue_labels: Vec::new(),
             lanes: crate::config::TrackerLaneRoles::default(),
         };
-        std::fs::write(
-            root.join("workflow-draft.json"),
-            serde_json::to_vec_pretty(&draft)?,
-        )?;
+        super::save_json(&root.join("workflow-draft.json"), &draft)?;
+        // Publish the entry last, after its private connections and initial
+        // draft are durable. An interrupted add cannot expose partial JSON to
+        // the directory's startup scan. A port collision refuses child startup.
+        super::save_json(&root.join("entry.json"), &entry)?;
+        #[cfg(unix)]
+        std::fs::File::open(&self.root)?.sync_all()?;
         drop(listener);
         let running = self.spawn(&id, &entry).await?;
         let client = reqwest::Client::builder()

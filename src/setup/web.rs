@@ -121,12 +121,7 @@ async fn prepare(
         return error(StatusCode::CONFLICT, "Preparation is already running");
     }
     let connections = setup.connections.lock().await.value.clone();
-    let saved = serde_json::to_vec_pretty(&request)
-        .map_err(anyhow::Error::from)
-        .and_then(|draft| {
-            std::fs::write(setup.root.join("workflow-draft.json"), draft)
-                .map_err(anyhow::Error::from)
-        });
+    let saved = super::save_json(&setup.root.join("workflow-draft.json"), &request);
     if saved.is_err() {
         return error(
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -535,28 +535,8 @@ impl ConnectionStore {
     }
 
     pub fn save(&self, connections: &Connections) -> Result<()> {
-        use std::io::Write;
         connections.validate()?;
-        let pending = self.directory.join("connections.pending");
-        let bytes = serde_json::to_vec_pretty(connections)?;
-        let mut options = private_options();
-        options.create_new(true);
-        let mut file = options
-            .open(&pending)
-            .context("create private credential transaction")?;
-        let written = (|| -> Result<()> {
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            std::fs::rename(&pending, self.directory.join("connections.json"))?;
-            Ok(())
-        })();
-        if let Err(error) = written {
-            std::fs::remove_file(pending).context("clean up credential transaction")?;
-            return Err(error);
-        }
-        #[cfg(unix)]
-        std::fs::File::open(&self.directory)?.sync_all()?;
-        Ok(())
+        super::save_json(&self.directory.join("connections.json"), connections)
     }
 }
 
@@ -841,6 +821,30 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn interrupted_credential_save_keeps_committed_values_and_allows_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let previous = connections();
+        {
+            let store = ConnectionStore::open(root.path()).unwrap();
+            store.save(&previous).unwrap();
+            // A process died while writing the former fixed transaction file.
+            std::fs::write(
+                root.path().join("private/connections.pending"),
+                b"{\"model\":",
+            )
+            .unwrap();
+        }
+        let reopened = ConnectionStore::open(root.path()).unwrap();
+        assert_eq!(
+            reopened.load().unwrap().environment(),
+            previous.environment()
+        );
+        let updated = Connections::default();
+        reopened.save(&updated).unwrap();
+        assert!(reopened.load().unwrap().environment().is_empty());
     }
 
     #[test]

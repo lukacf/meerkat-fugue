@@ -58,25 +58,7 @@ impl ActiveWorkspace {
     }
 
     pub fn activate(&self, root: &Path) -> Result<()> {
-        use std::io::Write;
-        let pending = root.join("workspace.pending");
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&pending)?;
-        let result = (|| -> Result<()> {
-            file.write_all(&serde_json::to_vec_pretty(self)?)?;
-            file.sync_all()?;
-            std::fs::rename(&pending, root.join("workspace.json"))?;
-            Ok(())
-        })();
-        if let Err(error) = result {
-            std::fs::remove_file(&pending)?;
-            return Err(error);
-        }
-        #[cfg(unix)]
-        std::fs::File::open(root)?.sync_all()?;
-        Ok(())
+        super::save_json(&root.join("workspace.json"), self)
     }
 }
 
@@ -446,6 +428,33 @@ pub async fn shutdown_signal() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_activation_keeps_committed_generation_and_allows_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let mut workspace = ActiveWorkspace {
+            generation: "generation-old".into(),
+            setup: jira_setup(),
+        };
+        workspace.activate(root.path()).unwrap();
+        // A process died before replacing the manifest with a complete write.
+        std::fs::write(root.path().join("workspace.pending"), b"{\"generation\":").unwrap();
+        assert_eq!(
+            ActiveWorkspace::load(root.path())
+                .unwrap()
+                .unwrap()
+                .generation,
+            "generation-old"
+        );
+        workspace.generation = "generation-new".into();
+        workspace.activate(root.path()).unwrap();
+        let restored = ActiveWorkspace::load(root.path()).unwrap().unwrap();
+        assert_eq!(restored.generation, "generation-new");
+        assert_eq!(
+            restored.setup.jira_issue_labels,
+            workspace.setup.jira_issue_labels
+        );
+    }
 
     fn jira_setup() -> WorkflowSetup {
         serde_json::from_str(
