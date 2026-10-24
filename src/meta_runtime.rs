@@ -3787,22 +3787,12 @@ fn issue_lead_prompt_for_tracker(
     tracker: &crate::config::TrackerConfig,
     projection: Option<&crate::config::MaterializedLinearProjection>,
 ) -> String {
-    if tracker.kind != "jira" {
-        return issue_lead_prompt(issue, instructions);
-    }
     let active = running_lane(tracker, projection);
     let handoff = projection
         .map(|projection| projection.terminal_lanes.succeeded.as_str())
         .unwrap_or("the configured development handoff lane");
     format!(
-        "You are the Fugue issue lead for {issue}. Coordinate visible worker peers through Meta comms. You own issue-level Jira lane projection: inspect the issue, update the Workpad, and use linear_move_issue with the configured Jira status names. Kapellmeister owns repo-level startup/resume/retire coordination. Once intake is accepted, project the issue to {active}. Record internal planner/coder/reviewer/remediation phases in labels, WorkGraph, Workpad, and Meta evidence. Follow the template's configured node and terminal projections; never invent tracker statuses or enter operator action lanes from inside the issue mob. Successful development projects to {handoff} after its issue-team review and implementation obligations are satisfied. The issue lead owns this development handoff projection; Kapellmeister coordinates the downstream repository review. When the configured handoff also requests repository independent review, entering it does not require the result of the subsequent repository review. Resolve current implementation findings first. Do not close future review or merge obligations to permit this handoff. This shared holding status requests review and is not terminal acceptance or review approval. A configured review holding lane may be entered for this handoff; other operator action lanes remain forbidden. Do not substitute the tracker completion lane for this projection. Merging requires a separate explicit action and verified merge completion follows its configured success projection. Red review, failed checks, or actionable operator findings must create or update WorkGraph blockers and keep or return the issue to {active} for focused replanning. Use labels `fugue`, `issue:{issue}`, and `blocking`. Deleted comments do not clear obligations without explicit newer acceptance. Use the default WorkGraph scope: omit realm_id and namespace unless following an exact returned item reference; never invent a realm or namespace from the issue identifier. Planner/coder may claim, update, and add evidence, but only reviewer-role agents may close completed review obligations. Before terminal success, query WorkGraph yourself and verify every blocking `issue:{issue}` item is terminal. Execute actual transition calls before reporting lane movement complete.\n\n{}",
-        instructions.unwrap_or_default()
-    )
-}
-
-fn issue_lead_prompt(issue: &str, instructions: Option<&str>) -> String {
-    format!(
-        "You are the Fugue issue lead for {issue}. Coordinate the visible worker peers through Meta comms. You own issue-level IMS/Linear lane projection for this issue: inspect the issue, update the Workpad, and call linear_move_issue when the issue's coarse operator lane should change. Kapellmeister owns repo-level startup/resume/retire coordination; do not wait for Kapellmeister to approve ordinary issue-mob projection such as Queue, Active, Blocked, Done, or Canceled when your mob has the evidence to move. Queue is the intake lane, and Active is the single running issue-mob lane; once an intake or legacy remediation signal has been accepted by the mob, project the issue to Active and record detailed planner/coder/reviewer/remediation phase as labels, WorkGraph, Workpad, and Meta runtime evidence. Review, Deploy, and final-review lanes are action lanes: never move an issue there from inside the issue mob; they are operator or host-observed control inputs. Done means accepted development work, not merged PR; merge/OTA is a separate Deploy action. Red review, failed checks, operator review findings, or concrete blocking remediation should create/update WorkGraph blockers and keep or return the issue to Active for focused replanning; do not create separate tracker statuses for internal phases. If Kapellmeister reports an issue comment add/update/delete, operator_review_finding, PR finding, check failure, or concrete blocking remediation, convert the actionable finding into WorkGraph items with labels `fugue`, `issue:{issue}`, and `blocking` before replanning; deleted comments are not acceptance unless a newer operator comment explicitly clears the finding. For normal issue-mob WorkGraph queries, use the default WorkGraph scope: omit realm_id and namespace unless you are following an exact returned item reference; never invent a realm or namespace from the issue identifier. Planner/coder may claim, update, and add evidence to WorkGraph items, but reviewer-role agents are the only agents allowed to close completed review obligations. Before moving this issue to a non-Blocked terminal success/cancel/duplicate lane, query WorkGraph yourself and ensure every blocking `issue:{issue}` item is terminal; the linear_move_issue tool will reject terminal success while unresolved obligations remain. If your task names a sequence of issue lanes, execute the actual linear_move_issue calls for each lane in that sequence before you report the sequence complete; do not merely announce future lane movement.\n\n{}",
+        "You are the Fugue issue lead for {issue}. Coordinate visible worker peers through Meta comms. You own issue-level tracker lane projection: inspect the issue, update the Workpad, and use linear_move_issue with the configured tracker status names. Kapellmeister owns repo-level startup/resume/retire coordination. Once intake is accepted, project the issue to {active}. Record internal planner/coder/reviewer/remediation phases in labels, WorkGraph, Workpad, and Meta evidence. Follow the template's configured node and terminal projections; never invent tracker statuses or enter operator action lanes from inside the issue mob. Successful development projects to {handoff} after its issue-team review and implementation obligations are satisfied. The issue lead owns this development handoff projection; Kapellmeister coordinates the downstream repository review. When the configured handoff also requests repository independent review, entering it does not require the result of the subsequent repository review. Resolve current implementation findings first. Do not close future review or merge obligations to permit this handoff. This shared holding status requests review and is not terminal acceptance or review approval. A configured review holding lane may be entered for this handoff; other operator action lanes remain forbidden. Do not substitute the tracker completion lane for this projection. Merging requires a separate explicit action and verified merge completion follows its configured success projection. Red review, failed checks, or actionable operator findings must create or update WorkGraph blockers and keep or return the issue to {active} for focused replanning. Use labels `fugue`, `issue:{issue}`, and `blocking`. Deleted comments do not clear obligations without explicit newer acceptance. Use the default WorkGraph scope: omit realm_id and namespace unless following an exact returned item reference; never invent a realm or namespace from the issue identifier. Planner/coder may claim, update, and add evidence, but only reviewer-role agents may close completed review obligations. Before terminal success, query WorkGraph yourself and verify every blocking `issue:{issue}` item is terminal. Execute actual transition calls before reporting lane movement complete.\n\n{}",
         instructions.unwrap_or_default()
     )
 }
@@ -4548,13 +4538,65 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn issue_lead_prompt_projects_running_work_to_active_with_phase_evidence() {
-        let prompt = issue_lead_prompt("LUC-900", None);
+    fn every_tracker_issue_lead_uses_configured_development_handoff() {
+        for kind in ["jira", "fugue-ims", "linear"] {
+            let mut tracker = tracker_with_key();
+            tracker.kind = kind.into();
+            tracker.in_flight_states = vec!["Working".into()];
+            let projection = crate::config::MaterializedLinearProjection {
+                id: "development".into(),
+                node_lanes: BTreeMap::new(),
+                node_phase_labels: BTreeMap::new(),
+                aggregate: crate::config::NativeLinearProjectionAggregate {
+                    precedence: vec![],
+                    fallback: Some("Implementation".into()),
+                },
+                terminal_lanes: crate::config::NativeLinearProjectionTerminals {
+                    succeeded: "Awaiting review".into(),
+                    failed: "Implementation".into(),
+                    cancelled: "Abandoned".into(),
+                },
+            };
+            let prompt = issue_lead_prompt_for_tracker(
+                "TEST-1",
+                Some("Preserve the test contract."),
+                &tracker,
+                Some(&projection),
+            );
+            assert!(
+                prompt.contains("project the issue to Implementation"),
+                "{kind}"
+            );
+            assert!(
+                prompt.contains("Successful development projects to Awaiting review"),
+                "{kind}"
+            );
+            assert!(
+                prompt.contains("A configured review holding lane may be entered"),
+                "{kind}"
+            );
+            assert!(
+                prompt.contains("Do not substitute the tracker completion lane"),
+                "{kind}"
+            );
+            assert!(
+                !prompt.contains("Done means accepted development"),
+                "{kind}"
+            );
+            assert!(!prompt.contains("Queue is the intake lane"), "{kind}");
+            assert!(prompt.contains("Preserve the test contract."), "{kind}");
+        }
+    }
 
-        assert!(prompt.contains("Queue is the intake lane"));
-        assert!(prompt.contains("Active is the single running issue-mob lane"));
+    #[test]
+    fn issue_lead_prompt_projects_running_work_to_active_with_phase_evidence() {
+        let mut tracker = tracker_with_key();
+        tracker.in_flight_states = vec!["Active".into()];
+        let prompt = issue_lead_prompt_for_tracker("LUC-900", None, &tracker, None);
+
+        assert!(!prompt.contains("Queue is the intake lane"));
         assert!(prompt.contains("project the issue to Active"));
-        assert!(prompt.contains("labels, WorkGraph, Workpad, and Meta runtime evidence"));
+        assert!(prompt.contains("labels, WorkGraph, Workpad, and Meta evidence"));
         assert!(!prompt.contains("ordinary issue-stage movement"));
     }
 
@@ -4634,7 +4676,7 @@ pub(crate) mod tests {
 
     #[test]
     fn issue_member_prompts_define_workgraph_scope() {
-        let lead = issue_lead_prompt("LUC-900", None);
+        let lead = issue_lead_prompt_for_tracker("LUC-900", None, &tracker_with_key(), None);
         let planner = worker_prompt("LUC-900", "planner", None);
         let coder = worker_prompt("LUC-900", "coder", None);
         let reviewer = worker_prompt("LUC-900", "reviewer", None);

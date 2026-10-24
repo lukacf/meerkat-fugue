@@ -34,6 +34,18 @@ pub fn extract_unresolved_operator_review_note(body: &str) -> Option<String> {
         return Some(findings.summary);
     }
 
+    // The managed Workpad describes progress and policy. Only its explicit
+    // unresolved findings section above is actionable; incidental keywords
+    // must not turn a status update into a new operator rework request.
+    if body
+        .trim_start()
+        .lines()
+        .next()
+        .is_some_and(|line| normalize_heading(line.trim()).eq_ignore_ascii_case("## Fugue Workpad"))
+    {
+        return None;
+    }
+
     let lower = body.to_ascii_lowercase();
     let is_operator_review = lower.contains("operator review")
         || lower.contains("requesting changes")
@@ -162,6 +174,24 @@ mod tests {
         assert!(merged.contains("### Review findings\n- [ ] Source: fix behavior."));
         assert_eq!(merged.matches("### Review findings").count(), 1);
         assert_eq!(merged, merged_again);
+    }
+
+    #[test]
+    fn workpad_narrative_is_not_an_operator_review_finding() {
+        let body = "## Fugue Workpad\n\n### Current review\n- Native admission accepted; operator review findings will be handled if received.\n- No current code defect.\n";
+        for prefix in ["", "\n\n", "  \n\t"] {
+            assert!(extract_unresolved_operator_review_note(&format!("{prefix}{body}")).is_none());
+        }
+    }
+
+    #[test]
+    fn workpad_explicit_unresolved_findings_remain_actionable() {
+        let body =
+            "## Fugue Workpad\n\n### Review findings\n- [ ] Fix the Unicode boundary regression.\n";
+        assert_eq!(
+            extract_unresolved_operator_review_note(body).as_deref(),
+            Some("Fix the Unicode boundary regression.")
+        );
     }
 
     #[test]
