@@ -73,23 +73,33 @@ function restore(data){if(data.model){$('provider').value=data.model.provider;$(
 async function save(form,result,connection,value){
   const button=form.querySelector('button:not([type=button])');
   const previousTracker=current?.tracker?.kind;
+  const fields=[...form.querySelectorAll('input,select,textarea')].map(field=>({field,value:field.value,checked:field.checked}));
+  const laneValues=connection==='tracker'?Object.fromEntries(Object.keys(laneDefaults).map(key=>[key,$('lane-'+key).value])):null;
   button.disabled=true;result.className='result';result.textContent='Saving...';
   try{
     const saved=await api('/api/setup/connections',{connection,value});
+    const unchanged=fields.every(({field,value,checked})=>field.value===value&&field.checked===checked);
     if(connection==='tracker'&&previousTracker!==saved.tracker.kind){
-      // A new tracker has different workflow defaults. Apply them only once the
-      // connection is saved; rejected saves and credential updates keep edits.
+      // Keep statuses edited while the request was in flight. Untouched fields
+      // receive the new tracker's defaults only after its connection is saved.
       const defaults=saved.tracker.kind==='jira'?jiraLaneDefaults:laneDefaults;
-      for(const [key,lane]of Object.entries(defaults))$('lane-'+key).value=lane;
+      for(const [key,lane]of Object.entries(defaults))if($('lane-'+key).value===laneValues[key])$('lane-'+key).value=lane;
     }
-    unsavedConnections.delete(form.id);invalidatePreparation();render(saved);
-    form.querySelectorAll('input[type=password]').forEach(input=>input.value='');
-    result.textContent=connection==='model'?'AI account selected.':'Saved privately.';
-    $('startWorkspace').disabled=true;$('workflowResult').textContent='Check the workspace after changing connections.';
-  }catch(error){result.className='result error';result.textContent=error.message;}
+    if(unchanged)unsavedConnections.delete(form.id);else unsavedConnections.add(form.id);
+    invalidatePreparation();
+    // Another form may have saved after this response's snapshot was taken.
+    // Only this request's connection is confirmed by its response.
+    render({...current,[connection]:saved[connection],environment_providers:saved.environment_providers});
+    for(const {field,value}of fields)if(field.type==='password'&&field.value===value)field.value='';
+    result.textContent=unchanged?(connection==='model'?'AI account selected.':'Saved privately.'):'Earlier values saved. You have newer unsaved changes.';
+    $('startWorkspace').disabled=true;
+    if(unsavedConnections.size){$('workflowResult').textContent='Save changed connections before preparing the workspace.';updateSteps(0);}
+    else $('workflowResult').textContent='Check the workspace after changing connections.';
+    return unchanged;
+  }catch(error){result.className='result error';result.textContent=error.message;return false;}
   finally{button.disabled=false;}
 }
-$('modelForm').addEventListener('submit',async e=>{e.preventDefault();const method=$('modelMethod').value;const credential={method};if(method==='api_key')credential.key=$('modelKey').value;if(method==='binding'){const account=accounts[Number($('authAccount').value)];if(!account)return;credential.auth_binding=account.auth_binding;}await save(e.target,$('modelResult'),'model',{provider:$('provider').value,model:$('model').value.trim(),credential});if(current?.model?.auth_binding){$('modelMethod').value='binding';await refreshAccounts();visibility();}});
+$('modelForm').addEventListener('submit',async e=>{e.preventDefault();const method=$('modelMethod').value;const credential={method};if(method==='api_key')credential.key=$('modelKey').value;if(method==='binding'){const account=accounts[Number($('authAccount').value)];if(!account)return;credential.auth_binding=account.auth_binding;}const unchanged=await save(e.target,$('modelResult'),'model',{provider:$('provider').value,model:$('model').value.trim(),credential});if(unchanged&&current?.model?.auth_binding){$('modelMethod').value='binding';await refreshAccounts();visibility();}});
 $('refreshAccounts').addEventListener('click',refreshAccounts);
 async function pollLogin(){try{const status=await api('/api/setup/auth/login');const waiting=status.phase==='waiting';$('cancelLogin').hidden=!waiting;$('loginRkat').disabled=waiting;if(waiting){$('loginResult').textContent='Complete sign-in in the browser opened by rkat on this machine.';setTimeout(pollLogin,1500);}else if(status.phase==='complete'){$('loginResult').textContent='rkat sign-in completed. Select the account and save your AI selection.';await refreshAccounts();}else if(status.phase==='failed'){$('loginResult').textContent=status.error;}else if(status.phase==='cancelled'){$('loginResult').textContent='Sign-in cancelled.';}}catch(error){$('loginResult').textContent=error.message;$('loginRkat').disabled=false;}}
 $('loginRkat').addEventListener('click',async()=>{try{await api('/api/setup/auth/login',{provider:$('provider').value});await pollLogin();}catch(error){$('loginResult').textContent=error.message;}});
