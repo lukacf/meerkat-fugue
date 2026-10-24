@@ -63,7 +63,6 @@ use crate::workgraph_gate::{
 #[cfg(test)]
 use crate::tools::{LinearStateRef, MoveIssueInput};
 
-const RUNTIME_KEY: &str = "fugue";
 const MOB_ID: &str = crate::native_mob_contract::FUGUE_MOB_ID;
 pub(crate) const KAPELLMEISTER: &str = "kapellmeister";
 const ISSUE_LEAD: &str = "issue_lead";
@@ -75,12 +74,6 @@ const META_EVENT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_NATIVE_MAX_ORPHANED_TURNS: u32 = 128;
 const TURN_LIMIT_PHASE: &str = "turn_limit_reached";
 const MEMBER_TERMINAL_FAILURE_PHASE: &str = "member_terminal_failure";
-
-#[derive(Debug, Clone)]
-pub struct FugueHostSignalAccepted {
-    pub interaction_id: String,
-    pub identity: String,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -656,33 +649,51 @@ impl MetaRuntimeRegistry {
         )
     }
 
-    pub async fn deliver_repo_kapellmeister_signal_batch(
+    pub async fn deliver_repo_kapellmeister_signal(
         &self,
-        content: String,
-    ) -> Result<FugueHostSignalAccepted, String> {
+        scope: &crate::host_signal_journal::HostSignalScope,
+        signal: &crate::host_signal_journal::PendingSignal,
+    ) -> Result<meerkat_contracts::WireContinuationReceipt, String> {
+        let binding = self
+            .host_signal_binding
+            .as_ref()
+            .ok_or("host signal routing is not configured")?;
+        if scope != &binding.scope
+            || scope.member != KAPELLMEISTER
+            || scope.mob_id != self.meerkat.mob_id()
+            || scope.runtime_path
+                != std::path::absolute(self.state_path()).map_err(|error| error.to_string())?
+        {
+            return Err("host signal scope does not match the coordinator runtime".into());
+        }
         let runtime = self.runtime().await?;
         {
             let _bootstrap_guard = self.kapellmeister_bootstrap.lock().await;
             self.ensure_repo_kapellmeister_member(&runtime).await?;
         }
-        // A host observation must reach the coordinator even when another
-        // member's wiring is the failure being reported. Admission owns wiring.
+        let handle = runtime.mob_handle();
+        if handle.mob_id().as_str() != scope.mob_id {
+            return Err("host signal mob does not match the active native owner".into());
+        }
+        let mode = match signal.envelope.mode {
+            crate::host_signal_journal::SignalHandlingMode::Steer => HandlingMode::Steer,
+        };
+        // This is the public native admission door also used by Meta's keyed
+        // identity sender. Use the original spawn identity for this Core member.
+        // Native continuation service owns admission, replay and lifecycle.
         runtime
-            .mob_handle()
-            .member(&AgentIdentity::from(KAPELLMEISTER))
+            .mob_runtime()
+            .agent_mob_mcp_state()
+            .ok_or("native member continuation service is unavailable")?
+            .mob_member_send_keyed(
+                handle.mob_id(),
+                AgentIdentity::from(scope.member.as_str()),
+                signal.envelope.content.clone().into(),
+                mode,
+                &signal.key.0,
+            )
             .await
-            .map_err(|err| format!("resolve Kapellmeister member: {err}"))?
-            .send(content, HandlingMode::Steer)
-            .await
-            .map_err(|err| format!("deliver Kapellmeister host signal: {err}"))?;
-        let interaction_id = format!(
-            "fugue-host-signal-repo-kapellmeister-{}",
-            Utc::now().timestamp_millis()
-        );
-        Ok(FugueHostSignalAccepted {
-            interaction_id,
-            identity: format!("{RUNTIME_KEY}/{KAPELLMEISTER}"),
-        })
+            .map_err(|error| format!("admit coordinator host signal: {error}"))
     }
 
     pub fn use_console(&self, console: Arc<crate::console::ConsoleHub>) -> Result<(), String> {
@@ -5675,21 +5686,42 @@ pub(crate) mod tests {
             .bootstrap_repo_kapellmeister()
             .await
             .expect("initial coordinator");
-        // Reuse the same native owner but require an absent representative. A
-        // failed repository wiring pass must not prevent host diagnostics.
+        // A failed peer-wiring pass must not prevent subsequent diagnostics.
+        let original_meerkat = registry.meerkat.clone();
         registry.meerkat.repository_runtime = Some(crate::config::RepositoryRuntimeBinding {
             repository: crate::ensemble::config::RepoId::try_from("unavailable-peer".to_owned())
                 .expect("repo id"),
             state_path: temp.path().join("state"),
         });
         assert!(registry.bootstrap_repo_kapellmeister().await.is_err());
+        registry.meerkat = original_meerkat;
         let message = "Fugue host signal fixture: worker completed fixture-123";
+        let scope = crate::host_signal_journal::HostSignalScope {
+            repository_path: temp.path().to_owned(),
+            runtime_path: std::path::absolute(registry.state_path()).unwrap(),
+            mob_id: registry.meerkat.mob_id().into_owned(),
+            member: KAPELLMEISTER.to_owned(),
+            tracker: crate::host_signal_journal::TrackerScope::Linear {
+                endpoint: "https://api.linear.app/graphql".to_owned(),
+                project: "fixture".to_owned(),
+            },
+        };
+        registry.host_signal_binding = Some(HostSignalBinding {
+            path: temp.path().join("signals.sqlite3"),
+            scope: scope.clone(),
+        });
+        let signal = crate::host_signal_journal::PendingSignal {
+            key: crate::host_signal_journal::DeliveryKey("fugue-history-fixture".to_owned()),
+            envelope: crate::host_signal_journal::SignalEnvelope {
+                content: message.to_owned(),
+                mode: crate::host_signal_journal::SignalHandlingMode::Steer,
+            },
+        };
         let accepted = registry
-            .deliver_repo_kapellmeister_signal_batch(message.to_owned())
+            .deliver_repo_kapellmeister_signal(&scope, &signal)
             .await
             .expect("native signal acceptance");
-        assert_eq!(accepted.identity, format!("{RUNTIME_KEY}/{KAPELLMEISTER}"));
-        assert!(!accepted.interaction_id.is_empty());
+        assert!(!accepted.delivery_id.is_empty());
         let runtime = registry.runtime().await.expect("runtime");
         let member = runtime
             .mob_handle()
@@ -5717,6 +5749,207 @@ pub(crate) mod tests {
         .await;
         registry.shutdown().await.expect("shutdown");
         delivered.expect("host signal must reach the native coordinator session");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admitted_host_signal_replays_after_restart_without_duplicate_input() {
+        if !isolated_runtime_test(
+            "admitted_host_signal_replays_after_restart_without_duplicate_input",
+        ) {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        assert_native_host_signal_replay(directory.path(), false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admitted_host_signal_replays_after_process_loss_without_duplicate_input() {
+        const NAME: &str =
+            "admitted_host_signal_replays_after_process_loss_without_duplicate_input";
+        if !isolated_runtime_test(NAME) {
+            return;
+        }
+        const ROOT: &str = "FUGUE_SIGNAL_CRASH_ROOT";
+        if let Some(root) = std::env::var_os(ROOT) {
+            assert_native_host_signal_replay(Path::new(&root), true, false).await;
+            panic!("child must exit before acknowledgement and runtime shutdown");
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(ROOT, directory.path())
+            .env("FUGUE_ISOLATED_RUNTIME_TEST", NAME)
+            .arg(format!("meta_runtime::tests::{NAME}"))
+            .args(["--exact", "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_native_host_signal_replay(directory.path(), false, true).await;
+    }
+
+    async fn assert_native_host_signal_replay(
+        root: &Path,
+        exit_before_ack: bool,
+        restore_after_exit: bool,
+    ) {
+        use crate::host_signal_journal::{
+            HostSignalScope, SignalEnvelope, SignalHandlingMode, TrackerScope,
+        };
+        use meerkat_contracts::WireContinuationStatus;
+        let config = test_meerkat_config(root.join("state"));
+        let scope = HostSignalScope {
+            repository_path: root.to_owned(),
+            runtime_path: meta_runtime_state_path(&config),
+            mob_id: config.mob_id().into_owned(),
+            member: KAPELLMEISTER.to_owned(),
+            tracker: TrackerScope::Linear {
+                endpoint: "https://api.linear.app/graphql".to_owned(),
+                project: "fixture".to_owned(),
+            },
+        };
+        let binding = HostSignalBinding {
+            path: root.join("signals.sqlite3"),
+            scope: scope.clone(),
+        };
+        let message = "host notification survives native admission before journal acknowledgement";
+        {
+            let mut journal = binding.open().unwrap();
+            let mut update = journal.begin().unwrap();
+            update
+                .enqueue_once("fixture-completion", || {
+                    Ok(SignalEnvelope {
+                        content: message.to_owned(),
+                        mode: SignalHandlingMode::Steer,
+                    })
+                })
+                .unwrap();
+            update.commit().unwrap();
+        }
+        let accepted: meerkat_contracts::WireContinuationReceipt = if restore_after_exit {
+            serde_json::from_slice(&std::fs::read(root.join("native-admission.json")).unwrap())
+                .unwrap()
+        } else {
+            let registry = MetaRuntimeRegistry::with_templates(
+                config.clone(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .with_host_signal_binding(binding.clone());
+            let saved = binding.open().unwrap().pending(1).unwrap().remove(0);
+            let accepted = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let receipt = registry
+                        .deliver_repo_kapellmeister_signal(&scope, &saved)
+                        .await
+                        .unwrap();
+                    match receipt.status {
+                        WireContinuationStatus::Admitted { .. } => break receipt,
+                        WireContinuationStatus::Pending => {
+                            tokio::time::sleep(Duration::from_millis(20)).await
+                        }
+                        _ => panic!("unexpected terminal admission: {receipt:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("native admission");
+            // Native has admitted the input, but the host has not committed its ack.
+            assert_eq!(
+                binding.open().unwrap().pending(1).unwrap(),
+                vec![saved.clone()]
+            );
+            let mut conflict = saved.clone();
+            conflict.envelope.content.push_str(" changed");
+            assert!(
+                registry
+                    .deliver_repo_kapellmeister_signal(&scope, &conflict)
+                    .await
+                    .is_err(),
+                "the same key cannot commit changed content"
+            );
+            if exit_before_ack {
+                let path = root.join("native-admission.json");
+                let file = std::fs::File::create(path).unwrap();
+                serde_json::to_writer(&file, &accepted).unwrap();
+                file.sync_all().unwrap();
+                std::fs::File::open(root).unwrap().sync_all().unwrap();
+                std::process::exit(0);
+            }
+            registry.shutdown().await.unwrap();
+            drop(registry);
+            accepted
+        };
+        let saved = binding.open().unwrap().pending(1).unwrap().remove(0);
+        let registry =
+            MetaRuntimeRegistry::with_templates(config, BTreeMap::new(), BTreeMap::new())
+                .with_host_signal_binding(binding.clone());
+        let replayed = Arc::new(Mutex::new(None));
+        let progress = binding
+            .drain_pending(std::num::NonZeroU32::MIN, |scope, signal| {
+                let registry = &registry;
+                let replayed = Arc::clone(&replayed);
+                async move {
+                    let receipt = registry
+                        .deliver_repo_kapellmeister_signal(&scope, &signal)
+                        .await
+                        .map_err(crate::error::FugueError::Workspace)?;
+                    *replayed.lock().unwrap() = Some(receipt.clone());
+                    Ok(receipt)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            replayed.lock().unwrap().as_ref(),
+            Some(&accepted),
+            "restart must reuse the original native receipt and input"
+        );
+        assert_eq!(progress.acknowledged, 1);
+        assert!(binding.open().unwrap().pending(1).unwrap().is_empty());
+        let runtime = registry.runtime().await.unwrap();
+        let session_id = match accepted.status {
+            WireContinuationStatus::Admitted { session_id, .. } => session_id,
+            _ => unreachable!(),
+        };
+        let history = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let history = runtime
+                    .mob_runtime()
+                    .read_session_history(&session_id, 0, None)
+                    .await
+                    .unwrap();
+                if serde_json::to_string(&history.messages)
+                    .unwrap()
+                    .contains(message)
+                {
+                    break history;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("admitted input in canonical history");
+        assert_eq!(
+            history
+                .messages
+                .iter()
+                .filter(|entry| serde_json::to_string(entry).unwrap().contains(message))
+                .count(),
+            1
+        );
+        let mut wrong_scope = scope;
+        wrong_scope.mob_id = "other-repository".into();
+        assert!(
+            registry
+                .deliver_repo_kapellmeister_signal(&wrong_scope, &saved)
+                .await
+                .is_err()
+        );
+        registry.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
