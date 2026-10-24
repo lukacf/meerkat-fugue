@@ -398,6 +398,16 @@ visible to terminal and merge checks. Tracker IDs are resolved to canonical issu
 keys before those checks. Lifecycle tool calls must use tracker state names so
 the configured terminal policy can be evaluated.
 
+Independent review uses existing repository specialists outside the issue's
+execution team. The review orchestrator selects their focus areas and requests
+admission with `fugue_admit_independent_review`. Fugue reserves the current request
+before native flows start; it does not create replacement reviewers. Native
+records supply each verdict. Completion submits run references and must match
+the current request and exact PR head. Replacing a request requires its current
+ID in `supersedes` and a new idempotency key. See the
+[review request contract](./development.mdx#current-review-request) for recovery
+and qualification requirements.
+
 `linear_claim_issue` can also request a lane change through `target_state`.
 That change receives the terminal-obligation check before either assignment or
 transition. Claiming is restricted to issue leads and repository coordinators;

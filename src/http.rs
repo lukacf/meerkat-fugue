@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,10 +19,8 @@ use axum::{Json, Router};
 use base64::Engine;
 use chrono::Utc;
 use indexmap::IndexMap;
-use meerkat::{
-    CreateWorkItemRequest, SqliteWorkGraphStore, WorkCompletionPolicy, WorkGraphService,
-    WorkItemFilter, WorkNamespace, WorkPriority, WorkStatus,
-};
+#[cfg(test)]
+use meerkat::{SqliteWorkGraphStore, WorkGraphService, WorkItemFilter, WorkNamespace};
 use meerkat_meta::ConsolePolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -40,14 +39,15 @@ use crate::deploy_gate::{
 };
 use crate::domain::Issue;
 use crate::final_pr_gate::FinalPrGateStartRequest;
-use crate::github_tools::GitHubToolHost;
+#[cfg(test)]
+use crate::independent_review::{IndependentReviewAggregationInput, aggregate_independent_review};
 use crate::independent_review::{
-    IndependentReviewAggregationInput, IndependentReviewCompletionRequest,
-    IndependentReviewDecision, IndependentReviewStartRequest, IndependentReviewWorkGraphScope,
-    aggregate_independent_review,
+    IndependentReviewCompletionRequest, IndependentReviewStartRequest,
 };
 use crate::linear_adapter::IssueAdapter;
-use crate::meta_runtime::{MetaRuntimeRegistry, meta_runtime_state_path};
+use crate::meta_runtime::MetaRuntimeRegistry;
+#[cfg(test)]
+use crate::meta_runtime::meta_runtime_state_path;
 use crate::orchestrator::{
     InternalMessage, RetryRow, RunningRow, SharedState, issue_snapshot, snapshot,
 };
@@ -67,6 +67,7 @@ struct AppState {
     config: ServiceConfig,
     refresh_tx: mpsc::Sender<()>,
     internal_tx: mpsc::Sender<InternalMessage>,
+    meta_runtime_registry: MetaRuntimeRegistry,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -151,6 +152,7 @@ pub(crate) async fn router(
         config: config.clone(),
         refresh_tx,
         internal_tx,
+        meta_runtime_registry: meta_runtime_registry.clone(),
     };
     let app = Router::new()
         .route("/api/v1/build", get(crate::build_identity::endpoint))
@@ -206,8 +208,16 @@ pub(crate) async fn router(
             post(api_kapellmeister_start_independent_review),
         )
         .route(
+            "/api/v1/kapellmeister/admit-independent-review",
+            post(api_kapellmeister_admit_independent_review),
+        )
+        .route(
             "/api/v1/kapellmeister/complete-independent-review",
             post(api_kapellmeister_complete_independent_review),
+        )
+        .route(
+            "/api/v1/kapellmeister/complete-final-pr-gate",
+            post(api_kapellmeister_complete_final_pr_gate),
         )
         .route(
             "/api/v1/kapellmeister/deploy",
@@ -4565,104 +4575,149 @@ async fn api_kapellmeister_start_independent_review(
     }
 }
 
+async fn api_kapellmeister_admit_independent_review(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<crate::independent_review::IndependentReviewAdmissionRequest>,
+) -> axum::response::Response {
+    if let Err(response) = authorize_console_browser(&app.config, &headers) {
+        return response;
+    }
+    if !app.config.independent_review.enabled && !app.config.final_review.enabled {
+        return bad_request(
+            "independent_review_disabled",
+            "Independent review is disabled for this repository.",
+        );
+    }
+    let (candidate, _) = match crate::native_review::resolve_candidate(
+        &app.config,
+        request.issue,
+        &request.repo,
+        crate::tools::GitHubPullRequestRef::Number {
+            number: request.pull_request,
+        },
+    )
+    .await
+    {
+        Ok(candidate) => candidate,
+        Err(error) => return bad_request("review_candidate_unavailable", &error.to_string()),
+    };
+    if candidate.head_sha != request.head_sha {
+        return bad_request(
+            "review_candidate_changed",
+            "The PR head changed. Inspect it before requesting review.",
+        );
+    }
+    let draft = crate::review_requests::ReviewRequestDraft {
+        candidate,
+        reviewers: request.reviewers,
+        task: request.task,
+        idempotency_key: request.idempotency_key,
+        supersedes: request.supersedes,
+    };
+    match app.meta_runtime_registry.admit_native_review(draft).await {
+        Ok((intent, native_review)) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "result": {"accepted":true, "intent":intent, "native_review":native_review}
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            use crate::review_requests::ReviewRequestError;
+            let current = match &error {
+                ReviewRequestError::CurrentChanged { current } => current.as_deref(),
+                _ => None,
+            };
+            let message = match &error {
+                ReviewRequestError::CurrentChanged { .. } => {
+                    "A review request already exists. Explicitly supersede its current request ID."
+                }
+                ReviewRequestError::KeyConflict => {
+                    "This idempotency key belongs to another assignment. Retry unchanged or supersede explicitly with a new key."
+                }
+                ReviewRequestError::Superseded => {
+                    "This request has been superseded and cannot be restored by retrying."
+                }
+                ReviewRequestError::IneligibleReviewer => {
+                    "Select existing repository specialists outside this issue's execution team, using their actual native profiles."
+                }
+                _ => {
+                    "Review admission could not be confirmed. Retry the unchanged request and key; inspect native runs if it remains unavailable."
+                }
+            };
+            tracing::warn!(%error, "native review admission rejected");
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "result": {"accepted":false, "message":message, "current_request":current}
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn api_kapellmeister_complete_independent_review(
     State(app): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<IndependentReviewCompletionRequest>,
 ) -> axum::response::Response {
+    complete_native_review_response(
+        app,
+        headers,
+        request,
+        crate::review_completion::ReviewCompletionKind::Independent,
+    )
+    .await
+}
+
+async fn api_kapellmeister_complete_final_pr_gate(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<IndependentReviewCompletionRequest>,
+) -> axum::response::Response {
+    complete_native_review_response(
+        app,
+        headers,
+        request,
+        crate::review_completion::ReviewCompletionKind::Final,
+    )
+    .await
+}
+
+async fn complete_native_review_response(
+    app: AppState,
+    headers: HeaderMap,
+    request: IndependentReviewCompletionRequest,
+    kind: crate::review_completion::ReviewCompletionKind,
+) -> axum::response::Response {
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
-    let issue_identifier =
-        issue_identifier_from_ref_http(&request.issue).unwrap_or_else(|| "unknown".to_string());
-    if !app.config.independent_review.enabled {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "result": {
-                    "accepted": false,
-                    "issue_identifier": issue_identifier,
-                    "message": "independent review lane is disabled by configuration"
-                }
-            })),
+    // Finish an accepted operation even if the browser disconnects. An unchanged
+    // final-review retry also accepts an already-confirmed merge for projection.
+    let completion = tokio::spawn(async move {
+        let host = crate::github_tools::GitHubToolHost::with_connections(
+            app.config.meerkat.runtime_connections.clone(),
+        );
+        crate::review_completion::complete(
+            &app.config,
+            &app.meta_runtime_registry,
+            request,
+            kind,
+            host,
         )
-            .into_response();
-    }
-    if let Err(error) = request.validate().and_then(|()| {
-        request
-            .workgraph_scope
-            .validate_for_mob(&app.config.meerkat.mob_id())
-    }) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "result": {
-                    "accepted": false,
-                    "issue_identifier": issue_identifier,
-                    "message": format!("invalid independent review completion: {error}")
-                }
-            })),
-        )
-            .into_response();
-    }
-    let issue_identifier = match crate::workgraph_gate::canonical_issue_identifier(
-        &app.config.tracker,
-        &request.issue,
-    )
-    .await
-    {
-        Ok(identifier) => identifier,
-        Err(error) => return bad_request("issue_not_resolved", &error),
-    };
-    let plan = aggregate_independent_review(IndependentReviewAggregationInput {
-        config: app.config.independent_review.clone(),
-        issue_identifier: issue_identifier.clone(),
-        head_sha: request.head_sha.clone(),
-        verdicts: request.verdicts.clone(),
-        timed_out: request.timed_out,
-    });
-    if plan.decision == IndependentReviewDecision::Waiting {
-        return (
-            StatusCode::ACCEPTED,
-            Json(json!({
-                "result": {
-                    "accepted": true,
-                    "issue_identifier": issue_identifier,
-                    "message": plan.reasons.join("; "),
-                    "plan": plan
-                }
-            })),
-        )
-            .into_response();
-    }
-    match record_independent_review_projection(&app.config, &request, &issue_identifier, &plan)
         .await
-    {
-        Ok(result) => (
-            StatusCode::ACCEPTED,
-            Json(json!({
-                "result": {
-                    "accepted": true,
-                    "issue_identifier": issue_identifier,
-                    "message": "independent review completion recorded",
-                    "plan": plan,
-                    "projection": result
-                }
-            })),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({
-                "result": {
-                    "accepted": false,
-                    "issue_identifier": issue_identifier,
-                    "message": error.to_string(),
-                    "plan": plan
-                }
-            })),
-        )
-            .into_response(),
+    })
+    .await;
+    match completion {
+        Ok(Ok(result)) => (StatusCode::ACCEPTED, Json(json!({"result":result}))).into_response(),
+        Ok(Err(error)) => {
+            let status = if error.code == "review_projection_failed" { StatusCode::BAD_GATEWAY } else { StatusCode::CONFLICT };
+            (status, Json(json!({"result":{"accepted":false,"message":error.message}, "error":{"code":error.code}}))).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"result":{"accepted":false,"message":"Review completion was interrupted. Inspect current review and remote PR state before retrying."}}))).into_response(),
     }
 }
 
@@ -4696,7 +4751,7 @@ async fn execute_kapellmeister_deploy(
     app: AppState,
     request: DeployStartRequest,
 ) -> axum::response::Response {
-    let result = execute_deploy_transaction(app.config, request).await;
+    let result = execute_deploy_transaction(app.config, app.meta_runtime_registry, request).await;
     let status = if result.accepted {
         StatusCode::ACCEPTED
     } else {
@@ -4719,6 +4774,7 @@ async fn execute_kapellmeister_deploy(
 
 pub async fn execute_deploy_transaction(
     config: ServiceConfig,
+    registry: MetaRuntimeRegistry,
     request: DeployStartRequest,
 ) -> DeployTransactionResult {
     let issue_identifier =
@@ -4734,33 +4790,23 @@ pub async fn execute_deploy_transaction(
             ota: None,
         };
     }
-    match deploy_idempotency_already_recorded(&config, &request.issue, &request.idempotency_key)
-        .await
-    {
-        Ok(true) => {
-            return DeployTransactionResult {
-                accepted: true,
-                issue_identifier,
-                message: "deploy idempotency key is already recorded; skipping duplicate merge/OTA attempt".to_string(),
-                failure_category: None,
-                plan: None,
-                outcome: None,
-                ota: None,
-            };
-        }
-        Ok(false) => {}
-        Err(error) => {
-            return DeployTransactionResult {
-                accepted: false,
-                issue_identifier,
-                message: error.to_string(),
-                failure_category: Some(DeployFailureCategory::Unknown),
-                plan: None,
-                outcome: None,
-                ota: None,
-            };
-        }
-    }
+    let issue_identifier =
+        match crate::workgraph_gate::canonical_issue_identifier(&config.tracker, &request.issue)
+            .await
+        {
+            Ok(identifier) => identifier,
+            Err(error) => {
+                return DeployTransactionResult {
+                    accepted: false,
+                    issue_identifier,
+                    message: format!("Cannot resolve the deployment issue: {error}"),
+                    failure_category: Some(DeployFailureCategory::UnsafeDeploy),
+                    plan: None,
+                    outcome: None,
+                    ota: None,
+                };
+            }
+        };
     let ota_update = config.ota_update.clone();
     let ota_update_enabled = ota_update.as_ref().is_some_and(|config| config.enabled);
     let plan = plan_deploy_gate(DeployGateInput {
@@ -4808,12 +4854,14 @@ pub async fn execute_deploy_transaction(
             ota: None,
         };
     };
-    let merge_result = crate::workgraph_gate::WorkGraphTerminalGate::for_service(&config)
-        .merge_pr_with(&config.tracker, &request.issue, merge_input, |input| {
-            GitHubToolHost::with_connections(config.meerkat.runtime_connections.clone())
-                .merge_pr(input)
-        })
-        .await;
+    let merge_result = crate::merge_gate::merge(
+        &config,
+        &registry,
+        request.issue.clone(),
+        merge_input,
+        crate::merge_gate::MergePurpose::Deploy,
+    )
+    .await;
     let merge_output = match merge_result {
         crate::tools::FugueToolResult::Ok {
             output: FugueToolOutput::GitHubMergePr(output),
@@ -4945,16 +4993,35 @@ pub async fn execute_deploy_transaction(
             ota: None,
         };
     };
-    let ota_report = match run_ota_update(&ota_config).await {
-        Ok(report) => report,
+    // The receipt retains deployment ownership through every projection below.
+    let receipt = match crate::deployment_receipts::run(&config, &request, &merged_sha).await {
+        Ok(receipt) => receipt,
         Err(error) => {
-            let outcome = deploy_failure_outcome(
+            return DeployTransactionResult {
+                accepted: false,
+                issue_identifier,
+                message: error.to_string(),
+                failure_category: Some(DeployFailureCategory::UnsafeDeploy),
+                plan: Some(plan),
+                outcome: None,
+                ota: None,
+            };
+        }
+    };
+    let ota_report = match &receipt.outcome {
+        Ok(report) => report.clone(),
+        Err(error) => {
+            let mut outcome = deploy_failure_outcome(
                 issue_identifier.clone(),
                 &request,
                 DeployFailureCategory::OtaFailed,
                 Utc::now(),
                 Utc::now(),
             );
+            outcome.merge = Some(crate::deploy_gate::DeployMergeEvidence {
+                method: config.deploy.merge_method,
+                merged_sha: merged_sha.clone(),
+            });
             if let Err(projection_error) = record_failed_deploy_projection(
                 &config,
                 &request,
@@ -5170,6 +5237,7 @@ async fn record_deploy_projection(
     Ok(())
 }
 
+#[cfg(test)]
 async fn deploy_idempotency_already_recorded(
     config: &ServiceConfig,
     issue: &LinearIssueRef,
@@ -5186,6 +5254,7 @@ async fn deploy_idempotency_already_recorded(
     }))
 }
 
+#[cfg(test)]
 fn deploy_success_idempotency_recorded_in_workpad(
     body_markdown: &str,
     idempotency_key: &IdempotencyKey,
@@ -5338,189 +5407,24 @@ fn deploy_post_merge_ota_failure_outcome(
     }
 }
 
-#[derive(Debug, Serialize)]
-struct IndependentReviewProjectionResult {
-    target_lane: String,
-    workpad_comment_id: String,
-    findings_comment_id: Option<String>,
-    workgraph_items: Vec<IndependentReviewWorkGraphItemRef>,
-}
-
-#[derive(Debug, Serialize)]
-struct IndependentReviewWorkGraphItemRef {
-    id: String,
-    realm_id: String,
-    namespace: String,
-}
-
+#[cfg(test)]
 async fn record_independent_review_projection(
     config: &ServiceConfig,
     request: &IndependentReviewCompletionRequest,
     issue_identifier: &str,
     plan: &crate::independent_review::IndependentReviewAggregationPlan,
-) -> anyhow::Result<IndependentReviewProjectionResult> {
-    request.validate()?;
-    request
-        .workgraph_scope
-        .validate_for_mob(&config.meerkat.mob_id())?;
-    let target_lane = plan
-        .target_lane
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("independent review projection has no target lane"))?;
-    let adapter = IssueAdapter::from_config(&config.tracker)?;
-    let canonical = adapter
-        .inspect_issue(InspectIssueInput {
-            issue: request.issue.clone(),
-        })
-        .await?;
-    if canonical.issue.identifier.0 != issue_identifier {
-        anyhow::bail!("review obligation labels must use the tracker's canonical issue identifier");
-    }
-    let review_summary = serde_json::to_string_pretty(&json!({
-        "schema_version": crate::independent_review::INDEPENDENT_REVIEW_SCHEMA_VERSION,
-        "issue_identifier": issue_identifier,
-        "pull_request": request.pull_request,
-        "head_sha": request.head_sha,
-        "decision": plan.decision,
-        "target_lane": target_lane,
-        "reasons": plan.reasons,
-        "verdicts": request.verdicts,
-        "timed_out": request.timed_out,
-    }))?;
-    let workpad = adapter
-        .upsert_workpad(UpsertWorkpadInput {
-            issue: request.issue.clone(),
-            heading: "## Fugue Workpad".to_string(),
-            body_markdown: format!("### Independent Review\n\n```json\n{review_summary}\n```"),
-            create_if_missing: true,
-            idempotency_key: IdempotencyKey(format!(
-                "independent-review-workpad:{}:{}",
-                issue_identifier, request.idempotency_key.0
-            )),
-        })
-        .await?;
-
-    let workgraph_projection =
-        create_independent_review_workgraph_items(config, &request.workgraph_scope, plan).await?;
-
-    let mut findings_comment_id = None;
-    if let Some(comment) = &plan.consolidated_comment
-        && (workgraph_projection.created_any || workgraph_projection.item_refs.is_empty())
-    {
-        let comment = adapter
-            .add_comment(AddCommentInput {
-                issue: request.issue.clone(),
-                body_markdown: format!(
-                    "{}\n\nIdempotency-Key: `{}`",
-                    comment, request.idempotency_key.0
-                ),
-                attachments: Vec::new(),
-            })
-            .await?;
-        findings_comment_id = Some(comment.comment_id.0);
-    }
-
-    adapter
-        .move_issue(MoveIssueInput {
-            issue: request.issue.clone(),
-            state: LinearStateRef::Name {
-                name: target_lane.clone(),
-            },
-            expected_updated_at: None,
-            idempotency_key: IdempotencyKey(format!(
-                "independent-review-move:{}:{}",
-                issue_identifier, request.idempotency_key.0
-            )),
-        })
-        .await?;
-
-    Ok(IndependentReviewProjectionResult {
-        target_lane,
-        workpad_comment_id: workpad.comment_id.0,
-        findings_comment_id,
-        workgraph_items: workgraph_projection.item_refs,
-    })
-}
-
-struct IndependentReviewWorkGraphProjection {
-    item_refs: Vec<IndependentReviewWorkGraphItemRef>,
-    created_any: bool,
-}
-
-async fn create_independent_review_workgraph_items(
-    config: &ServiceConfig,
-    scope: &IndependentReviewWorkGraphScope,
-    plan: &crate::independent_review::IndependentReviewAggregationPlan,
-) -> anyhow::Result<IndependentReviewWorkGraphProjection> {
-    if plan.workgraph_items.is_empty() {
-        return Ok(IndependentReviewWorkGraphProjection {
-            item_refs: Vec::new(),
-            created_any: false,
-        });
-    }
-    scope.validate()?;
-    let workgraph_path = meta_runtime_state_path(&config.meerkat).join("workgraph.sqlite3");
-    if let Some(parent) = workgraph_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let store = SqliteWorkGraphStore::open(&workgraph_path)?;
-    let namespace = WorkNamespace::new(scope.namespace.clone())?;
-    let service = WorkGraphService::with_scope(Arc::new(store), &scope.realm_id, namespace.clone());
-    let mut item_refs = Vec::new();
-    let mut created_any = false;
-    for item in &plan.workgraph_items {
-        let labels = item.labels.iter().cloned().collect::<BTreeSet<_>>();
-        let existing = service
-            .list(WorkItemFilter {
-                realm_id: Some(scope.realm_id.clone()),
-                namespace: Some(namespace.clone()),
-                all_namespaces: false,
-                statuses: Vec::new(),
-                labels: item.labels.clone(),
-                include_terminal: false,
-                limit: None,
-            })
-            .await?
-            .into_iter()
-            .find(|existing| {
-                existing.title == item.title
-                    && existing.description.as_deref() == Some(item.detail.as_str())
-            });
-        let work_item = match existing {
-            Some(existing) => existing,
-            None => {
-                created_any = true;
-                service
-                    .create(CreateWorkItemRequest {
-                        realm_id: Some(scope.realm_id.clone()),
-                        namespace: Some(namespace.clone()),
-                        title: item.title.clone(),
-                        description: Some(item.detail.clone()),
-                        priority: WorkPriority::High,
-                        completion_policy: WorkCompletionPolicy::SelfAttest,
-                        failed_child_join_policy: Default::default(),
-                        cancelled_child_join_policy: Default::default(),
-                        labels,
-                        due_at: None,
-                        not_before: None,
-                        snoozed_until: None,
-                        external_refs: Vec::new(),
-                        evidence_refs: Vec::new(),
-                        status: Some(WorkStatus::Open),
-                    })
-                    .await?
-            }
-        };
-        item_refs.push(IndependentReviewWorkGraphItemRef {
-            id: work_item.id.to_string(),
-            realm_id: work_item.realm_id,
-            namespace: work_item.namespace.to_string(),
-        });
-    }
-    Ok(IndependentReviewWorkGraphProjection {
-        item_refs,
-        created_any,
-    })
+    verdicts: &[crate::independent_review::IndependentReviewVerdict],
+) -> anyhow::Result<crate::review_completion::IndependentReviewProjectionResult> {
+    crate::review_completion::record_review_projection(
+        config,
+        request,
+        issue_identifier,
+        plan,
+        verdicts,
+        None,
+        crate::review_completion::ReviewCompletionKind::Independent,
+    )
+    .await
 }
 
 async fn api_ota_update(State(app): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -8383,6 +8287,7 @@ mod tests {
             ci_status: Some(crate::tools::CiStatus::Success),
             unresolved_workgraph_blockers: 0,
             idempotency_key: IdempotencyKey("deploy:LUC-631:abc123".to_string()),
+            retry_deployment: None,
         };
         let now = Utc::now();
         let outcome = DeployOutcome {
@@ -8464,6 +8369,24 @@ mod tests {
                 .await
                 .expect("idempotency check")
         );
+        // A historical receipt is useful evidence, but cannot authorize a
+        // changed request with the same key or bypass current policy.
+        let mut retry = request.clone();
+        retry.issue = LinearIssueRef::Id {
+            id: inspected.issue.id.clone(),
+        };
+        retry.pull_request.repo.name = GitHubRepoName("unconfigured-repository".into());
+        let registry = MetaRuntimeRegistry::new(config.meerkat.clone());
+        let refused = execute_deploy_transaction(config, registry, retry).await;
+        assert!(
+            !refused.accepted,
+            "a Workpad receipt must not authorize a deploy"
+        );
+        assert!(refused.plan.is_some(), "retry must evaluate current policy");
+        assert_eq!(
+            refused.issue_identifier, "LUC-631",
+            "immutable IDs must resolve to the canonical issue key in deployment evidence"
+        );
     }
 
     #[tokio::test]
@@ -8528,6 +8451,7 @@ mod tests {
             ci_status: Some(crate::tools::CiStatus::Failure),
             unresolved_workgraph_blockers: 0,
             idempotency_key: IdempotencyKey("deploy:LUC-632:abc123".to_string()),
+            retry_deployment: None,
         };
         let plan = plan_deploy_gate(DeployGateInput {
             config: config.deploy.clone(),
@@ -8605,6 +8529,7 @@ mod tests {
             ci_status: Some(crate::tools::CiStatus::Success),
             unresolved_workgraph_blockers: 0,
             idempotency_key: IdempotencyKey("deploy:LUC-637:head123".to_string()),
+            retry_deployment: None,
         };
         let merge = MergePrOutput {
             pull_request: request.pull_request.clone(),
@@ -8612,6 +8537,7 @@ mod tests {
             merge_commit_sha: Some(GitSha("merge456".to_string())),
         };
         let ota = OtaUpdateReport {
+            deployment_attempt: None,
             status: OtaUpdateStatus::Failed,
             branch: "main".to_string(),
             remote: "origin".to_string(),
@@ -8665,6 +8591,7 @@ mod tests {
     fn deploy_success_requires_ota_target_to_match_merge_commit() {
         let now = Utc::now();
         let ota = OtaUpdateReport {
+            deployment_attempt: None,
             status: OtaUpdateStatus::Succeeded,
             branch: "main".to_string(),
             remote: "origin".to_string(),
@@ -8720,8 +8647,10 @@ mod tests {
             ci_status: Some(crate::tools::CiStatus::Success),
             unresolved_workgraph_blockers: 0,
             idempotency_key: IdempotencyKey("deploy:LUC-642:head123".to_string()),
+            retry_deployment: None,
         };
         let ota = OtaUpdateReport {
+            deployment_attempt: None,
             status: OtaUpdateStatus::Succeeded,
             branch: "main".to_string(),
             remote: "origin".to_string(),
@@ -8817,6 +8746,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn independent_review_http_rejects_caller_verdicts_before_projection() {
+        use tower::ServiceExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let (_, owner) = managed_test_router(root.path(), None).await;
+        let mut config = owner.config().effective().clone();
+        config.independent_review.enabled = true;
+        crate::fugue_ims::create_issue_for_config(
+            &config.tracker,
+            CreateFugueIssue {
+                key: ImsIssueKey("TEST-1".into()),
+                repo: "test/repository".into(),
+                title: "Review must use native results".into(),
+                description: None,
+                stage: ImsStageName("Todo".into()),
+                labels: Vec::new(),
+            },
+        )
+        .unwrap();
+        let adapter = IssueAdapter::from_config(&config.tracker).unwrap();
+        let issue = LinearIssueRef::Identifier {
+            identifier: LinearIssueIdentifier("TEST-1".into()),
+        };
+        let before = adapter
+            .inspect_issue(InspectIssueInput {
+                issue: issue.clone(),
+            })
+            .await
+            .unwrap();
+        let request = IndependentReviewCompletionRequest {
+            issue: issue.clone(),
+            pull_request: GitHubPullRequestSnapshot {
+                repo: GitHubRepoRef {
+                    host: None,
+                    owner: GitHubOwner("test".into()),
+                    name: GitHubRepoName("repository".into()),
+                },
+                number: GitHubPullRequestNumber(1),
+                title: "Review candidate".into(),
+                url: "https://github.com/test/repository/pull/1".into(),
+                state: PullRequestState::Open,
+                draft: false,
+                head_branch: BranchName("feature".into()),
+                base_branch: BranchName("main".into()),
+                head_sha: GitSha("a".repeat(40)),
+            },
+            head_sha: GitSha("a".repeat(40)),
+            workgraph_scope: crate::independent_review::IndependentReviewWorkGraphScope {
+                realm_id: meerkat_core::mob_realm_id(&config.meerkat.mob_id())
+                    .unwrap()
+                    .to_string(),
+                namespace: meerkat::WorkNamespace::default().as_str().into(),
+            },
+            native_review: crate::native_review::ReviewReference {
+                runs: vec![meerkat_mob::RunId::new()],
+            },
+            idempotency_key: IdempotencyKey("review:test-1:round-1".into()),
+        };
+        let (refresh, _receiver) = mpsc::channel(1);
+        let app = router(
+            owner.shared_state(),
+            config,
+            refresh,
+            owner.internal_sender(),
+            owner.meta_runtime_registry(),
+            None,
+        )
+        .await
+        .unwrap();
+        for endpoint in ["complete-independent-review", "complete-final-pr-gate"] {
+            for forged_field in ["verdicts", "timed_out", "missing_native_review"] {
+                let mut payload = serde_json::to_value(&request).unwrap();
+                match forged_field {
+                    "verdicts" => {
+                        payload["verdicts"] = json!([test_review_verdict(
+                            "claimed-reviewer",
+                            crate::independent_review::IndependentReviewVerdictStatus::Green,
+                        )])
+                    }
+                    "timed_out" => payload["timed_out"] = json!(true),
+                    _ => {
+                        payload.as_object_mut().unwrap().remove("native_review");
+                    }
+                }
+                let response = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::post(format!("/api/v1/kapellmeister/{endpoint}"))
+                            .header("host", "127.0.0.1:4719")
+                            .header("origin", "http://127.0.0.1:4719")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(payload.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "{forged_field}"
+                );
+            }
+        }
+        let admission = json!({
+            "issue":issue, "repo":request.pull_request.repo,
+            "pull_request":1, "head_sha":"a".repeat(40),
+            "reviewers":{"domain":["repo:a", "repo:b", "repo:c"]},
+            "task":"Review the candidate", "idempotency_key":"test-request"
+        });
+        for field in ["round", "verdicts", "accepted", "tracker_context"] {
+            let mut forged = admission.clone();
+            forged[field] = json!("caller-owned authority");
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::post("/api/v1/kapellmeister/admit-independent-review")
+                        .header("host", "127.0.0.1:4719")
+                        .header("origin", "http://127.0.0.1:4719")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(forged.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{field}"
+            );
+        }
+        let after = adapter
+            .inspect_issue(InspectIssueInput { issue })
+            .await
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "untrusted completion must not change issue, comments or workpad"
+        );
+    }
+
+    #[tokio::test]
     async fn independent_review_red_projection_records_comment_workgraph_and_rework_lane() {
         let temp = tempfile::tempdir().expect("tempdir");
         let ims_path = temp.path().join("ims.sqlite");
@@ -8861,6 +8931,20 @@ mod tests {
             },
         )
         .expect("create issue");
+        let verdicts = vec![
+            test_review_verdict(
+                "runtime-boundary",
+                crate::independent_review::IndependentReviewVerdictStatus::Red,
+            ),
+            test_review_verdict(
+                "operator-workflow",
+                crate::independent_review::IndependentReviewVerdictStatus::Green,
+            ),
+            test_review_verdict(
+                "test-coverage",
+                crate::independent_review::IndependentReviewVerdictStatus::Green,
+            ),
+        ];
         let request = IndependentReviewCompletionRequest {
             issue: LinearIssueRef::Identifier {
                 identifier: LinearIssueIdentifier("LUC-633".to_string()),
@@ -8887,35 +8971,23 @@ mod tests {
                     .to_string(),
                 namespace: WorkNamespace::default().as_str().to_string(),
             },
-            verdicts: vec![
-                test_review_verdict(
-                    "runtime-boundary",
-                    crate::independent_review::IndependentReviewVerdictStatus::Red,
-                ),
-                test_review_verdict(
-                    "operator-workflow",
-                    crate::independent_review::IndependentReviewVerdictStatus::Green,
-                ),
-                test_review_verdict(
-                    "test-coverage",
-                    crate::independent_review::IndependentReviewVerdictStatus::Green,
-                ),
-            ],
-            timed_out: false,
+            native_review: crate::native_review::ReviewReference {
+                runs: vec![meerkat_mob::RunId::new()],
+            },
             idempotency_key: IdempotencyKey("review:LUC-633:abc123:1".to_string()),
         };
         let plan = aggregate_independent_review(IndependentReviewAggregationInput {
             config: config.independent_review.clone(),
             issue_identifier: "LUC-633".to_string(),
             head_sha: request.head_sha.clone(),
-            verdicts: request.verdicts.clone(),
+            verdicts: verdicts.clone(),
             timed_out: false,
         });
 
         let mut mismatched = request.clone();
         mismatched.pull_request.head_sha = GitSha("new-unreviewed-head".into());
         assert!(
-            record_independent_review_projection(&config, &mismatched, "LUC-633", &plan)
+            record_independent_review_projection(&config, &mismatched, "LUC-633", &plan, &verdicts)
                 .await
                 .is_err(),
             "a PR snapshot and review must name the same head before any projection"
@@ -8924,24 +8996,37 @@ mod tests {
         let mut foreign_scope = request.clone();
         foreign_scope.workgraph_scope.realm_id = "another-repository".into();
         assert!(
-            record_independent_review_projection(&config, &foreign_scope, "LUC-633", &plan)
-                .await
-                .is_err(),
+            record_independent_review_projection(
+                &config,
+                &foreign_scope,
+                "LUC-633",
+                &plan,
+                &verdicts
+            )
+            .await
+            .is_err(),
             "review obligations must not escape the repository's native realm"
         );
 
         let mut foreign_namespace = request.clone();
         foreign_namespace.workgraph_scope.namespace = "hidden-review".into();
         assert!(
-            record_independent_review_projection(&config, &foreign_namespace, "LUC-633", &plan)
-                .await
-                .is_err(),
+            record_independent_review_projection(
+                &config,
+                &foreign_namespace,
+                "LUC-633",
+                &plan,
+                &verdicts
+            )
+            .await
+            .is_err(),
             "review blockers must use the namespace granted to repository agents and merge guards"
         );
 
-        let projection = record_independent_review_projection(&config, &request, "LUC-633", &plan)
-            .await
-            .expect("review projection");
+        let projection =
+            record_independent_review_projection(&config, &request, "LUC-633", &plan, &verdicts)
+                .await
+                .expect("review projection");
 
         assert_eq!(projection.target_lane, "Rework");
         assert!(projection.findings_comment_id.is_some());
@@ -8957,7 +9042,7 @@ mod tests {
             WorkNamespace::default().as_str()
         );
         let repeated_projection =
-            record_independent_review_projection(&config, &request, "LUC-633", &plan)
+            record_independent_review_projection(&config, &request, "LUC-633", &plan, &verdicts)
                 .await
                 .expect("repeat review projection");
         assert_eq!(repeated_projection.target_lane, "Rework");

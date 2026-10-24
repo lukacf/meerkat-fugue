@@ -64,6 +64,25 @@ pub struct DeployStartRequest {
     #[serde(default)]
     pub unresolved_workgraph_blockers: usize,
     pub idempotency_key: IdempotencyKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_deployment: Option<crate::DeploymentRetry>,
+}
+
+pub(crate) fn deploy_start_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Typed DeployStartRequest with issue, PR snapshot, recorded head, CI status, WorkGraph blocker count and idempotency key. Replay unchanged requests with the same key. An intentional deployment retry requires a new key and retry_deployment; it does not waive review, PR, CI or WorkGraph checks.",
+        "properties": {
+            "retry_deployment": {
+                "type":"object", "additionalProperties":false,
+                "description":"Use only after the operator inspected a failed or uncertain attempt and explicitly authorized another execution. Do not automatically retry an uncertain deployment.",
+                "properties": {
+                    "attempt_id":{"type":"string", "minLength":1},
+                    "reason":{"type":"string", "minLength":1}
+                }, "required":["attempt_id","reason"]
+            }
+        }, "additionalProperties":true
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,12 +330,17 @@ pub fn plan_deploy_gate(input: DeployGateInput) -> DeployGatePlan {
             "PR base branch does not match deploy policy",
         );
     }
-    if pull_request.state != PullRequestState::Open {
+    // A merged snapshot may resume an uncertain transaction. The execution
+    // gate still verifies the actual merge commit and every current prerequisite.
+    if !matches!(
+        pull_request.state,
+        PullRequestState::Open | PullRequestState::Merged
+    ) {
         return deploy_failure_plan(
             DeployGateDecision::Blocked,
             config.blocked_lane,
             DeployFailureCategory::MergeFailed,
-            "PR is not open",
+            "PR is neither open nor already merged",
         );
     }
     if config.require_fresh_head {

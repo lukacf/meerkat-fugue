@@ -148,6 +148,39 @@ pub(crate) struct RepositorySpecialist {
     pub paths: Vec<PathBuf>,
 }
 
+fn resolve_review_specialists(
+    reviewers: &meerkat_mob::FlowRoleTargets,
+    specialists: &[RepositorySpecialist],
+    issue_participants: &BTreeSet<String>,
+) -> Result<meerkat_mob::FlowRoleTargets, crate::review_requests::ReviewRequestError> {
+    let mut bindings = Vec::new();
+    for (role, identities) in reviewers.bound_roles() {
+        let mut resolved = Vec::new();
+        for identity in identities {
+            let specialist = specialists
+                .iter()
+                .find(|specialist| {
+                    specialist.identity == identity.as_str()
+                        || meerkat_meta::member_comms_id::roster_member_id_for_identity(
+                            &specialist.identity,
+                        ) == *identity
+                })
+                .ok_or(crate::review_requests::ReviewRequestError::IneligibleReviewer)?;
+            let native =
+                meerkat_meta::member_comms_id::roster_member_id_for_identity(&specialist.identity);
+            if issue_participants.contains(native.as_str())
+                || issue_participants.contains(&specialist.identity)
+            {
+                return Err(crate::review_requests::ReviewRequestError::IneligibleReviewer);
+            }
+            resolved.push(native);
+        }
+        bindings.push((role.clone(), resolved));
+    }
+    meerkat_mob::FlowRoleTargets::new(bindings)
+        .map_err(|_| crate::review_requests::ReviewRequestError::IneligibleReviewer)
+}
+
 #[derive(Clone)]
 pub struct MetaRuntimeRegistry {
     meerkat: MeerkatConfig,
@@ -156,7 +189,7 @@ pub struct MetaRuntimeRegistry {
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
     templates: BTreeMap<String, MaterializedMobTemplate>,
-    final_review_reviewers: Vec<FinalReviewReviewerConfig>,
+    final_review: crate::config::FinalReviewConfig,
     independent_review: IndependentReviewConfig,
     runtime: Arc<tokio::sync::Mutex<Option<Arc<UnifiedRuntime>>>>,
     specialists: Arc<OnceLock<Vec<RepositorySpecialist>>>,
@@ -171,6 +204,186 @@ pub struct MetaRuntimeRegistry {
 }
 
 impl MetaRuntimeRegistry {
+    fn review_requests(&self) -> crate::review_requests::ReviewRequestStore {
+        crate::review_requests::ReviewRequestStore::new(
+            self.state_path().join("review-requests.sqlite3"),
+        )
+    }
+
+    pub(crate) async fn with_current_review<T: Send + 'static>(
+        &self,
+        intent: crate::native_review::ReviewIntent,
+        action: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, crate::review_requests::ReviewRequestError> {
+        let store = self.review_requests();
+        tokio::task::spawn_blocking(move || store.with_current(&intent, action))
+            .await
+            .map_err(|_| crate::review_requests::ReviewRequestError::Unavailable)?
+    }
+
+    pub(crate) fn verify_review_independence(
+        &self,
+        intent: &crate::native_review::ReviewIntent,
+    ) -> Result<(), crate::review_requests::ReviewRequestError> {
+        use crate::review_requests::ReviewRequestError;
+        self.restore_jobs()
+            .map_err(|_| ReviewRequestError::Unavailable)?;
+        let participants: BTreeSet<_> = self
+            .jobs
+            .lock()
+            .map_err(|_| ReviewRequestError::Unavailable)?
+            .values()
+            .filter(|job| match &job.run.issue {
+                Some(LinearIssueRef::Id { id }) => id == &intent.candidate.issue_id,
+                Some(LinearIssueRef::Identifier { identifier }) => {
+                    identifier.0 == intent.candidate.issue_identifier
+                }
+                None => false,
+            })
+            .flat_map(|job| job.member_identities.iter().cloned())
+            .collect();
+        let specialists = self
+            .specialists
+            .get()
+            .ok_or(ReviewRequestError::Unavailable)?;
+        let resolved = resolve_review_specialists(&intent.reviewers, specialists, &participants)?;
+        if resolved != intent.reviewers {
+            return Err(ReviewRequestError::IneligibleReviewer);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn read_current_native_review(
+        &self,
+        candidate: &crate::native_review::ReviewCandidate,
+    ) -> Result<crate::native_review::VerifiedReview, crate::native_review::ReviewProofError> {
+        let store = self.review_requests();
+        let lookup = candidate.clone();
+        let intent = tokio::task::spawn_blocking(move || store.current(&lookup))
+            .await
+            .map_err(|_| crate::native_review::ReviewProofError::Unavailable)?
+            .map_err(|_| crate::native_review::ReviewProofError::Unavailable)?
+            .ok_or(crate::native_review::ReviewProofError::Superseded)?;
+        let reference =
+            crate::native_review::reference_for(&self.meerkat.mob_id().as_ref().into(), &intent)?;
+        self.read_native_review(candidate, &reference).await
+    }
+
+    pub(crate) async fn admit_native_review(
+        &self,
+        mut draft: crate::review_requests::ReviewRequestDraft,
+    ) -> Result<
+        (
+            crate::native_review::ReviewIntent,
+            crate::native_review::ReviewReference,
+        ),
+        crate::review_requests::ReviewRequestError,
+    > {
+        use crate::review_requests::ReviewRequestError;
+        if !self.reviews_enabled() || self.stopping.load(Ordering::SeqCst) {
+            return Err(ReviewRequestError::Unavailable);
+        }
+        self.restore_jobs()
+            .map_err(|_| ReviewRequestError::Unavailable)?;
+        let participants: BTreeSet<String> = self
+            .jobs
+            .lock()
+            .map_err(|_| ReviewRequestError::Unavailable)?
+            .values()
+            .filter(|job| match &job.run.issue {
+                Some(LinearIssueRef::Id { id }) => id == &draft.candidate.issue_id,
+                Some(LinearIssueRef::Identifier { identifier }) => {
+                    identifier.0 == draft.candidate.issue_identifier
+                }
+                None => false,
+            })
+            .flat_map(|job| job.member_identities.iter().cloned())
+            .collect();
+        let specialists = self
+            .specialists
+            .get()
+            .ok_or(ReviewRequestError::Unavailable)?;
+        draft.reviewers = resolve_review_specialists(&draft.reviewers, specialists, &participants)?;
+        let runtime = self
+            .runtime()
+            .await
+            .map_err(|_| ReviewRequestError::Unavailable)?;
+        let handle = runtime.mob_handle();
+        for (role, identities) in draft.reviewers.bound_roles() {
+            for identity in identities {
+                let member = handle
+                    .get_member(identity)
+                    .await
+                    .map_err(|_| ReviewRequestError::Unavailable)?
+                    .ok_or(ReviewRequestError::IneligibleReviewer)?;
+                if &member.role != role {
+                    return Err(ReviewRequestError::IneligibleReviewer);
+                }
+            }
+        }
+        let store = self.review_requests();
+        let required = self.configured_review_count(&draft.reviewers)?;
+        // Commit the current-request decision before any native admission.
+        let intent = tokio::task::spawn_blocking(move || store.reserve(draft, required))
+            .await
+            .map_err(|_| ReviewRequestError::Unavailable)??;
+        let reference = crate::native_review::admit(&handle, &intent, required).await?;
+        let store = self.review_requests();
+        tokio::task::spawn_blocking(move || {
+            store.require_current(&intent)?;
+            Ok((intent, reference))
+        })
+        .await
+        .map_err(|_| ReviewRequestError::Unavailable)?
+    }
+
+    pub(crate) async fn read_native_review(
+        &self,
+        candidate: &crate::native_review::ReviewCandidate,
+        reference: &crate::native_review::ReviewReference,
+    ) -> Result<crate::native_review::VerifiedReview, crate::native_review::ReviewProofError> {
+        let store = self.review_requests();
+        let candidate_for_request = candidate.clone();
+        let current = tokio::task::spawn_blocking(move || store.current(&candidate_for_request))
+            .await
+            .map_err(|_| crate::native_review::ReviewProofError::Unavailable)?
+            .map_err(|_| crate::native_review::ReviewProofError::Unavailable)?
+            .ok_or(crate::native_review::ReviewProofError::Superseded)?;
+        if &current.candidate != candidate {
+            return Err(crate::native_review::ReviewProofError::Superseded);
+        }
+        let runtime = self
+            .runtime()
+            .await
+            .map_err(|_| crate::native_review::ReviewProofError::Unavailable)?;
+        let expected =
+            crate::native_review::reference_for(&runtime.mob_handle().definition().id, &current)?;
+        if expected.runs.len() != reference.runs.len()
+            || expected.runs.iter().collect::<BTreeSet<_>>()
+                != reference.runs.iter().collect::<BTreeSet<_>>()
+        {
+            return Err(crate::native_review::ReviewProofError::Superseded);
+        }
+        let proof = crate::native_review::read(
+            &runtime.mob_handle(),
+            candidate,
+            self.configured_review_count(&current.reviewers)?,
+            reference,
+        )
+        .await?;
+        let store = self.review_requests();
+        tokio::task::spawn_blocking(move || {
+            if proof.intent() != &current {
+                return Err(crate::native_review::ReviewProofError::Superseded);
+            }
+            store
+                .with_current(&current, || proof)
+                .map_err(|_| crate::native_review::ReviewProofError::Superseded)
+        })
+        .await
+        .map_err(|_| crate::native_review::ReviewProofError::Unavailable)?
+    }
+
     pub(crate) fn connections(&self) -> Option<&Arc<crate::setup::connections::Connections>> {
         self.meerkat.runtime_connections.as_ref()
     }
@@ -204,7 +417,7 @@ impl MetaRuntimeRegistry {
                 .collect(),
             default_auth_binding: self.meerkat.auth_binding.clone(),
             review_orchestrator_profile: self.independent_review.orchestrator_profile.clone(),
-            independent_review_enabled: self.independent_review.enabled,
+            independent_review_enabled: self.reviews_enabled(),
             tracker: self.tracker.clone(),
             host_api_url: self.host_api_url.clone(),
             host_api_auth: self.host_api_auth.clone(),
@@ -276,7 +489,7 @@ impl MetaRuntimeRegistry {
             host_api_url,
             host_api_auth,
             templates,
-            final_review_reviewers: Vec::new(),
+            final_review: crate::config::FinalReviewConfig::default(),
             independent_review: IndependentReviewConfig::default(),
             runtime: Arc::new(tokio::sync::Mutex::new(None)),
             specialists: Arc::new(OnceLock::new()),
@@ -302,8 +515,35 @@ impl MetaRuntimeRegistry {
         mut self,
         reviewers: Vec<FinalReviewReviewerConfig>,
     ) -> Self {
-        self.final_review_reviewers = reviewers;
+        self.final_review.enabled = !reviewers.is_empty();
+        self.final_review.reviewers = reviewers;
         self
+    }
+
+    pub fn with_final_review_config(mut self, config: crate::config::FinalReviewConfig) -> Self {
+        self.final_review = config;
+        self
+    }
+
+    fn reviews_enabled(&self) -> bool {
+        self.independent_review.enabled || self.final_review.enabled
+    }
+
+    fn review_runtime_config(&self) -> IndependentReviewConfig {
+        let mut config = self.independent_review.clone();
+        config.enabled = self.reviews_enabled();
+        config
+    }
+
+    fn configured_review_count(
+        &self,
+        reviewers: &meerkat_mob::FlowRoleTargets,
+    ) -> Result<usize, crate::native_review::ReviewProofError> {
+        crate::native_review::configured_review_count(
+            &self.independent_review,
+            &self.final_review,
+            reviewers,
+        )
     }
 
     pub fn with_independent_review_config(mut self, config: IndependentReviewConfig) -> Self {
@@ -479,7 +719,7 @@ impl MetaRuntimeRegistry {
                 .collect(),
             self.meerkat.auth_binding.clone(),
             self.meerkat.max_sessions,
-            self.independent_review.clone(),
+            self.review_runtime_config(),
             self.repo_mcp_servers.clone(),
             self.tracker.clone(),
             self.host_api_url.clone(),
@@ -596,19 +836,7 @@ impl MetaRuntimeRegistry {
                 }
             }
         }
-        for reviewer in &self.final_review_reviewers {
-            definition
-                .profiles
-                .entry(ProfileName::from(reviewer.profile.as_str()))
-                .or_insert_with(|| {
-                    ProfileBinding::Inline(Box::new(final_reviewer_profile(
-                        &reviewer.id,
-                        &self.repo_mcp_servers,
-                        model,
-                    )))
-                });
-        }
-        if self.independent_review.enabled {
+        if self.reviews_enabled() {
             definition
                 .profiles
                 .entry(ProfileName::from(
@@ -972,7 +1200,11 @@ impl HostToolAuthority {
 
     fn allows_host_tool(self, name: &str) -> bool {
         match name {
-            "fugue_complete_independent_review" => matches!(self, Self::ReviewOrchestrator),
+            "fugue_admit_independent_review"
+            | "fugue_complete_independent_review"
+            | "fugue_complete_final_pr_gate" => {
+                matches!(self, Self::ReviewOrchestrator)
+            }
             "fugue_start_issue_mob"
             | "fugue_start_final_pr_gate"
             | "fugue_start_independent_review"
@@ -1128,11 +1360,29 @@ impl AgentToolDispatcher for FugueDirectToolDispatcher {
             .await;
             return Ok(ToolResult::new(call.id.to_string(), content, is_error).into());
         }
-        if call.name == "fugue_complete_independent_review" {
-            let (is_error, content) = call_fugue_complete_independent_review(
+        if call.name == "fugue_admit_independent_review" {
+            let (is_error, content) = call_fugue_admit_independent_review(
                 self.host_api_url.as_deref(),
                 self.host_api_auth.as_ref(),
                 &arguments,
+            )
+            .await;
+            return Ok(ToolResult::new(call.id.to_string(), content, is_error).into());
+        }
+        if matches!(
+            call.name,
+            "fugue_complete_independent_review" | "fugue_complete_final_pr_gate"
+        ) {
+            let endpoint = if call.name == "fugue_complete_final_pr_gate" {
+                "complete-final-pr-gate"
+            } else {
+                "complete-independent-review"
+            };
+            let (is_error, content) = call_fugue_complete_native_review(
+                self.host_api_url.as_deref(),
+                self.host_api_auth.as_ref(),
+                &arguments,
+                endpoint,
             )
             .await;
             return Ok(ToolResult::new(call.id.to_string(), content, is_error).into());
@@ -1206,24 +1456,33 @@ fn direct_tool_dispatcher(
         }),
     )));
     tools.push(Arc::new(ToolDef::new(
+        "fugue_admit_independent_review",
+        "Request native review by selected existing repository specialists. The host resolves the candidate, reserves the current request and admits native flows. Replay an uncertain response with exactly the same key and assignment; replacing a request requires its current ID in supersedes.",
+        crate::independent_review::independent_review_admission_input_schema(),
+    )));
+    tools.push(Arc::new(ToolDef::new(
         "fugue_complete_independent_review",
-        "Submit typed independent reviewer verdicts to Fugue so the host can aggregate them, persist the Workpad/comment/WorkGraph evidence, and move to the configured review outcome lane. Use only from the review orchestrator after collecting exactly three reviewer verdicts. Every verdict.schema_version must be exactly \"fugue.review.v1\". Include workgraph_scope copied exactly from the reviewer obligation items so red-review blockers are created in the same WorkGraph realm and namespace.",
+        "Submit native review flow references after the selected specialists finish. Fugue reads durable producer results and verifies the current repository, tracker issue and PR head before recording review evidence. Do not submit verdicts or timeout claims. WorkGraph scope must be this repository native realm and default namespace.",
+        independent_review_completion_input_schema(),
+    )));
+    tools.push(Arc::new(ToolDef::new(
+        "fugue_complete_final_pr_gate",
+        "Finish the configured final review using native run references from the selected existing specialists. The host verifies required profiles, current intent, immutable PR head, CI and WorkGraph before its guarded merge, then projects the actual success/rework/blocked outcome. Caller verdicts are not accepted.",
         independent_review_completion_input_schema(),
     )));
     tools.push(Arc::new(ToolDef::new(
         "fugue_run_deploy",
-        "Run the configured guarded merge-only or merge-and-OTA action from a typed DeployStartRequest: verify policy and merge the exact PR head, then perform OTA only when configured. Use only as repo Kapellmeister authority after explicit action-lane/operator intent.",
-        json!({
-            "type": "object",
-            "description": "Typed DeployStartRequest payload with issue, PR snapshot, recorded head, CI status, WorkGraph blocker count, and idempotency key.",
-            "additionalProperties": true
-        }),
+        "Run the configured guarded merge-only or merge-and-OTA action. Use only as repository authority after explicit action-lane/operator intent. Replay lost responses unchanged. For a failed or uncertain deployment, report the attempt ID and wait for operator inspection and authorization before supplying retry_deployment with a new key.",
+        crate::deploy_gate::deploy_start_input_schema(),
     )));
     tools.retain(|tool| {
         if !independent_review_enabled
             && matches!(
                 tool.name.as_str(),
-                "fugue_start_independent_review" | "fugue_complete_independent_review"
+                "fugue_start_independent_review"
+                    | "fugue_admit_independent_review"
+                    | "fugue_complete_independent_review"
+                    | "fugue_complete_final_pr_gate"
             )
         {
             return false;
@@ -1850,10 +2109,37 @@ async fn call_fugue_start_independent_review(
     }
 }
 
-async fn call_fugue_complete_independent_review(
+async fn call_fugue_admit_independent_review(
     host_api_url: Option<&str>,
     host_api_auth: Option<&MetaConsoleBasicAuthConfig>,
     arguments: &Value,
+) -> (bool, String) {
+    let request = match serde_json::from_value::<
+        crate::independent_review::IndependentReviewAdmissionRequest,
+    >(arguments.clone())
+    {
+        Ok(request) => request,
+        Err(_) => {
+            return (
+                true,
+                json!({"error":"invalid_review_assignment"}).to_string(),
+            );
+        }
+    };
+    call_fugue_review_request(
+        host_api_url,
+        host_api_auth,
+        "admit-independent-review",
+        &request,
+    )
+    .await
+}
+
+async fn call_fugue_complete_native_review(
+    host_api_url: Option<&str>,
+    host_api_auth: Option<&MetaConsoleBasicAuthConfig>,
+    arguments: &Value,
+    endpoint: &str,
 ) -> (bool, String) {
     let request =
         match serde_json::from_value::<IndependentReviewCompletionRequest>(arguments.clone()) {
@@ -1869,18 +2155,27 @@ async fn call_fugue_complete_independent_review(
                 );
             }
         };
+    call_fugue_review_request(host_api_url, host_api_auth, endpoint, &request).await
+}
+
+async fn call_fugue_review_request<T: Serialize>(
+    host_api_url: Option<&str>,
+    host_api_auth: Option<&MetaConsoleBasicAuthConfig>,
+    endpoint: &str,
+    request: &T,
+) -> (bool, String) {
     let Some(host_api_url) = host_api_url.filter(|url| !url.trim().is_empty()) else {
         return (
             true,
             json!({
                 "error": "fugue_host_unconfigured",
-                "message": "fugue_complete_independent_review requires server.port or an explicit Fugue host API URL"
+                "message": "Review operations require server.port or an explicit Fugue host API URL"
             })
             .to_string(),
         );
     };
     let url = format!(
-        "{}/api/v1/kapellmeister/complete-independent-review",
+        "{}/api/v1/kapellmeister/{endpoint}",
         host_api_url.trim_end_matches('/')
     );
     let client = match fugue_host_api_client() {
@@ -1930,7 +2225,12 @@ async fn call_fugue_complete_independent_review(
         Ok(response) => {
             let status = response.status();
             match response.text().await {
-                Ok(text) if status.is_success() => (false, text),
+                Ok(text)
+                    if status.is_success()
+                        && crate::independent_review::completion_acknowledged(&text) =>
+                {
+                    (false, text)
+                }
                 Ok(text) => (
                     true,
                     json!({
@@ -3129,38 +3429,6 @@ fn agent_mcp_servers(
     visible
 }
 
-fn final_reviewer_profile(
-    reviewer_id: &str,
-    mcp_servers: &BTreeMap<String, NativeMcpServerConfig>,
-    model: &str,
-) -> Profile {
-    Profile {
-        model_fallback: None,
-        provider: None,
-        self_hosted_server_id: None,
-        image_generation_provider: None,
-        auto_compact_threshold: None,
-        resume_overrides: Vec::new(),
-        model: model.to_string(),
-        skills: Vec::new(),
-        tools: ToolConfig {
-            builtins: true,
-            shell: true,
-            comms: true,
-            workgraph: true,
-            mcp_servers: agent_mcp_server_configs(mcp_servers),
-            ..ToolConfig::default()
-        },
-        peer_description: format!("Repo-level final PR reviewer {reviewer_id}"),
-        external_addressable: true,
-        backend: None,
-        runtime_mode: MobRuntimeMode::AutonomousHost,
-        max_inline_peer_notifications: None,
-        output_schema: None,
-        provider_params: None,
-    }
-}
-
 fn independent_review_orchestrator_profile(
     mcp_servers: &BTreeMap<String, NativeMcpServerConfig>,
     model: &str,
@@ -3478,7 +3746,7 @@ fn member_initial_message_for_plan(plan: &NativeMobLaunchPlan, member: &str) -> 
         return None;
     }
     Some(format!(
-        "Start your required repo-level final PR review now.\n\nIssue: {}\nReviewer: {}\nWorkspace: {}\nTemplate: {}\n\nEmit a typed FinalReviewVerdict to the issue lead when complete. Do not merge.\n\n{}",
+        "Start repo-level final review coordination now.\n\nIssue: {}\nCoordinator: {}\nWorkspace: {}\nTemplate: {}\n\nSelect existing specialists, admit native review, then call fugue_complete_final_pr_gate with native run references. Do not merge directly.\n\n{}",
         issue_key(&plan.input.issue),
         member,
         plan.input
@@ -3532,6 +3800,62 @@ fn block_on<T>(future: impl Future<Output = T>) -> Result<T, String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn review_selection_resolves_durable_aliases_and_excludes_issue_participants() {
+        let specialist = RepositorySpecialist {
+            identity: "repo:domain".into(),
+            label: "Domain".into(),
+            focus: "Domain review".into(),
+            paths: vec![],
+        };
+        let canonical =
+            meerkat_meta::member_comms_id::roster_member_id_for_identity(&specialist.identity);
+        let public =
+            meerkat_mob::FlowRoleTargets::new([("domain", [specialist.identity.clone().into()])])
+                .unwrap();
+        let native = meerkat_mob::FlowRoleTargets::new([("domain", [canonical.clone()])]).unwrap();
+        for input in [&public, &native] {
+            assert_eq!(
+                resolve_review_specialists(
+                    input,
+                    std::slice::from_ref(&specialist),
+                    &BTreeSet::new()
+                )
+                .unwrap(),
+                native
+            );
+            for participant in [&specialist.identity, &canonical.to_string()] {
+                assert!(
+                    resolve_review_specialists(
+                        input,
+                        std::slice::from_ref(&specialist),
+                        &BTreeSet::from([participant.clone()])
+                    )
+                    .is_err()
+                );
+            }
+        }
+        let duplicates = meerkat_mob::FlowRoleTargets::new([(
+            "domain",
+            [canonical, specialist.identity.clone().into()],
+        )])
+        .unwrap();
+        assert!(
+            resolve_review_specialists(
+                &duplicates,
+                std::slice::from_ref(&specialist),
+                &BTreeSet::new()
+            )
+            .is_err()
+        );
+        assert!(resolve_review_specialists(&public, &[], &BTreeSet::new()).is_err());
+        let runtime_alias =
+            meerkat_mob::FlowRoleTargets::new([("domain", ["rt:repo:domain:0".into()])]).unwrap();
+        assert!(
+            resolve_review_specialists(&runtime_alias, &[specialist], &BTreeSet::new()).is_err()
+        );
+    }
 
     use crate::config::{MaterializedMobMember, MobExecutionBackend};
     use crate::tools::{IdempotencyKey, LinearIssueIdentifier, WorkspaceKey};
@@ -3872,7 +4196,9 @@ pub(crate) mod tests {
         assert!(!tools.tools().iter().any(|tool| {
             matches!(
                 tool.name.as_str(),
-                "fugue_start_independent_review" | "fugue_complete_independent_review"
+                "fugue_start_independent_review"
+                    | "fugue_complete_independent_review"
+                    | "fugue_complete_final_pr_gate"
             )
         }));
         assert!(
@@ -3944,7 +4270,19 @@ pub(crate) mod tests {
             reviewer
                 .tools()
                 .iter()
+                .any(|tool| tool.name == "fugue_admit_independent_review")
+        );
+        assert!(
+            reviewer
+                .tools()
+                .iter()
                 .any(|tool| tool.name == "fugue_complete_independent_review")
+        );
+        assert!(
+            reviewer
+                .tools()
+                .iter()
+                .any(|tool| tool.name == "fugue_complete_final_pr_gate")
         );
         assert!(
             !reviewer
@@ -4023,17 +4361,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn final_gate_reviewers_receive_bootstrap_assignment() {
+    fn final_gate_coordinator_receives_native_review_assignment() {
         let mut plan = launch_plan();
         plan.input.template_id = crate::tools::MobTemplateId("final-pr-gate-191".to_string());
         plan.input.instructions =
-            Some("Review exact head SHA `abc123` and emit FinalReviewVerdict.".to_string());
+            Some("Review exact head SHA `abc123` using existing specialists.".to_string());
 
-        let message = member_initial_message_for_plan(&plan, "tests")
-            .expect("final gate reviewer assignment");
+        let message = member_initial_message_for_plan(&plan, "review_orchestrator")
+            .expect("final gate coordinator assignment");
 
-        assert!(message.contains("Reviewer: tests"));
-        assert!(message.contains("FinalReviewVerdict"));
+        assert!(message.contains("Coordinator: review_orchestrator"));
+        assert!(message.contains("fugue_complete_final_pr_gate"));
         assert!(message.contains("Do not merge"));
         assert!(message.contains("abc123"));
     }
@@ -4860,7 +5198,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn generated_reviewer_profiles_expose_playwright_mcp_when_configured() {
+    fn review_coordinator_exposes_playwright_mcp_when_configured() {
         let mcp_servers = BTreeMap::from([
             ("linear".to_string(), mcp_server(&["fugue-linear-mcp"], &[])),
             ("github".to_string(), mcp_server(&["fugue-github-mcp"], &[])),
@@ -4874,12 +5212,11 @@ pub(crate) mod tests {
             ),
         ]);
 
-        let final_reviewer = final_reviewer_profile("tests", &mcp_servers, default_agent_model());
         let independent_orchestrator =
             independent_review_orchestrator_profile(&mcp_servers, default_agent_model());
 
         assert_eq!(
-            final_reviewer
+            independent_orchestrator
                 .tools
                 .mcp_servers
                 .iter()
@@ -4887,14 +5224,10 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             vec!["playwright"]
         );
-        assert_eq!(
-            final_reviewer.tools.mcp_servers,
-            independent_orchestrator.tools.mcp_servers
-        );
     }
 
     #[test]
-    fn mob_definition_registers_final_reviewer_profiles() {
+    fn final_only_review_registers_coordinator_without_manufacturing_specialists() {
         let mcp_servers = BTreeMap::from([
             ("linear".to_string(), mcp_server(&["fugue-linear-mcp"], &[])),
             ("github".to_string(), mcp_server(&["fugue-github-mcp"], &[])),
@@ -4910,10 +5243,17 @@ pub(crate) mod tests {
             required: true,
         }]);
         let definition = registry.mob_definition().expect("valid definition");
+        assert!(
+            !definition
+                .profiles
+                .contains_key(&ProfileName::from("final_architecture_reviewer"))
+        );
         let binding = definition
             .profiles
-            .get(&ProfileName::from("final_architecture_reviewer"))
-            .expect("final reviewer profile");
+            .get(&ProfileName::from(
+                IndependentReviewConfig::default().orchestrator_profile,
+            ))
+            .expect("shared review coordinator");
         let ProfileBinding::Inline(profile) = binding else {
             panic!("final reviewer profile must be inline")
         };
@@ -4942,12 +5282,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     });
             let definition = registry.mob_definition().expect("valid definition");
-            for name in [
-                KAPELLMEISTER,
-                ISSUE_LEAD,
-                "final_tests",
-                "review_orchestrator",
-            ] {
+            for name in [KAPELLMEISTER, ISSUE_LEAD, "review_orchestrator"] {
                 let ProfileBinding::Inline(profile) =
                     &definition.profiles[&ProfileName::from(name)]
                 else {

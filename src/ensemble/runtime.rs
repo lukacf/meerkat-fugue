@@ -401,6 +401,16 @@ impl EnsembleRuntime {
                             migrated.flows.remove(&flow_id);
                         }
                     }
+                    for name in legacy_profiles
+                        .into_iter()
+                        .filter(|name| *name != REPRESENTATIVE)
+                    {
+                        let role = name.into();
+                        let id = crate::native_review::flow_id(&role);
+                        if migrated.flows.get(&id) == Some(&crate::native_review::flow(&role)) {
+                            migrated.flows.remove(&id);
+                        }
+                    }
                 } else {
                     // Earlier Ensemble definitions omitted native memory. Only
                     // this host-owned capability changes for an existing team;
@@ -413,7 +423,7 @@ impl EnsembleRuntime {
                         }
                     }
                 }
-                // Add only our missing native handoff flows. Existing flow drift
+                // Add only our missing native flows. Existing flow drift
                 // remains visible and fails definition validation.
                 for (flow_id, flow) in &desired_definition.flows {
                     migrated
@@ -1481,6 +1491,13 @@ fn definition(repo: &RepoId, model: &str, grants: &BTreeMap<String, MemberGrant>
         source_identity: None,
     };
     for name in grants.keys() {
+        if name != REPRESENTATIVE {
+            let role = name.clone().into();
+            definition.flows.insert(
+                crate::native_review::flow_id(&role),
+                crate::native_review::flow(&role),
+            );
+        }
         definition.profiles.insert(
             name.clone().into(),
             ProfileBinding::Inline(Box::new(Profile {
@@ -3479,6 +3496,844 @@ mod tests {
         );
         recovered.shutdown().await.expect("shutdown");
     }
+    #[derive(Default)]
+    struct NativeReviewScript {
+        reviews: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmClient for NativeReviewScript {
+        async fn health_check(&self) -> std::result::Result<(), LlmError> {
+            Ok(())
+        }
+
+        fn project_replay_messages(
+            &self,
+            messages: &[Message],
+        ) -> std::result::Result<Vec<Message>, LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
+            let latest_user = request
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    Message::User(user) => Some(serde_json::to_string(&user.content).unwrap()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if latest_user.contains("[HOLD REVIEW]") {
+                return Box::pin(futures::stream::pending());
+            }
+            let text = if latest_user.contains("[INDEPENDENT REVIEW]") {
+                let role = ["planner", "coder", "reviewer"]
+                    .into_iter()
+                    .find(|role| latest_user.contains(&format!("Review role: {role}")))
+                    .expect("native assignment preserves the selected role");
+                self.reviews.fetch_add(1, Ordering::SeqCst);
+                json!({
+                    "schema_version":"fugue.review.v1", "reviewer_id":format!("alpha:{role}"),
+                    "focus":role, "verdict":"green", "summary":"Fixture checks pass",
+                    "findings":[], "evidence":{"base":"main", "head_sha":"a".repeat(40),
+                    "commands":["fixture check"], "checked_paths":["README.md"]}
+                })
+                .to_string()
+            } else {
+                "Ready.".into()
+            };
+            Box::pin(futures::stream::iter(vec![
+                Ok(LlmEvent::TextDelta {
+                    delta: text,
+                    meta: None,
+                }),
+                Ok(LlmEvent::UsageUpdate {
+                    usage: TurnUsage::host_declared(
+                        Provider::OpenAI,
+                        &request.model,
+                        Usage::default(),
+                    ),
+                }),
+                Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::success(StopReason::EndTurn),
+                }),
+            ]))
+        }
+
+        fn provider(&self) -> Provider {
+            Provider::OpenAI
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_review_proof_uses_selected_specialists_and_survives_restart() {
+        if !isolated("native_review_proof_uses_selected_specialists_and_survives_restart") {
+            return;
+        }
+        exercise_native_review_completion(false).await;
+        exercise_native_review_completion(true).await;
+    }
+
+    async fn exercise_native_review_completion(final_only: bool) {
+        use crate::native_review::{ReviewCandidate, ReviewIntent};
+        use crate::tools::{
+            GitHubOwner, GitHubPullRequestNumber, GitHubRepoName, GitHubRepoRef, GitSha,
+            LinearIssueId,
+        };
+        use meerkat_mob::{FlowRoleTargets, MobRunStatus};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = fixture_config(temp.path());
+        config.repositories.retain(|id, _| id.as_str() == "alpha");
+        config.peers.clear();
+        let repo = RepoId::try_from("alpha".to_owned()).unwrap();
+        let client = Arc::new(NativeReviewScript::default());
+        let mut queue_config =
+            crate::meta_runtime::tests::test_meerkat_config(temp.path().join("queue"));
+        queue_config.repository_runtime = Some(crate::config::RepositoryRuntimeBinding {
+            repository: repo.clone(),
+            state_path: config.state_root.join("alpha"),
+        });
+        let mut service = crate::config::ServiceConfig::from_definition(temp.path().join("fugue.yaml"),
+            &crate::config::WorkflowDefinition {
+                config: json!({
+                    "tracker":{"kind":"fugue-ims", "endpoint":temp.path().join("issues.sqlite"), "project_slug":"example/app"},
+                    "kapellmeister":{"authority_mode":"guarded_labeled", "safe_selectors":{"repositories":[{"owner":"example","name":"app"}]}},
+                    "deploy":{"enabled":true, "procedure":"merge-only", "require_ota_update":false,
+                        "allow_no_ci_checks":true, "allowed_repositories":[{"owner":"example", "name":"app"}]}
+                }).as_object().unwrap().clone(), prompt_template:"test".into(),
+            }).unwrap();
+        service.meerkat = queue_config.clone();
+        let tracker_issue = crate::fugue_ims::create_issue_for_config(
+            &service.tracker,
+            crate::fugue_ims::CreateFugueIssue {
+                key: crate::ims::ImsIssueKey("TEST-1".into()),
+                repo: "example/app".into(),
+                title: "Native merge gate".into(),
+                description: None,
+                stage: crate::ims::ImsStageName("Todo".into()),
+                labels: vec![],
+            },
+        )
+        .unwrap();
+        let review_config = crate::config::IndependentReviewConfig {
+            enabled: !final_only,
+            ..Default::default()
+        };
+        service.independent_review = review_config.clone();
+        service.final_review = crate::config::FinalReviewConfig {
+            enabled: true,
+            reviewers: ["planner", "coder", "reviewer"]
+                .map(|profile| crate::config::FinalReviewReviewerConfig {
+                    id: profile.into(),
+                    profile: profile.into(),
+                    required: true,
+                })
+                .to_vec(),
+            ..Default::default()
+        };
+        let queue = crate::meta_runtime::MetaRuntimeRegistry::new(queue_config.clone())
+            .with_independent_review_config(review_config.clone())
+            .with_final_review_config(service.final_review.clone());
+        let ensemble =
+            EnsembleRuntime::build_inner(config.clone(), Some(client.clone()), Some(queue.clone()))
+                .await
+                .unwrap();
+        let handle = ensemble.repository(&repo).unwrap().mob_handle();
+        let before: BTreeSet<_> = handle
+            .list_all_members()
+            .await
+            .into_iter()
+            .map(|member| member.agent_identity)
+            .collect();
+        let intent = ReviewIntent {
+            schema_version: "fugue.native-review.v1".into(),
+            round: "review-round-1".into(),
+            candidate: ReviewCandidate {
+                tracker_context: service.tracker_context_id(),
+                issue_id: LinearIssueId(tracker_issue.id.0),
+                issue_identifier: "TEST-1".into(),
+                repo: GitHubRepoRef {
+                    host: None,
+                    owner: GitHubOwner("example".into()),
+                    name: GitHubRepoName("app".into()),
+                },
+                pull_request: GitHubPullRequestNumber(1),
+                head_sha: GitSha("a".repeat(40)),
+            },
+            reviewers: FlowRoleTargets::new(["planner", "coder", "reviewer"].map(|role| {
+                (
+                    role,
+                    [
+                        meerkat_meta::member_comms_id::roster_member_id_for_identity(
+                            member_identity(&repo, role).unwrap().as_str(),
+                        ),
+                    ],
+                )
+            }))
+            .unwrap(),
+            task: "Inspect the immutable fixture candidate".into(),
+        };
+        let draft = crate::review_requests::ReviewRequestDraft {
+            candidate: intent.candidate,
+            reviewers: intent.reviewers,
+            task: intent.task,
+            idempotency_key: crate::tools::IdempotencyKey("request-1".into()),
+            supersedes: None,
+        };
+        let (first, concurrent) = tokio::join!(
+            queue.admit_native_review(draft.clone()),
+            queue.admit_native_review(draft.clone()),
+        );
+        let (intent, reference) = first.unwrap();
+        assert_eq!(
+            concurrent.unwrap(),
+            (intent.clone(), reference.clone()),
+            "concurrent retries reuse admission"
+        );
+        for change in ["task", "candidate", "targets"] {
+            let mut different = intent.clone();
+            match change {
+                "task" => different.task = "Different instructions".into(),
+                "candidate" => different.candidate.head_sha = GitSha("b".repeat(40)),
+                _ => {
+                    different.reviewers =
+                        FlowRoleTargets::new(
+                            [
+                                ("planner", vec!["alpha:reviewer"]),
+                                ("coder", vec!["alpha:coder"]),
+                                ("reviewer", vec!["alpha:planner"]),
+                            ]
+                            .map(|(role, members)| {
+                                (role, members.into_iter().map(
+                        meerkat_meta::member_comms_id::roster_member_id_for_identity,
+                    ))
+                            }),
+                        )
+                        .unwrap();
+                }
+            }
+            assert!(
+                matches!(
+                    crate::native_review::admit(&handle, &different, 3).await,
+                    Err(crate::native_review::ReviewAdmissionError::Conflict { .. })
+                ),
+                "same round must reject changed {change}"
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(40), async {
+            for id in &reference.runs {
+                loop {
+                    let run = handle.flow_status(id.clone()).await.unwrap().unwrap();
+                    if matches!(
+                        run.status,
+                        MobRunStatus::Completed | MobRunStatus::Failed | MobRunStatus::Canceled
+                    ) {
+                        assert_eq!(run.status, MobRunStatus::Completed, "{run:?}");
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        })
+        .await
+        .expect("bounded native reviews");
+        let verified = queue
+            .read_native_review(&intent.candidate, &reference)
+            .await
+            .unwrap();
+        verified.require_approval().unwrap();
+        assert_eq!(
+            crate::native_review::admit(&handle, &intent, 3)
+                .await
+                .unwrap(),
+            reference,
+            "terminal replay does not launch another review"
+        );
+        assert_eq!(verified.verdicts().count(), 3);
+        assert_eq!(client.reviews.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            before,
+            handle
+                .list_all_members()
+                .await
+                .into_iter()
+                .map(|member| member.agent_identity)
+                .collect()
+        );
+        // Exercise the production merge gate with real native proof and tracker
+        // state. Only forge responses are fixtures; no external PR is mutated.
+        let graph_path = crate::meta_runtime::meta_runtime_state_path(&service.meerkat)
+            .join("workgraph.sqlite3");
+        let graph_store = meerkat::SqliteWorkGraphStore::open(&graph_path).unwrap();
+        drop(graph_store);
+        let merge_input = crate::tools::MergePrInput {
+            repo: intent.candidate.repo.clone(),
+            pull_request: crate::tools::GitHubPullRequestRef::Number {
+                number: intent.candidate.pull_request,
+            },
+            method: crate::tools::MergeMethod::Squash,
+            expected_head_sha: Some(intent.candidate.head_sha.clone()),
+            idempotency_key: crate::tools::IdempotencyKey("fixture-merge".into()),
+        };
+        let issue_ref = crate::tools::LinearIssueRef::Id {
+            id: intent.candidate.issue_id.clone(),
+        };
+        let forge_pr = |state: &str| {
+            json!({"number":1,"title":"Candidate", "url":"https://github.com/example/app/pull/1",
+            "state":state, "isDraft":false, "headRefName":"feature", "baseRefName":"main", "headRefOid":"a".repeat(40)}).to_string()
+        };
+        let ci = |state: &str| {
+            json!({"data":{"repository":{"pullRequest":{
+            "headRefOid":"a".repeat(40), "commits":{"nodes":[{"commit":{"oid":"a".repeat(40),
+            "statusCheckRollup":{"contexts":{"nodes":[{"__typename":"StatusContext", "context":"test", "state":state, "targetUrl":null}],
+            "pageInfo":{"hasNextPage":false,"endCursor":null}}}}}]}
+        }}}}).to_string()
+        };
+        let completion = crate::independent_review::IndependentReviewCompletionRequest {
+            issue: issue_ref.clone(),
+            pull_request: crate::tools::GitHubPullRequestSnapshot {
+                repo: intent.candidate.repo.clone(),
+                number: intent.candidate.pull_request,
+                title: "Candidate".into(),
+                url: "https://github.com/example/app/pull/1".into(),
+                state: crate::tools::PullRequestState::Open,
+                draft: false,
+                head_branch: crate::tools::BranchName("feature".into()),
+                base_branch: crate::tools::BranchName("main".into()),
+                head_sha: intent.candidate.head_sha.clone(),
+            },
+            head_sha: intent.candidate.head_sha.clone(),
+            workgraph_scope: crate::independent_review::IndependentReviewWorkGraphScope {
+                realm_id: meerkat_core::mob_realm_id(&service.meerkat.mob_id())
+                    .unwrap()
+                    .to_string(),
+                namespace: meerkat::WorkNamespace::default().as_str().into(),
+            },
+            native_review: reference.clone(),
+            idempotency_key: crate::tools::IdempotencyKey("final-completion".into()),
+        };
+        let final_kind = crate::review_completion::ReviewCompletionKind::Final;
+        let mut wrong_profiles = service.clone();
+        wrong_profiles
+            .final_review
+            .reviewers
+            .push(crate::config::FinalReviewReviewerConfig {
+                id: "second-planner".into(),
+                profile: "planner".into(),
+                required: true,
+            });
+        let (host, calls) = crate::github_tools::scripted_host(vec![forge_pr("OPEN")]);
+        let error = crate::review_completion::complete(
+            &wrong_profiles,
+            &queue,
+            completion.clone(),
+            final_kind,
+            host,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "final_review_profiles_not_satisfied");
+        assert_eq!(
+            calls().len(),
+            1,
+            "missing profile coverage cannot reach merge"
+        );
+        // The common merge gate independently enforces the same profile policy.
+        let (host, calls) = crate::github_tools::scripted_host(vec![forge_pr("OPEN")]);
+        let result = crate::merge_gate::merge_with_host(
+            &wrong_profiles,
+            &queue,
+            issue_ref.clone(),
+            merge_input.clone(),
+            crate::merge_gate::MergePurpose::FinalReview,
+            host,
+        )
+        .await;
+        assert!(matches!(result, crate::tools::FugueToolResult::Err { .. }));
+        assert_eq!(calls().len(), 1);
+        let mut shadow_only = service.clone();
+        shadow_only.kapellmeister.shadow_mode.authority = Default::default();
+        let (host, calls) = crate::github_tools::scripted_host(vec![forge_pr("OPEN")]);
+        let error = crate::review_completion::complete(
+            &shadow_only,
+            &queue,
+            completion.clone(),
+            final_kind,
+            host,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "final_review_not_authorized");
+        assert_eq!(calls().len(), 1);
+        let mut disabled = service.clone();
+        disabled.final_review.enabled = false;
+        let (host, calls) = crate::github_tools::scripted_host(vec![]);
+        let error = crate::review_completion::complete(
+            &disabled,
+            &queue,
+            completion.clone(),
+            final_kind,
+            host,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "review_disabled");
+        assert!(calls().is_empty());
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            ci("FAILURE"),
+        ]);
+        let blocked = crate::review_completion::complete(
+            &service,
+            &queue,
+            completion.clone(),
+            final_kind,
+            host,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            blocked.plan.decision,
+            crate::independent_review::IndependentReviewDecision::Blocked
+        );
+        assert_eq!(
+            blocked.projection.target_lane,
+            service.final_review.blocked_lane
+        );
+        assert!(blocked.merge.is_none());
+        assert_eq!(calls().len(), 4);
+        let adapter = crate::linear_adapter::IssueAdapter::from_config(&service.tracker).unwrap();
+        let state = adapter
+            .inspect_issue(crate::tools::InspectIssueInput {
+                issue: issue_ref.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(state.issue.state.name, service.final_review.blocked_lane);
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            ci("SUCCESS"),
+            forge_pr("OPEN"),
+            String::new(),
+            forge_pr("MERGED"),
+            json!({"mergeCommit":{"oid":"b".repeat(40)}}).to_string(),
+        ]);
+        let completed = crate::review_completion::complete(
+            &service,
+            &queue,
+            completion.clone(),
+            final_kind,
+            host,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            completed.plan.decision,
+            crate::independent_review::IndependentReviewDecision::Success
+        );
+        assert_eq!(
+            completed.projection.target_lane,
+            service.final_review.success_lane
+        );
+        assert_eq!(
+            completed.merge.unwrap().merge_commit_sha,
+            Some(GitSha("b".repeat(40)))
+        );
+        assert_eq!(
+            calls()
+                .iter()
+                .filter(|args| args.get(1).is_some_and(|arg| arg == "merge"))
+                .count(),
+            1
+        );
+        let state = adapter
+            .inspect_issue(crate::tools::InspectIssueInput {
+                issue: issue_ref.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(state.issue.state.name, service.final_review.success_lane);
+        let workpad = adapter.issue_comments(&issue_ref).await.unwrap();
+        assert!(
+            workpad
+                .iter()
+                .any(|comment| comment.body_markdown.contains(&"b".repeat(40)))
+        );
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("MERGED"),
+            forge_pr("MERGED"),
+            forge_pr("MERGED"),
+            ci("SUCCESS"),
+            forge_pr("MERGED"),
+            json!({"mergeCommit":{"oid":"b".repeat(40)}}).to_string(),
+        ]);
+        let replay = crate::review_completion::complete(
+            &service,
+            &queue,
+            completion.clone(),
+            final_kind,
+            host,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay.plan.decision,
+            crate::independent_review::IndependentReviewDecision::Success
+        );
+        assert!(
+            !replay.merge.unwrap().merged,
+            "retry records the existing merge"
+        );
+        assert!(
+            !calls()
+                .iter()
+                .any(|args| args.get(1).is_some_and(|arg| arg == "merge"))
+        );
+        let mut old_intent = intent.clone();
+        old_intent.round = "an-older-request".into();
+        let (host, calls) = crate::github_tools::scripted_host(vec![forge_pr("OPEN")]);
+        let result = crate::merge_gate::merge_review_with_host(
+            &service,
+            &queue,
+            issue_ref.clone(),
+            merge_input.clone(),
+            crate::merge_gate::MergePurpose::FinalReview,
+            host,
+            Some(&old_intent),
+        )
+        .await;
+        assert!(matches!(result, crate::tools::FugueToolResult::Err { .. }));
+        assert_eq!(
+            calls().len(),
+            1,
+            "an old completion cannot merge using a newer green request"
+        );
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            ci("FAILURE"),
+        ]);
+        let result = crate::merge_gate::merge_with_host(
+            &service,
+            &queue,
+            issue_ref.clone(),
+            merge_input.clone(),
+            crate::merge_gate::MergePurpose::Deploy,
+            host,
+        )
+        .await;
+        assert!(
+            matches!(result, crate::tools::FugueToolResult::Err { .. }),
+            "{result:?}"
+        );
+        assert_eq!(calls().len(), 3);
+        assert!(
+            !calls()
+                .iter()
+                .any(|args| args.get(1).is_some_and(|arg| arg == "merge"))
+        );
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            ci("SUCCESS"),
+        ]);
+        let mut unavailable_graph = service.clone();
+        unavailable_graph
+            .meerkat
+            .repository_runtime
+            .as_mut()
+            .unwrap()
+            .state_path = temp.path().join("missing-runtime");
+        let result = crate::merge_gate::merge_with_host(
+            &unavailable_graph,
+            &queue,
+            issue_ref.clone(),
+            merge_input.clone(),
+            crate::merge_gate::MergePurpose::Deploy,
+            host,
+        )
+        .await;
+        assert!(
+            matches!(result, crate::tools::FugueToolResult::Err { error, .. }
+            if error.message.contains("WorkGraph database is unavailable"))
+        );
+        assert_eq!(calls().len(), 3);
+        assert!(!temp.path().join("missing-runtime").exists());
+
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            ci("SUCCESS"),
+            forge_pr("OPEN"),
+            String::new(),
+            forge_pr("MERGED"),
+            json!({"mergeCommit":{"oid":"b".repeat(40)}}).to_string(),
+        ]);
+        let result = crate::merge_gate::merge_with_host(
+            &service,
+            &queue,
+            issue_ref.clone(),
+            merge_input.clone(),
+            crate::merge_gate::MergePurpose::Deploy,
+            host,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                crate::tools::FugueToolResult::Ok {
+                    output: crate::tools::FugueToolOutput::GitHubMergePr(_),
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+        assert_eq!(calls().len(), 7);
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("MERGED"),
+            forge_pr("MERGED"),
+            ci("SUCCESS"),
+            forge_pr("MERGED"),
+            json!({"mergeCommit":{"oid":"b".repeat(40)}}).to_string(),
+        ]);
+        let result = crate::merge_gate::merge_with_host(
+            &service,
+            &queue,
+            issue_ref.clone(),
+            merge_input.clone(),
+            crate::merge_gate::MergePurpose::Deploy,
+            host,
+        )
+        .await;
+        assert!(
+            matches!(result,crate::tools::FugueToolResult::Ok { output:crate::tools::FugueToolOutput::GitHubMergePr(output),.. } if !output.merged)
+        );
+        assert_eq!(calls().len(), 5);
+        assert!(
+            !calls()
+                .iter()
+                .any(|args| args.get(1).is_some_and(|arg| arg == "merge"))
+        );
+        let graph = meerkat::WorkGraphService::with_scope(
+            Arc::new(meerkat::SqliteWorkGraphStore::open(&graph_path).unwrap()),
+            meerkat_core::mob_realm_id(service.meerkat.mob_id().as_ref())
+                .unwrap()
+                .as_str(),
+            meerkat::WorkNamespace::default(),
+        );
+        graph
+            .create(meerkat::CreateWorkItemRequest {
+                realm_id: None,
+                namespace: None,
+                title: "Unresolved review finding".into(),
+                description: None,
+                priority: meerkat::WorkPriority::High,
+                completion_policy: meerkat::WorkCompletionPolicy::SelfAttest,
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                labels: BTreeSet::from(["fugue".into(), "blocking".into(), "issue:TEST-1".into()]),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: Some(meerkat::WorkStatus::Open),
+            })
+            .await
+            .unwrap();
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            ci("SUCCESS"),
+        ]);
+        let result = crate::merge_gate::merge_with_host(
+            &service,
+            &queue,
+            issue_ref.clone(),
+            merge_input.clone(),
+            crate::merge_gate::MergePurpose::Deploy,
+            host,
+        )
+        .await;
+        assert!(
+            matches!(result, crate::tools::FugueToolResult::Err { error, .. }
+            if error.message.contains("unresolved blocking WorkGraph"))
+        );
+        assert_eq!(
+            calls().len(),
+            3,
+            "native obligations stop the actual merge gate before mutation"
+        );
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            ci("SUCCESS"),
+        ]);
+        let blocked = crate::review_completion::complete(
+            &service,
+            &queue,
+            completion.clone(),
+            final_kind,
+            host,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            blocked.plan.decision,
+            crate::independent_review::IndependentReviewDecision::Blocked
+        );
+        assert!(blocked.merge.is_none());
+        assert_eq!(calls().len(), 4);
+        assert_eq!(
+            client.reviews.load(Ordering::SeqCst),
+            3,
+            "completion never asks specialists to review again"
+        );
+        let verdicts: Vec<_> = verified.verdicts().cloned().collect();
+        let projection = crate::review_completion::record_review_projection(
+            &service,
+            &completion,
+            "TEST-1",
+            &completed.plan,
+            &verdicts,
+            None,
+            final_kind,
+        )
+        .await;
+        assert!(
+            projection.is_err(),
+            "a newly arrived blocker prevents terminal projection after merge"
+        );
+        let state = adapter
+            .inspect_issue(crate::tools::InspectIssueInput {
+                issue: issue_ref.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(state.issue.state.name, service.final_review.blocked_lane);
+        drop(graph);
+        ensemble.shutdown().await.unwrap();
+        drop(handle);
+        drop(ensemble);
+
+        drop(queue);
+        let queue = crate::meta_runtime::MetaRuntimeRegistry::new(queue_config)
+            .with_independent_review_config(review_config)
+            .with_final_review_config(service.final_review.clone());
+        let restarted =
+            EnsembleRuntime::build_inner(config, Some(client.clone()), Some(queue.clone()))
+                .await
+                .unwrap();
+        let handle = restarted.repository(&repo).unwrap().mob_handle();
+        assert_eq!(
+            crate::native_review::admit(&handle, &intent, 3)
+                .await
+                .unwrap(),
+            reference,
+            "restart replay returns the same durable run identities"
+        );
+        let verified = queue
+            .read_native_review(&intent.candidate, &reference)
+            .await
+            .unwrap();
+        verified.require_approval().unwrap();
+        assert_eq!(verified.verdicts().count(), 3);
+        assert_eq!(
+            client.reviews.load(Ordering::SeqCst),
+            3,
+            "restart reads durable results without asking agents again"
+        );
+        let mut changed = intent.candidate.clone();
+        changed.head_sha = GitSha("b".repeat(40));
+        assert!(
+            crate::native_review::read(&handle, &changed, 3, &reference)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            queue.admit_native_review(draft.clone()).await.unwrap(),
+            (intent.clone(), reference.clone())
+        );
+        let mut replacement = draft.clone();
+        replacement.idempotency_key.0 = "request-2".into();
+        replacement.supersedes = Some(intent.round.clone());
+        replacement.task = "[HOLD REVIEW] Exercise cancellation before completion".into();
+        let (another_round, canceled) = queue
+            .admit_native_review(replacement.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            queue.admit_native_review(draft).await,
+            Err(crate::review_requests::ReviewRequestError::Superseded)
+        ));
+        assert!(matches!(
+            queue
+                .read_native_review(&intent.candidate, &reference)
+                .await,
+            Err(crate::native_review::ReviewProofError::Superseded)
+        ));
+        let (host, calls) = crate::github_tools::scripted_host(vec![forge_pr("OPEN")]);
+        let result = crate::merge_gate::merge_with_host(
+            &service,
+            &queue,
+            issue_ref,
+            merge_input,
+            crate::merge_gate::MergePurpose::Deploy,
+            host,
+        )
+        .await;
+        assert!(matches!(result, crate::tools::FugueToolResult::Err { .. }));
+        assert_eq!(
+            calls().len(),
+            1,
+            "replacement invalidates old approval before forge mutation"
+        );
+        let (host, calls) = crate::github_tools::scripted_host(vec![forge_pr("OPEN")]);
+        let stale =
+            crate::review_completion::complete(&service, &queue, completion, final_kind, host)
+                .await
+                .unwrap_err();
+        assert_eq!(stale.code, "native_review_not_verified");
+        assert_eq!(calls().len(), 1);
+        assert!(canceled.runs.iter().all(|id| !reference.runs.contains(id)));
+        for id in &canceled.runs {
+            handle.cancel_flow(id.clone()).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            for id in &canceled.runs {
+                loop {
+                    let run = handle.flow_status(id.clone()).await.unwrap().unwrap();
+                    if run.status == MobRunStatus::Canceled {
+                        break;
+                    }
+                    assert_ne!(run.status, MobRunStatus::Completed);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        })
+        .await
+        .expect("native cancellation is bounded");
+        assert_eq!(
+            queue.admit_native_review(replacement).await.unwrap(),
+            (another_round.clone(), canceled.clone()),
+            "a canceled round is returned, never relaunched"
+        );
+        assert!(matches!(
+            queue
+                .read_native_review(&another_round.candidate, &canceled)
+                .await,
+            Err(crate::native_review::ReviewProofError::NotCompleted)
+        ));
+        restarted.shutdown().await.unwrap();
+    }
+
     struct HandoffScript {
         fail_worker: bool,
         pause_worker: bool,

@@ -28,10 +28,14 @@ use crate::domain::{
     is_todo_state, normalize_state, sanitize_workspace_key,
 };
 use crate::error::{FugueError, Result};
+#[cfg(test)]
 use crate::final_pr_gate::{
-    FinalPrGateCompletionInput, FinalPrGateCompletionPlan, FinalPrGateProjectionPlan,
-    FinalPrGateRuntimePlan, FinalPrGateRuntimeTriggerInput, FinalPrGateStartRequest,
-    final_pr_gate_completion_plan, final_pr_gate_start_request,
+    FinalPrGateCompletionInput, FinalPrGateCompletionPlan, FinalPrGateRuntimePlan,
+    final_pr_gate_completion_plan,
+};
+use crate::final_pr_gate::{
+    FinalPrGateProjectionPlan, FinalPrGateRuntimeTriggerInput, FinalPrGateStartRequest,
+    final_pr_gate_start_request,
 };
 use crate::github_tools::GitHubToolHost;
 use crate::independent_review::IndependentReviewStartRequest;
@@ -73,10 +77,10 @@ use crate::native_mob_contract::{NativeMobE2eEvidence, inspect_native_mob_e2e_co
 use crate::native_reviewer_gate::{ReviewerGateObservation, latest_reviewer_gate_observation};
 use crate::tool_layer::{FugueToolLayer, clean_workspace_for_issue_identifier_best_effort};
 use crate::tools::{
-    BranchName, CancelExecutionInput, CheckCiInput, CheckCiOutput, CiStatus, ClaimIssueInput,
-    CreatePrInput, Cursor, ExistingPrMatch, FugueToolError, FugueToolErrorCode, FugueToolOperation,
+    BranchName, CancelExecutionInput, CheckCiOutput, CiStatus, ClaimIssueInput, CreatePrInput,
+    Cursor, ExistingPrMatch, FugueToolError, FugueToolErrorCode, FugueToolOperation,
     FugueToolOutput, FugueToolResult, GitHubPullRequestNumber, GitHubPullRequestRef,
-    GitHubPullRequestSnapshot, GitHubRepoRef, GitRef, GitSha, IdempotencyKey, InspectRepoInput,
+    GitHubPullRequestSnapshot, GitHubRepoRef, GitSha, IdempotencyKey, InspectRepoInput,
     LinearIssueIdentifier, LinearIssueRef, LinearStateRef, ListRunsInput, MergePrInput,
     MobEventSnapshot, MobRunId, MobRunSnapshot, MobRunStatus, MoveIssueInput, MoveIssueOutput,
     PullRequestState, RetryAdvice, SpawnOrResumeExecutionInput, ToolExecutionMetadata,
@@ -151,7 +155,6 @@ pub struct OrchestratorState {
     pub meerkat_rate_limits: Option<Value>,
     pub last_error: Option<String>,
     pub recent_events: HashMap<String, Vec<RecentEvent>>,
-    final_pr_gates: HashMap<String, FinalPrGateRunHandle>,
 }
 
 #[derive(Debug)]
@@ -174,14 +177,6 @@ struct NativeRunHandle {
     run_id: MobRunId,
     observed_events: Vec<MobEventSnapshot>,
     recovery: NativeStatusRecovery,
-}
-
-#[derive(Debug, Clone)]
-struct FinalPrGateRunHandle {
-    run_id: MobRunId,
-    start_request: FinalPrGateStartRequest,
-    observed_events: Vec<MobEventSnapshot>,
-    completed: bool,
 }
 
 #[derive(Debug)]
@@ -286,8 +281,8 @@ struct NativeStatusReviewEvidence {
 
 trait NativeStatusGitHubInspector: Send + Sync {
     fn inspect_pr(&self, input: crate::tools::InspectPrInput) -> FugueToolResult;
-    fn check_ci(&self, input: CheckCiInput) -> FugueToolResult {
-        GitHubToolHost::new().check_ci(input)
+    fn check_pr_ci(&self, pull_request: &GitHubPullRequestSnapshot) -> FugueToolResult {
+        GitHubToolHost::new().check_pr_ci(pull_request)
     }
 }
 
@@ -296,8 +291,8 @@ impl NativeStatusGitHubInspector for GitHubToolHost {
         GitHubToolHost::inspect_pr(self, input)
     }
 
-    fn check_ci(&self, input: CheckCiInput) -> FugueToolResult {
-        GitHubToolHost::check_ci(self, input)
+    fn check_pr_ci(&self, pull_request: &GitHubPullRequestSnapshot) -> FugueToolResult {
+        GitHubToolHost::check_pr_ci(self, pull_request)
     }
 }
 
@@ -438,7 +433,11 @@ impl KapellmeisterHostToolExecutor for OrchestratorFinalPrGateStartExecutor {
         request: FinalPrGateStartRequest,
     ) -> FugueToolResult {
         let mcp_tools = agent_visible_mcp_tool_names(&self.config.mob.mcp_servers);
-        let template = final_pr_gate_native_launch_template(&request, &mcp_tools);
+        let template = crate::kapellmeister_host::final_pr_gate_native_launch_template_with_profile(
+            &request,
+            &mcp_tools,
+            &self.config.independent_review.orchestrator_profile,
+        );
         let repository = Some(request.pr.repo.clone());
         let plan = match NativeMobLaunchPlan::new(
             request.spawn_input,
@@ -557,6 +556,7 @@ fn unsupported_final_gate_operation(
 pub struct FinalPrGateProjectionExecutor {
     config: ServiceConfig,
     issue: LinearIssueRef,
+    registry: MetaRuntimeRegistry,
 }
 
 #[async_trait]
@@ -665,12 +665,14 @@ impl KapellmeisterHostToolExecutor for FinalPrGateProjectionExecutor {
     }
 
     async fn merge_pr(&mut self, input: MergePrInput) -> FugueToolResult {
-        crate::workgraph_gate::WorkGraphTerminalGate::for_service(&self.config)
-            .merge_pr_with(&self.config.tracker, &self.issue, input, |input| {
-                GitHubToolHost::with_connections(self.config.meerkat.runtime_connections.clone())
-                    .merge_pr(input)
-            })
-            .await
+        crate::merge_gate::merge(
+            &self.config,
+            &self.registry,
+            self.issue.clone(),
+            input,
+            crate::merge_gate::MergePurpose::FinalReview,
+        )
+        .await
     }
 }
 
@@ -732,44 +734,16 @@ pub async fn execute_final_pr_gate_projection_with_executor(
     Ok(())
 }
 
+#[cfg(test)]
 fn final_pr_gate_native_launch_template(
     request: &FinalPrGateStartRequest,
     mcp_tools: &[String],
 ) -> MaterializedMobTemplate {
-    let members = request
-        .reviewers
-        .iter()
-        .map(|reviewer| crate::config::MaterializedMobMember {
-            name: reviewer.id.clone(),
-            profile: reviewer.profile.clone(),
-            agent: crate::config::NativeAgentProfile {
-                model: None,
-                provider: None,
-                auth_binding: None,
-                max_tokens: None,
-                system_prompt: None,
-                output_schema: None,
-                structured_output_retries: None,
-                provider_params: None,
-                tools: review_agent_tools(
-                    ["mob", "shell", "comms", "workgraph"],
-                    mcp_tools,
-                ),
-                skills: Vec::new(),
-                additional_instructions: Some(vec![
-                    "You are a repo-level final PR reviewer. Emit typed final-review verdicts only. Do not merge. Inspect the PR diff against base and WorkGraph obligations yourself with shell/GitHub/workgraph tools; do not rely on precomputed summaries."
-                        .to_string(),
-                ]),
-            },
-        })
-        .collect::<Vec<_>>();
-    MaterializedMobTemplate {
-        backend: MobExecutionBackend::NativeExecution,
-        members,
-        flow: None,
-        linear_projection: None,
-        max_review_cycles: None,
-    }
+    crate::kapellmeister_host::final_pr_gate_native_launch_template_with_profile(
+        request,
+        mcp_tools,
+        &crate::config::IndependentReviewConfig::default().orchestrator_profile,
+    )
 }
 
 fn agent_visible_mcp_tool_names(
@@ -782,19 +756,6 @@ fn agent_visible_mcp_tool_names(
         .collect()
 }
 
-fn review_agent_tools<const N: usize>(base_tools: [&str; N], mcp_tools: &[String]) -> Vec<String> {
-    let mut tools = base_tools
-        .into_iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    for tool in mcp_tools {
-        if !tools.iter().any(|existing| existing == tool) {
-            tools.push(tool.clone());
-        }
-    }
-    tools
-}
-
 impl Orchestrator {
     pub fn new(config: WorkflowConfigManager, refresh_rx: mpsc::Receiver<()>) -> Self {
         let (internal_tx, internal_rx) = mpsc::channel(256);
@@ -802,11 +763,6 @@ impl Orchestrator {
         let meerkat_config = effective.meerkat.clone();
         let fugue_host_api_url = fugue_host_api_url_from_config(effective);
         let fugue_host_api_auth = fugue_host_api_auth_from_config(effective);
-        let final_review_reviewers = if effective.final_review.enabled {
-            effective.final_review.reviewers.clone()
-        } else {
-            Vec::new()
-        };
         let meta_runtime_registry = MetaRuntimeRegistry::with_config(
             meerkat_config,
             effective.tracker.clone(),
@@ -826,7 +782,7 @@ impl Orchestrator {
             ),
             effective.mob.templates.clone(),
         )
-        .with_final_review_reviewers(final_review_reviewers)
+        .with_final_review_config(effective.final_review.clone())
         .with_independent_review_config(effective.independent_review.clone());
         let native_event_observer = NativeMobEventObserver::for_config(effective);
         let state = Arc::new(RwLock::new(OrchestratorState {
@@ -841,7 +797,6 @@ impl Orchestrator {
             meerkat_rate_limits: None,
             last_error: None,
             recent_events: HashMap::new(),
-            final_pr_gates: HashMap::new(),
         }));
         Self {
             config,
@@ -1373,6 +1328,7 @@ impl Orchestrator {
                 Ok(Some(request)) => {
                     let result = crate::http::execute_deploy_transaction(
                         self.config.effective().clone(),
+                        self.meta_runtime_registry(),
                         request,
                     )
                     .await;
@@ -1483,6 +1439,7 @@ impl Orchestrator {
             ci_status: ci.map(|output| output.status),
             unresolved_workgraph_blockers,
             idempotency_key,
+            retry_deployment: None,
         }))
     }
 
@@ -1908,7 +1865,6 @@ impl Orchestrator {
     async fn reconcile_running_issues(&mut self) {
         self.recover_native_running_entries_after_restart().await;
         self.reconcile_native_mob_events().await;
-        self.reconcile_final_pr_gate_events_internal().await;
         self.reconcile_stalled_runs().await;
         let running_ids = {
             let state = self.state.read().await;
@@ -2416,241 +2372,6 @@ impl Orchestrator {
                 );
                 None
             }
-        }
-    }
-
-    fn final_pr_gate_merge_authorized(
-        &self,
-        issue: &Issue,
-        pr: &GitHubPullRequestSnapshot,
-    ) -> bool {
-        let context = kapellmeister_context_for_issue(issue, Some(pr.repo.clone()));
-        crate::kapellmeister_host::guarded_mode_allows_mutation(
-            &self.config.effective().kapellmeister.shadow_mode.authority,
-            &context,
-            FugueToolOperation::GitHubMergePr,
-        )
-    }
-
-    fn final_pr_gate_mergeable_evidence(&self, pr: &GitHubPullRequestSnapshot) -> bool {
-        pr.state == PullRequestState::Open && !pr.draft
-    }
-
-    async fn reconcile_final_pr_gate_events_internal(&mut self) {
-        let github_host = GitHubToolHost::with_connections(
-            self.config.effective().meerkat.runtime_connections.clone(),
-        );
-        self.reconcile_final_pr_gate_events_with_projector(
-            None::<&mut FinalPrGateProjectionExecutor>,
-            &github_host,
-        )
-        .await;
-    }
-
-    async fn reconcile_final_pr_gate_events_with_projector<E: KapellmeisterHostToolExecutor>(
-        &mut self,
-        projection_executor: Option<&mut E>,
-        github: &dyn NativeStatusGitHubInspector,
-    ) {
-        self.reconcile_final_pr_gate_events_with_projector_and_ci(
-            projection_executor,
-            github,
-            None,
-            None,
-            None,
-        )
-        .await;
-    }
-
-    async fn reconcile_final_pr_gate_events_with_projector_and_ci<
-        E: KapellmeisterHostToolExecutor,
-    >(
-        &mut self,
-        projection_executor: Option<&mut E>,
-        github: &dyn NativeStatusGitHubInspector,
-        ci_override: Option<CheckCiOutput>,
-        merge_authorized_override: Option<bool>,
-        mergeable_override: Option<bool>,
-    ) {
-        let mut projection_executor = projection_executor;
-        let gates = {
-            let state = self.state.read().await;
-            state
-                .final_pr_gates
-                .iter()
-                .filter(|(_, gate)| !gate.completed)
-                .map(|(id, gate)| (id.clone(), gate.clone()))
-                .collect::<Vec<_>>()
-        };
-        for (run_id_key, mut gate) in gates {
-            let observation = match self.native_event_observer.observe(
-                self.native_execution_host.as_ref(),
-                &gate.run_id,
-                100,
-            ) {
-                Ok(observation) => observation,
-                Err(err) => {
-                    let mut state = self.state.write().await;
-                    state.last_error = Some(err.to_string());
-                    continue;
-                }
-            };
-            if observation.events.is_empty() {
-                let _ = self
-                    .native_event_observer
-                    .commit(&gate.run_id, &observation);
-                continue;
-            }
-            merge_mob_event_snapshots(&mut gate.observed_events, &observation.events);
-            let mut extra_blockers = Vec::new();
-            let current_pr = match github.inspect_pr(crate::tools::InspectPrInput {
-                repo: gate.start_request.pr.repo.clone(),
-                pull_request: GitHubPullRequestRef::Number {
-                    number: gate.start_request.pr.number,
-                },
-            }) {
-                FugueToolResult::Ok {
-                    output: FugueToolOutput::GitHubInspectPr(output),
-                    ..
-                } => output.pull_request,
-                FugueToolResult::Err { error, .. } => {
-                    let blocker = format!(
-                        "current PR refresh failed for PR #{}: {}",
-                        gate.start_request.pr.number.0, error.message
-                    );
-                    let mut state = self.state.write().await;
-                    state.last_error = Some(format!("final PR gate {blocker}"));
-                    extra_blockers.push(blocker);
-                    let mut stale = gate.start_request.pr.clone();
-                    stale.head_sha = GitSha(format!(
-                        "unverified-current-pr-refresh-failed:{}",
-                        stale.head_sha.0
-                    ));
-                    stale
-                }
-                FugueToolResult::Ok { output, .. } => {
-                    let blocker =
-                        format!("current PR refresh returned unexpected output {output:?}");
-                    let mut state = self.state.write().await;
-                    state.last_error = Some(format!("final PR gate {blocker}"));
-                    extra_blockers.push(blocker);
-                    let mut stale = gate.start_request.pr.clone();
-                    stale.head_sha = GitSha(format!(
-                        "unverified-current-pr-refresh-unexpected:{}",
-                        stale.head_sha.0
-                    ));
-                    stale
-                }
-            };
-            let ci = if let Some(ci) = ci_override.clone() {
-                Some(ci)
-            } else {
-                match github.check_ci(native_pr_handoff_ci_input(&current_pr)) {
-                    FugueToolResult::Ok {
-                        output: FugueToolOutput::GitHubCheckCi(output),
-                        ..
-                    } => Some(output),
-                    FugueToolResult::Err { error, .. } => {
-                        let mut state = self.state.write().await;
-                        state.last_error = Some(format!(
-                            "final PR gate CI evidence unavailable for PR #{}: {}",
-                            current_pr.number.0, error.message
-                        ));
-                        None
-                    }
-                    FugueToolResult::Ok { output, .. } => {
-                        let mut state = self.state.write().await;
-                        state.last_error = Some(format!(
-                            "final PR gate CI check returned unexpected output {output:?}"
-                        ));
-                        None
-                    }
-                }
-            };
-            let issue_identifier = issue_identifier_from_ref(&gate.start_request.issue)
-                .unwrap_or_else(|| "unknown".to_string());
-            let issue = Issue {
-                id: issue_identifier.clone(),
-                identifier: issue_identifier,
-                title: format!("Final PR gate for PR #{}", current_pr.number.0),
-                description: None,
-                priority: None,
-                state: self.config.effective().final_review.lane.clone(),
-                branch_name: Some(current_pr.head_branch.0.clone()),
-                url: Some(current_pr.url.clone()),
-                labels: Vec::new(),
-                blocked_by: Vec::new(),
-                attachments: Vec::new(),
-                created_at: None,
-                updated_at: None,
-            };
-            let completion_ci = ci.clone();
-            let completion = final_pr_gate_completion_plan(
-                Utc::now(),
-                FinalPrGateCompletionInput {
-                    config: self.config.effective().final_review.clone(),
-                    start_request: gate.start_request.clone(),
-                    current_pr: current_pr.clone(),
-                    ci: completion_ci.clone(),
-                    merge_authorized_by_kapellmeister: merge_authorized_override.unwrap_or_else(
-                        || self.final_pr_gate_merge_authorized(&issue, &current_pr),
-                    ),
-                    mergeable: mergeable_override
-                        .unwrap_or_else(|| self.final_pr_gate_mergeable_evidence(&current_pr)),
-                    idempotency_key: IdempotencyKey(format!(
-                        "final-gate-complete:{}:{}",
-                        current_pr.number.0, gate.start_request.pr.head_sha.0
-                    )),
-                    extra_blockers,
-                    events: gate.observed_events.clone(),
-                },
-            );
-            match completion {
-                FinalPrGateCompletionPlan::Waiting { .. } => {
-                    let mut state = self.state.write().await;
-                    if let Some(stored) = state.final_pr_gates.get_mut(&run_id_key) {
-                        stored.observed_events = gate.observed_events;
-                    }
-                }
-                FinalPrGateCompletionPlan::Ready(plan) => {
-                    let projection_result = if let Some(executor) =
-                        projection_executor.as_deref_mut()
-                    {
-                        execute_final_pr_gate_projection_with_executor(
-                            &self.config.effective().kapellmeister.shadow_mode.authority,
-                            &kapellmeister_context_for_issue(&issue, Some(current_pr.repo.clone())),
-                            plan.projection.clone(),
-                            executor,
-                        )
-                        .await
-                    } else {
-                        let mut executor = FinalPrGateProjectionExecutor {
-                            config: self.config.effective().clone(),
-                            issue: gate.start_request.issue.clone(),
-                        };
-                        execute_final_pr_gate_projection_with_executor(
-                            &self.config.effective().kapellmeister.shadow_mode.authority,
-                            &kapellmeister_context_for_issue(&issue, Some(current_pr.repo.clone())),
-                            plan.projection.clone(),
-                            &mut executor,
-                        )
-                        .await
-                    };
-                    if let Err(err) = projection_result {
-                        let mut state = self.state.write().await;
-                        state.last_error = Some(err.to_string());
-                        continue;
-                    }
-                    let mut state = self.state.write().await;
-                    if let Some(stored) = state.final_pr_gates.get_mut(&run_id_key) {
-                        stored.observed_events = gate.observed_events;
-                        stored.completed = true;
-                    }
-                }
-            }
-            let _ = self
-                .native_event_observer
-                .commit(&gate.run_id, &observation);
         }
     }
 
@@ -3707,12 +3428,6 @@ impl Orchestrator {
         issue: &Issue,
         final_gate_start: &FinalPrGateStartRequest,
     ) -> Result<bool> {
-        if self
-            .matching_final_pr_gate_is_running(issue, final_gate_start)
-            .await
-        {
-            return Ok(false);
-        }
         self.deliver_kapellmeister_shadow_signal(
             KapellmeisterShadowSignal::final_pr_gate_requested(
                 Utc::now(),
@@ -3759,21 +3474,6 @@ impl Orchestrator {
             decision = ?decision,
             "delivered PR handoff monitor observation to repo Kapellmeister"
         );
-    }
-
-    async fn matching_final_pr_gate_is_running(
-        &self,
-        issue: &Issue,
-        final_gate_start: &FinalPrGateStartRequest,
-    ) -> bool {
-        let state = self.state.read().await;
-        state.final_pr_gates.values().any(|gate| {
-            !gate.completed
-                && issue_identifier_from_ref(&gate.start_request.issue)
-                    .is_some_and(|identifier| identifier == issue.identifier)
-                && gate.start_request.pr.number == final_gate_start.pr.number
-                && gate.start_request.pr.head_sha == final_gate_start.pr.head_sha
-        })
     }
 
     #[cfg(test)]
@@ -4440,10 +4140,27 @@ impl Orchestrator {
 
     async fn handle_kapellmeister_start_final_pr_gate(
         &self,
-        request: FinalPrGateStartRequest,
+        mut request: FinalPrGateStartRequest,
     ) -> KapellmeisterStartIssueResult {
         let issue_identifier =
             issue_identifier_from_ref(&request.issue).unwrap_or_else(|| "unknown".to_string());
+        let config = self.config.effective();
+        if !config.final_review.enabled {
+            return KapellmeisterStartIssueResult {
+                issue_identifier,
+                accepted: false,
+                message: "Final review is disabled for this repository.".into(),
+            };
+        }
+        request.reviewers = crate::final_pr_gate::final_reviewer_member_specs(&config.final_review);
+        request.trigger_mode = config.final_review.mode;
+        request.spawn_input.instructions =
+            Some(crate::final_pr_gate::final_pr_gate_reviewer_instructions(
+                &config.final_review,
+                &request.issue,
+                &request.pr,
+                request.trigger_mode,
+            ));
         let issue = Issue {
             id: issue_identifier.clone(),
             identifier: issue_identifier.clone(),
@@ -4490,26 +4207,14 @@ impl Orchestrator {
                 Some(FugueToolResult::Ok {
                     output: FugueToolOutput::MobSpawnOrResumeExecution(output),
                     ..
-                }) => {
-                    let mut state = self.state.write().await;
-                    state.final_pr_gates.insert(
-                        output.run.run_id.0.clone(),
-                        FinalPrGateRunHandle {
-                            run_id: output.run.run_id.clone(),
-                            start_request: request.clone(),
-                            observed_events: Vec::new(),
-                            completed: false,
-                        },
-                    );
-                    KapellmeisterStartIssueResult {
-                        issue_identifier,
-                        accepted: true,
-                        message: format!(
-                            "Kapellmeister-authorized final PR gate start/resume accepted: run_id={}, spawned={}, resumed={}",
-                            output.run.run_id.0, output.spawned, output.resumed
-                        ),
-                    }
-                }
+                }) => KapellmeisterStartIssueResult {
+                    issue_identifier,
+                    accepted: true,
+                    message: format!(
+                        "Kapellmeister-authorized final PR gate start/resume accepted: run_id={}, spawned={}, resumed={}",
+                        output.run.run_id.0, output.spawned, output.resumed
+                    ),
+                },
                 Some(FugueToolResult::Err { error, .. }) => KapellmeisterStartIssueResult {
                     issue_identifier,
                     accepted: false,
@@ -4649,75 +4354,6 @@ impl Orchestrator {
                 accepted: false,
                 message: error.to_string(),
             },
-        }
-    }
-
-    pub async fn handle_final_pr_gate_completion_events(
-        &self,
-        start_request: FinalPrGateStartRequest,
-        current_pr: GitHubPullRequestSnapshot,
-        ci: Option<CheckCiOutput>,
-        merge_authorized_by_kapellmeister: bool,
-        mergeable: bool,
-        events: Vec<MobEventSnapshot>,
-    ) -> Result<Option<FinalPrGateRuntimePlan>> {
-        let completion = final_pr_gate_completion_plan(
-            Utc::now(),
-            FinalPrGateCompletionInput {
-                config: self.config.effective().final_review.clone(),
-                start_request: start_request.clone(),
-                current_pr: current_pr.clone(),
-                ci,
-                merge_authorized_by_kapellmeister,
-                mergeable,
-                idempotency_key: IdempotencyKey(format!(
-                    "final-gate-complete:{}:{}",
-                    current_pr.number.0, start_request.pr.head_sha.0
-                )),
-                extra_blockers: Vec::new(),
-                events,
-            },
-        );
-        match completion {
-            FinalPrGateCompletionPlan::Waiting { reason } => {
-                debug!(
-                    pull_request = current_pr.number.0,
-                    reason = %reason,
-                    "final PR gate completion aggregation is waiting for typed verdict evidence"
-                );
-                Ok(None)
-            }
-            FinalPrGateCompletionPlan::Ready(plan) => {
-                let issue_identifier = issue_identifier_from_ref(&start_request.issue)
-                    .unwrap_or_else(|| "unknown".to_string());
-                let issue = Issue {
-                    id: issue_identifier.clone(),
-                    identifier: issue_identifier,
-                    title: format!("Final PR gate for PR #{}", current_pr.number.0),
-                    description: None,
-                    priority: None,
-                    state: self.config.effective().final_review.lane.clone(),
-                    branch_name: Some(current_pr.head_branch.0.clone()),
-                    url: Some(current_pr.url.clone()),
-                    labels: Vec::new(),
-                    blocked_by: Vec::new(),
-                    attachments: Vec::new(),
-                    created_at: None,
-                    updated_at: None,
-                };
-                let mut executor = FinalPrGateProjectionExecutor {
-                    config: self.config.effective().clone(),
-                    issue: start_request.issue.clone(),
-                };
-                execute_final_pr_gate_projection_with_executor(
-                    &self.config.effective().kapellmeister.shadow_mode.authority,
-                    &kapellmeister_context_for_issue(&issue, Some(current_pr.repo.clone())),
-                    plan.projection.clone(),
-                    &mut executor,
-                )
-                .await?;
-                Ok(Some(plan))
-            }
         }
     }
 
@@ -6276,21 +5912,11 @@ fn kapellmeister_host_projection_repair_allowed(idempotency_suffix: &str) -> boo
     )
 }
 
-fn native_pr_handoff_ci_input(pull_request: &GitHubPullRequestSnapshot) -> CheckCiInput {
-    // `gh pr checks` accepts a PR number/branch selector, not an arbitrary commit SHA.
-    // The monitored PR snapshot still carries the exact head SHA used as final-gate
-    // evidence; CI is queried through the PR branch that resolves to that snapshot.
-    CheckCiInput {
-        repo: pull_request.repo.clone(),
-        git_ref: GitRef(pull_request.head_branch.0.clone()),
-    }
-}
-
 fn inspect_native_pr_handoff_ci(
     github: &dyn NativeStatusGitHubInspector,
     pull_request: &GitHubPullRequestSnapshot,
 ) -> std::result::Result<CheckCiOutput, String> {
-    match github.check_ci(native_pr_handoff_ci_input(pull_request)) {
+    match github.check_pr_ci(pull_request) {
         FugueToolResult::Ok {
             output: FugueToolOutput::GitHubCheckCi(output),
             ..
@@ -9860,6 +9486,11 @@ mod tests {
             mob_definition: json!({}),
         };
         let final_template = final_pr_gate_native_launch_template(&final_request, &mcp_tools);
+        assert_eq!(final_template.members.len(), 1);
+        assert_eq!(
+            final_template.members[0].name, "review_orchestrator",
+            "final review must select existing specialists through one coordinator"
+        );
         let final_tools = &final_template.members[0].agent.tools;
         assert!(final_tools.contains(&"mcp:github".to_string()));
         assert!(final_tools.contains(&"mcp:linear".to_string()));
@@ -10570,7 +10201,7 @@ mod tests {
             self.result.clone()
         }
 
-        fn check_ci(&self, _input: CheckCiInput) -> FugueToolResult {
+        fn check_pr_ci(&self, _pull_request: &GitHubPullRequestSnapshot) -> FugueToolResult {
             match self.ci.clone() {
                 Some(output) => FugueToolResult::Ok {
                     output: FugueToolOutput::GitHubCheckCi(output),
@@ -12231,7 +11862,6 @@ worker:
             meerkat_rate_limits: None,
             last_error: None,
             recent_events: HashMap::new(),
-            final_pr_gates: HashMap::new(),
         };
         let mut issue = active_issue_with_labels(&["native"]);
         issue.state = "In Progress".to_string();
@@ -12939,29 +12569,29 @@ worker:
     }
 
     #[test]
-    fn native_pr_handoff_ci_uses_pr_branch_ref_not_bare_head_sha() {
-        let pull_request = pr_snapshot(
-            187,
-            "luka/luc-623",
-            "df54ff6bba8830904fb69815e95b454b94b2fbfe",
-        );
-        assert_eq!(
-            native_pr_handoff_ci_input(&pull_request),
-            CheckCiInput {
-                repo: pull_request.repo.clone(),
-                git_ref: GitRef("luka/luc-623".to_string()),
+    fn native_pr_handoff_ci_passes_exact_candidate_to_inspector() {
+        struct Inspector(std::sync::Mutex<Option<GitHubPullRequestSnapshot>>);
+        impl NativeStatusGitHubInspector for Inspector {
+            fn inspect_pr(&self, _: crate::tools::InspectPrInput) -> FugueToolResult {
+                panic!("the CI read already has a candidate");
             }
-        );
-        assert_ne!(
-            native_pr_handoff_ci_input(&pull_request).git_ref,
-            GitRef(pull_request.head_sha.0.clone()),
-            "gh pr checks treats a bare commit SHA as a branch/PR selector, so the native monitor must not pass the reviewed head SHA as the check ref"
-        );
+            fn check_pr_ci(&self, candidate: &GitHubPullRequestSnapshot) -> FugueToolResult {
+                *self.0.lock().unwrap() = Some(candidate.clone());
+                FugueToolResult::Ok {
+                    output: FugueToolOutput::GitHubCheckCi(ci_output(CiStatus::Success)),
+                    metadata: ToolExecutionMetadata::default(),
+                }
+            }
+        }
+        let candidate = pr_snapshot(187, "feature", "df54ff6bba8830904fb69815e95b454b94b2fbfe");
+        let inspector = Inspector(std::sync::Mutex::new(None));
         assert_eq!(
-            pull_request.head_sha,
-            GitSha("df54ff6bba8830904fb69815e95b454b94b2fbfe".to_string()),
-            "CI lookup uses the branch selector, but final-gate evidence remains tied to the exact monitored PR head SHA"
+            inspect_native_pr_handoff_ci(&inspector, &candidate)
+                .unwrap()
+                .status,
+            CiStatus::Success
         );
+        assert_eq!(inspector.0.into_inner().unwrap(), Some(candidate));
     }
 
     #[test]
@@ -13152,306 +12782,6 @@ worker:
         assert_eq!(executor.operations, vec!["workpad", "move"]);
     }
 
-    async fn live_reconcile_completion_for_test(
-        status: FinalReviewVerdictStatus,
-        current_sha_override: Option<&str>,
-        merge_authorized_override: Option<bool>,
-        mergeable_override: Option<bool>,
-        require_fresh_head: bool,
-    ) -> (
-        Orchestrator,
-        Arc<RecordingNativeMobExecutionHost>,
-        RecordingFinalGateProjectionExecutor,
-    ) {
-        let current_sha = current_sha_override.unwrap_or("sha-a").to_string();
-        live_reconcile_completion_for_test_with_inspector(
-            status,
-            StaticGitHubInspector::ok(pr_snapshot(187, "luka/luc-623", &current_sha)),
-            merge_authorized_override,
-            mergeable_override,
-            require_fresh_head,
-        )
-        .await
-    }
-
-    async fn live_reconcile_completion_for_test_with_inspector(
-        status: FinalReviewVerdictStatus,
-        inspector: StaticGitHubInspector,
-        merge_authorized_override: Option<bool>,
-        mergeable_override: Option<bool>,
-        require_fresh_head: bool,
-    ) -> (
-        Orchestrator,
-        Arc<RecordingNativeMobExecutionHost>,
-        RecordingFinalGateProjectionExecutor,
-    ) {
-        let mut definition = native_kapellmeister_workflow_definition();
-        definition.config.insert(
-            "kapellmeister".to_string(),
-            json!({
-                "authority_mode": "guarded_labeled",
-                "safe_selectors": {
-                    "repositories": [{"owner": "lukacf", "name": "meerkat-fugue"}]
-                }
-            }),
-        );
-        definition.config.insert(
-            "final_review".to_string(),
-            json!({
-                "enabled": true,
-                "mode": "manual",
-                "lane": "Custom Final Gate",
-                "rework_lane": "Custom Rework",
-                "blocked_lane": "Custom Blocked",
-                "success_lane": "Custom Done",
-                "merge": {"strategy": "squash", "delete_branch": true, "require_ci_success": true, "require_fresh_head": true},
-                "reviewers": [
-                    {"id": "architecture", "profile": "final_architecture_reviewer", "required": true},
-                    {"id": "tests", "profile": "final_test_reviewer", "required": true}
-                ]
-            }),
-        );
-        definition.config.insert(
-            "final_review".to_string(),
-            json!({
-                "enabled": true,
-                "mode": "manual",
-                "lane": "Custom Final Gate",
-                "rework_lane": "Custom Rework",
-                "blocked_lane": "Custom Blocked",
-                "success_lane": "Custom Done",
-                "merge": {"strategy": "squash", "delete_branch": true, "require_ci_success": true, "require_fresh_head": require_fresh_head},
-                "reviewers": [
-                    {"id": "architecture", "profile": "final_architecture_reviewer", "required": true},
-                    {"id": "tests", "profile": "final_test_reviewer", "required": true}
-                ]
-            }),
-        );
-        let (mut orchestrator, native_host) = native_orchestrator_for_definition(definition);
-        let cursor_dir = tempfile::tempdir().expect("cursor tempdir");
-        orchestrator.native_event_observer =
-            NativeMobEventObserver::new(crate::mob_event_observer::MobEventCursorStore::new(
-                cursor_dir.path().join("meta-cursors.json"),
-            ));
-        let mut config = orchestrator.config.effective().clone();
-        config.final_review = crate::config::FinalReviewConfig {
-            enabled: true,
-            mode: crate::config::FinalReviewMode::Manual,
-            lane: "Custom Final Gate".to_string(),
-            rework_lane: "Custom Rework".to_string(),
-            blocked_lane: "Custom Blocked".to_string(),
-            success_lane: "Custom Done".to_string(),
-            merge: crate::config::FinalReviewMergeConfig::default(),
-            reviewers: vec![
-                crate::config::FinalReviewReviewerConfig {
-                    id: "architecture".to_string(),
-                    profile: "final_architecture_reviewer".to_string(),
-                    required: true,
-                },
-                crate::config::FinalReviewReviewerConfig {
-                    id: "tests".to_string(),
-                    profile: "final_test_reviewer".to_string(),
-                    required: true,
-                },
-            ],
-        };
-        let sha = "sha-a";
-        let mut issue = issue("issue-623", "LUC-623", Some(1), 10);
-        issue.state = "Custom Final Gate".to_string();
-        let github = recover_native_github_evidence(pr_snapshot(187, "luka/luc-623", sha));
-        let request = native_final_pr_gate_start_request_from_handoff(&config, &issue, &github)
-            .expect("start request construction")
-            .expect("manual mode should produce request");
-        let result = orchestrator
-            .handle_kapellmeister_start_final_pr_gate(request.clone())
-            .await;
-        assert!(result.accepted, "{}", result.message);
-        let run_id = {
-            let state = orchestrator.state.read().await;
-            state
-                .final_pr_gates
-                .values()
-                .next()
-                .map(|gate| gate.run_id.clone())
-                .expect("tracked final gate run")
-        };
-        let test_status = if status == FinalReviewVerdictStatus::RequestChanges {
-            FinalReviewVerdictStatus::RequestChanges
-        } else {
-            FinalReviewVerdictStatus::Approve
-        };
-        let mut verdicts = vec![crate::final_pr_gate::FinalReviewVerdict {
-            reviewer: "architecture".to_string(),
-            status: FinalReviewVerdictStatus::Approve,
-            pr: pr_snapshot(187, "luka/luc-623", sha),
-            head_sha: GitSha(sha.to_string()),
-            findings: Vec::new(),
-            required_checks: Vec::new(),
-        }];
-        if status != FinalReviewVerdictStatus::Blocked {
-            verdicts.push(crate::final_pr_gate::FinalReviewVerdict {
-                reviewer: "tests".to_string(),
-                status: test_status,
-                pr: pr_snapshot(187, "luka/luc-623", sha),
-                head_sha: GitSha(sha.to_string()),
-                findings: Vec::new(),
-                required_checks: Vec::new(),
-            });
-        }
-        native_host
-            .append_structural_event(
-                &run_id,
-                crate::tools::MobEventKind::RunCompleted {
-                    status: MobRunStatus::Succeeded,
-                    structured_output: Some(json!({ "verdicts": verdicts })),
-                },
-                None,
-            )
-            .expect("append final gate event");
-        let mut executor = RecordingFinalGateProjectionExecutor::default();
-        orchestrator
-            .reconcile_final_pr_gate_events_with_projector_and_ci(
-                Some(&mut executor),
-                &inspector,
-                None,
-                merge_authorized_override,
-                mergeable_override,
-            )
-            .await;
-        (orchestrator, native_host, executor)
-    }
-
-    #[tokio::test]
-    async fn live_reconcile_final_gate_completion_events_drive_rework_projection() {
-        let (_orchestrator, _native_host, executor) = live_reconcile_completion_for_test(
-            FinalReviewVerdictStatus::RequestChanges,
-            None,
-            None,
-            None,
-            true,
-        )
-        .await;
-        assert_eq!(executor.workpads.len(), 1);
-        assert_eq!(executor.moves.len(), 1);
-        assert!(executor.merges.is_empty());
-    }
-
-    #[tokio::test]
-    async fn live_reconcile_final_gate_completion_blocks_stale_refreshed_head() {
-        let (_orchestrator, _native_host, executor) = live_reconcile_completion_for_test(
-            FinalReviewVerdictStatus::Approve,
-            Some("sha-drift"),
-            None,
-            None,
-            true,
-        )
-        .await;
-        assert_eq!(executor.workpads.len(), 1);
-        assert_eq!(executor.moves.len(), 1);
-        assert!(executor.merges.is_empty());
-    }
-
-    #[tokio::test]
-    async fn live_reconcile_final_gate_completion_blocks_pr_refresh_failure() {
-        let (_orchestrator, _native_host, executor) =
-            live_reconcile_completion_for_test_with_inspector(
-                FinalReviewVerdictStatus::Approve,
-                StaticGitHubInspector::err("boom refresh failed"),
-                None,
-                None,
-                true,
-            )
-            .await;
-        assert_eq!(executor.workpads.len(), 1);
-        assert_eq!(executor.moves.len(), 1);
-        assert!(executor.merges.is_empty());
-        assert!(
-            executor.workpads[0]
-                .body_markdown
-                .contains("current PR refresh failed")
-        );
-    }
-
-    #[tokio::test]
-    async fn live_reconcile_final_gate_completion_blocks_pr_refresh_failure_without_fresh_head_requirement()
-     {
-        let (_orchestrator, _native_host, executor) =
-            live_reconcile_completion_for_test_with_inspector(
-                FinalReviewVerdictStatus::Approve,
-                StaticGitHubInspector::err("boom refresh failed"),
-                None,
-                None,
-                false,
-            )
-            .await;
-        assert_eq!(executor.workpads.len(), 1);
-        assert_eq!(executor.moves.len(), 1);
-        assert!(executor.merges.is_empty());
-        assert!(
-            executor.workpads[0]
-                .body_markdown
-                .contains("current PR refresh failed")
-        );
-    }
-
-    #[tokio::test]
-    async fn live_reconcile_final_gate_completion_blocks_false_authority_or_mergeability() {
-        let (_orchestrator, _native_host, no_authority) = live_reconcile_completion_for_test(
-            FinalReviewVerdictStatus::Approve,
-            None,
-            Some(false),
-            None,
-            true,
-        )
-        .await;
-        assert_eq!(no_authority.workpads.len(), 1);
-        assert_eq!(no_authority.moves.len(), 1);
-        assert!(no_authority.merges.is_empty());
-
-        let (_orchestrator, _native_host, not_mergeable) = live_reconcile_completion_for_test(
-            FinalReviewVerdictStatus::Approve,
-            None,
-            None,
-            Some(false),
-            true,
-        )
-        .await;
-        assert_eq!(not_mergeable.workpads.len(), 1);
-        assert_eq!(not_mergeable.moves.len(), 1);
-        assert!(not_mergeable.merges.is_empty());
-    }
-
-    #[tokio::test]
-    async fn live_reconcile_final_gate_completion_events_drive_merge_projection() {
-        let (_orchestrator, _native_host, executor) = live_reconcile_completion_for_test(
-            FinalReviewVerdictStatus::Approve,
-            None,
-            None,
-            None,
-            true,
-        )
-        .await;
-        assert_eq!(executor.workpads.len(), 1);
-        assert_eq!(executor.moves.len(), 1);
-        assert_eq!(executor.merges.len(), 1);
-        assert!(executor.merges[0].expected_head_sha.is_some());
-    }
-
-    #[tokio::test]
-    async fn live_reconcile_final_gate_completion_events_drive_blocked_projection() {
-        let (_orchestrator, _native_host, executor) = live_reconcile_completion_for_test(
-            FinalReviewVerdictStatus::Blocked,
-            None,
-            None,
-            None,
-            true,
-        )
-        .await;
-        assert_eq!(executor.workpads.len(), 1);
-        assert_eq!(executor.moves.len(), 1);
-        assert!(executor.merges.is_empty());
-    }
-
     #[tokio::test]
     async fn production_final_gate_completion_events_drive_blocked_projection() {
         let mut definition = native_kapellmeister_workflow_definition();
@@ -13597,7 +12927,7 @@ worker:
                 }
             }),
         );
-        let (orchestrator, native_host) = native_orchestrator_for_definition(definition);
+        let (mut orchestrator, native_host) = native_orchestrator_for_definition(definition);
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
             enabled: true,
@@ -13614,6 +12944,16 @@ worker:
             }],
         };
         config.linear.lanes.review_ready = Some("Repo Ready".to_string());
+        let mut enabled_definition = orchestrator.config.definition().clone();
+        enabled_definition.config.insert(
+            "final_review".into(),
+            serde_json::to_value(&config.final_review).unwrap(),
+        );
+        orchestrator.config = WorkflowConfigManager::from_definition_for_test(
+            PathBuf::from("/tmp/fugue.yaml"),
+            enabled_definition,
+        )
+        .unwrap();
         let mut issue = issue("issue-623", "LUC-623", Some(1), 10);
         issue.state = "Repo Ready".to_string();
         let github = recover_native_github_evidence(pr_snapshot(187, "luka/luc-623", "api-head"));
@@ -13647,7 +12987,7 @@ worker:
                 }
             }),
         );
-        let (orchestrator, _native_host) = native_orchestrator_for_definition(definition);
+        let (mut orchestrator, _native_host) = native_orchestrator_for_definition(definition);
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
             enabled: true,
@@ -13664,6 +13004,16 @@ worker:
             }],
         };
         config.linear.lanes.review_ready = Some("Repo Ready".to_string());
+        let mut enabled_definition = orchestrator.config.definition().clone();
+        enabled_definition.config.insert(
+            "final_review".into(),
+            serde_json::to_value(&config.final_review).unwrap(),
+        );
+        orchestrator.config = WorkflowConfigManager::from_definition_for_test(
+            PathBuf::from("/tmp/fugue.yaml"),
+            enabled_definition,
+        )
+        .unwrap();
         let mut issue = issue("issue-623", "LUC-623", Some(1), 10);
         issue.state = "Repo Ready".to_string();
         let github = recover_native_github_evidence(pr_snapshot(187, "luka/luc-623", "api-head"));
@@ -13683,7 +13033,7 @@ worker:
 
     #[tokio::test]
     async fn production_final_pr_gate_does_not_self_authorize_label_only_selector() {
-        let (orchestrator, native_host) =
+        let (mut orchestrator, native_host) =
             native_orchestrator_for_definition(native_kapellmeister_workflow_definition());
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
@@ -13701,6 +13051,16 @@ worker:
             }],
         };
         config.linear.lanes.review_ready = Some("Repo Ready".to_string());
+        let mut enabled_definition = orchestrator.config.definition().clone();
+        enabled_definition.config.insert(
+            "final_review".into(),
+            serde_json::to_value(&config.final_review).unwrap(),
+        );
+        orchestrator.config = WorkflowConfigManager::from_definition_for_test(
+            PathBuf::from("/tmp/fugue.yaml"),
+            enabled_definition,
+        )
+        .unwrap();
         let mut issue = issue("issue-623", "LUC-623", Some(1), 10);
         issue.state = "Repo Ready".to_string();
         let github = recover_native_github_evidence(pr_snapshot(187, "luka/luc-623", "api-head"));
@@ -13780,8 +13140,8 @@ worker:
         );
         let instructions = input.instructions.as_deref().unwrap();
         assert!(instructions.contains("via Auto"));
-        assert!(instructions.contains("Review exact head SHA `new-head`"));
-        assert!(instructions.contains("success=`Custom Done`"));
+        assert!(instructions.contains("Review exact head new-head"));
+        assert!(instructions.contains("success=Custom Done"));
         assert_eq!(start.reviewers.len(), 2);
         assert!(
             start
@@ -13908,53 +13268,6 @@ worker:
                 .unwrap()
                 .contains("via Manual")
         );
-    }
-
-    #[tokio::test]
-    async fn final_gate_observation_is_suppressed_while_matching_gate_runs() {
-        let (orchestrator, _) =
-            native_orchestrator_for_definition(native_kapellmeister_workflow_definition());
-        let mut config = orchestrator.config.effective().clone();
-        config.final_review = crate::config::FinalReviewConfig {
-            enabled: true,
-            mode: crate::config::FinalReviewMode::Manual,
-            lane: "Custom Final Gate".to_string(),
-            rework_lane: "Custom Rework".to_string(),
-            blocked_lane: "Custom Blocked".to_string(),
-            success_lane: "Custom Done".to_string(),
-            merge: crate::config::FinalReviewMergeConfig::default(),
-            reviewers: vec![crate::config::FinalReviewReviewerConfig {
-                id: "tests".to_string(),
-                profile: "final_test_reviewer".to_string(),
-                required: true,
-            }],
-        };
-        let mut issue = issue("issue-624", "LUC-624", Some(1), 10);
-        issue.state = "Custom Final Gate".to_string();
-        let github =
-            recover_native_github_evidence(pr_snapshot(188, "luka/luc-624", "manual-head"));
-        let start = native_final_pr_gate_start_request_from_handoff(&config, &issue, &github)
-            .expect("start request construction")
-            .expect("manual mode should start from final gate lane");
-        {
-            let mut state = orchestrator.state.write().await;
-            state.final_pr_gates.insert(
-                start.spawn_input.idempotency_key.0.clone(),
-                FinalPrGateRunHandle {
-                    run_id: crate::tools::MobRunId(start.spawn_input.idempotency_key.0.clone()),
-                    start_request: start.clone(),
-                    observed_events: Vec::new(),
-                    completed: false,
-                },
-            );
-        }
-
-        let delivered = orchestrator
-            .deliver_native_final_pr_gate_request_to_kapellmeister(&issue, &start)
-            .await
-            .expect("suppression check succeeds");
-
-        assert!(!delivered);
     }
 
     #[test]
@@ -15679,7 +14992,6 @@ worker:
             meerkat_rate_limits: None,
             last_error: None,
             recent_events: HashMap::new(),
-            final_pr_gates: HashMap::new(),
         };
         state.running.insert(
             issue.id.clone(),
@@ -16244,7 +15556,6 @@ worker:
             meerkat_rate_limits: None,
             last_error: None,
             recent_events: HashMap::new(),
-            final_pr_gates: HashMap::new(),
         };
         let cancel = CancellationToken::new();
         let running_handle = tokio::spawn(async {});
@@ -16326,7 +15637,6 @@ worker:
             meerkat_rate_limits: None,
             last_error: None,
             recent_events: HashMap::new(),
-            final_pr_gates: HashMap::new(),
         };
         let mut issue = issue("running-1", "LUC-624", Some(1), 10);
         issue.state = "Final Review & Merge".to_string();

@@ -1117,17 +1117,17 @@ pub fn external_tools_for_tracker(config: &crate::config::TrackerConfig) -> Opti
         }),
         json!({
             "name": FugueToolOperation::GitHubMergePr.provider_callback_name(),
-            "description": "Merge a GitHub pull request through Fugue's typed GitHub tool layer after validating the current PR state and optional expected head SHA.",
+            "description": "Merge an open, non-draft GitHub pull request at the explicit expected head SHA. Success requires GitHub to confirm the merged state and merge commit.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "repo": reference_schema::<crate::tools::GitHubRepoRef>(),
                     "pull_request": reference_schema::<crate::tools::GitHubPullRequestRef>(),
                     "method": { "type": "string", "enum": ["merge", "squash", "rebase"] },
-                    "expected_head_sha": { "type": ["string", "null"] },
+                    "expected_head_sha": { "type": "string", "minLength": 1 },
                     "idempotency_key": { "type": "string" }
                 },
-                "required": ["repo", "pull_request", "method", "idempotency_key"],
+                "required": ["repo", "pull_request", "method", "expected_head_sha", "idempotency_key"],
                 "additionalProperties": false
             }
         }),

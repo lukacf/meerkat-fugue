@@ -119,9 +119,25 @@ commit credentials, private hostnames or organization-specific evidence here.
 For the browser journey, start from repository onboarding and verify mapping
 creates specialists. Follow a small issue through planning, code, testing,
 independent review and the configured merge action. Confirm the actual merged
-PR and terminal tracker state. Test login, streaming and restart through the
-intended hosted gateway. Laptop connectivity and local fixtures do not establish
-that the deployment can reach GHE or Jira.
+PR and terminal tracker state. A zero exit from the merge command is insufficient:
+verify that GitHub reports the expected head as merged and returns its merge
+commit. Retrying an already merged PR must confirm that evidence without issuing
+another merge command. Repository-scoped MCP calls must reject a different
+repository, and tool aliases must obey the same merge permission.
+
+CI evidence must belong to the exact PR head. The native monitor and final-review
+path read every GraphQL check page, checking the PR head and latest commit on
+each page. Include both check runs and legacy commit statuses in tests. A
+cancelled check alongside a passing check must remain cancelled; an unfinished
+run with a previous success conclusion must remain pending. Missing fields,
+partial GraphQL errors and broken pagination must fail the read, rather than
+activate the configured exception for repositories without CI. GitHub's
+[check result types](https://github.com/cli/cli/blob/trunk/api/queries_pr.go)
+define the two response shapes.
+
+Test login, streaming and restart through the intended hosted gateway. Laptop
+connectivity and local fixtures do not establish that the deployment can reach
+GHE or Jira.
 
 ### Tracker-specific acceptance
 
@@ -136,6 +152,107 @@ then restart and confirm issues and comments persist. Configure a second
 repository using the same database and verify that its board, lookups, comments
 and mutations remain isolated. A passing journey on one tracker does not
 qualify another backend.
+
+Keep Linear's supported path covered and repair known defects even when another
+tracker is the deployment's primary acceptance target. Prioritization determines
+the order of qualification; it does not waive failures.
+
+### Current review request
+
+Review selection belongs to repository authority. Fugue records only the current
+request intent in `review-requests.sqlite3`, alongside the other repository state.
+Native runs retain ownership of dispatch, lifecycle and reviewer verdicts. Include
+the request database in complete state backups.
+
+The review orchestrator selects existing specialists outside the issue's execution
+team and calls `fugue_admit_independent_review`. Admission reserves a server-issued
+request ID before calling native flows. An unchanged idempotency key reuses that
+request after a lost response or restart. Different assignments under the same key
+conflict. Replacing a request requires a new key and the current ID in `supersedes`.
+A retry of an older request must never make it current again.
+
+Verify both native run identity and immutable activation parameters. Copying an
+assignment into an unrelated run must not establish review evidence. Completion
+must use every selected profile's run from the current request, with native
+producer-bound results for the exact issue, repository and PR head. Failed,
+canceled or recovery-canceled runs cannot be replayed into approval; replacement
+needs a new explicit request.
+
+Exercise concurrent first requests, simultaneous retries, explicit replacement,
+stale completion, reviewer alias normalization and a restart between admission
+and response. Final merge must still recheck current review authority, PR head,
+CI and WorkGraph obligations at the irreversible operation.
+
+### Final review uses the same native protocol
+
+The final gate starts one coordinator in the repository mob. It selects existing
+specialists, admits the current review request and submits native run references
+to `fugue_complete_final_pr_gate`. This works with `final_review` enabled even
+when the independent Review action is disabled. The host reads durable native
+results; transient completion events and caller-supplied verdicts cannot approve
+this gate.
+
+`final_review.reviewers[].profile` selects an existing native specialist profile
+from the repository roster. Every required entry needs a distinct eligible member;
+two required entries for one profile need two members of that profile. At least
+three distinct specialists must participate. Optional profiles may be omitted,
+and additional eligible specialists may be selected. Missing required coverage
+blocks the gate instead of creating generic replacement reviewers.
+
+Keep the configured manual or automatic trigger and success, rework and blocked
+lanes. Final completion checks profile coverage again and binds its merge to the
+exact completed request. A changed current request, failed CI or active WorkGraph
+blocker cannot project merge success. Confirmed merge evidence is written to the
+Workpad before the terminal tracker update; retrying after an interrupted update
+reads the existing merge without issuing a second merge command.
+
+### Merge authority
+
+The configured deploy and final-review paths use the same merge gate. It resolves
+the canonical tracker issue, reads the current native review and checks that all
+selected reviewers approved the exact candidate. It then holds the current-request
+lock while refreshing the PR, checking all CI pages, rechecking reviewer eligibility
+and checking native WorkGraph obligations before calling GitHub. Review completion
+holds the same lock while publishing its results, so replacement admission cannot
+race that publication.
+
+The bare GitHub adapter cannot authorize a merge. Standalone `fugue-github-mcp`
+does not advertise `github_merge_pr`, including when a legacy merge permission
+flag is set. Use the configured repository host action, which has access to the
+tracker, native runtime and merge policy.
+
+Tests must cover a successful native review-to-merge call as well as failed CI,
+superseded review, missing WorkGraph storage and unresolved native obligations.
+An already merged retry still verifies current authority and actual forge evidence,
+but must not issue a second merge command. A historical Workpad receipt cannot
+skip these checks or authorize a changed request under a reused key.
+
+### Deployment recovery
+
+Issue-driven OTA execution records its attempt in `deployment-receipts.sqlite3`
+before starting commands. The receipt binds the tracker context and immutable
+issue ID, repository, PR head, merge commit and configured procedure. An unchanged
+request replays its recorded result after a lost response or restart. Changing
+only the request key does not rerun a completed or uncertain deployment.
+
+An intentional retry needs a new key and `retry_deployment` with the current
+attempt's ID and an explanation of the operator's inspection and authorization.
+The retry uses fresh merge checks and must compare against the current attempt.
+Older requests cannot restore a superseded attempt. Native verdicts remain the
+review authority; these receipts record only external deployment effects.
+
+The deployment lease remains held through tracker projection. Exercise both a
+lost response after completion and interruption before a result was recorded.
+Verify that simultaneous calls cannot execute or project competing attempts.
+Also test an actual command with observable effects, completed-result replay,
+explicit retry, a changed procedure, corrupt storage and private file permissions.
+
+OTA must compare the fetched branch revision with the verified merge commit
+before creating a worktree or running build, health-check or deploy commands.
+Moving the branch ahead must refuse execution. The update lock uses a process
+lease: a stale diagnostic file does not own the lock, and the default lock file
+must not make a clean checkout dirty. These local checks do not replace hosted
+installation, recovery and service-health acceptance.
 
 ### Opt-in Linear/GitHub harness
 

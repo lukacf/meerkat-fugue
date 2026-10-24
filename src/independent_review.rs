@@ -8,6 +8,20 @@ use crate::tools::{
 
 pub const INDEPENDENT_REVIEW_SCHEMA_VERSION: &str = "fugue.review.v1";
 
+/// HTTP success alone does not establish that the host accepted a completion.
+/// This decodes only the acknowledgement, not the host's review evidence.
+pub(crate) fn completion_acknowledged(body: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Response {
+        result: Acceptance,
+    }
+    #[derive(Deserialize)]
+    struct Acceptance {
+        accepted: bool,
+    }
+    serde_json::from_str::<Response>(body).is_ok_and(|response| response.result.accepted)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndependentReviewVerdict {
@@ -30,6 +44,42 @@ pub struct IndependentReviewStartRequest {
     pub orchestrator_profile: String,
 }
 
+/// The caller selects members, not a review request identity or verdict. The
+/// host resolves the candidate and atomically creates the current request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndependentReviewAdmissionRequest {
+    pub issue: LinearIssueRef,
+    pub repo: crate::tools::GitHubRepoRef,
+    pub pull_request: crate::tools::GitHubPullRequestNumber,
+    pub head_sha: GitSha,
+    pub reviewers: meerkat_mob::FlowRoleTargets,
+    pub task: String,
+    pub idempotency_key: IdempotencyKey,
+    #[serde(default)]
+    pub supersedes: Option<String>,
+}
+
+pub fn independent_review_admission_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "issue": {"type":"object", "description":"Configured tracker issue reference: kind id with id, or kind identifier with identifier."},
+            "repo": {"type":"object", "properties":{"host":{"type":"string"}, "owner":{"type":"string"}, "name":{"type":"string"}}, "required":["owner","name"], "additionalProperties":false},
+            "pull_request": {"type":"integer", "minimum":1},
+            "head_sha": {"type":"string", "description":"Expected immutable PR head; host rechecks it."},
+            "reviewers": {"type":"object", "minProperties":1,
+                "description":"Map existing native profile names to selected existing specialist identities. Use the repository specialist directory and native roster. Never create replacement reviewers.",
+                "additionalProperties":{"type":"array", "minItems":1, "uniqueItems":true, "items":{"type":"string", "minLength":1}}},
+            "task": {"type":"string", "minLength":1},
+            "idempotency_key": {"type":"string", "minLength":1, "description":"Reuse the same key and unchanged assignment after an uncertain response."},
+            "supersedes": {"type":["string","null"], "description":"Current request ID to replace explicitly. Omit only when no request exists."}
+        },
+        "required":["issue","repo","pull_request","head_sha","reviewers","task","idempotency_key"],
+        "additionalProperties":false
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndependentReviewCompletionRequest {
@@ -37,10 +87,7 @@ pub struct IndependentReviewCompletionRequest {
     pub pull_request: GitHubPullRequestSnapshot,
     pub head_sha: GitSha,
     pub workgraph_scope: IndependentReviewWorkGraphScope,
-    #[serde(default)]
-    pub verdicts: Vec<IndependentReviewVerdict>,
-    #[serde(default)]
-    pub timed_out: bool,
+    pub native_review: crate::native_review::ReviewReference,
     pub idempotency_key: IdempotencyKey,
 }
 
@@ -50,11 +97,10 @@ impl IndependentReviewCompletionRequest {
         if self.head_sha.0.trim().is_empty() || self.pull_request.head_sha != self.head_sha {
             return Err(IndependentReviewVerdictError::MismatchedHead);
         }
-        for verdict in &self.verdicts {
-            verdict.validate()?;
-            if verdict.evidence.head_sha != self.head_sha {
-                return Err(IndependentReviewVerdictError::MismatchedHead);
-            }
+        if self.native_review.runs.is_empty() {
+            return Err(IndependentReviewVerdictError::MissingField(
+                "native_review.runs",
+            ));
         }
         Ok(())
     }
@@ -217,115 +263,27 @@ impl std::error::Error for IndependentReviewVerdictError {}
 pub fn independent_review_completion_input_schema() -> Value {
     json!({
         "type": "object",
-        "description": format!(
-            "Typed IndependentReviewCompletionRequest. Every verdict.schema_version must be exactly {:?}.",
-            INDEPENDENT_REVIEW_SCHEMA_VERSION
-        ),
+        "description": "Complete independent review using native flow references. The host reads producer results from durable native records and rechecks the current repository, issue and PR head. Do not submit verdicts or timeout claims.",
         "properties": {
-            "issue": {
-                "type": "object",
-                "description": "Linear issue reference, for example {\"kind\":\"identifier\",\"identifier\":\"LUC-631\"}."
-            },
-            "pull_request": {
-                "type": "object",
-                "description": "GitHubPullRequestSnapshot for the reviewed PR."
-            },
-            "head_sha": {
-                "type": "string",
-                "description": "Exact reviewed PR head SHA."
-            },
+            "issue": {"type": "object", "description": "The repository's tracker issue reference."},
+            "pull_request": {"type": "object", "description": "PR selector and expected snapshot; the host fetches current forge state."},
+            "head_sha": {"type": "string", "description": "Exact reviewed PR head SHA."},
             "workgraph_scope": {
                 "type": "object",
-                "description": "The repository's native mob WorkGraph scope. Copy realm_id and namespace from its reviewer obligation items. Only this repository's native realm and default namespace are accepted so every blocker remains visible to merge and terminal checks.",
-                "properties": {
-                    "realm_id": {
-                        "type": "string",
-                        "minLength": 1
-                    },
-                    "namespace": {
-                        "type": "string",
-                        "minLength": 1
-                    }
+                "description": "The repository's native mob realm and default WorkGraph namespace.",
+                "properties": {"realm_id": {"type": "string", "minLength": 1}, "namespace": {"type": "string", "minLength": 1}},
+                "required": ["realm_id", "namespace"], "additionalProperties": false
+            },
+            "native_review": {
+                "type": "object", "properties": {
+                    "runs": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": true,
+                        "items": {"type": "string", "format": "uuid"}}
                 },
-                "required": ["realm_id", "namespace"],
-                "additionalProperties": false
+                "required": ["runs"], "additionalProperties": false
             },
-            "timed_out": {
-                "type": "boolean",
-                "default": false
-            },
-            "idempotency_key": {
-                "type": "string"
-            },
-            "verdicts": {
-                "type": "array",
-                "minItems": 3,
-                "maxItems": 3,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "schema_version": {
-                            "type": "string",
-                            "const": INDEPENDENT_REVIEW_SCHEMA_VERSION
-                        },
-                        "reviewer_id": {"type": "string"},
-                        "focus": {"type": "string"},
-                        "verdict": {
-                            "type": "string",
-                            "enum": ["green", "red", "blocked"]
-                        },
-                        "summary": {"type": "string"},
-                        "findings": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "severity": {
-                                        "type": "string",
-                                        "enum": ["blocker", "major", "minor", "note"]
-                                    },
-                                    "title": {"type": "string"},
-                                    "detail": {"type": "string"},
-                                    "file": {"type": "string"},
-                                    "line": {"type": "integer", "minimum": 1}
-                                },
-                                "required": ["severity", "title", "detail"],
-                                "additionalProperties": false
-                            }
-                        },
-                        "evidence": {
-                            "type": "object",
-                            "properties": {
-                                "base": {"type": "string"},
-                                "head_sha": {"type": "string"},
-                                "commands": {"type": "array", "items": {"type": "string"}},
-                                "checked_paths": {"type": "array", "items": {"type": "string"}}
-                            },
-                            "required": ["base", "head_sha"],
-                            "additionalProperties": false
-                        }
-                    },
-                    "required": [
-                        "schema_version",
-                        "reviewer_id",
-                        "focus",
-                        "verdict",
-                        "summary",
-                        "evidence"
-                    ],
-                    "additionalProperties": false
-                }
-            }
+            "idempotency_key": {"type": "string"}
         },
-        "required": [
-            "issue",
-            "pull_request",
-            "head_sha",
-            "workgraph_scope",
-            "verdicts",
-            "timed_out",
-            "idempotency_key"
-        ],
+        "required": ["issue", "pull_request", "head_sha", "workgraph_scope", "native_review", "idempotency_key"],
         "additionalProperties": false
     })
 }
@@ -621,20 +579,16 @@ mod tests {
     }
 
     #[test]
-    fn independent_review_completion_schema_exposes_exact_verdict_schema() {
+    fn independent_review_completion_schema_accepts_references_not_verdicts() {
         let schema = independent_review_completion_input_schema();
-
-        assert_eq!(
-            schema
-                .pointer("/properties/verdicts/items/properties/schema_version/const")
-                .and_then(Value::as_str),
-            Some(INDEPENDENT_REVIEW_SCHEMA_VERSION)
-        );
+        assert!(schema.pointer("/properties/verdicts").is_none());
+        assert!(schema.pointer("/properties/timed_out").is_none());
+        assert_eq!(schema["additionalProperties"], false);
         assert!(
             schema
-                .pointer("/description")
-                .and_then(Value::as_str)
-                .is_some_and(|description| description.contains(INDEPENDENT_REVIEW_SCHEMA_VERSION))
+                .pointer("/required")
+                .and_then(Value::as_array)
+                .is_some_and(|required| required.iter().any(|value| value == "native_review"))
         );
         assert_eq!(
             schema

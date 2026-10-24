@@ -143,6 +143,37 @@ A tracker status or an agent's final message does not replace merge evidence.
 A green health endpoint does not prove that member tools can update Jira, create
 PRs or consult specialists.
 
+Run merges through the repository's configured Fugue host action. The standalone
+GitHub tool server cannot check repository review authority and does not offer
+merge. If a merge response is lost, inspect the PR and preserve its head and merge
+commit before retrying the same action. A deployment receipt in the Workpad is
+historical evidence; it does not bypass current review, CI or WorkGraph checks.
+
+Each GitHub CLI command has a 60-second deadline and runs without interactive
+prompts. On Linux and macOS, Fugue terminates the command's process group and
+reaps the direct child before releasing review authority. A timeout is an
+uncertain result: the server may already have accepted a PR creation or merge.
+Inspect the remote PR before retrying; do not assume that timeout means failure.
+Output beyond the 16 MiB capture limit is also rejected as incomplete evidence.
+
+For repositories with OTA deployment configured, an unchanged retry returns the
+durable attempt result instead of running the deploy command again. The report
+includes `deployment_attempt`. If Fugue reports an uncertain attempt, inspect the
+service's installed revision and the command's effects before deciding to retry.
+Do not infer failure from a lost browser response.
+
+After inspection, an operator can ask the repository coordinator in **Agents**
+to retry the recorded attempt. Include the attempt ID, what you verified and
+explicit permission to run the deployment again. The coordinator must use a new
+request key and `retry_deployment` with `attempt_id` and `reason`. Repeating an
+ordinary Merge/Deploy action does not authorize another uncertain execution.
+The new request still has to pass review, PR, CI and WorkGraph checks.
+
+Back up `deployment-receipts.sqlite3` with the complete repository state. Do not
+delete a receipt or lock file to force recovery. Lock ownership belongs to the
+running process, and removing its pathname does not stop that process. A lock
+file left behind by a stopped process can be reused normally.
+
 ## Recover from an incident
 
 First preserve the error, affected issue, runtime identity, workspace, PR and

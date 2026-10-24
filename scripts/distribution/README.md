@@ -98,11 +98,13 @@ on the intended gateway before treating a deployment as accepted.
 
 ## Temporary dependency follow-up
 
-The current candidate binds Core `3a57ae76847564288fba92dc0563436509b21265`
-and Meta `c14eb2516451cb449e4c72de08f603220f05bc73`. Core includes the
-checkpoint recovery and durable-tail retirement corrections; Meta includes the console panels and sign-in
-recovery changes. Every Core package, including Meta's transitive dependencies,
-must resolve to that same Core commit in `Cargo.lock`.
+The integration candidate binds Core `605870998255cd83d9d807978fbb239c4ca7aa5c`
+and Meta `cc0751d485324d25b80e5bf92524a8e2bd6b6af2`. Core includes the
+checkpoint recovery, archive retirement, compaction acknowledgement and stream
+corrections, plus keyed admission of flows bound to selected members. Meta
+includes the compatible console, sign-in recovery and keyed flow API changes.
+Every Core package, including Meta's transitive dependencies, must resolve to
+that same Core commit in `Cargo.lock`.
 
 Fugue qualifies these source bindings through its own build, native recovery
 and hosted ticket-cycle checks. Upstream CI and publication do not block starting
@@ -110,18 +112,18 @@ that qualification. Replace the temporary pins when a released pair passes the
 same checks, then verify the new lock and release manifest. A source binding or
 an upstream merge alone is not deployed acceptance.
 
-The current candidate is not qualified for production distribution. The
-previous retirement correction passed twenty consumer trials at concurrency four and
-five native handoff/restart rounds, but a later full-suite run again failed
-retirement because durable-tail recovery was refused. Qualification is reopened;
-retain both the earlier passes and the failure. The new archive-scoped correction
-allows a stopped runtime to settle its tail while ending the session; other
-recovery paths retain their refusal. This candidate must qualify that correction.
-The separate compaction-outbox baseline correction and stream-overflow correction
-are not included in these pins. They still need compatible source uptake and
-consumer qualification. The final built candidate needs hosted recovery acceptance.
-The merge path also needs authoritative, durable review
-results bound to the exact candidate; matching a caller-supplied SHA or a fresh
-PR observation does not establish review acceptance. Keep the release gates open
-until the final candidate passes regression tests and hosted acceptance. Local
-qualification or a successful bundle build does not establish that result.
+This integration candidate is not qualified for production distribution. The
+previous Core `3a57ae76847564288fba92dc0563436509b21265` / Meta
+`c14eb2516451cb449e4c72de08f603220f05bc73` pair passed Fugue's full Linux suite,
+twenty retirement trials, five handoff/restart rounds and bundle installation
+checks. Preserve that evidence separately; it does not qualify this new pair.
+Repeat the consumer checks and fresh hosted acceptance on the final candidate.
+
+The merge path also needs authoritative, durable review results bound to the
+exact candidate. Native keyed admission prevents duplicate execution of a
+profile's review flow when the same issue/round assignment is retried, including
+after restart. It does not by itself establish reviewer independence, the current
+review round, or approval to merge. Those policies and the common merge gate
+remain release requirements. Matching a caller-supplied SHA or observing a fresh
+PR is insufficient. Keep the release gates open until the final candidate passes
+regression tests and hosted acceptance.
