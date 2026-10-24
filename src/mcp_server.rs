@@ -250,12 +250,8 @@ pub async fn run_host_mcp_server() -> anyhow::Result<()> {
         }),
         json!({
             "name": "fugue_start_independent_review",
-            "description": "Ask the Fugue host to start or resume the independent review orchestrator mob from a typed IndependentReviewStartRequest.",
-            "input_schema": {
-                "type": "object",
-                "description": "Typed IndependentReviewStartRequest payload prepared after inspecting issue and PR evidence.",
-                "additionalProperties": true
-            }
+            "description": "Request configured independent review using the inspected issue, repository, open ready PR number, exact head and stable request key. The host supplies runtime configuration; do not supply profiles, templates or paths.",
+            "input_schema": crate::independent_review::independent_review_launch_input_schema()
         }),
         json!({
             "name": "fugue_admit_independent_review",
@@ -471,43 +467,21 @@ async fn execute_host_start_independent_review(
     password: Option<&str>,
     arguments: Value,
 ) -> (bool, String) {
-    let url = format!(
-        "{}/api/v1/kapellmeister/start-independent-review",
-        endpoint.trim_end_matches('/')
-    );
-    let client = reqwest::Client::new();
-    let mut request = client.post(url).json(&arguments);
-    if let (Some(username), Some(password)) = (username, password) {
-        request = request.basic_auth(username, Some(password));
-    }
-    match request.send().await {
-        Ok(response) => {
-            let status = response.status();
-            match response.text().await {
-                Ok(body) => {
-                    let content = if body.trim().is_empty() {
-                        json!({
-                            "error": "Fugue host returned an empty response body",
-                            "status": status.as_u16(),
-                        })
-                        .to_string()
-                    } else {
-                        body
-                    };
-                    (false, content)
-                }
-                Err(error) => (
-                    false,
-                    json!({"error": format!("failed to read Fugue host response: {error}")})
-                        .to_string(),
-                ),
-            }
-        }
-        Err(error) => (
-            false,
-            json!({"error": format!("failed to call Fugue host: {error}")}).to_string(),
-        ),
-    }
+    let request = match serde_json::from_value::<
+        crate::independent_review::IndependentReviewLaunchRequest,
+    >(arguments)
+    {
+        Ok(request) => request,
+        Err(_) => return (true, json!({"error":"invalid_review_launch"}).to_string()),
+    };
+    execute_host_review_request(
+        endpoint,
+        username,
+        password,
+        "start-independent-review",
+        &request,
+    )
+    .await
 }
 
 async fn execute_host_admit_independent_review(
@@ -1403,6 +1377,39 @@ fn protocol_tool_descriptor(tool: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn configured_review_launch_mcp_requires_real_acknowledgement() {
+        use axum::{Json, Router, routing::post};
+        let payload = json!({
+            "issue":{"kind":"identifier","identifier":"TEST-1"},
+            "repo":{"owner":"example","name":"app"},
+            "pull_request":7,"head_sha":"a".repeat(40),
+            "idempotency_key":"review-start-1"
+        });
+        let expected = payload.clone();
+        let router = Router::new().route(
+            "/api/v1/kapellmeister/start-independent-review",
+            post(move |Json(body): Json<Value>| {
+                assert_eq!(body, expected);
+                async { Json(json!({"result":{"accepted":false,"message":"disabled"}})) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (error, response) =
+            execute_host_start_independent_review(&endpoint, None, None, payload.clone()).await;
+        assert!(error, "a successful HTTP response is not review admission");
+        assert!(response.contains("disabled"));
+        let mut forged = payload;
+        forged["spawn_input"] = json!({"worktree_path":"/another-repository"});
+        let (error, response) =
+            execute_host_start_independent_review(&endpoint, None, None, forged).await;
+        assert!(error);
+        assert!(response.contains("invalid_review_launch"));
+        server.abort();
+    }
+
     #[tokio::test]
     async fn review_admission_mcp_preserves_assignment_and_rejects_forged_authority() {
         use axum::{Json, Router, routing::post};

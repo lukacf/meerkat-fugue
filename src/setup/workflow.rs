@@ -25,6 +25,9 @@ pub struct WorkflowSetup {
     pub repository_url: Option<String>,
     #[serde(default)]
     pub allow_no_ci_checks: bool,
+    /// Older saved setups required three; new repository drafts opt into one.
+    #[serde(default = "legacy_reviewer_count")]
+    pub independent_reviewer_count: u8,
     pub owner: String,
     pub repository: String,
     /// Existing checkout, or a managed clone when absent.
@@ -45,6 +48,10 @@ pub struct WorkflowSetup {
     /// drafts have no tracker yet; older unannotated workflows retain their maps.
     #[serde(default)]
     pub lane_configuration: LaneConfiguration,
+}
+
+fn legacy_reviewer_count() -> u8 {
+    3
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,6 +133,9 @@ pub struct GeneratedWorkspace {
 impl WorkflowSetup {
     pub fn validate(&self) -> Result<()> {
         self.commit_identity.validate()?;
+        if self.independent_reviewer_count == 0 {
+            bail!("Choose at least one independent specialist for review");
+        }
         if let Some(url) = &self.repository_url {
             let parsed = super::repository::RepositoryAddress::parse(url)?;
             if parsed.owner != self.owner || parsed.repository != self.repository {
@@ -243,16 +253,17 @@ impl WorkflowSetup {
         let mut config: NativeFugueConfig =
             serde_yaml::from_str(include_str!("../../fugue.jira.example.yaml"))?;
         let lanes = &self.lanes;
-        // A Jira workflow may have fewer statuses than Fugue has semantic
-        // outcomes. Keep the handoff status distinct from action triggers.
-        config.tracker_lanes = (!jira).then(|| lanes.clone());
+        // Setup uses the review action as a nonterminal development handoff for
+        // every tracker. Do not let the legacy role expansion replace this
+        // explicit mapping with a direct development-to-success projection.
+        config.tracker_lanes = None;
         config.linear.lanes = NativeLinearLanes {
             parked: lanes.parked.clone(),
             ready: lanes.intake.clone(),
             active: Some(lanes.active.clone()),
-            review_ready: jira.then(|| lanes.review_action.clone()),
+            review_ready: Some(lanes.review_action.clone()),
             rework: None,
-            do_review: (!jira).then(|| lanes.review_action.clone()),
+            do_review: None,
             deploy: Some(lanes.deploy_action.clone()),
             blocked: if jira
                 && [
@@ -416,6 +427,7 @@ impl WorkflowSetup {
         });
         config.independent_review = Some(IndependentReviewConfig {
             enabled: true,
+            reviewer_count: self.independent_reviewer_count,
             lane: lanes.review_action.clone(),
             success_lane: lanes.review_action.clone(),
             rework_lane: lanes.intake.clone(),
@@ -502,6 +514,32 @@ mod tests {
         }))
         .unwrap();
         (connections, request)
+    }
+
+    #[test]
+    fn review_policy_preserves_old_drafts_and_renders_explicit_new_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let (connections, mut request) = local_fixture("example", "app");
+        assert_eq!(request.independent_reviewer_count, 3);
+        for count in [1, 2, 3] {
+            request.independent_reviewer_count = count;
+            let generated = request
+                .render(&connections, root.path(), 8788, Path::new("/opt/fugue/bin"))
+                .unwrap();
+            assert_eq!(
+                generated
+                    .workflow
+                    .independent_review
+                    .unwrap()
+                    .reviewer_count,
+                count
+            );
+            let restored: WorkflowSetup =
+                serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+            assert_eq!(restored.independent_reviewer_count, count);
+        }
+        request.independent_reviewer_count = 0;
+        assert!(request.validate().is_err());
     }
 
     #[test]
@@ -679,6 +717,7 @@ mod tests {
             lane_configuration: LaneConfiguration::Unspecified,
             commit_identity: Default::default(),
             allow_no_ci_checks: false,
+            independent_reviewer_count: 3,
             repository_url: None,
             owner: "example".into(),
             repository: "app".into(),
@@ -799,6 +838,7 @@ mod tests {
             lane_configuration: LaneConfiguration::Unspecified,
             commit_identity: Default::default(),
             allow_no_ci_checks: false,
+            independent_reviewer_count: 3,
             repository_url: None,
             owner: "example".into(),
             repository: "application".into(),
@@ -831,6 +871,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(config.tracker.kind, "fugue-ims");
+        assert_eq!(config.linear.lanes.review_ready.as_deref(), Some("Review"));
+        assert_eq!(config.independent_review_handoff_lane(), Some("Review"));
         assert!(
             config.independent_review.enabled,
             "new built-in queues need an admissible review before merge"

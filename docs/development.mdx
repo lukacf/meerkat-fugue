@@ -237,8 +237,9 @@ no-checks exception is `deploy.allow_no_ci_checks`. Repository setup generates
 an enabled independent Review action and the same scoped policy for Jira,
 built-in tickets and Linear.
 
-Jira can map **Awaiting review** to one existing holding status without needing
-another workflow status. When `linear.lanes.review_ready` equals the enabled
+Generated setups for all trackers use **Awaiting review** as a nonterminal
+holding status. Jira can map it to an existing status without requiring another
+workflow status. When `linear.lanes.review_ready` equals the enabled
 independent-review lane and no separate `do_review` lane exists, the repository
 coordinator may hand completed work to that status. First-seen and recovered
 observations report pending review to Kapellmeister, which inspects the PR and
@@ -249,8 +250,10 @@ Review action remains protected from direct agent lane mutations.
 
 `final_review.reviewers[].profile` selects an existing native specialist profile
 from the repository roster. Every required entry needs a distinct eligible member;
-two required entries for one profile need two members of that profile. At least
-three distinct specialists must participate. Optional profiles may be omitted,
+two required entries for one profile need two members of that profile. The
+`final_review.minimum_reviewers` setting defaults to three distinct specialists.
+An explicit smaller minimum still requires every required profile entry.
+Optional profiles may be omitted,
 and additional eligible specialists may be selected. Missing required coverage
 blocks the gate instead of creating generic replacement reviewers.
 

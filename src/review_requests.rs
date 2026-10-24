@@ -49,6 +49,10 @@ pub(crate) enum ReviewRequestError {
     Corrupt,
     #[error("selected reviewer is not an eligible existing repository specialist")]
     IneligibleReviewer,
+    #[error(
+        "review requires {required} independent specialists, but only {available} are eligible; keep review blocked or explicitly change the repository policy in setup"
+    )]
+    InsufficientCapacity { required: usize, available: usize },
     #[error("repository runtime or execution history is unavailable")]
     Unavailable,
     #[error(transparent)]

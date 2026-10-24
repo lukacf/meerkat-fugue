@@ -58,7 +58,9 @@ pub(crate) fn final_review_count(
         .bound_roles()
         .map(|(_, members)| members.len())
         .sum::<usize>();
-    if !(3..=usize::from(u8::MAX)).contains(&count) {
+    if config.minimum_reviewers == 0
+        || !(usize::from(config.minimum_reviewers)..=usize::from(u8::MAX)).contains(&count)
+    {
         return Err(ReviewProofError::ReviewerCount);
     }
     let mut required = BTreeMap::<&str, usize>::new();
@@ -89,6 +91,9 @@ pub(crate) fn configured_review_count(
         .sum::<usize>();
     if independent.enabled && count == usize::from(independent.reviewer_count) {
         return Ok(count);
+    }
+    if independent.enabled && !final_review.enabled {
+        return Err(ReviewProofError::ReviewerCount);
     }
     final_review_count(final_review, reviewers)
 }

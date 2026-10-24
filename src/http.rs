@@ -42,7 +42,7 @@ use crate::final_pr_gate::FinalPrGateStartRequest;
 #[cfg(test)]
 use crate::independent_review::{IndependentReviewAggregationInput, aggregate_independent_review};
 use crate::independent_review::{
-    IndependentReviewCompletionRequest, IndependentReviewStartRequest,
+    IndependentReviewCompletionRequest, IndependentReviewLaunchRequest,
 };
 use crate::linear_adapter::IssueAdapter;
 use crate::meta_runtime::MetaRuntimeRegistry;
@@ -4536,11 +4536,44 @@ async fn api_kapellmeister_start_final_pr_gate(
 async fn api_kapellmeister_start_independent_review(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<IndependentReviewStartRequest>,
+    Json(request): Json<IndependentReviewLaunchRequest>,
 ) -> axum::response::Response {
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
+    if !app.config.independent_review.enabled {
+        return bad_request(
+            "independent_review_disabled",
+            "Independent review is disabled for this repository.",
+        );
+    }
+    let (candidate, pull_request) = match crate::native_review::resolve_candidate(
+        &app.config,
+        request.issue.clone(),
+        &request.repo,
+        crate::tools::GitHubPullRequestRef::Number {
+            number: request.pull_request,
+        },
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return bad_request(
+                "review_candidate_unavailable",
+                &format!("Review needs an open, ready-for-review PR in this repository: {error}"),
+            );
+        }
+    };
+    let request = match crate::independent_review::configured_review_launch(
+        &app.config.independent_review,
+        request,
+        candidate,
+        pull_request,
+    ) {
+        Ok(request) => request,
+        Err(error) => return bad_request("review_candidate_changed", &error.to_string()),
+    };
     let (response_tx, response_rx) = oneshot::channel();
     if app
         .internal_tx
