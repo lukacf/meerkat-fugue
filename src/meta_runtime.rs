@@ -254,10 +254,31 @@ pub struct MetaRuntimeRegistry {
     meta_task_runtime: Arc<Mutex<Option<tokio::runtime::Runtime>>>,
     event_drain_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     kapellmeister_bootstrap: Arc<tokio::sync::Mutex<()>>,
+    // Serializes native member admission/materialization and retirement. Agent
+    // execution and review flows do not hold this mechanism lock.
+    member_lifecycle: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    launch_pause: Arc<Mutex<Option<LaunchPause>>>,
     jobs: Arc<Mutex<BTreeMap<String, FugueMobJob>>>,
     jobs_loaded: Arc<OnceLock<Result<(), String>>>,
     stopping: Arc<AtomicBool>,
     launch_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LaunchPauseStage {
+    BeforeMembers,
+    AfterLead,
+    BeforeKickoff,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct LaunchPause {
+    stage: LaunchPauseStage,
+    arrived: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
 }
 
 impl MetaRuntimeRegistry {
@@ -562,6 +583,9 @@ impl MetaRuntimeRegistry {
             meta_task_runtime: Arc::new(Mutex::new(None)),
             event_drain_task: Arc::new(Mutex::new(None)),
             kapellmeister_bootstrap: Arc::new(tokio::sync::Mutex::new(())),
+            member_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            launch_pause: Arc::new(Mutex::new(None)),
             jobs: Arc::new(Mutex::new(BTreeMap::new())),
             jobs_loaded: Arc::new(OnceLock::new()),
             stopping: Arc::new(AtomicBool::new(false)),
@@ -2604,6 +2628,16 @@ impl NativeMobExecutionHost for MetaRuntimeNativeMobExecutionHost {
                 "Fugue runtime is shutting down",
             );
         }
+        let lifecycle = match self.lock_member_lifecycle() {
+            Ok(guard) => guard,
+            Err(message) => return err(FugueToolOperation::MobSpawnOrResumeExecution, &message),
+        };
+        if self.registry.stopping.load(Ordering::Acquire) {
+            return err(
+                FugueToolOperation::MobSpawnOrResumeExecution,
+                "Fugue runtime is shutting down",
+            );
+        }
         let run_id = MobRunId(plan.input.idempotency_key.0.clone());
         let now = Utc::now();
         let (run, spawned, resumed) = match self.registry.jobs.lock() {
@@ -2649,7 +2683,7 @@ impl NativeMobExecutionHost for MetaRuntimeNativeMobExecutionHost {
                     let host = self.clone();
                     let task = handle.spawn(async move {
                         if let Err(message) = host
-                            .complete_spawn_or_resume_plan_async(plan, run_id.clone())
+                            .complete_spawn_or_resume_plan_async(plan, run_id.clone(), lifecycle)
                             .await
                         {
                             warn!(
@@ -2657,9 +2691,6 @@ impl NativeMobExecutionHost for MetaRuntimeNativeMobExecutionHost {
                                 error = %message,
                                 "Meta runtime issue launch failed"
                             );
-                            if let Err(error) = host.set_launch_failure(&run_id, message.clone()) {
-                                warn!(%error, "persist failed Fugue launch");
-                            }
                         }
                     });
                     match self.registry.launch_tasks.lock() {
@@ -2684,13 +2715,13 @@ impl NativeMobExecutionHost for MetaRuntimeNativeMobExecutionHost {
                     }
                 }
                 Err(_) => {
-                    if let Err(message) =
-                        block_on(self.complete_spawn_or_resume_plan_async(plan, run_id.clone()))
-                            .and_then(|result| result)
+                    if let Err(message) = block_on(self.complete_spawn_or_resume_plan_async(
+                        plan,
+                        run_id.clone(),
+                        lifecycle,
+                    ))
+                    .and_then(|result| result)
                     {
-                        if let Err(error) = self.set_launch_failure(&run_id, message.clone()) {
-                            return err(FugueToolOperation::MobSpawnOrResumeExecution, &error);
-                        }
                         return err(FugueToolOperation::MobSpawnOrResumeExecution, &message);
                     }
                 }
@@ -2709,6 +2740,10 @@ impl NativeMobExecutionHost for MetaRuntimeNativeMobExecutionHost {
         if let Err(message) = self.registry.restore_jobs() {
             return err(FugueToolOperation::MobCancelExecution, &message);
         }
+        let _lifecycle = match self.lock_member_lifecycle() {
+            Ok(guard) => guard,
+            Err(message) => return err(FugueToolOperation::MobCancelExecution, &message),
+        };
         let job = match self.registry.jobs.lock() {
             Ok(jobs) => jobs.get(&input.run_id.0).cloned(),
             Err(_) => {
@@ -2744,6 +2779,7 @@ impl NativeMobExecutionHost for MetaRuntimeNativeMobExecutionHost {
 
     fn cleanup_execution(&self, run_id: &MobRunId, _reason: &str) -> Result<usize, String> {
         self.registry.restore_jobs()?;
+        let _lifecycle = self.lock_member_lifecycle()?;
         let job = self
             .registry
             .jobs
@@ -2848,6 +2884,13 @@ the operator explicitly instructs otherwise."
 }
 
 impl MetaRuntimeNativeMobExecutionHost {
+    fn lock_member_lifecycle(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+        match self.registry.member_lifecycle.clone().try_lock_owned() {
+            Ok(guard) => Ok(guard),
+            Err(_) => block_on(self.registry.member_lifecycle.clone().lock_owned()),
+        }
+    }
+
     fn remove_job(&self, run_id: &MobRunId) -> Result<(), String> {
         let mut jobs = self
             .registry
@@ -2862,10 +2905,24 @@ impl MetaRuntimeNativeMobExecutionHost {
     }
 
     async fn retire_run_members(&self, job: &FugueMobJob) -> Result<usize, String> {
+        // A lead may belong to development and independent review at once.
+        // Only the last persisted owner may retire that native identity.
+        let shared = self
+            .registry
+            .jobs
+            .lock()
+            .map_err(|_| "Fugue run registry poisoned".to_string())?
+            .values()
+            .filter(|other| other.run.run_id != job.run.run_id)
+            .flat_map(|other| other.member_identities.iter().cloned())
+            .collect::<BTreeSet<_>>();
         let runtime = self.registry.runtime().await?;
         let handle = runtime.mob_handle();
         let mut retired = 0;
         for identity in &job.member_identities {
+            if shared.contains(identity) {
+                continue;
+            }
             match handle.retire(AgentIdentity::from(identity.as_str())).await {
                 Ok(()) => retired += 1,
                 Err(meerkat_mob::MobError::MemberNotFound(_)) => {}
@@ -2879,7 +2936,48 @@ impl MetaRuntimeNativeMobExecutionHost {
         &self,
         plan: NativeMobLaunchPlan,
         run_id: MobRunId,
+        lifecycle: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<(), String> {
+        // Native send waits for bounded input acceptance, not the agent turn.
+        // Keep the identity stable through that admission so an old kickoff
+        // cannot be delivered to a replacement created by a concurrent launch.
+        let result = async {
+            let runtime = self.materialize_plan_async(&plan, &run_id).await?;
+            let issue = issue_key(&plan.input.issue);
+            let issue_lead = native_member_identity(&issue, ISSUE_LEAD);
+            self.deliver_issue_lead_task(&runtime, &plan, &run_id, &issue, &issue_lead)
+                .await
+        }
+        .await;
+        if let Err(message) = &result {
+            self.set_launch_failure(&run_id, message.clone())?;
+        }
+        drop(lifecycle);
+        result
+    }
+
+    #[cfg(test)]
+    async fn pause_launch_for_test(&self, stage: LaunchPauseStage) {
+        let pause = self
+            .registry
+            .launch_pause
+            .lock()
+            .expect("launch barrier")
+            .clone();
+        if let Some(pause) = pause.filter(|pause| pause.stage == stage) {
+            pause.arrived.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    async fn materialize_plan_async(
+        &self,
+        plan: &NativeMobLaunchPlan,
+        run_id: &MobRunId,
+    ) -> Result<Arc<UnifiedRuntime>, String> {
+        #[cfg(test)]
+        self.pause_launch_for_test(LaunchPauseStage::BeforeMembers)
+            .await;
         self.registry.bootstrap_repo_kapellmeister().await?;
         let runtime = self.registry.runtime().await?;
         let issue = issue_key(&plan.input.issue);
@@ -2908,6 +3006,9 @@ impl MetaRuntimeNativeMobExecutionHost {
                 .or(self.registry.meerkat.auth_binding.as_ref()),
         )
         .await?;
+        #[cfg(test)]
+        self.pause_launch_for_test(LaunchPauseStage::AfterLead)
+            .await;
         wire_pair(&runtime, KAPELLMEISTER, &issue_lead).await?;
         self.registry.wire_repository_members(&runtime).await?;
 
@@ -2918,7 +3019,7 @@ impl MetaRuntimeNativeMobExecutionHost {
             .filter(|member| !is_issue_lead_member(member))
         {
             let identity = native_member_identity(&issue, &member.name);
-            let initial_message = member_initial_message_for_plan(&plan, &member.name);
+            let initial_message = member_initial_message_for_plan(plan, &member.name);
             ensure_member(
                 &runtime,
                 &member.profile,
@@ -2949,16 +3050,29 @@ impl MetaRuntimeNativeMobExecutionHost {
             self.registry.wire_repository_members(&runtime).await?;
         }
         wire_template_members(&runtime, &issue, &plan.template).await?;
-        self.set_run_status(&run_id, MobRunStatus::Running)?;
+        self.set_run_status(run_id, MobRunStatus::Running)?;
+        Ok(runtime)
+    }
 
+    async fn deliver_issue_lead_task(
+        &self,
+        runtime: &UnifiedRuntime,
+        plan: &NativeMobLaunchPlan,
+        run_id: &MobRunId,
+        issue: &str,
+        issue_lead: &str,
+    ) -> Result<(), String> {
+        #[cfg(test)]
+        self.pause_launch_for_test(LaunchPauseStage::BeforeKickoff)
+            .await;
         match tokio::time::timeout(
             Duration::from_secs(15),
             runtime
                 .mob_handle()
-                .member(&AgentIdentity::from(issue_lead.as_str()))
+                .member(&AgentIdentity::from(issue_lead))
                 .await
                 .map_err(|err| format!("resolve issue lead: {err}"))?
-                .send(issue_lead_task(&plan), HandlingMode::Steer),
+                .send(issue_lead_task(plan), HandlingMode::Steer),
         )
         .await
         {
@@ -3894,6 +4008,9 @@ fn err_with_key(
 fn block_on<T>(future: impl Future<Output = T>) -> Result<T, String> {
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|_| "Meta runtime call requires a Tokio runtime".to_string())?;
+    if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+        return Err("Native lifecycle is busy; retry from a multithreaded runtime".to_owned());
+    }
     Ok(tokio::task::block_in_place(|| handle.block_on(future)))
 }
 
@@ -6675,10 +6792,42 @@ pub(crate) mod tests {
             "Meta should own and emit topology wiring events"
         );
 
+        let review_id = MobRunId("independent-review:LUC-900".into());
+        {
+            let mut jobs = registry.jobs.lock().expect("jobs");
+            let mut review = jobs["native-execution:LUC-900"].clone();
+            review.run.run_id = review_id.clone();
+            review.member_identities = vec!["issue_LUC-900__issue_5Flead".into()];
+            jobs.insert(review_id.0.clone(), review);
+            registry
+                .persist_jobs(&jobs)
+                .expect("persist review ownership");
+        }
         assert_eq!(
             host.cleanup_execution(&MobRunId("native-execution:LUC-900".to_string()), "test")
                 .expect("cleanup retires issue members"),
-            3
+            2
+        );
+        assert!(
+            runtime
+                .mob_handle()
+                .get_member(&AgentIdentity::from("issue_LUC-900__issue_5Flead"))
+                .await
+                .expect("shared lead")
+                .is_some()
+        );
+        assert_eq!(
+            host.cleanup_execution(&review_id, "review complete")
+                .expect("last owner retirement"),
+            1
+        );
+        assert!(
+            runtime
+                .mob_handle()
+                .get_member(&AgentIdentity::from(KAPELLMEISTER))
+                .await
+                .expect("permanent coordinator")
+                .is_some()
         );
         let mut retired = Vec::new();
         for _ in 0..500 {
@@ -6718,6 +6867,97 @@ pub(crate) mod tests {
         }
         registry.shutdown().await.expect("shutdown");
     }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_cleanup_waits_for_pending_native_materialization() {
+        const NAME: &str = "terminal_cleanup_waits_for_pending_native_materialization";
+        if !isolated_runtime_test(NAME) {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("isolated runtime");
+        let registry = MetaRuntimeRegistry::with_templates(
+            test_meerkat_config(temp.path().join("state")),
+            BTreeMap::new(),
+            BTreeMap::from([("implementation_mob".into(), test_template())]),
+        );
+        let runtime = registry.runtime().await.expect("runtime");
+        let host = MetaRuntimeNativeMobExecutionHost::from_registry(registry.clone());
+        for (index, stage) in [
+            LaunchPauseStage::BeforeMembers,
+            LaunchPauseStage::AfterLead,
+            LaunchPauseStage::BeforeKickoff,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let pause = LaunchPause {
+                stage,
+                arrived: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+            };
+            *registry.launch_pause.lock().expect("barrier") = Some(pause.clone());
+            let mut plan = launch_plan();
+            plan.input.idempotency_key = IdempotencyKey(format!("native-retirement-race-{index}"));
+            let run_id = MobRunId(plan.input.idempotency_key.0.clone());
+            let receipt = host.spawn_or_resume_plan(plan);
+            assert!(matches!(receipt, FugueToolResult::Ok { .. }), "{receipt:?}");
+            tokio::time::timeout(Duration::from_secs(15), pause.arrived.notified())
+                .await
+                .expect("launch reached barrier");
+            let cleanup_host = host.clone();
+            let cleanup_id = run_id.clone();
+            let mut cleanup = tokio::task::spawn_blocking(move || {
+                cleanup_host.cleanup_execution(&cleanup_id, "terminal race")
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut cleanup)
+                    .await
+                    .is_err(),
+                "cleanup must wait for materialization"
+            );
+            pause.release.notify_one();
+            let retired = tokio::time::timeout(Duration::from_secs(30), cleanup)
+                .await
+                .expect("cleanup bounded")
+                .expect("join")
+                .expect("retire");
+            assert_eq!(retired, 3);
+            let tasks: Vec<_> = registry
+                .launch_tasks
+                .lock()
+                .expect("launches")
+                .drain(..)
+                .collect();
+            for task in tasks {
+                task.await.expect("launch joined");
+            }
+            for identity in [
+                "issue_LUC-900__issue_5Flead",
+                "issue_LUC-900__planner",
+                "issue_LUC-900__coder",
+            ] {
+                assert!(
+                    runtime
+                        .mob_handle()
+                        .get_member(&AgentIdentity::from(identity))
+                        .await
+                        .expect("member lookup")
+                        .is_none(),
+                    "{identity} recreated after cleanup"
+                );
+            }
+            assert!(!registry.jobs.lock().expect("jobs").contains_key(&run_id.0));
+        }
+        assert!(
+            runtime
+                .mob_handle()
+                .get_member(&AgentIdentity::from(KAPELLMEISTER))
+                .await
+                .expect("coordinator")
+                .is_some()
+        );
+        registry.shutdown().await.expect("shutdown");
+    }
+
     #[test]
     fn issue_run_mapping_survives_registry_recreation() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -6852,6 +7092,27 @@ pub(crate) mod tests {
             registry.runtime.lock().await.is_none(),
             "no replacement runtime"
         );
+    }
+
+    #[tokio::test]
+    async fn contended_current_thread_admission_is_retryable_without_partial_job() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = MetaRuntimeRegistry::new(test_meerkat_config(temp.path().join("state")));
+        let host = MetaRuntimeNativeMobExecutionHost::from_registry(registry.clone());
+        let _guard = registry.member_lifecycle.lock().await;
+        let result = host.spawn_or_resume_plan(launch_plan());
+        assert!(matches!(
+            result,
+            FugueToolResult::Err {
+                error: crate::tools::FugueToolError {
+                    retry: RetryAdvice::SafeToRetry,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(registry.jobs.lock().expect("jobs").is_empty());
+        assert!(registry.launch_tasks.lock().expect("launches").is_empty());
     }
 
     #[test]

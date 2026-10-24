@@ -329,14 +329,12 @@ enum RunningTerminationTarget {
     NativeWorker {
         identifier: String,
         session_id: String,
-        run_id: MobRunId,
         cancel: CancellationToken,
         handle: JoinHandle<()>,
     },
     Native {
         identifier: String,
         session_id: String,
-        run_id: MobRunId,
     },
 }
 
@@ -1860,6 +1858,12 @@ impl Orchestrator {
         {
             Ok(issues) => {
                 for issue in issues {
+                    if let Err(error) =
+                        self.cleanup_native_executions_for_issue(&issue, "startup-terminal-cleanup")
+                    {
+                        self.record_terminal_cleanup_error(&issue, &error).await;
+                        continue;
+                    }
                     clean_workspace_for_issue_identifier_best_effort(
                         self.config.effective(),
                         &issue.identifier,
@@ -1872,6 +1876,7 @@ impl Orchestrator {
     }
 
     async fn reconcile_running_issues(&mut self) {
+        self.reconcile_untracked_terminal_executions().await;
         self.recover_native_running_entries_after_restart().await;
         self.reconcile_native_mob_events().await;
         self.reconcile_stalled_runs().await;
@@ -2960,9 +2965,13 @@ impl Orchestrator {
         else {
             let mut state = self.state.write().await;
             state.last_error = Some(format!(
-                "native mob terminal handling skipped {} because the Linear issue could not be refreshed",
+                "native mob terminal handling deferred {} because the issue could not be refreshed",
                 entry.identifier
             ));
+            state.claimed.insert(issue_id.clone());
+            state.ended_runtime_seconds =
+                (state.ended_runtime_seconds - ended_runtime_seconds).max(0.0);
+            state.running.insert(issue_id, entry);
             return;
         };
         let lane_action = if native_kapellmeister_prompt_control_enabled(self.config.effective()) {
@@ -2976,17 +2985,16 @@ impl Orchestrator {
             }
             HumanLaneAction::StopAndCleanup => {
                 if let Err(cleanup_error) =
-                    self.cleanup_native_execution_for_entry(&entry, "native-terminal-lane-cleanup")
+                    self.cleanup_native_executions_for_issue(&issue, "native-terminal-lane-cleanup")
                 {
-                    self.park_native_issue_for_liveness(
-                        issue_id,
-                        entry,
-                        NativeRunParkReason::HostMechanics,
-                        Some(format!(
-                            "native execution cleanup failed after terminal lane observation: {cleanup_error}"
-                        )),
-                    )
-                    .await;
+                    self.record_terminal_cleanup_error(&issue, &cleanup_error)
+                        .await;
+                    entry.issue = issue;
+                    let mut state = self.state.write().await;
+                    state.claimed.insert(issue_id.clone());
+                    state.ended_runtime_seconds =
+                        (state.ended_runtime_seconds - ended_runtime_seconds).max(0.0);
+                    state.running.insert(issue_id, entry);
                     return;
                 }
                 clean_workspace_for_issue_identifier_best_effort(
@@ -3786,6 +3794,93 @@ impl Orchestrator {
         state.last_error = Some(message);
     }
 
+    fn cleanup_native_executions_for_issue(
+        &self,
+        issue: &Issue,
+        reason: &str,
+    ) -> std::result::Result<usize, String> {
+        let mut retired = 0;
+        for run in list_native_runs_for_restart(self.native_execution_host.as_ref())? {
+            if native_run_belongs_to_issue(&run, issue) {
+                retired += self
+                    .native_execution_host
+                    .cleanup_execution(&run.run_id, reason)?;
+            }
+        }
+        Ok(retired)
+    }
+
+    async fn record_terminal_cleanup_error(&self, issue: &Issue, error: &str) {
+        warn!(issue_identifier = %issue.identifier, %error, "terminal native cleanup deferred; retaining workspace for retry");
+        self.state.write().await.last_error = Some(format!(
+            "native cleanup deferred for {}: {error}",
+            issue.identifier
+        ));
+    }
+
+    async fn reconcile_untracked_terminal_executions(&self) {
+        let runs = match list_native_runs_for_restart(self.native_execution_host.as_ref()) {
+            Ok(runs) => runs,
+            Err(error) => {
+                self.state.write().await.last_error =
+                    Some(format!("native cleanup listing failed: {error}"));
+                return;
+            }
+        };
+        let untracked = {
+            let state = self.state.read().await;
+            runs.into_iter()
+                .filter(|run| {
+                    !state
+                        .running
+                        .values()
+                        .any(|entry| native_run_belongs_to_issue(run, &entry.issue))
+                })
+                .collect::<Vec<_>>()
+        };
+        if untracked.is_empty() {
+            return;
+        }
+        let adapter = match IssueAdapter::from_config(&self.config.effective().tracker) {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                self.state.write().await.last_error =
+                    Some(format!("native cleanup issue adapter failed: {error}"));
+                return;
+            }
+        };
+        let terminal = match adapter
+            .fetch_issues_by_states(&self.config.effective().tracker.terminal_states)
+            .await
+        {
+            Ok(issues) => issues,
+            Err(error) => {
+                self.state.write().await.last_error = Some(format!(
+                    "native cleanup terminal issue refresh failed: {error}"
+                ));
+                return;
+            }
+        };
+        for issue in terminal {
+            if !untracked
+                .iter()
+                .any(|run| native_run_belongs_to_issue(run, &issue))
+            {
+                continue;
+            }
+            match self.cleanup_native_executions_for_issue(&issue, "untracked-terminal-cleanup") {
+                Ok(_) => {
+                    clean_workspace_for_issue_identifier_best_effort(
+                        self.config.effective(),
+                        &issue.identifier,
+                    )
+                    .await
+                }
+                Err(error) => self.record_terminal_cleanup_error(&issue, &error).await,
+            }
+        }
+    }
+
     fn cleanup_native_execution_for_entry(
         &self,
         entry: &RunningEntry,
@@ -4016,6 +4111,45 @@ impl Orchestrator {
                 return;
             }
         }
+        let native = {
+            let state = self.state.read().await;
+            state.running.get(issue_id).and_then(|entry| {
+                entry
+                    .native_run
+                    .as_ref()
+                    .map(|run| (entry.issue.clone(), run.run_id.clone()))
+            })
+        };
+        let Some((issue, run_id)) = native else {
+            return;
+        };
+        let retirement = if matches!(authority, TerminationAuthority::LinearTerminalLane) {
+            self.cleanup_native_executions_for_issue(&issue, reason)
+                .map(|_| ())
+        } else {
+            match self
+                .native_execution_host
+                .cancel_execution(CancelExecutionInput {
+                    run_id,
+                    reason: reason.to_owned(),
+                    idempotency_key: IdempotencyKey(format!(
+                        "native-execution-cancel:{issue_id}:{reason}"
+                    )),
+                }) {
+                FugueToolResult::Ok {
+                    output: FugueToolOutput::MobCancelExecution(output),
+                    ..
+                } if output.cancelled => Ok(()),
+                FugueToolResult::Err { error, .. } => Err(error.message),
+                FugueToolResult::Ok { .. } => {
+                    Err("native cancellation did not confirm retirement".to_owned())
+                }
+            }
+        };
+        if let Err(error) = retirement {
+            self.record_terminal_cleanup_error(&issue, &error).await;
+            return;
+        }
         let target = {
             let mut state = self.state.write().await;
             state.claimed.remove(issue_id);
@@ -4025,12 +4159,11 @@ impl Orchestrator {
                     retry,
                     reason: reason.to_string(),
                 });
-                if let Some(native_run) = entry.native_run.clone() {
+                if entry.native_run.is_some() {
                     if let Some(handle) = entry.handle.take() {
                         Some(RunningTerminationTarget::NativeWorker {
                             identifier: entry.identifier.clone(),
                             session_id: entry.session.session_id.clone().unwrap_or_default(),
-                            run_id: native_run.run_id,
                             cancel: entry.cancel.clone(),
                             handle,
                         })
@@ -4038,7 +4171,6 @@ impl Orchestrator {
                         Some(RunningTerminationTarget::Native {
                             identifier: entry.identifier.clone(),
                             session_id: entry.session.session_id.clone().unwrap_or_default(),
-                            run_id: native_run.run_id,
                         })
                     }
                 } else {
@@ -4055,19 +4187,9 @@ impl Orchestrator {
             RunningTerminationTarget::NativeWorker {
                 identifier,
                 session_id,
-                run_id,
                 cancel,
                 mut handle,
             } => {
-                let _ = self
-                    .native_execution_host
-                    .cancel_execution(CancelExecutionInput {
-                        run_id,
-                        reason: reason.to_string(),
-                        idempotency_key: IdempotencyKey(format!(
-                            "native-execution-cancel:{issue_id}:{reason}"
-                        )),
-                    });
                 cancel.cancel();
                 let shutdown_timeout = self.worker_shutdown_timeout();
                 match tokio::time::timeout(shutdown_timeout, &mut handle).await {
@@ -4108,19 +4230,7 @@ impl Orchestrator {
             RunningTerminationTarget::Native {
                 identifier,
                 session_id,
-                run_id,
-            } => {
-                let _ = self
-                    .native_execution_host
-                    .cancel_execution(CancelExecutionInput {
-                        run_id,
-                        reason: reason.to_string(),
-                        idempotency_key: IdempotencyKey(format!(
-                            "native-execution-cancel:{issue_id}:{reason}"
-                        )),
-                    });
-                (identifier, session_id)
-            }
+            } => (identifier, session_id),
         };
         self.drain_internal_messages().await;
         let orphaned_entry = {
@@ -7216,6 +7326,14 @@ fn next_native_run_generation_from_workpad(
                 .max(workpad_generation.saturating_add(1)),
         ),
         None => requested_generation,
+    }
+}
+
+fn native_run_belongs_to_issue(run: &MobRunSnapshot, issue: &Issue) -> bool {
+    match run.issue.as_ref() {
+        Some(LinearIssueRef::Id { id }) => id.0 == issue.id,
+        Some(LinearIssueRef::Identifier { identifier }) => identifier.0 == issue.identifier,
+        None => false,
     }
 }
 
@@ -10366,6 +10484,7 @@ mod tests {
         restore_error: std::sync::Mutex<Option<String>>,
         launch_failure_override: std::sync::Mutex<Option<crate::tools::NativeLaunchFailure>>,
         cleanup_calls: std::sync::Mutex<Vec<(MobRunId, String)>>,
+        retirement_error: std::sync::Mutex<Option<String>>,
     }
 
     impl RecordingNativeMobExecutionHost {
@@ -10504,6 +10623,23 @@ mod tests {
             self.inner.spawn_or_resume_execution(input)
         }
         fn cancel_execution(&self, input: crate::tools::CancelExecutionInput) -> FugueToolResult {
+            if let Some(message) = self
+                .retirement_error
+                .lock()
+                .expect("retirement error")
+                .clone()
+            {
+                return FugueToolResult::Err {
+                    error: FugueToolError {
+                        operation: FugueToolOperation::MobCancelExecution,
+                        code: crate::tools::FugueToolErrorCode::BackendUnavailable,
+                        message,
+                        retry: crate::tools::RetryAdvice::SafeToRetry,
+                        idempotency_key: Some(input.idempotency_key),
+                    },
+                    metadata: ToolExecutionMetadata::default(),
+                };
+            }
             self.inner.cancel_execution(input)
         }
 
@@ -10514,6 +10650,14 @@ mod tests {
         ) -> std::result::Result<usize, String> {
             if let Ok(mut calls) = self.cleanup_calls.lock() {
                 calls.push((run_id.clone(), reason.to_string()));
+            }
+            if let Some(message) = self
+                .retirement_error
+                .lock()
+                .expect("retirement error")
+                .clone()
+            {
+                return Err(message);
             }
             Ok(1)
         }
@@ -15995,6 +16139,213 @@ worker:
             !state.running.contains_key(&issue.id),
             "terminal Linear lanes retire the live issue mob"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_cleanup_includes_independent_review_jobs() {
+        let (_workspace, mut orchestrator, native_host, issue) =
+            dispatched_terminal_fixture("Done").await;
+        let development = list_native_runs_for_restart(native_host.as_ref())
+            .expect("persisted jobs")
+            .remove(0);
+        let mut review = development.clone();
+        review.run_id = MobRunId("independent-review:fixture:round-one".to_owned());
+        review.issue = Some(LinearIssueRef::Id {
+            id: crate::tools::LinearIssueId(issue.id.clone()),
+        });
+        let mut other = development.clone();
+        other.run_id = MobRunId("independent-review:other-issue".to_owned());
+        other.issue = Some(issue_ref_for_identifier("LUC-169"));
+        *native_host.list_override.lock().expect("jobs") =
+            Some(vec![development.clone(), review.clone(), other]);
+        orchestrator
+            .handle_native_run_finished(issue.id.clone(), issue, MobRunStatus::Succeeded)
+            .await;
+        let retired: BTreeSet<_> = native_host
+            .cleanup_calls()
+            .into_iter()
+            .map(|(id, _)| id.0)
+            .collect();
+        assert_eq!(
+            retired,
+            BTreeSet::from([development.run_id.0, review.run_id.0]),
+            "terminal cleanup must cover every issue phase without touching another issue"
+        );
+    }
+
+    async fn refused_retirement_keeps_ownership(
+        with_worker: bool,
+        authority: TerminationAuthority,
+    ) {
+        let (_workspace, mut orchestrator, native_host, issue) =
+            dispatched_terminal_fixture("Done").await;
+        let cleanup_workspace = matches!(authority, TerminationAuthority::LinearTerminalLane);
+        let state = orchestrator.shared_state();
+        let workspace_path = state.read().await.running[&issue.id].workspace_path.clone();
+        let sentinel = PathBuf::from(&workspace_path).join("uncommitted-evidence.txt");
+        std::fs::write(&sentinel, "retain until native retirement succeeds").expect("sentinel");
+        if with_worker {
+            let mut state = state.write().await;
+            let entry = state.running.get_mut(&issue.id).expect("entry");
+            let cancel = entry.cancel.clone();
+            entry.handle = Some(tokio::spawn(async move { cancel.cancelled().await }));
+        }
+        *native_host.retirement_error.lock().expect("error") =
+            Some("native retirement refused".to_owned());
+        orchestrator
+            .terminate_running_issue(
+                &issue.id,
+                cleanup_workspace,
+                false,
+                "retirement-test",
+                authority,
+            )
+            .await;
+        {
+            let state = state.read().await;
+            assert!(
+                state.running.contains_key(&issue.id),
+                "retirement failure must keep cleanup ownership"
+            );
+            assert!(
+                state
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("native retirement refused"))
+            );
+            assert_eq!(state.running[&issue.id].handle.is_some(), with_worker);
+            assert!(sentinel.exists(), "live members still own their workspace");
+        }
+        *native_host.retirement_error.lock().expect("error") = None;
+        orchestrator
+            .terminate_running_issue(
+                &issue.id,
+                cleanup_workspace,
+                false,
+                "retirement-test",
+                authority,
+            )
+            .await;
+        assert!(!state.read().await.running.contains_key(&issue.id));
+        assert_eq!(
+            sentinel.exists(),
+            !cleanup_workspace,
+            "successful retry obeys workspace cleanup policy"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_cleanup_refusal_keeps_native_entry_for_retry() {
+        refused_retirement_keeps_ownership(false, TerminationAuthority::LinearTerminalLane).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_cleanup_refusal_keeps_native_worker_for_retry() {
+        refused_retirement_keeps_ownership(true, TerminationAuthority::LinearTerminalLane).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_refusal_keeps_native_entry_for_retry() {
+        refused_retirement_keeps_ownership(false, TerminationAuthority::HostRuntime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_refusal_keeps_native_worker_for_retry() {
+        refused_retirement_keeps_ownership(true, TerminationAuthority::HostRuntime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_cleanup_retries_after_terminal_event_without_changing_done() {
+        let (_workspace, mut orchestrator, host, issue) = dispatched_terminal_fixture("Done").await;
+        *host.retirement_error.lock().expect("error") = Some("retirement unavailable".into());
+        orchestrator
+            .handle_native_run_finished(issue.id.clone(), issue.clone(), MobRunStatus::Succeeded)
+            .await;
+        assert!(
+            orchestrator
+                .state
+                .read()
+                .await
+                .running
+                .contains_key(&issue.id)
+        );
+        let adapter =
+            IssueAdapter::from_config(&orchestrator.config.effective().tracker).expect("tracker");
+        let current = adapter
+            .fetch_issue_states_by_ids(std::slice::from_ref(&issue.id))
+            .await
+            .expect("issue");
+        assert_eq!(current[0].state, "Done");
+        *host.retirement_error.lock().expect("error") = None;
+        orchestrator
+            .handle_native_run_finished(issue.id.clone(), issue.clone(), MobRunStatus::Succeeded)
+            .await;
+        assert!(
+            !orchestrator
+                .state
+                .read()
+                .await
+                .running
+                .contains_key(&issue.id)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_cleanup_retries_persisted_review_without_running_entry() {
+        let (_workspace, orchestrator, host, issue) = dispatched_terminal_fixture("Done").await;
+        let mut review = list_native_runs_for_restart(host.as_ref())
+            .expect("jobs")
+            .remove(0);
+        review.run_id = MobRunId("independent-review:restart".into());
+        review.issue = Some(LinearIssueRef::Id {
+            id: crate::tools::LinearIssueId(issue.id.clone()),
+        });
+        *host.list_override.lock().expect("jobs") = Some(vec![review.clone()]);
+        let state = orchestrator.shared_state();
+        let entry = state
+            .write()
+            .await
+            .running
+            .remove(&issue.id)
+            .expect("entry");
+        state.write().await.claimed.clear();
+        let sentinel = PathBuf::from(&entry.workspace_path).join("preserved-until-retirement.txt");
+        std::fs::write(&sentinel, "recovery evidence").expect("sentinel");
+        *host.retirement_error.lock().expect("error") = Some("refused after restart".into());
+        orchestrator.startup_terminal_workspace_cleanup().await;
+        assert!(sentinel.exists());
+        assert!(
+            state
+                .read()
+                .await
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("refused after restart"))
+        );
+        *host.retirement_error.lock().expect("error") = None;
+        orchestrator.reconcile_untracked_terminal_executions().await;
+        assert!(!sentinel.exists());
+        assert_eq!(
+            host.cleanup_calls().last().expect("cleanup").0,
+            review.run_id
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_cleanup_keeps_untracked_nonterminal_review() {
+        let (_workspace, orchestrator, host, issue) =
+            dispatched_terminal_fixture("Ready for review").await;
+        let state = orchestrator.shared_state();
+        let entry = state
+            .write()
+            .await
+            .running
+            .remove(&issue.id)
+            .expect("entry");
+        state.write().await.claimed.clear();
+        orchestrator.reconcile_untracked_terminal_executions().await;
+        assert!(host.cleanup_calls().is_empty());
+        assert!(PathBuf::from(entry.workspace_path).exists());
     }
 
     #[tokio::test]
