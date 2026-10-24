@@ -98,13 +98,18 @@ on the intended gateway before treating a deployment as accepted.
 
 ## Temporary dependency follow-up
 
-The integration candidate binds Core `605870998255cd83d9d807978fbb239c4ca7aa5c`
-and Meta `cc0751d485324d25b80e5bf92524a8e2bd6b6af2`. Core includes the
-checkpoint recovery, archive retirement, compaction acknowledgement and stream
-corrections, plus keyed admission of flows bound to selected members. Meta
-includes the compatible console, sign-in recovery and keyed flow API changes.
-Every Core package, including Meta's transitive dependencies, must resolve to
-that same Core commit in `Cargo.lock`.
+The candidate uses exact public Core and Meta source revisions. Read
+[Cargo.toml](../../Cargo.toml) for the selected revisions and
+[Cargo.lock](../../Cargo.lock) for the resolved versions and commits. Every
+Core package, including Meta's transitive dependencies, must resolve to the same
+Core commit. The separately packaged rkat CLI uses [rkat.json](rkat.json); its
+version can differ from the embedded runtime.
+
+For an installed bundle, run `meerkat-fugue build-info` and compare its commit
+and tree with `manifest.json`. Inspect the dependency files at that source
+revision, not at the repository's current default branch. PR artifacts can name
+a synthetic test-merge commit; verify its parents and tree against the intended
+change. A stable release must identify its actual tag commit.
 
 Fugue qualifies these source bindings through its own build, native recovery
 and hosted ticket-cycle checks. Upstream CI and publication do not block starting
@@ -112,12 +117,11 @@ that qualification. Replace the temporary pins when a released pair passes the
 same checks, then verify the new lock and release manifest. A source binding or
 an upstream merge alone is not deployed acceptance.
 
-This integration candidate is not qualified for production distribution. The
-previous Core `3a57ae76847564288fba92dc0563436509b21265` / Meta
-`c14eb2516451cb449e4c72de08f603220f05bc73` pair passed Fugue's full Linux suite,
-twenty retirement trials, five handoff/restart rounds and bundle installation
-checks. Preserve that evidence separately; it does not qualify this new pair.
-Repeat the consumer checks and fresh hosted acceptance on the final candidate.
+This integration candidate is not qualified for production distribution.
+Retain each candidate's CI, native recovery and bundle-installation evidence
+with its exact source identity, including failed trials. Passing checks on an
+older pair does not qualify a replacement. Complete the consumer checks and
+fresh hosted acceptance on the final candidate.
 
 The merge path also needs authoritative, durable review results bound to the
 exact candidate. Native keyed admission prevents duplicate execution of a

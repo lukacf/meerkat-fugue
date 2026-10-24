@@ -92,7 +92,10 @@ live queue.
 
 Keep the historical `mobkit-runtime` state-directory name when upgrading older
 installations. Renaming a package must not create an empty runtime state root.
-Before adopting the 0.9.4 runtime candidate, follow [the stopped-state migration guide](./upgrading-0.9.4.mdx). Older configuration changes are in [the 0.9.3 guide](./upgrading-0.9.3.mdx).
+Legacy state from before the native storage layout needs a separate migration
+rehearsal; see [the stopped-state migration guide](./upgrading-0.9.4.mdx).
+Fresh installations do not need that migration. Older configuration changes are
+in [the 0.9.3 guide](./upgrading-0.9.3.mdx).
 
 ## Upgrade and roll back
 
@@ -122,7 +125,10 @@ installer preserves the previous release and refuses to promote a damaged curren
 release to the rollback target. Do not edit manifest fields to bypass validation.
 
 Do not change a shared dependency pin merely because upstream merged a fix.
-Qualify the published replacement against the same persistence and E2E checks.
+Qualify the exact replacement source against the same persistence and E2E checks.
+An upstream release tag is not required to qualify an exact backport. Record the
+resolved dependencies from that candidate's lockfile, as described in the
+[bundle guide](../scripts/distribution/README.md#temporary-dependency-follow-up).
 
 ## Monitor the right signals
 
