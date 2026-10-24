@@ -4,7 +4,8 @@ Fugue's native configuration file is `fugue.yaml` or `fugue.yml`. Native configs
 are parsed into typed Rust structs at startup and fail fast on unknown fields or
 invalid combinations.
 
-new queues should use `fugue.yaml`.
+Use [repository setup](./getting-started.mdx) for browser onboarding. This
+reference is for advanced, manually maintained workflow files.
 
 ## Native defaults
 
@@ -35,7 +36,7 @@ If `linear.api_key` is omitted, Fugue also checks `LINEAR_API_KEY`.
 version: 1
 backend: native-execution # optional; omitted is native-execution
 tracker_lanes: { ... }
-linear: { ... }
+tracker: { ... }
 linear_projections: { ... }
 selection: { ... }
 agents: { ... }
@@ -50,11 +51,40 @@ kapellmeister: { ... }
 server: { ... }
 ```
 
+## `tracker`
+
+Choose one issue backend per repository. `tracker` is the preferred name for
+this section; the historical `linear` name accepts the same settings. Specify
+only one. `linear_projections` and the `linear_*` tool names are retained for
+compatibility across trackers and do not select Linear by themselves.
+
+| `kind` | Connection and scope |
+| --- | --- |
+| `jira` | Jira site in `endpoint`, project key in `project_slug`, and private authentication/JQL settings under `jira`. |
+| `fugue-ims` | Persistent SQLite file in `endpoint` and a repository scope in `project_slug`; no external tracker account. |
+| `linear` | Linear API endpoint, API key, project and optional team. This is the default when `kind` is omitted. |
+
+For example, a manually configured built-in queue can use:
+
+```yaml
+tracker:
+  kind: fugue-ims
+  endpoint: sqlite:///absolute/private/fugue-issues.sqlite3
+  project_slug: example-app
+```
+
+Use a writable private path and keep the database in complete state backups.
+Different repositories need distinct tracker scopes. Browser setup manages this
+configuration for you. For Jira, use the complete
+[Jira example](../fugue.jira.example.yaml) and
+[Jira/GitHub Enterprise guide](./jira-and-github-enterprise.mdx); map the project's
+existing statuses and use `provisioning.mode: validate`.
+
 ## `linear`
 
-Configures issue intake, universal lane anchors, and optional workflow-state
-provisioning. Linear is a projection surface owned per issue by the issue lead;
-Fugue observes Linear for external lane drift.
+This historical section name is an alias for `tracker`. The example below
+shows a Linear connection. Lane roles and projections also apply to Jira and
+built-in tickets, using the selected tracker's actual status names.
 
 Fugue's canonical tracker lane roles are intentionally coarse:
 
@@ -111,7 +141,7 @@ The lane anchors are semantic defaults used across templates:
 - `success`: terminal success.
 - `canceled` and `duplicate`: terminal canceled states.
 
-`linear.team` is required for projection preflight because Linear workflow
+For Linear, `linear.team` is required for projection preflight because workflow
 states are team-scoped. When `provisioning.mode` is `validate`, Fugue fails
 preflight if required states are missing. When it is `create_missing`, Fugue
 creates missing team-scoped workflow states. Fugue never deletes or renames
@@ -122,7 +152,7 @@ existing Linear states automatically.
 
 ## `linear_projections`
 
-Maps mob flow node ids to Linear lanes. Member ids are used as a fallback only
+Maps mob flow node ids to configured tracker lanes. Member ids are used as a fallback only
 when Meta does not expose node ids.
 
 ```yaml
@@ -168,7 +198,7 @@ selection:
     native: implementation_mob
 ```
 
-`by_label` maps Linear label names to template ids. Issues without a matching
+`by_label` maps issue label names to template ids. Issues without a matching
 label use `default_template`.
 
 ## `agents`
@@ -205,6 +235,10 @@ authority; the standalone GitHub tool server does not offer merge. Deploy all
 five Fugue binaries together with the bundle's pinned rkat, and retain their
 checksums in post-deploy evidence. The special `mob` tool means
 Meerkat-provided mob tooling (`tools.mob=true`), not a Fugue-defined pseudo-tool.
+
+For Jira, configure `mcp:jira` with `fugue-jira-mcp`. Built-in tickets use
+host-provided tracker tools through the compatible `mcp:linear` declaration
+and do not need a Linear server or token.
 
 Fugue provides Playwright MCP to native agents by default. The default server is:
 
@@ -243,12 +277,14 @@ mob_templates:
 ```
 
 Members may be plain profile names or `{name, profile}` pairs. Template backend
-inherits the top-level backend unless explicitly set. Native issue mobs are
-prompt-driven by default: Fugue launches the issue lead plus worker members and
-the issue lead coordinates planner, coder, and reviewer through comms. Leave
-`flow:` unset unless the template intentionally uses Meta `mob/flow_run`.
-Native planner/coder/reviewer mobs must keep review cycles bounded with
-`max_review_cycles`.
+inherits the top-level backend unless explicitly set. Issue execution is
+prompt-driven: the issue lead coordinates its worker members through native
+communication. In managed repositories they join the existing repository mob
+alongside its specialists. Keep review cycles bounded with `max_review_cycles`.
+
+Optional `flow` selects a supported role/review contract. Native members still
+coordinate in-process through Meta; this does not start a separate `rkat-rpc`
+process or invoke an external `mob/flow_run` endpoint.
 
 ## `worker`
 
@@ -273,7 +309,7 @@ polling:
   interval_ms: 30000
 ```
 
-Controls the regular Linear poll cadence. Operators can also request an
+Controls the regular tracker poll cadence. Operators can also request an
 immediate poll with `POST /api/v1/refresh` when the status API is enabled.
 
 ## `workspace`
@@ -499,6 +535,7 @@ ota_update:
   deploy_command: >-
     install -m 0755 target/release/meerkat-fugue /usr/local/bin/meerkat-fugue &&
     install -m 0755 target/release/fugue-linear-mcp /usr/local/bin/fugue-linear-mcp &&
+    install -m 0755 target/release/fugue-jira-mcp /usr/local/bin/fugue-jira-mcp &&
     install -m 0755 target/release/fugue-github-mcp /usr/local/bin/fugue-github-mcp &&
     install -m 0755 target/release/fugue-host-mcp /usr/local/bin/fugue-host-mcp &&
     systemctl restart meerkat-fugue
