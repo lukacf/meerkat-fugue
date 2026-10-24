@@ -108,6 +108,14 @@ Before adopting the 0.9.4 runtime candidate, follow [the stopped-state migration
 The public bundle installer atomically changes executable links. It does not
 stop your service or roll back application-state migrations for you. Deployment
 integrations may automate these steps; follow their verified recovery procedure.
+
+If the installer rejects a candidate's manifest or checksum, obtain the verified
+archive and its matching checksum again, then retry. Rejection leaves the current
+and previous executable releases in place. If it reports an invalid **existing**
+manifest, restore that release from your verified backup before upgrading. The
+installer preserves the previous release and refuses to promote a damaged current
+release to the rollback target. Do not edit manifest fields to bypass validation.
+
 Do not change a shared dependency pin merely because upstream merged a fix.
 Qualify the published replacement against the same persistence and E2E checks.
 
