@@ -86,9 +86,10 @@ operator has access to the instance's repositories and controls. Keep deployment
 configuration, credentials, databases and transcripts outside this public repo.
 See [SECURITY.md](SECURITY.md).
 
-This branch uses Meerkat/Meta 0.9.4 with an exact public Meta backport for
-shared-console identities, peer links, Memory and Work Graph. Upgrading an
-existing 0.9.3 installation requires an offline native storage migration.
+This branch uses exact public Meerkat and Meta source revisions. The
+[dependency declarations](Cargo.toml) and [lockfile](Cargo.lock) identify the
+versions and commits used by this checkout; the bundled rkat CLI has its own
+[release pin](scripts/distribution/rkat.json).
 The first release targets fresh installations and still requires crash-recovery
 and hosted acceptance. Legacy migration is a separate, unqualified upgrade path;
 it is not a prerequisite for a fresh installation. Follow the

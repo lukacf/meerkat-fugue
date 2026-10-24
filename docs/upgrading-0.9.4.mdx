@@ -3,16 +3,17 @@ title: "Upgrading native runtime storage"
 description: "A stopped-state migration, verification and rollback procedure for the Meerkat 0.9.4 train."
 ---
 
-The 0.9.4 dependency candidate changes how Meta stores sessions and identities.
-Existing repository runtimes need an explicit offline migration. Starting a
-new binary against old state does not perform that migration automatically.
+This guide covers legacy state from before the native storage layout introduced
+in the 0.9.4 train. Fresh installations do not need this migration. Starting a
+new binary against legacy state does not migrate it automatically.
 
-This candidate is still under qualification. In particular, the upstream
-crash-recovery correction for compacted persistent sessions has not yet been
-qualified for Fugue. Passing a normal restart is not evidence that an
-interrupted checkpoint recovers. Keep this limitation visible in release
-acceptance and retain the currently installed release until the required
-recovery proof is complete.
+Legacy upgrades remain a separate, unqualified acceptance track. Rehearse on a
+complete copy using the exact old and new bundles before changing the original.
+Keep the currently installed release and its matching stopped-state backup until
+that rehearsal proves both migration and recovery. Fresh-install acceptance
+does not qualify legacy stores, and a normal restart does not prove recovery
+from an interrupted checkpoint. Use the [bundle guide](../scripts/distribution/README.md#temporary-dependency-follow-up)
+to identify the candidate's exact runtime revisions.
 
 ## Before changing anything
 
