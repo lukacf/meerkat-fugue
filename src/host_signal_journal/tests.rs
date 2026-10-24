@@ -73,16 +73,26 @@ async fn native_receipts_without_admission_preserve_pending_work_and_their_statu
             .await
             .unwrap();
         assert_eq!(progress.acknowledged, 1);
-        assert_eq!(
-            progress.deferred,
-            Some(DeferredSignal {
-                key: second.key.clone(),
-                receipt
-            })
-        );
+        let deferred = progress.deferred.unwrap();
+        assert_eq!(deferred.key, second.key);
+        assert_eq!(deferred.receipt, receipt);
+        let expected_second = match deferred.replacement_key {
+            Some(key) => {
+                assert!(!matches!(receipt.status, WireContinuationStatus::Pending));
+                assert_ne!(key, second.key);
+                PendingSignal {
+                    key,
+                    envelope: second.envelope,
+                }
+            }
+            None => {
+                assert!(matches!(receipt.status, WireContinuationStatus::Pending));
+                second
+            }
+        };
         assert_eq!(
             binding.open().unwrap().pending(10).unwrap(),
-            vec![second, third]
+            vec![expected_second, third]
         );
     }
 }
@@ -98,6 +108,88 @@ fn enqueue(binding: &HostSignalBinding, event: &str) -> PendingSignal {
         .into_iter()
         .find(|row| row.key == key)
         .unwrap()
+}
+
+#[test]
+fn replacement_is_durable_idempotent_and_requires_a_terminal_non_admission() {
+    use meerkat_contracts::WireContinuationStatus;
+    let temp = tempfile::tempdir().unwrap();
+    let binding = binding(&temp);
+    let first = enqueue(&binding, "first");
+    let mut journal = binding.open().unwrap();
+    let mut receipt = admitted("native-original");
+    assert!(journal.replace_unadmitted(&first.key, &receipt).is_err());
+    receipt.status = WireContinuationStatus::Pending;
+    assert!(journal.replace_unadmitted(&first.key, &receipt).is_err());
+    receipt.status = WireContinuationStatus::Stranded;
+    let replacement = journal.replace_unadmitted(&first.key, &receipt).unwrap();
+    assert_ne!(replacement, first.key);
+    drop(journal);
+    let mut reopened = binding.open().unwrap();
+    assert_eq!(
+        reopened.replace_unadmitted(&first.key, &receipt).unwrap(),
+        replacement
+    );
+    assert_eq!(
+        reopened.pending(10).unwrap(),
+        vec![PendingSignal {
+            key: replacement.clone(),
+            envelope: first.envelope.clone(),
+        }]
+    );
+    let mut different_receipt = receipt.clone();
+    different_receipt.delivery_id = "conflicting-native-delivery".into();
+    assert!(
+        reopened
+            .replace_unadmitted(&first.key, &different_receipt)
+            .is_err()
+    );
+    reopened
+        .acknowledge(&replacement, "native-replacement")
+        .unwrap();
+    assert_eq!(
+        reopened.replace_unadmitted(&first.key, &receipt).unwrap(),
+        replacement
+    );
+    assert!(reopened.pending(10).unwrap().is_empty());
+    assert!(reopened.replace_unadmitted(&replacement, &receipt).is_err());
+}
+
+#[test]
+fn replacement_link_and_current_key_commit_in_one_transaction() {
+    let temp = tempfile::tempdir().unwrap();
+    let binding = binding(&temp);
+    let first = enqueue(&binding, "first");
+    let mut journal = binding.open().unwrap();
+    journal.connection.execute_batch(
+        "CREATE TRIGGER fail_rekey BEFORE UPDATE OF delivery_key ON deliveries BEGIN SELECT RAISE(ABORT, 'rekey unavailable'); END;"
+    ).unwrap();
+    let mut receipt = admitted("never-admitted");
+    receipt.status = meerkat_contracts::WireContinuationStatus::Stranded;
+    assert!(
+        journal
+            .replace_unadmitted(&first.key, &receipt)
+            .unwrap_err()
+            .to_string()
+            .contains("rekey unavailable")
+    );
+    drop(journal);
+    let mut journal = binding.open().unwrap();
+    assert_eq!(journal.pending(10).unwrap(), vec![first.clone()]);
+    assert_eq!(
+        journal
+            .connection
+            .query_row("SELECT count(*) FROM replacements", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    journal
+        .connection
+        .execute_batch("DROP TRIGGER fail_rekey;")
+        .unwrap();
+    let replacement = journal.replace_unadmitted(&first.key, &receipt).unwrap();
+    assert_eq!(journal.pending(10).unwrap()[0].key, replacement);
 }
 
 #[tokio::test]
@@ -472,14 +564,88 @@ fn journal_process_exit_helper() {
     let mut journal = HostSignalJournal::open(Path::new(&path), &scope()).unwrap();
     let mut update = journal.begin().unwrap();
     update.observe_lane("APP-1", "Active");
-    update
+    let key = update
         .enqueue_once("event-1", || Ok(message("persist through process exit")))
         .unwrap();
+    if std::env::var("FUGUE_JOURNAL_PROCESS_TEST_REPLACE").as_deref() == Ok("yes") {
+        update.commit().unwrap();
+        let mut receipt = admitted("stranded-before-process-loss");
+        receipt.status = meerkat_contracts::WireContinuationStatus::Stranded;
+        journal.replace_unadmitted(&key, &receipt).unwrap();
+        // Crash after the new key is committed but before any new submission.
+        std::process::exit(0);
+    }
     if std::env::var("FUGUE_JOURNAL_PROCESS_TEST_COMMIT").as_deref() == Ok("yes") {
         update.commit().unwrap();
     }
     // Both database close and transaction destructors are deliberately skipped.
     std::process::exit(0);
+}
+
+#[tokio::test]
+async fn process_exit_before_resubmission_replays_the_committed_replacement() {
+    let temp = tempfile::tempdir().unwrap();
+    let binding = binding(&temp);
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "host_signal_journal::tests::journal_process_exit_helper",
+            "--nocapture",
+        ])
+        .env("FUGUE_JOURNAL_PROCESS_TEST_PATH", &binding.path)
+        .env("FUGUE_JOURNAL_PROCESS_TEST_REPLACE", "yes")
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("replacement child exceeded its bounded local test");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let journal = binding.open().unwrap();
+    let (previous, replacement): (String, String) = journal
+        .connection
+        .query_row(
+            "SELECT previous_key, replacement_key FROM replacements",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_ne!(previous, replacement);
+    assert_eq!(
+        journal.pending(10).unwrap(),
+        vec![PendingSignal {
+            key: DeliveryKey(replacement.clone()),
+            envelope: message("persist through process exit"),
+        }]
+    );
+    drop(journal);
+    let progress = binding
+        .drain_pending(std::num::NonZeroU32::new(1).unwrap(), |_, signal| {
+            assert_eq!(
+                signal.key.0, replacement,
+                "replay the saved replacement, not a new key"
+            );
+            assert_eq!(signal.envelope, message("persist through process exit"));
+            std::future::ready(Ok(admitted("native-replacement-admitted")))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        progress,
+        DrainProgress {
+            acknowledged: 1,
+            deferred: None
+        }
+    );
+    assert!(binding.open().unwrap().pending(10).unwrap().is_empty());
 }
 
 #[test]

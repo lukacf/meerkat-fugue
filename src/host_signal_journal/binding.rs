@@ -91,6 +91,8 @@ impl HostSignalBinding {
     /// key. Native admission, not this journal, deduplicates uncertain retries.
     /// Pending, stranded and refused receipts stop this snapshot and return
     /// their native status intact; only an Admitted receipt is acknowledged.
+    /// Terminal non-admission also commits a deterministic replacement key for
+    /// the next attempt. An ambiguous result never rotates the key.
     pub async fn drain_pending<F, Fut>(
         &self,
         limit: std::num::NonZeroU32,
@@ -119,10 +121,22 @@ impl HostSignalBinding {
                     self.open()?.acknowledge(&key, &receipt.delivery_id)?;
                     progress.acknowledged += 1;
                 }
-                meerkat_contracts::WireContinuationStatus::Pending
-                | meerkat_contracts::WireContinuationStatus::Stranded
+                meerkat_contracts::WireContinuationStatus::Pending => {
+                    progress.deferred = Some(DeferredSignal {
+                        key,
+                        receipt,
+                        replacement_key: None,
+                    });
+                    break;
+                }
+                meerkat_contracts::WireContinuationStatus::Stranded
                 | meerkat_contracts::WireContinuationStatus::Refused { .. } => {
-                    progress.deferred = Some(DeferredSignal { key, receipt });
+                    let replacement_key = Some(self.open()?.replace_unadmitted(&key, &receipt)?);
+                    progress.deferred = Some(DeferredSignal {
+                        key,
+                        receipt,
+                        replacement_key,
+                    });
                     break;
                 }
             }

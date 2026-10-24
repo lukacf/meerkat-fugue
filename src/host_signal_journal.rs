@@ -19,7 +19,7 @@ use crate::linear_lane_state::{
 };
 
 const APPLICATION_ID: i64 = 0x46554753;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 mod binding;
 pub use binding::{HOST_SIGNAL_BINDING_ENV, HostSignalBinding};
@@ -125,6 +125,7 @@ pub struct PendingSignal {
 pub struct DeferredSignal {
     pub key: DeliveryKey,
     pub receipt: meerkat_contracts::WireContinuationReceipt,
+    pub replacement_key: Option<DeliveryKey>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -234,6 +235,11 @@ fn create_if_missing(path: &Path, scope: &HostSignalScope) -> Result<()> {
             delivery_key TEXT NOT NULL UNIQUE,
             envelope TEXT NOT NULL,
             accepted_delivery_id TEXT UNIQUE
+        );
+        CREATE TABLE replacements (
+            previous_key TEXT PRIMARY KEY NOT NULL,
+            replacement_key TEXT NOT NULL UNIQUE,
+            terminal_receipt TEXT NOT NULL
         );",
         )
         .map_err(failure)?;
@@ -357,6 +363,70 @@ impl HostSignalJournal {
             })
         })
         .collect()
+    }
+
+    /// Core proves terminal Stranded/Refused continuations were never admitted.
+    /// Record the next attempt before sending it. Pending and submit errors
+    /// cannot authorize a replacement; they must keep their current key.
+    pub fn replace_unadmitted(
+        &mut self,
+        key: &DeliveryKey,
+        receipt: &meerkat_contracts::WireContinuationReceipt,
+    ) -> Result<DeliveryKey> {
+        use meerkat_contracts::WireContinuationStatus;
+        use sha2::{Digest, Sha256};
+        if !matches!(
+            receipt.status,
+            WireContinuationStatus::Stranded | WireContinuationStatus::Refused { .. }
+        ) || receipt.delivery_id.trim().is_empty()
+        {
+            return Err(failure(
+                "replacement requires a terminal native non-admission receipt",
+            ));
+        }
+        let saved_receipt = encode(receipt)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(failure)?;
+        let existing: Option<(String, String)> = transaction.query_row(
+            "SELECT replacement_key, terminal_receipt FROM replacements WHERE previous_key = ?1",
+            [&key.0], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(failure)?;
+        if let Some((replacement, original_receipt)) = existing {
+            if original_receipt != saved_receipt {
+                return Err(failure("conflicting terminal native receipt"));
+            }
+            return Ok(DeliveryKey(replacement));
+        }
+        let accepted: Option<Option<String>> = transaction
+            .query_row(
+                "SELECT accepted_delivery_id FROM deliveries WHERE delivery_key = ?1",
+                [&key.0],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(failure)?;
+        if !matches!(accepted, Some(None)) {
+            return Err(failure(
+                "only a recorded unacknowledged delivery can be replaced",
+            ));
+        }
+        let identity = encode(&(&key.0, &receipt.delivery_id))?;
+        let replacement = DeliveryKey(format!(
+            "fugue-retry-{:x}",
+            Sha256::digest(identity.as_bytes())
+        ));
+        transaction.execute(
+            "INSERT INTO replacements (previous_key, replacement_key, terminal_receipt) VALUES (?1, ?2, ?3)",
+            params![key.0, replacement.0, saved_receipt],
+        ).map_err(failure)?;
+        transaction.execute(
+            "UPDATE deliveries SET delivery_key = ?1 WHERE delivery_key = ?2 AND accepted_delivery_id IS NULL",
+            params![replacement.0, key.0],
+        ).map_err(failure)?;
+        transaction.commit().map_err(failure)?;
+        Ok(replacement)
     }
 
     /// Call only after native keyed admission returns its canonical receipt.
