@@ -219,6 +219,14 @@ impl OwnedProcess {
         {
             use nix::sys::signal::{Signal, killpg};
             use nix::unistd::Pid;
+            // An observation error is not permission to signal a numeric PID.
+            // If another waiter consumed this child, disarm Drop as well.
+            if let Err(error) = exited_without_reaping(child) {
+                if error.raw_os_error() == Some(nix::libc::ECHILD) {
+                    self.child = None;
+                }
+                return Err(error);
+            }
             let pid = i32::try_from(child.id()).map_err(io::Error::other)?;
             // Never reap the leader before this signal. Even a naturally exited
             // leader retains ownership of its PID until the following wait.
@@ -234,9 +242,19 @@ impl OwnedProcess {
         if child.try_wait()?.is_none() {
             child.kill()?;
         }
-        let status = child.wait()?;
-        self.child = None;
-        Ok(Some(status))
+        match child.wait() {
+            Ok(status) => {
+                self.child = None;
+                Ok(Some(status))
+            }
+            Err(error) => {
+                #[cfg(unix)]
+                if error.raw_os_error() == Some(nix::libc::ECHILD) {
+                    self.child = None;
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -256,6 +274,23 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", script]);
         command
+    }
+
+    #[test]
+    fn cleanup_disarms_after_another_reaper_consumes_the_child() {
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+
+        let mut capture = CapturedProcess::start(shell("exit 0")).unwrap();
+        let pid = capture.process.child.as_ref().unwrap().id();
+        waitpid(Pid::from_raw(i32::try_from(pid).unwrap()), None).unwrap();
+        let error = capture.process.finish().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(nix::libc::ECHILD));
+        assert!(
+            capture.process.child.is_none(),
+            "lost child ownership must prevent any later signal by cleanup or Drop"
+        );
+        assert!(capture.process.finish().unwrap().is_none());
     }
 
     #[test]

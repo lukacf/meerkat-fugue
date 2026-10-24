@@ -310,6 +310,11 @@ pub fn workgraph_blocked_states_env_value(states: &[String]) -> String {
 }
 
 fn workgraph_service_for_mob(path: &Path, mob_id: &str) -> Result<WorkGraphService, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("native WorkGraph database is unavailable: {error}"))?;
+    if !metadata.is_file() {
+        return Err("native WorkGraph database is not a regular file".into());
+    }
     let store = SqliteWorkGraphStore::open(path)
         .map_err(|error| format!("open WorkGraph store at {}: {error}", path.display()))?;
     let realm = meerkat_core::mob_realm_id(mob_id)
@@ -577,6 +582,35 @@ mod tests {
             .unwrap_err();
 
         assert!(error.contains("unresolved Fugue WorkGraph obligation"));
+    }
+
+    #[tokio::test]
+    async fn terminal_gate_refuses_missing_native_state_without_creating_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workgraph.sqlite3");
+        let (tracker, issue) = test_tracker(&temp.path().join("issues.sqlite3"), "DEMO-1");
+        let gate = WorkGraphTerminalGate::new(&path, vec!["Done".into()], Vec::new());
+        let result = gate
+            .guard_terminal_move(
+                &tracker,
+                &MoveIssueInput {
+                    issue,
+                    state: LinearStateRef::Name {
+                        name: "Done".into(),
+                    },
+                    expected_updated_at: None,
+                    idempotency_key: IdempotencyKey("missing-native-state".into()),
+                },
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "missing native state must not mean no obligations"
+        );
+        assert!(
+            !path.exists(),
+            "the read gate must not initialize a replacement store"
+        );
     }
 
     #[tokio::test]

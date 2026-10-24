@@ -4777,6 +4777,18 @@ pub async fn execute_deploy_transaction(
     registry: MetaRuntimeRegistry,
     request: DeployStartRequest,
 ) -> DeployTransactionResult {
+    let host = crate::github_tools::GitHubToolHost::with_connections(
+        config.meerkat.runtime_connections.clone(),
+    );
+    execute_deploy_transaction_with_host(config, registry, request, host).await
+}
+
+pub(crate) async fn execute_deploy_transaction_with_host(
+    config: ServiceConfig,
+    registry: MetaRuntimeRegistry,
+    request: DeployStartRequest,
+    host: crate::github_tools::GitHubToolHost,
+) -> DeployTransactionResult {
     let issue_identifier =
         issue_identifier_from_ref_http(&request.issue).unwrap_or_else(|| "unknown".to_string());
     if !config.deploy.enabled {
@@ -4854,12 +4866,13 @@ pub async fn execute_deploy_transaction(
             ota: None,
         };
     };
-    let merge_result = crate::merge_gate::merge(
+    let merge_result = crate::merge_gate::merge_with_host(
         &config,
         &registry,
         request.issue.clone(),
         merge_input,
         crate::merge_gate::MergePurpose::Deploy,
+        host,
     )
     .await;
     let merge_output = match merge_result {
@@ -5197,8 +5210,15 @@ async fn record_deploy_projection(
             issue: request.issue.clone(),
         })
         .await?;
+    // A refused retry is diagnostic evidence, not a replacement for an
+    // already observed merge or deployment. Keep both in the same Workpad.
+    let heading = if outcome.merge.is_none() && outcome.ota.is_none() {
+        "### Deployment attempt"
+    } else {
+        "### Deployment"
+    };
     let deployment = format!(
-        "### Deployment\n\nIdempotency-Key: `{}`\n\n```json\n{evidence}\n```",
+        "{heading}\n\nIdempotency-Key: `{}`\n\n```json\n{evidence}\n```",
         request.idempotency_key.0
     );
     let body_markdown = crate::orchestrator::upsert_markdown_section(
@@ -5206,7 +5226,7 @@ async fn record_deploy_projection(
             .workpad
             .as_ref()
             .map_or("", |workpad| workpad.body_markdown.as_str()),
-        "### Deployment",
+        heading,
         &deployment,
     );
     adapter
@@ -5236,13 +5256,10 @@ async fn record_deploy_projection(
     graph
         .terminal_states
         .push(config.deploy.success_lane.clone());
-    graph
-        .allowed_terminal_states
-        .push(config.deploy.blocked_lane.clone());
-    if outcome.status == DeployOutcomeStatus::Succeeded && !graph.state_path.is_file() {
-        anyhow::bail!(
-            "The repository's native WorkGraph database is unavailable before completion"
-        );
+    if outcome.status == DeployOutcomeStatus::Failed {
+        graph
+            .allowed_terminal_states
+            .push(config.deploy.blocked_lane.clone());
     }
     graph
         .guard_terminal_move(&config.tracker, &movement)
@@ -8356,6 +8373,29 @@ mod tests {
             })
             .await
             .expect("initial workpad");
+        let mut missing_graph_config = config.clone();
+        missing_graph_config.meerkat =
+            crate::meta_runtime::tests::test_meerkat_config(temp.path().join("missing-runtime"));
+        let missing_graph =
+            crate::workgraph_gate::WorkGraphTerminalGate::for_service(&missing_graph_config);
+        std::fs::create_dir_all(missing_graph.state_path.parent().unwrap()).unwrap();
+        for status in [DeployOutcomeStatus::Merged, DeployOutcomeStatus::Succeeded] {
+            let mut completed = outcome.clone();
+            completed.status = status;
+            if status == DeployOutcomeStatus::Merged {
+                completed.ota = None;
+            }
+            let error =
+                record_successful_deploy_projection(&missing_graph_config, &request, &completed)
+                    .await
+                    .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("WorkGraph database is unavailable")
+            );
+            assert!(!missing_graph.state_path.exists());
+        }
         record_successful_deploy_projection(&config, &request, &outcome)
             .await
             .expect("deploy projection");
@@ -8432,6 +8472,14 @@ mod tests {
         // A custom success lane is terminal for this operation even if the
         // tracker's generic terminal list does not include it.
         config.deploy.success_lane = "Shipped".into();
+        let mut overlapping_config = config.clone();
+        overlapping_config.deploy.blocked_lane = "Shipped".into();
+        assert!(
+            record_successful_deploy_projection(&overlapping_config, &request, &outcome)
+                .await
+                .is_err(),
+            "success cannot use the failure-only blocked exemption"
+        );
         let refused = record_successful_deploy_projection(&config, &request, &outcome)
             .await
             .unwrap_err();

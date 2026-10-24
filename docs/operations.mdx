@@ -149,12 +149,25 @@ merge. If a merge response is lost, inspect the PR and preserve its head and mer
 commit before retrying the same action. A deployment receipt in the Workpad is
 historical evidence; it does not bypass current review, CI or WorkGraph checks.
 
+If a new blocking obligation appears after the merge, Fugue keeps the confirmed
+merge/deployment evidence and refuses successful completion. A later rejected
+retry is recorded under **Deployment attempt** in the same Workpad, preserving
+the earlier **Deployment** result. Resolve the native obligation and retry the
+intended action. A missing native WorkGraph database is an error, including for
+merge-only repositories; restoring complete state is required before completion.
+The configured success and blocked statuses must differ.
+
 Each GitHub CLI command has a 60-second deadline and runs without interactive
 prompts. On Linux and macOS, Fugue terminates the command's process group and
 reaps the direct child before releasing review authority. A timeout is an
 uncertain result: the server may already have accepted a PR creation or merge.
 Inspect the remote PR before retrying; do not assume that timeout means failure.
 Output beyond the 16 MiB capture limit is also rejected as incomplete evidence.
+If the operating system reports that another waiter has already consumed the
+child, Fugue refuses cleanup using its old process ID. OTA commands use the same
+owned-process cleanup for deadlines and cancellation. Start persistent services
+through their service manager; shell helpers left in the command's process group
+are terminated when the command finishes.
 
 For repositories with OTA deployment configured, an unchanged retry returns the
 durable attempt result instead of running the deploy command again. The report

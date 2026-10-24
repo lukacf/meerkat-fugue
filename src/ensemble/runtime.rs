@@ -4076,24 +4076,29 @@ mod tests {
             forge_pr("MERGED"),
             json!({"mergeCommit":{"oid":"b".repeat(40)}}).to_string(),
         ]);
-        let result = crate::merge_gate::merge_with_host(
-            &service,
-            &queue,
-            issue_ref.clone(),
-            merge_input.clone(),
-            crate::merge_gate::MergePurpose::Deploy,
+        let mut deploy_config = service.clone();
+        deploy_config.deploy.require_ota_update = false;
+        deploy_config.deploy.procedure = "merge-only".into();
+        let deploy_request = crate::deploy_gate::DeployStartRequest {
+            issue: issue_ref.clone(),
+            pull_request: completion.pull_request.clone(),
+            recorded_head_sha: Some(completion.head_sha.clone()),
+            ci_status: Some(crate::tools::CiStatus::Success),
+            unresolved_workgraph_blockers: 0,
+            idempotency_key: crate::tools::IdempotencyKey("native-merge-transaction".into()),
+            retry_deployment: None,
+        };
+        let result = crate::http::execute_deploy_transaction_with_host(
+            deploy_config.clone(),
+            queue.clone(),
+            deploy_request.clone(),
             host,
         )
         .await;
-        assert!(
-            matches!(
-                result,
-                crate::tools::FugueToolResult::Ok {
-                    output: crate::tools::FugueToolOutput::GitHubMergePr(_),
-                    ..
-                }
-            ),
-            "{result:?}"
+        assert!(result.accepted, "{result:?}");
+        assert_eq!(
+            result.outcome.unwrap().status,
+            crate::deploy_gate::DeployOutcomeStatus::Merged
         );
         assert_eq!(calls().len(), 7);
         let (host, calls) = crate::github_tools::scripted_host(vec![
@@ -4171,6 +4176,42 @@ mod tests {
             3,
             "native obligations stop the actual merge gate before mutation"
         );
+        // The exact transaction can be retried after a new native blocker.
+        // A precondition failure must not erase the earlier observed merge.
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("MERGED"),
+            forge_pr("MERGED"),
+            ci("SUCCESS"),
+        ]);
+        let replay = crate::http::execute_deploy_transaction_with_host(
+            deploy_config,
+            queue.clone(),
+            deploy_request,
+            host,
+        )
+        .await;
+        assert!(!replay.accepted, "{replay:?}");
+        assert!(replay.message.contains("unresolved blocking WorkGraph"));
+        assert_eq!(calls().len(), 3);
+        assert!(
+            !calls()
+                .iter()
+                .any(|args| args.get(1).is_some_and(|arg| arg == "merge"))
+        );
+        let workpad = adapter
+            .inspect_issue(crate::tools::InspectIssueInput {
+                issue: issue_ref.clone(),
+            })
+            .await
+            .unwrap()
+            .workpad
+            .unwrap()
+            .body_markdown;
+        assert!(workpad.contains("### Deployment\n"));
+        assert!(workpad.contains(&format!("\"merged_sha\": \"{}\"", "b".repeat(40))));
+        assert!(workpad.contains("### Deployment attempt\n"));
+        assert!(workpad.contains("\"status\": \"failed\""));
+
         let (host, calls) = crate::github_tools::scripted_host(vec![
             forge_pr("OPEN"),
             forge_pr("OPEN"),

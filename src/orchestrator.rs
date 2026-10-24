@@ -1745,7 +1745,11 @@ impl Orchestrator {
             &signals,
             &self.config.effective().linear.lanes.success,
             self.config.effective().linear.lanes.review_ready.as_deref(),
-            self.config.effective().independent_review.enabled,
+            self.config
+                .effective()
+                .independent_review
+                .enabled
+                .then_some(self.config.effective().independent_review.lane.as_str()),
         ) {
             Ok(message) => {
                 #[cfg(test)]
@@ -6973,7 +6977,7 @@ fn native_repo_review_handoff_states(config: &ServiceConfig) -> Vec<String> {
         .collect()
 }
 
-fn native_action_lanes(config: &ServiceConfig) -> Vec<String> {
+pub(crate) fn native_action_lanes(config: &ServiceConfig) -> Vec<String> {
     let mut states = Vec::new();
     if let Some(do_review) = &config.linear.lanes.do_review {
         add_unique_lane(&mut states, do_review);
@@ -6981,7 +6985,7 @@ fn native_action_lanes(config: &ServiceConfig) -> Vec<String> {
     if let Some(deploy) = &config.linear.lanes.deploy {
         add_unique_lane(&mut states, deploy);
     }
-    if config.independent_review.enabled {
+    if config.independent_review.enabled && config.independent_review_handoff_lane().is_none() {
         add_unique_lane(&mut states, &config.independent_review.lane);
     }
     if config.deploy.enabled {
@@ -8927,17 +8931,24 @@ fn sort_retry_rows(rows: &mut [RetryRow]) {
 fn repo_kapellmeister_signal_message(
     signals: &[KapellmeisterShadowSignal],
 ) -> std::result::Result<String, serde_json::Error> {
-    repo_kapellmeister_signal_message_with_lanes(signals, "Done", None, true)
+    repo_kapellmeister_signal_message_with_lanes(signals, "Done", None, Some("Review"))
 }
 
 fn repo_kapellmeister_signal_message_with_lanes(
     signals: &[KapellmeisterShadowSignal],
     success: &str,
     review_ready: Option<&str>,
-    independent_review_enabled: bool,
+    independent_review_lane: Option<&str>,
 ) -> std::result::Result<String, serde_json::Error> {
     let payload = serde_json::to_string_pretty(signals)?;
     let handoff_instruction = match review_ready {
+        Some(lane)
+            if independent_review_lane.is_some_and(|review| same_issue_lane(review, lane)) =>
+        {
+            format!(
+                "When implementation and its issue-team review are ready, record the PR evidence and move the issue to {lane} for independent specialist review. This shared holding status is a review request, never proof of approval. On first-seen, recovered or changed observations in {lane}, inspect the PR and current native review: admit or resume the required independent review, and retain an already completed current review instead of starting it again. Do not start a new implementation mob from this observation. Only an explicit merge action with verified review and merge evidence may project to {success}."
+            )
+        }
         Some(lane) => format!(
             "When reviewer and WorkGraph obligations are satisfied, move the issue to {lane} to await operator review. This is a holding lane, not a review action trigger. Keep it there until an explicit merge action; only verified merge completion projects to {success}."
         ),
@@ -8945,8 +8956,8 @@ fn repo_kapellmeister_signal_message_with_lanes(
             "When reviewer and WorkGraph obligations are satisfied, move the issue to {success}. In this workspace that lane records accepted development; merging still requires a separate explicit action."
         ),
     };
-    let review_instruction = if independent_review_enabled {
-        "For a configured Review action lane, inspect the issue/PR evidence and use fugue_start_independent_review with a typed IndependentReviewStartRequest; the review orchestrator must choose exactly three reviewers and spawn them through Meta."
+    let review_instruction = if independent_review_lane.is_some() {
+        "For a configured Review action or shared review holding status, inspect the issue/PR and current native review evidence, then use fugue_start_independent_review with a typed IndependentReviewStartRequest when review is required. The review coordinator must select the configured quorum from existing repository specialists through native admission; never create substitute reviewers. Reuse the same request identity after an uncertain response."
     } else {
         "The independent Review action is disabled in this workspace. Review is a holding lane only; do not start an independent review orchestrator or create three-reviewer quorum obligations. Ordinary issue-mob review still applies."
     };
@@ -9008,8 +9019,13 @@ mod tests {
 
     #[test]
     fn repo_signal_prompt_uses_configured_success_lane() {
-        let body = super::repo_kapellmeister_signal_message_with_lanes(&[], "Accepted", None, true)
-            .expect("prompt");
+        let body = super::repo_kapellmeister_signal_message_with_lanes(
+            &[],
+            "Accepted",
+            None,
+            Some("Review"),
+        )
+        .expect("prompt");
         assert!(body.contains("move the issue to Accepted"));
         assert!(!body.contains("move the issue to Done"));
     }
@@ -9020,7 +9036,7 @@ mod tests {
             &[],
             "Closed",
             Some("Resolved"),
-            false,
+            None,
         )
         .expect("prompt");
         assert!(body.contains("move the issue to Resolved to await operator review"));
@@ -9030,8 +9046,26 @@ mod tests {
     }
 
     #[test]
+    fn shared_review_handoff_requests_native_review_without_claiming_approval() {
+        let body = super::repo_kapellmeister_signal_message_with_lanes(
+            &[],
+            "Closed",
+            Some("Resolved"),
+            Some("Resolved"),
+        )
+        .unwrap();
+        assert!(body.contains("move the issue to Resolved for independent specialist review"));
+        assert!(body.contains("first-seen, recovered or changed observations"));
+        assert!(body.contains("retain an already completed current review"));
+        assert!(body.contains("never proof of approval"));
+        assert!(body.contains("never create substitute reviewers"));
+        assert!(!body.contains("holding lane, not a review action trigger"));
+        assert!(!body.contains("spawn them"));
+    }
+
+    #[test]
     fn repo_signal_prompt_does_not_request_disabled_review_action() {
-        let body = super::repo_kapellmeister_signal_message_with_lanes(&[], "Done", None, false)
+        let body = super::repo_kapellmeister_signal_message_with_lanes(&[], "Done", None, None)
             .expect("prompt");
         assert!(body.contains("Review is a holding lane only"));
         assert!(!body.contains("fugue_start_independent_review"));
@@ -11398,7 +11432,7 @@ mod tests {
 
         let message = repo_kapellmeister_signal_message(&signals).expect("signal message");
 
-        assert!(message.contains("For a configured Review action lane"));
+        assert!(message.contains("For a configured Review action or shared review holding status"));
         assert!(message.contains("fugue_start_independent_review"));
         assert!(message.contains("For a configured Deploy lane"));
         assert!(message.contains("do not start the implementation mob"));

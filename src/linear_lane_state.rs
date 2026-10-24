@@ -99,6 +99,14 @@ pub fn classify_linear_lane(config: &ServiceConfig, lane: &str) -> LinearLaneCla
         return LinearLaneClassification::Parked;
     }
     if config
+        .independent_review_handoff_lane()
+        .is_some_and(|handoff| same_lane(lane, handoff))
+    {
+        // Report pending review after restart as well as on a transition.
+        // Kapellmeister inspects native review state before admitting work.
+        return LinearLaneClassification::ControlActive;
+    }
+    if config
         .linear
         .lanes
         .review_ready

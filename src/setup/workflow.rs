@@ -705,6 +705,35 @@ mod tests {
         assert_eq!(config.independent_review.success_lane, "Resolved");
         assert_eq!(config.independent_review.rework_lane, "Open");
         assert_eq!(config.independent_review.blocked_lane, "In Progress");
+        let movement = crate::tools::MoveIssueInput {
+            issue: crate::tools::LinearIssueRef::Identifier {
+                identifier: crate::tools::LinearIssueIdentifier("DEMO-1".into()),
+            },
+            state: crate::tools::LinearStateRef::Name {
+                name: "Resolved".into(),
+            },
+            expected_updated_at: None,
+            idempotency_key: crate::tools::IdempotencyKey("review-handoff".into()),
+        };
+        crate::workgraph_gate::guard_public_lane_move(
+            &config.tracker,
+            &["Resolved".into()],
+            &crate::orchestrator::native_action_lanes(&config),
+            &movement,
+        )
+        .expect("the repository coordinator can hand completed work to review");
+        let classification = crate::linear_lane_state::classify_linear_lane(&config, "Resolved");
+        let recovered = crate::control_plane::reduce_open_issue_without_runtime::<String>(
+            "DEMO-1".into(),
+            "Resolved".into(),
+            classification,
+            crate::control_plane::RuntimePresence::Absent,
+        );
+        assert_eq!(
+            recovered.len(),
+            1,
+            "restart must report pending review to repository authority"
+        );
         assert!(!config.deploy.allow_no_ci_checks);
         assert!(config.linear.required_states.iter().all(|state| {
             ["Open", "In Progress", "Resolved", "Reopened", "Closed"].contains(&state.name.as_str())

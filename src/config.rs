@@ -1502,6 +1502,16 @@ impl ServiceConfig {
             && !self.tracker.is_intake_state(state)
     }
 
+    /// Workflows with few statuses can use one holding status for review.
+    /// The status requests attention; only native review evidence grants approval.
+    pub(crate) fn independent_review_handoff_lane(&self) -> Option<&str> {
+        let lane = self.linear.lanes.review_ready.as_deref()?;
+        (self.independent_review.enabled
+            && self.linear.lanes.do_review.is_none()
+            && normalize_state(lane) == normalize_state(&self.independent_review.lane))
+        .then_some(lane)
+    }
+
     pub fn from_definition(path: PathBuf, definition: &WorkflowDefinition) -> Result<Self> {
         let workflow_dir = path
             .parent()
@@ -2003,6 +2013,15 @@ impl DeployLaneConfig {
         if self.enabled && self.allowed_repositories.is_empty() {
             return Err(FugueError::InvalidConfig(
                 "deploy.enabled requires at least one allowed repository".to_string(),
+            ));
+        }
+        if self
+            .success_lane
+            .trim()
+            .eq_ignore_ascii_case(self.blocked_lane.trim())
+        {
+            return Err(FugueError::InvalidConfig(
+                "deploy.success_lane and deploy.blocked_lane must differ".into(),
             ));
         }
         for repo in &self.allowed_repositories {
@@ -4491,6 +4510,22 @@ mod tests {
             owner: GitHubOwner("lukacf".to_string()),
             name: GitHubRepoName("other".to_string()),
         }));
+    }
+
+    #[test]
+    fn deploy_success_cannot_share_the_blocked_lane() {
+        let config = DeployLaneConfig {
+            success_lane: "Closed".into(),
+            blocked_lane: " closed ".into(),
+            ..Default::default()
+        };
+        assert!(
+            config
+                .validate_static()
+                .unwrap_err()
+                .to_string()
+                .contains("deploy.success_lane and deploy.blocked_lane must differ")
+        );
     }
 
     #[test]
