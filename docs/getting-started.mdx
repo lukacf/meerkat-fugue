@@ -60,7 +60,26 @@ checkout; it does not change the machine's global Git identity.
 ## 2. Choose the issue tracker
 
 Use built-in tickets to try Fugue without a tracker account, or connect an
-existing Linear or Jira project.
+existing Jira or Linear project.
+
+### Fugue tickets
+
+Choose **Fugue tickets**, then **Save tracker access**. There is no tracker token
+or external project to enter. Each repository gets its own queue. Repository
+access and an AI account are still needed to develop code.
+
+The default **Backlog** lane holds drafts; **Queue** starts work. **Review**
+requests review. The default action lane is named **Deploy**, but browser setup
+configures it to request a guarded PR merge. It does not deploy your application.
+Read the action shown in the issue editor before confirming it.
+
+After preparation, choose **New issue** on that repository's Board. Write the
+ticket in Backlog and move it to Queue when its acceptance criteria are ready.
+At completion, verify the merged PR and the ticket's Done state. These tickets
+stay in Fugue and are not synchronized to Jira or Linear; include them in the
+installation's [complete state backup](./operations.mdx).
+
+### Jira
 
 For Jira, supply the site, account email and API token, then select the project
 key and issue type. Load its available statuses and map intake, active, review,
@@ -70,11 +89,16 @@ isolates Fugue issues inside a larger project and is required in browser setup.
 For a filter such as `labels = "fugue-app"`, enter `fugue-app` in **Labels for new
 issues**. The Board applies these labels when creating Jira tickets, so they
 appear in this repository's queue. Separate multiple labels with commas.
+See [Jira and GitHub Enterprise](./jira-and-github-enterprise.mdx) for project
+scope, transition requirements and advanced configuration.
+
+### Linear
 
 For Linear, supply the API key and project/team selection. Ensure the selected
 account can read and update issues, comments and the configured workflow states.
-See [Jira and GitHub Enterprise](./jira-and-github-enterprise.mdx) or the
-[configuration reference](./configuration.mdx) for exact fields.
+See the [configuration reference](./configuration.mdx) for exact fields.
+
+### Merge policy
 
 Keep **Allow merge when GitHub reports no CI checks** off unless you have made
 that decision for this repository. Missing checks are distinct from successful
