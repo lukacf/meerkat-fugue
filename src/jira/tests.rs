@@ -183,6 +183,235 @@ pub(crate) fn issue(status: &str) -> Value {
     json!({"id":"10001","key":"TEST-1","fields":{"summary":"Integration fixture","description":null,"project":{"id":"10","key":"TEST"},"updated":"2026-01-01T00:00:00.000+0000","status":{"id":if status == "Done" { "3" } else { "2" },"name":status,"statusCategory":{"key":if status == "Done" { "done" } else { "indeterminate" }}}}})
 }
 
+#[tokio::test]
+async fn inspect_issue_downloads_current_jira_attachments() {
+    let mock = mock_jira(Vec::new()).await;
+    let storage = tempfile::tempdir().unwrap();
+    let mut config = tracker(&mock.endpoint);
+    config.attachment_root = Some(storage.path().to_path_buf());
+    let url = format!("{}/rest/api/3/attachment/content/42", mock.endpoint);
+    let mut current = issue("In Progress");
+    current["fields"]["attachment"] = json!([{
+        "id":"42", "filename":"probe.json", "content":url, "mimeType":"application/json"
+    }]);
+    mock.responses.lock().unwrap().extend([
+        reply("GET", "/rest/api/3/issue/TEST-1", current),
+        reply(
+            "GET",
+            "/rest/api/3/issue/TEST-1/comment",
+            json!({"comments":[], "total":0}),
+        ),
+        reply(
+            "GET",
+            "/rest/api/3/attachment/content/42",
+            json!({"probe":"HEAD"}),
+        ),
+    ]);
+    let result = JiraClient::from_config(&config)
+        .unwrap()
+        .inspect_issue(InspectIssueInput {
+            issue: LinearIssueRef::Identifier {
+                identifier: LinearIssueIdentifier("TEST-1".into()),
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.attachments.len(), 1);
+    let file = &result.attachments[0];
+    assert_eq!(
+        file.source,
+        LinearFileAttachmentSource::IssueAttachment {
+            attachment_id: LinearAttachmentId("42".into())
+        }
+    );
+    assert_eq!(file.title.as_deref(), Some("probe.json"));
+    assert_eq!(file.url, url);
+    assert_eq!(file.content_type.as_deref(), Some("application/json"));
+    assert!(Path::new(&file.path).starts_with(storage.path()));
+    let bytes = tokio::fs::read(&file.path).await.unwrap();
+    assert_eq!(bytes, serde_json::to_vec(&json!({"probe":"HEAD"})).unwrap());
+    assert_eq!(file.byte_len, bytes.len() as u64);
+    assert!(
+        mock.requests.lock().unwrap()[2]
+            .0
+            .contains("redirect=false")
+    );
+    assert!(mock.responses.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn inspect_issue_rejects_untrusted_attachment_origin_before_download() {
+    let mock = mock_jira(Vec::new()).await;
+    let storage = tempfile::tempdir().unwrap();
+    let mut config = tracker(&mock.endpoint);
+    config.attachment_root = Some(storage.path().to_path_buf());
+    let mut current = issue("In Progress");
+    current["fields"]["attachment"] = json!([{
+        "id":"42", "filename":"probe.txt", "content":"https://untrusted.invalid/private"
+    }]);
+    mock.responses.lock().unwrap().extend([
+        reply("GET", "/rest/api/3/issue/TEST-1", current),
+        reply(
+            "GET",
+            "/rest/api/3/issue/TEST-1/comment",
+            json!({"comments":[], "total":0}),
+        ),
+    ]);
+    let error = JiraClient::from_config(&config)
+        .unwrap()
+        .inspect_issue(InspectIssueInput {
+            issue: LinearIssueRef::Identifier {
+                identifier: LinearIssueIdentifier("TEST-1".into()),
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("outside the configured site"));
+    assert_eq!(mock.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn inspect_issue_preserves_attachment_download_limits() {
+    for (files, per_file, total) in [(0, 1024, 2048), (2, 4, 2048), (2, 1024, 4)] {
+        let mock = mock_jira(Vec::new()).await;
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = tracker(&mock.endpoint);
+        config.attachment_root = Some(storage.path().to_path_buf());
+        config.max_attachment_files = files;
+        config.max_attachment_bytes = per_file;
+        config.max_attachment_total_bytes = total;
+        let mut current = issue("In Progress");
+        current["fields"]["attachment"] = json!([{
+            "id":"42", "filename":"probe.json",
+            "content":format!("{}/rest/api/3/attachment/content/42", mock.endpoint)
+        }]);
+        mock.responses.lock().unwrap().extend([
+            reply("GET", "/rest/api/3/issue/TEST-1", current),
+            reply(
+                "GET",
+                "/rest/api/3/issue/TEST-1/comment",
+                json!({"comments":[], "total":0}),
+            ),
+            reply(
+                "GET",
+                "/rest/api/3/attachment/content/42",
+                json!({"probe":"HEAD"}),
+            ),
+        ]);
+        let error = JiraClient::from_config(&config)
+            .unwrap()
+            .inspect_issue(InspectIssueInput {
+                issue: LinearIssueRef::Identifier {
+                    identifier: LinearIssueIdentifier("TEST-1".into()),
+                },
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, FugueError::ResponseError(ref message) if message.contains("attachment download blocked"))
+        );
+        assert_eq!(
+            mock.requests.lock().unwrap().len(),
+            if files == 0 { 2 } else { 3 }
+        );
+        let mut directory = tokio::fs::read_dir(storage.path().join("attachments/TEST-1"))
+            .await
+            .unwrap();
+        assert!(directory.next_entry().await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn jira_attachment_download_keeps_paths_local_and_supports_concurrent_readers() {
+    let mock = mock_jira(vec![
+        reply(
+            "GET",
+            "/rest/api/3/attachment/content/42",
+            json!({"probe":"HEAD"}),
+        ),
+        reply(
+            "GET",
+            "/rest/api/3/attachment/content/42",
+            json!({"probe":"HEAD"}),
+        ),
+    ])
+    .await;
+    let client = JiraClient::from_config(&tracker(&mock.endpoint)).unwrap();
+    let mut current = issue("In Progress");
+    current["fields"]["attachment"] = json!([{
+        "id":"42", "filename":"../../probe.json",
+        "content":format!("{}/rest/api/3/attachment/content/42", mock.endpoint)
+    }]);
+    let normalized = client.normalize(serde_json::from_value(current).unwrap());
+    let storage = tempfile::tempdir().unwrap();
+    let (first, second) = tokio::join!(
+        client.materialize_issue_attachments(&normalized, storage.path()),
+        client.materialize_issue_attachments(&normalized, storage.path()),
+    );
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(&json!({"probe":"HEAD"})).unwrap();
+    let expected = storage
+        .path()
+        .join(".fugue/attachments/TEST-1")
+        .join(format!("{:x}", Sha256::digest(&bytes)))
+        .join("probe.json");
+    for result in [first.unwrap(), second.unwrap()] {
+        assert_eq!(result.attachments[0].local_path.as_ref(), Some(&expected));
+    }
+    assert_eq!(
+        tokio::fs::read(&expected).await.unwrap(),
+        serde_json::to_vec(&json!({"probe":"HEAD"})).unwrap()
+    );
+    let mut directory = tokio::fs::read_dir(expected.parent().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        directory.next_entry().await.unwrap().unwrap().path(),
+        expected
+    );
+    assert!(directory.next_entry().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn jira_attachment_receipts_survive_catalog_replacement_with_same_filename() {
+    let mock = mock_jira(vec![
+        reply(
+            "GET",
+            "/rest/api/3/attachment/content/42",
+            json!({"version":1}),
+        ),
+        reply(
+            "GET",
+            "/rest/api/3/attachment/content/43",
+            json!({"version":2}),
+        ),
+    ])
+    .await;
+    let client = JiraClient::from_config(&tracker(&mock.endpoint)).unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let mut paths = Vec::new();
+    for id in ["42", "43"] {
+        let mut current = issue("In Progress");
+        current["fields"]["attachment"] = json!([{
+            "id":id, "filename":"plan.json",
+            "content":format!("{}/rest/api/3/attachment/content/{id}",mock.endpoint)
+        }]);
+        let normalized = client.normalize(serde_json::from_value(current).unwrap());
+        let materialized = client
+            .materialize_issue_attachments(&normalized, storage.path())
+            .await
+            .unwrap();
+        paths.push(materialized.attachments[0].local_path.clone().unwrap());
+    }
+    assert_ne!(paths[0], paths[1]);
+    for (index, path) in paths.iter().enumerate() {
+        assert_eq!(
+            tokio::fs::read(path).await.unwrap(),
+            serde_json::to_vec(&json!({"version":index+1})).unwrap()
+        );
+    }
+}
+
 #[test]
 fn opaque_jira_priority_ids_are_not_numeric_ranks() {
     let mut config = tracker("https://jira.example.com");

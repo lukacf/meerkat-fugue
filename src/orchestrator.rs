@@ -5952,7 +5952,7 @@ fn native_pr_handoff_monitor_signal_decision(
             NativePrHandoffWaitingReason::AwaitingReviewOrMerge,
         ) => (
             PrHandoffMonitorDecision::ReadyForDone,
-            "PR is eligible for handoff: CI is acceptable or no checks were reported. Follow the configured review holding lane and completion policy after reviewer and WorkGraph obligations are satisfied. This signal does not authorize a merge or claim checks ran.",
+            "PR is mechanically eligible for handoff: CI is acceptable or no checks were reported. Ask the issue lead to verify issue-team review and current implementation findings before the configured development handoff. A shared review holding status requests subsequent repository independent review, so that review and future merge obligations remain open until performed; they do not block their own admission. Follow the configured completion policy. This signal does not authorize a merge, obligation closure, or a claim that checks ran.",
         ),
         NativePrHandoffMonitorAction::Replan(_) => (
             PrHandoffMonitorDecision::Replan,
@@ -9147,6 +9147,22 @@ mod tests {
             .expect("prompt");
         assert!(body.contains("Review is a holding lane only"));
         assert!(!body.contains("fugue_start_independent_review"));
+    }
+
+    #[test]
+    fn hosted_acceptance_shared_review_handoff_has_one_projection_writer() {
+        let body = super::repo_kapellmeister_signal_message_with_lanes(
+            &[],
+            "Closed",
+            Some("Awaiting review"),
+            Some("Awaiting review"),
+        )
+        .unwrap();
+        assert!(body.contains("The issue lead owns the development handoff projection"));
+        assert!(body.contains("do not perform this transition yourself"));
+        assert!(body.contains("The shared review holding status is the sole exception"));
+        assert!(body.contains("never proof of approval"));
+        assert!(body.contains("Only an explicit merge action"));
     }
 
     use super::*;

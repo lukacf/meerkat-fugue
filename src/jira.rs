@@ -4,7 +4,7 @@
 //! Jira is translated at this boundary; no GraphQL or Linear service is involved.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -104,6 +104,13 @@ pub struct JiraClient {
     active_states: Vec<String>,
     terminal_states: Vec<String>,
     attachment_limits: crate::tracker::AttachmentDownloadLimits,
+    attachment_root: Option<PathBuf>,
+}
+
+struct JiraDownloadedFile {
+    path: PathBuf,
+    content_type: Option<String>,
+    byte_len: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -315,6 +322,7 @@ impl JiraClient {
             active_states: tracker.active_states.clone(),
             terminal_states: tracker.terminal_states.clone(),
             attachment_limits: crate::tracker::AttachmentDownloadLimits::from_config(tracker),
+            attachment_root: tracker.attachment_root.clone(),
         })
     }
 
@@ -602,10 +610,46 @@ impl JiraClient {
                 url: Some(self.comment_url(&issue.key, &comment.id)),
             }
         });
+        let snapshot = self.snapshot(&issue);
+        let normalized = self.normalize(issue);
+        let mut attachments = Vec::with_capacity(normalized.attachments.len());
+        if !normalized.attachments.is_empty() {
+            let root = match &self.attachment_root {
+                Some(root) => root.join("attachments"),
+                None => std::env::current_dir()
+                    .map_err(|error| FugueError::Workspace(error.to_string()))?
+                    .join(".fugue/attachments"),
+            }
+            .join(crate::domain::sanitize_workspace_key(
+                &normalized.identifier,
+            ));
+            tokio::fs::create_dir_all(&root)
+                .await
+                .map_err(|error| FugueError::Workspace(error.to_string()))?;
+            let mut budget = self.attachment_limits.budget();
+            for (index, attachment) in normalized.attachments.into_iter().enumerate() {
+                let downloaded = self
+                    .download_attachment(&attachment, &root, index, &mut budget)
+                    .await?;
+                let attachment_id = attachment
+                    .id
+                    .ok_or_else(|| invalid("Jira attachment is missing its identifier"))?;
+                attachments.push(LinearFileAttachmentSnapshot {
+                    source: LinearFileAttachmentSource::IssueAttachment {
+                        attachment_id: LinearAttachmentId(attachment_id),
+                    },
+                    title: attachment.title,
+                    url: attachment.url,
+                    path: downloaded.path.display().to_string(),
+                    content_type: downloaded.content_type,
+                    byte_len: downloaded.byte_len,
+                });
+            }
+        }
         Ok(InspectIssueOutput {
-            issue: self.snapshot(&issue),
+            issue: snapshot,
             workpad,
-            attachments: Vec::new(),
+            attachments,
         })
     }
 
@@ -993,7 +1037,6 @@ impl JiraClient {
         issue: &Issue,
         workspace: &Path,
     ) -> Result<Issue> {
-        use tokio::io::AsyncWriteExt;
         let mut materialized = issue.clone();
         let mut budget = self.attachment_limits.budget();
         let root = workspace
@@ -1005,75 +1048,107 @@ impl JiraClient {
                 .map_err(|err| FugueError::Workspace(err.to_string()))?;
         }
         for (index, attachment) in materialized.attachments.iter_mut().enumerate() {
-            let url = Url::parse(&attachment.url)
-                .map_err(|_| invalid("Jira attachment URL is invalid"))?;
-            // Only the configured Jira origin receives credentials. Redirects must be
-            // handled by the operator until a trusted download origin is configured.
-            if url.origin() != self.base.origin()
-                || !url.username().is_empty()
-                || url.password().is_some()
-            {
-                return Err(invalid(
-                    "Jira attachment URL is outside the configured site",
-                ));
-            }
-            budget.reserve_file(&attachment.url)?;
-            // Jira serves the bytes directly when redirect=false, avoiding CDN auth leakage.
-            let mut response = self
-                .client
-                .get(url)
-                .query(&[("redirect", "false")])
-                .send()
-                .await
-                .map_err(request_error)?;
-            if !response.status().is_success() {
-                return Err(FugueError::JiraApiStatus {
-                    status: response.status().as_u16(),
-                });
-            }
-            budget.check_content_length(&attachment.url, response.content_length())?;
-            let filename = attachment
-                .title
-                .as_deref()
-                .and_then(|title| Path::new(title).file_name())
-                .and_then(|name| name.to_str())
-                .unwrap_or("attachment");
-            let path = root.join(format!("{index}-{filename}"));
-            let temporary = root.join(format!(".{index}.download"));
-            let result = async {
-                let mut file = tokio::fs::File::create(&temporary)
-                    .await
-                    .map_err(|err| FugueError::Workspace(err.to_string()))?;
-                let mut bytes = 0u64;
-                while let Some(chunk) = response.chunk().await.map_err(request_error)? {
-                    bytes = bytes.saturating_add(chunk.len() as u64);
-                    budget.check_streamed_len(&attachment.url, bytes)?;
-                    file.write_all(&chunk)
-                        .await
-                        .map_err(|err| FugueError::Workspace(err.to_string()))?;
-                }
-                file.flush()
-                    .await
-                    .map_err(|err| FugueError::Workspace(err.to_string()))?;
-                tokio::fs::rename(&temporary, &path)
-                    .await
-                    .map_err(|err| FugueError::Workspace(err.to_string()))?;
-                budget.record_success(bytes);
-                Ok::<_, FugueError>(())
-            }
-            .await;
-            if result.is_err()
-                && let Err(error) = tokio::fs::remove_file(&temporary).await
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(FugueError::Workspace(format!(
-                    "Jira download failed and temporary file cleanup failed: {error}"
-                )));
-            }
-            result?;
-            attachment.local_path = Some(path);
+            let downloaded = self
+                .download_attachment(attachment, &root, index, &mut budget)
+                .await?;
+            attachment.local_path = Some(downloaded.path);
         }
         Ok(materialized)
+    }
+
+    async fn download_attachment(
+        &self,
+        attachment: &IssueAttachment,
+        root: &Path,
+        index: usize,
+        budget: &mut crate::tracker::AttachmentDownloadBudget,
+    ) -> Result<JiraDownloadedFile> {
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncWriteExt;
+        let url =
+            Url::parse(&attachment.url).map_err(|_| invalid("Jira attachment URL is invalid"))?;
+        // Only the configured Jira origin receives credentials. Redirects must be
+        // handled by the operator until a trusted download origin is configured.
+        if url.origin() != self.base.origin()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(invalid(
+                "Jira attachment URL is outside the configured site",
+            ));
+        }
+        budget.reserve_file(&attachment.url)?;
+        // Jira serves the bytes directly when redirect=false, avoiding CDN auth leakage.
+        let mut response = self
+            .client
+            .get(url)
+            .query(&[("redirect", "false")])
+            .send()
+            .await
+            .map_err(request_error)?;
+        if !response.status().is_success() {
+            return Err(FugueError::JiraApiStatus {
+                status: response.status().as_u16(),
+            });
+        }
+        budget.check_content_length(&attachment.url, response.content_length())?;
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let filename = attachment
+            .title
+            .as_deref()
+            .and_then(|title| Path::new(title).file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment");
+        let temporary = root.join(format!(".{index}-{}.download", uuid::Uuid::now_v7()));
+        let result = async {
+            let mut file = tokio::fs::File::create(&temporary)
+                .await
+                .map_err(|err| FugueError::Workspace(err.to_string()))?;
+            let mut bytes = 0u64;
+            let mut digest = Sha256::new();
+            while let Some(chunk) = response.chunk().await.map_err(request_error)? {
+                bytes = bytes.saturating_add(chunk.len() as u64);
+                budget.check_streamed_len(&attachment.url, bytes)?;
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|err| FugueError::Workspace(err.to_string()))?;
+                digest.update(&chunk);
+            }
+            file.flush()
+                .await
+                .map_err(|err| FugueError::Workspace(err.to_string()))?;
+            // A later catalog replacement must not change the bytes behind an
+            // earlier receipt, even when filenames or positions are reused.
+            let content_root = root.join(format!("{:x}", digest.finalize()));
+            tokio::fs::create_dir_all(&content_root)
+                .await
+                .map_err(|err| FugueError::Workspace(err.to_string()))?;
+            let path = content_root.join(filename);
+            tokio::fs::rename(&temporary, &path)
+                .await
+                .map_err(|err| FugueError::Workspace(err.to_string()))?;
+            budget.record_success(bytes);
+            Ok::<_, FugueError>((path, bytes))
+        }
+        .await;
+        if result.is_err()
+            && let Err(error) = tokio::fs::remove_file(&temporary).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(FugueError::Workspace(format!(
+                "Jira download failed and temporary file cleanup failed: {error}"
+            )));
+        }
+        let (path, byte_len) = result?;
+        Ok(JiraDownloadedFile {
+            path,
+            content_type,
+            byte_len,
+        })
     }
 
     pub async fn recent_issue_changes(

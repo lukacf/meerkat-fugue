@@ -1945,7 +1945,10 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
               attachments: createAttachmentPayload(),
             }),
           });
-          createdIssueReceipt = creationReceipt(payload.created_issue || payload.issue);
+          createdIssueReceipt = creationReceipt(payload.created_issue || {
+            id: payload.issue?.issue_id,
+            identifier: payload.issue?.identifier,
+          });
           creationWarning = typeof payload.warning?.message === "string" ? payload.warning.message : null;
           if (!saveCreationReceipt()) {
             creationWarning = `Created ${createdIssueReceipt.identifier}. Keep this tab open until you finish; its recovery details could not be saved.`;
@@ -6229,7 +6232,9 @@ mod tests {
                 );
             } else {
                 assert_eq!(payload["outcome"], "created");
+                assert_eq!(payload["issue"]["issue_id"], "10001");
                 assert_eq!(payload["issue"]["identifier"], "TEST-1");
+                assert!(payload["issue"].get("id").is_none());
             }
             assert!(mock.responses.lock().unwrap().is_empty());
             assert_eq!(

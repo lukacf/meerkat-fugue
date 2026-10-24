@@ -24,7 +24,7 @@ async function show(page, {partial=false, uploadFailures=0, uploadGate, uploadWa
       observed.creates++;
       return route.fulfill({status:201, json: partial
         ? {outcome:'created_with_warning', created_issue:receipt, warning}
-        : {outcome:'created', issue:receipt}});
+        : {outcome:'created', issue:{issue_id:receipt.id, identifier:receipt.identifier, url:receipt.url}}});
     }
     if (path.endsWith('/attachments')) {
       observed.uploads.push(path);
@@ -47,6 +47,15 @@ async function show(page, {partial=false, uploadFailures=0, uploadGate, uploadWa
   await page.getByLabel('Description',{exact:true}).fill('Keep this context if the upload fails.');
   return observed;
 }
+
+test('successful creation accepts the board issue response and closes the editor', async ({page}) => {
+  const observed = await show(page);
+  await page.getByRole('button',{name:'Create issue',exact:true}).click();
+  await expect(page.locator('#notice')).toContainText('Created TEST-1.');
+  await expect(page.locator('#createPanel')).not.toHaveClass(/open/);
+  expect(observed.creates).toBe(1);
+  expect(observed.uploads).toEqual([]);
+});
 
 test('attachment retry targets the acknowledged issue without creating another', async ({page}) => {
   const observed = await show(page,{uploadFailures:1});

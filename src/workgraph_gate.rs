@@ -614,6 +614,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_acceptance_future_review_blocks_terminal_success_but_not_shared_handoff() {
+        use crate::jira::tests::{issue, mock_jira, reply, tracker};
+        let mock = mock_jira(vec![
+            reply("GET", "/rest/api/3/issue/TEST-1", issue("In Progress")),
+            reply(
+                "GET",
+                "/rest/api/3/issue/TEST-1/comment",
+                serde_json::json!({"comments":[],"total":0}),
+            ),
+        ])
+        .await;
+        let tracker = tracker(&mock.endpoint);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workgraph.sqlite3");
+        let store = SqliteWorkGraphStore::open(&path).unwrap();
+        let realm = meerkat_core::mob_realm_id(crate::native_mob_contract::FUGUE_MOB_ID).unwrap();
+        let service = WorkGraphService::with_scope(
+            Arc::new(store),
+            realm.as_str(),
+            meerkat::WorkNamespace::default(),
+        );
+        service
+            .create(CreateWorkItemRequest {
+                realm_id: None,
+                namespace: None,
+                title: "Repository review after handoff".into(),
+                description: None,
+                priority: WorkPriority::High,
+                completion_policy: WorkCompletionPolicy::SelfAttest,
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                labels: BTreeSet::from([
+                    FUGUE_WORKGRAPH_LABEL.into(),
+                    issue_workgraph_label("TEST-1"),
+                    FUGUE_WORKGRAPH_BLOCKING_LABEL.into(),
+                ]),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: vec![],
+                evidence_refs: vec![],
+                status: Some(WorkStatus::Open),
+            })
+            .await
+            .unwrap();
+        let gate = WorkGraphTerminalGate::new(&path, tracker.terminal_states.clone(), vec![]);
+        let mut input = MoveIssueInput {
+            issue: LinearIssueRef::Identifier {
+                identifier: LinearIssueIdentifier("TEST-1".into()),
+            },
+            state: LinearStateRef::Name {
+                name: "Awaiting review".into(),
+            },
+            expected_updated_at: None,
+            idempotency_key: IdempotencyKey("handoff".into()),
+        };
+        guard_public_lane_move(
+            &tracker,
+            &["Awaiting review".into()],
+            &["Deploy".into()],
+            &input,
+        )
+        .unwrap();
+        gate.guard_terminal_move(&tracker, &input).await.unwrap();
+        input.state = LinearStateRef::Name {
+            name: "Done".into(),
+        };
+        assert!(
+            gate.guard_terminal_move(&tracker, &input)
+                .await
+                .unwrap_err()
+                .contains("unresolved Fugue WorkGraph obligation")
+        );
+        assert_eq!(
+            gate.unresolved_blocking_items("TEST-1")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_gate_allows_blocked_lane_with_open_obligation() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("workgraph.sqlite3");
