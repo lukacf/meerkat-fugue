@@ -3348,6 +3348,9 @@ fn control_profile(
     model: &str,
 ) -> Profile {
     Profile {
+        // Persisted mob membership supplies restart continuity; do not opt
+        // into a second durable-worker discovery contract for these profiles.
+        durable: false,
         model_fallback: None,
         provider: None,
         self_hosted_server_id: None,
@@ -3379,6 +3382,7 @@ fn agent_profile(
     mcp_servers: &BTreeMap<String, NativeMcpServerConfig>,
 ) -> Result<Profile, String> {
     Ok(Profile {
+        durable: false,
         model_fallback: None,
         provider: agent
             .provider
@@ -3466,6 +3470,7 @@ fn independent_review_orchestrator_profile(
     model: &str,
 ) -> Profile {
     Profile {
+        durable: false,
         model_fallback: None,
         provider: None,
         self_hosted_server_id: None,

@@ -1501,6 +1501,9 @@ fn definition(repo: &RepoId, model: &str, grants: &BTreeMap<String, MemberGrant>
         definition.profiles.insert(
             name.clone().into(),
             ProfileBinding::Inline(Box::new(Profile {
+                // The repository mob and Meta continuity own persistence.
+                // This optional flag is for separate durable-worker discovery.
+                durable: false,
                 model: model.to_owned(),
                 model_fallback: None,
                 provider: None,
@@ -1972,6 +1975,7 @@ pub(crate) fn write_fixture_teams(config: &EnsembleConfig) {
 
 #[cfg(test)]
 mod tests {
+    mod cold_restart_tests;
     mod fork_tests;
 
     use super::*;
