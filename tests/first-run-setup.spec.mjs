@@ -131,6 +131,59 @@ test('failed workflow restore keeps preparation disabled',async({page})=>{
   await expect(page.getByRole('button',{name:'Start Fugue'})).toBeDisabled();
 });
 
+for(const tracker of ['local','linear']) test(`switching from Jira to ${tracker} restores that tracker's workflow defaults`,async({page})=>{
+  const {writes}=await setup(page,{...connected,tracker:{kind:'jira',site:'https://example.atlassian.net',email:'test@example.com'}});
+  await expect(page.getByLabel('Ready to start',{exact:true})).toHaveValue('Open');
+  await page.getByLabel('Issue tracker',{exact:true}).selectOption(tracker);
+  if(tracker==='linear') await page.getByLabel('API token',{exact:true}).fill('linear-secret-sentinel');
+  await page.getByRole('button',{name:'Save tracker access'}).click();
+  await expect(page.locator('#trackerSaved')).toHaveText(`Saved: ${tracker}`);
+  await expect(page.getByLabel('Draft tickets',{exact:true})).toHaveValue('Backlog');
+  await expect(page.getByLabel('Ready to start',{exact:true})).toHaveValue('Queue');
+  await expect(page.getByLabel('Review',{exact:true})).toHaveValue('Review');
+  await expect(page.getByLabel('Deploy',{exact:true})).toHaveValue('Deploy');
+  await page.getByLabel('Repository URL',{exact:true}).fill('https://github.com/example/application');
+  if(tracker==='linear') {
+    await page.getByLabel('Tracker project',{exact:true}).fill('example-project');
+    await page.getByLabel('Linear team',{exact:true}).fill('example-team');
+  }
+  await page.getByRole('button',{name:'Check and prepare repository'}).click();
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeEnabled();
+  expect(writes.find(write=>write.connection==='workflow').value.lanes).toMatchObject({parked:'Backlog',intake:'Queue',review_action:'Review',deploy_action:'Deploy'});
+});
+
+test('a rejected tracker change preserves workflow mappings and blocks preparation',async({page})=>{
+  await setup(page,connected);
+  await page.getByText('Workflow statuses',{exact:true}).click();
+  await page.getByLabel('Ready to start',{exact:true}).fill('Ready for work');
+  await page.getByLabel('Review',{exact:true}).fill('Peer review');
+  await page.route('**/api/setup/connections',route=>route.request().method()==='POST'
+    ? route.fulfill({status:400,json:{error:'Tracker connection could not be saved.'}})
+    : route.fallback());
+  await page.getByLabel('Issue tracker',{exact:true}).selectOption('jira');
+  await page.getByLabel('Jira site',{exact:true}).fill('https://example.atlassian.net');
+  await page.getByLabel('Account email',{exact:true}).fill('test@example.com');
+  await page.getByLabel('API token',{exact:true}).fill('jira-secret-sentinel');
+  await page.getByRole('button',{name:'Save tracker access'}).click();
+  await expect(page.locator('#trackerResult')).toHaveText('Tracker connection could not be saved.');
+  await expect(page.getByLabel('Ready to start',{exact:true})).toHaveValue('Ready for work');
+  await expect(page.getByLabel('Review',{exact:true})).toHaveValue('Peer review');
+  await expect(page.locator('#trackerSaved')).toHaveText('Saved: local');
+  await expect(page.getByRole('button',{name:'Check and prepare repository'})).toBeDisabled();
+});
+
+test('resaving Jira credentials preserves custom workflow mappings',async({page})=>{
+  await setup(page,{...connected,tracker:{kind:'jira',site:'https://example.atlassian.net',email:'test@example.com'}});
+  await page.getByText('Workflow statuses',{exact:true}).click();
+  await page.getByLabel('Ready to start',{exact:true}).fill('Ready for work');
+  await page.getByLabel('Awaiting review',{exact:true}).fill('Peer review');
+  await page.getByLabel('API token',{exact:true}).fill('replacement-jira-sentinel');
+  await page.getByRole('button',{name:'Save tracker access'}).click();
+  await expect(page.locator('#trackerResult')).toHaveText('Saved privately.');
+  await expect(page.getByLabel('Ready to start',{exact:true})).toHaveValue('Ready for work');
+  await expect(page.getByLabel('Awaiting review',{exact:true})).toHaveValue('Peer review');
+});
+
 test('one repository selection produces preparation and a same-origin handoff',async({page})=>{
   const {writes}=await setup(page,connected);
   await page.getByLabel('Repository URL',{exact:true}).fill('https://github.com/example/application');
