@@ -193,3 +193,19 @@ service against the same queue, or switch execution backends as a workaround.
 
 - [Operations](./operations.mdx)
 - [Status API](./status-api.mdx)
+
+
+## Team startup failed
+
+Open the issue from Home's attention section to inspect the failure and its
+team. This means Fugue could not finish admitting the team. Some members may
+already exist, so do not add another copy of the issue to force a restart.
+
+Fugue retains the diagnostic in `native_recovery.launch_failure` on the
+issue status API and sends a failure observation to the repository coordinator.
+An unavailable specialist does not prevent that observation from reaching an
+available coordinator. The coordinator decides whether to resume, pause or
+request help; the host does not move the tracker lane or replace native sessions.
+If the coordinator itself is unavailable, check service logs and native runtime
+health before retrying. This behavior applies to Jira, the built-in tracker and
+Linear.

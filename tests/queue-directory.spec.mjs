@@ -89,3 +89,23 @@ test('home lists unfinished configuration once, outside active work', async ({pa
   await expect(page.locator('#portfolioRepositories')).toContainText('Prepare your team');
   await expect(page.getByRole('link',{name:'Add repository',exact:true})).toBeVisible();
 });
+
+
+test('home surfaces failed team admission in an active Jira lane', async ({page}) => {
+  await show(page, {view:'home', listing:[workspaces[0]]});
+  await page.route('http://fugue.test/repositories/repository-service/api/v1/issues/board', route => route.fulfill({json:{
+    generated_at:'2026-10-23T00:00:00Z', totals:{issues:1,running:0,retrying:0,launch_failed:1},
+    lanes:[{name:'In Development',kind:'active',action:null,issues:[{
+      identifier:'API-2',title:'Improve documentation',runtime:{kind:'running',launch_failure:{
+        occurred_at:'2026-10-23T00:00:00Z',message:'wire planner -> specialist: wire requires comms runtime'
+      }}
+    }]}]
+  }}));
+  await page.reload();
+  await expect(page.getByRole('heading',{level:1})).toHaveText('1 issue needs attention.');
+  const attention = page.locator('#portfolioAttention');
+  await expect(attention).toContainText('Team startup failed');
+  await expect(attention).toContainText('requires comms runtime');
+  await expect(attention.getByRole('link',{name:/API-2/})).toHaveAttribute('href','/repositories/repository-service/issues/API-2');
+  await expect(page.getByRole('region',{name:'example/service',exact:true})).toContainText('1 team startup failed');
+});

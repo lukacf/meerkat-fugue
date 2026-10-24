@@ -1110,6 +1110,15 @@ pub struct InspectRunInput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectRunOutput {
     pub run: MobRunSnapshot,
+    /// Fugue admission failure, distinct from native member/flow outcomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_failure: Option<NativeLaunchFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeLaunchFailure {
+    pub occurred_at: DateTime<Utc>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

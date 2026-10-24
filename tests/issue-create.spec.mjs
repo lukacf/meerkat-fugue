@@ -191,3 +191,17 @@ test('an uncertain Jira upload preserves the ticket and does not offer blind ret
   expect(observed.uploads).toHaveLength(1);
   expect(observed.uploadHeaders[0]['x-fugue-tracker-scope']).toBe('tracker-a');
 });
+
+
+test('repository board labels a partial launch instead of showing running activity', async ({page}) => {
+  await page.route('http://fugue.test/**', route => route.request().url().endsWith('/api/v1/issues/board')
+    ? route.fulfill({json:{totals:{issues:1,running:0,retrying:0,launch_failed:1},lanes:[{name:'In Development',kind:'active',issues:[{
+      identifier:'TEST-1',title:'Partial launch',lane:'In Development',labels:[],runtime:{kind:'running',turn_count:2,launch_failure:{message:'wire requires comms runtime'}}
+    }]}]}})
+    : route.fulfill({contentType:'text/html',body:html}));
+  await page.goto('http://fugue.test/repositories/repository-test/issues');
+  const card=page.locator('.card[data-issue="TEST-1"]');
+  await expect(card).toContainText('Team startup failed');
+  await expect(card).not.toContainText('Running');
+  await expect(card).toHaveAttribute('data-runtime','launch_failed');
+});

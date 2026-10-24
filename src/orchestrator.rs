@@ -174,6 +174,7 @@ struct RunningEntry {
 
 #[derive(Debug, Clone)]
 struct NativeRunHandle {
+    launch_failure: Option<crate::tools::NativeLaunchFailure>,
     run_id: MobRunId,
     observed_events: Vec<MobEventSnapshot>,
     recovery: NativeStatusRecovery,
@@ -2222,39 +2223,26 @@ impl Orchestrator {
         let restore_capacity = self.config.effective().agent.max_concurrent_agents - existing;
         let restore_keys =
             native_runtime_restore_keys(self.config.effective(), &issues, restore_capacity);
-        if let Err(error) = self
+        let native_restored = match self
             .native_execution_host
             .restore_persisted_runtimes(restore_keys, restore_capacity)
         {
-            warn!(error = %error, "native mob persisted runtime restore skipped");
-            let mut state = self.state.write().await;
-            state.last_error = Some(format!(
-                "native mob persisted runtime restore skipped: {error}"
-            ));
-            return;
-        }
-        let result = self
-            .native_execution_host
-            .list_runs(crate::tools::ListRunsInput {
-                issue: None,
-                status: Some(MobRunStatus::Running),
-                cursor: None,
-                limit: 100,
-            });
-        let runs = match result {
-            FugueToolResult::Ok {
-                output: FugueToolOutput::MobListRuns(output),
-                ..
-            } => output.runs,
-            FugueToolResult::Ok { output, .. } => {
-                let mut state = self.state.write().await;
-                state.last_error = Some(format!(
-                    "native mob restart reconciliation returned unexpected output {output:?}"
+            Ok(()) => true,
+            Err(error) => {
+                warn!(error = %error, "native mob persisted runtime restore skipped");
+                self.state.write().await.last_error = Some(format!(
+                    "native mob persisted runtime restore skipped: {error}"
                 ));
-                return;
+                false
             }
-            FugueToolResult::Err { error, .. } => {
-                warn!(message = %error.message, "native mob restart reconciliation skipped");
+        };
+        // Admission receipts remain readable when native materialization is
+        // unavailable. Preserve that error and restore only failure reporting.
+        let runs = match list_native_runs_for_restart(self.native_execution_host.as_ref()) {
+            Ok(runs) => runs,
+            Err(error) => {
+                warn!(message = %error, "native mob restart reconciliation skipped");
+                self.state.write().await.last_error = Some(error);
                 return;
             }
         };
@@ -2267,6 +2255,40 @@ impl Orchestrator {
         );
         let mut recovered = Vec::new();
         for run in newest_native_runs_by_issue(runs) {
+            if !native_restored && native_run_status_is_active(run.status) {
+                continue;
+            }
+            if !native_run_status_is_active(run.status) && run.status != MobRunStatus::Failed {
+                continue;
+            }
+            let launch_failure = if run.status == MobRunStatus::Failed {
+                match self
+                    .native_execution_host
+                    .status(crate::tools::InspectRunInput {
+                        run_id: run.run_id.clone(),
+                    }) {
+                    FugueToolResult::Ok {
+                        output: FugueToolOutput::MobInspectRun(output),
+                        ..
+                    } => output.launch_failure,
+                    FugueToolResult::Err { error, .. } => {
+                        warn!(run_id = %run.run_id.0, message = %error.message, "failed admission inspection could not be recovered");
+                        self.state.write().await.last_error = Some(error.message);
+                        return;
+                    }
+                    FugueToolResult::Ok { output, .. } => {
+                        self.state.write().await.last_error = Some(format!(
+                            "failed admission inspection returned unexpected output {output:?}"
+                        ));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            if run.status == MobRunStatus::Failed && launch_failure.is_none() {
+                continue;
+            }
             let workpad_body = match run.issue.as_ref() {
                 Some(issue_ref) => {
                     match adapter.workpad_body(issue_ref, "## Fugue Workpad").await {
@@ -2298,12 +2320,15 @@ impl Orchestrator {
             }
             if let Some((issue, mut entry)) = recover_native_running_entry(
                 &run,
+                launch_failure.as_ref(),
                 &issues,
                 self.config.effective(),
                 &workspace,
                 workpad_body.as_deref(),
             ) {
-                if matches!(entry.policy_mode, IssuePolicyMode::Kapellmeister) {
+                if launch_failure.is_none()
+                    && matches!(entry.policy_mode, IssuePolicyMode::Kapellmeister)
+                {
                     self.deliver_kapellmeister_shadow_signal(runtime_recovered_signal(
                         self.config.effective(),
                         &issue,
@@ -2406,6 +2431,48 @@ impl Orchestrator {
                 classify_issue_policy_mode(&issue, self.config.effective()),
                 IssuePolicyMode::Kapellmeister
             );
+            let inspected_run =
+                match self
+                    .native_execution_host
+                    .status(crate::tools::InspectRunInput {
+                        run_id: run_id.clone(),
+                    }) {
+                    FugueToolResult::Ok {
+                        output: FugueToolOutput::MobInspectRun(inspected),
+                        ..
+                    } => {
+                        self.observe_native_launch_failure(&issue_id, &inspected)
+                            .await;
+                        Some(inspected.run)
+                    }
+                    FugueToolResult::Ok { output, .. } => {
+                        let mut state = self.state.write().await;
+                        state.last_error = Some(format!(
+                            "native mob status returned unexpected output {output:?}"
+                        ));
+                        None
+                    }
+                    FugueToolResult::Err { error, .. } => {
+                        if native_mechanism_failure_is_nonretryable(&error.message)
+                            && self
+                                .park_running_native_issue_for_liveness(
+                                    &issue_id,
+                                    NativeRunParkReason::HostMechanics,
+                                    Some(error.message.clone()),
+                                )
+                                .await
+                        {
+                            continue;
+                        }
+                        warn!(
+                            message = %error.message,
+                            issue_identifier = %identifier,
+                            run_id = %run_id.0,
+                            "native mob status inspection failed"
+                        );
+                        None
+                    }
+                };
             let observation = match self.native_event_observer.observe(
                 self.native_execution_host.as_ref(),
                 &run_id,
@@ -2436,44 +2503,6 @@ impl Orchestrator {
                     continue;
                 }
             };
-            let inspected_run =
-                match self
-                    .native_execution_host
-                    .status(crate::tools::InspectRunInput {
-                        run_id: run_id.clone(),
-                    }) {
-                    FugueToolResult::Ok {
-                        output: FugueToolOutput::MobInspectRun(inspected),
-                        ..
-                    } => Some(inspected.run),
-                    FugueToolResult::Ok { output, .. } => {
-                        let mut state = self.state.write().await;
-                        state.last_error = Some(format!(
-                            "native mob status returned unexpected output {output:?}"
-                        ));
-                        None
-                    }
-                    FugueToolResult::Err { error, .. } => {
-                        if native_mechanism_failure_is_nonretryable(&error.message)
-                            && self
-                                .park_running_native_issue_for_liveness(
-                                    &issue_id,
-                                    NativeRunParkReason::HostMechanics,
-                                    Some(error.message.clone()),
-                                )
-                                .await
-                        {
-                            continue;
-                        }
-                        warn!(
-                            message = %error.message,
-                            issue_identifier = %identifier,
-                            run_id = %run_id.0,
-                            "native mob status inspection failed"
-                        );
-                        None
-                    }
-                };
             if observation.events.is_empty() {
                 if let Err(err) = self.native_event_observer.commit(&run_id, &observation) {
                     let mut state = self.state.write().await;
@@ -2833,6 +2862,49 @@ impl Orchestrator {
                 self.handle_native_run_finished(issue_id.clone(), issue, effective_status)
                     .await;
             }
+        }
+    }
+
+    async fn observe_native_launch_failure(
+        &self,
+        issue_id: &str,
+        inspected: &crate::tools::InspectRunOutput,
+    ) {
+        let identifier = {
+            let mut state = self.state.write().await;
+            let Some(entry) = state.running.get_mut(issue_id) else {
+                return;
+            };
+            let Some(native_run) = entry.native_run.as_mut() else {
+                return;
+            };
+            if native_run.run_id != inspected.run.run_id {
+                return;
+            }
+            native_run.launch_failure = inspected.launch_failure.clone();
+            entry.identifier.clone()
+        };
+        if let Some(failure) = &inspected.launch_failure {
+            let source_cursor = worker_cursor(
+                &identifier,
+                &format!(
+                    "launch_failed:{}:{}",
+                    inspected.run.run_id.0, failure.occurred_at
+                ),
+                0,
+                failure.occurred_at,
+            );
+            self.deliver_kapellmeister_shadow_signal(KapellmeisterShadowSignal::worker_failed(
+                failure.occurred_at,
+                Some(source_cursor),
+                issue_ref_for_identifier(&identifier),
+                workspace_key_for_identifier(&identifier),
+                ShadowWorkerFailure {
+                    reason: ShadowWorkerFailureReason::InfrastructureUnavailable,
+                    message: Some(format!("Issue team startup failed: {}", failure.message)),
+                    retry_scheduled: false,
+                },
+            ));
         }
     }
 
@@ -5306,6 +5378,7 @@ impl Orchestrator {
                 handle,
                 termination: None,
                 native_run: Some(NativeRunHandle {
+                    launch_failure: None,
                     run_id: run.run_id.clone(),
                     observed_events: Vec::new(),
                     recovery,
@@ -7119,6 +7192,43 @@ fn next_native_run_generation_from_workpad(
     }
 }
 
+pub(crate) fn list_native_runs_for_restart(
+    host: &dyn NativeMobExecutionHost,
+) -> std::result::Result<Vec<MobRunSnapshot>, String> {
+    let mut runs = Vec::new();
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    loop {
+        let output = match host.list_runs(crate::tools::ListRunsInput {
+            issue: None,
+            status: None,
+            cursor,
+            limit: 100,
+        }) {
+            FugueToolResult::Ok {
+                output: FugueToolOutput::MobListRuns(output),
+                ..
+            } => output,
+            FugueToolResult::Err { error, .. } => return Err(error.message),
+            FugueToolResult::Ok { output, .. } => {
+                return Err(format!(
+                    "native mob restart listing returned unexpected output {output:?}"
+                ));
+            }
+        };
+        if let Some(next) = &output.next_cursor
+            && !seen_cursors.insert(next.0.clone())
+        {
+            return Err("native mob restart listing repeated its cursor".to_owned());
+        }
+        runs.extend(output.runs);
+        cursor = output.next_cursor;
+        if cursor.is_none() {
+            return Ok(runs);
+        }
+    }
+}
+
 fn newest_native_runs_by_issue(runs: Vec<MobRunSnapshot>) -> Vec<MobRunSnapshot> {
     let mut newest = HashMap::<String, MobRunSnapshot>::new();
     for run in runs {
@@ -8119,12 +8229,15 @@ fn dispatch_backend_for_issue(issue: &Issue, config: &ServiceConfig) -> Dispatch
 
 fn recover_native_running_entry(
     run: &MobRunSnapshot,
+    launch_failure: Option<&crate::tools::NativeLaunchFailure>,
     issues: &[Issue],
     config: &ServiceConfig,
     workspace: &WorkspaceManager,
     workpad_body: Option<&str>,
 ) -> Option<(Issue, RunningEntry)> {
-    if !native_run_status_is_active(run.status) {
+    if !native_run_status_is_active(run.status)
+        && !(run.status == MobRunStatus::Failed && launch_failure.is_some())
+    {
         return None;
     }
     let issue_ref = run.issue.as_ref()?;
@@ -8181,6 +8294,7 @@ fn recover_native_running_entry(
             handle: None,
             termination: None,
             native_run: Some(NativeRunHandle {
+                launch_failure: launch_failure.cloned(),
                 run_id: run.run_id.clone(),
                 observed_events: Vec::new(),
                 recovery: native_status_recovery(
@@ -8521,6 +8635,7 @@ pub struct RunningLifecycleRow {
 #[serde(rename_all = "snake_case")]
 pub enum RunningLifecycleStatus {
     Running,
+    LaunchFailed,
     Terminating,
 }
 
@@ -8532,6 +8647,7 @@ pub enum StatusBackend {
 
 #[derive(Debug, Serialize)]
 pub struct NativeRecoveryStatusRow {
+    pub launch_failure: Option<crate::tools::NativeLaunchFailure>,
     pub run_id: String,
     pub workspace_path: Option<String>,
     pub workspace_branch: Option<String>,
@@ -8748,6 +8864,12 @@ fn running_row(issue_id: &str, entry: &RunningEntry) -> RunningRow {
             lane: entry.issue.state.clone(),
             status: if entry.termination.is_some() {
                 RunningLifecycleStatus::Terminating
+            } else if entry
+                .native_run
+                .as_ref()
+                .is_some_and(|run| run.launch_failure.is_some())
+            {
+                RunningLifecycleStatus::LaunchFailed
             } else {
                 RunningLifecycleStatus::Running
             },
@@ -8769,6 +8891,13 @@ fn running_row(issue_id: &str, entry: &RunningEntry) -> RunningRow {
 }
 
 fn running_row_last_message(entry: &RunningEntry) -> Option<String> {
+    if let Some(failure) = entry
+        .native_run
+        .as_ref()
+        .and_then(|run| run.launch_failure.as_ref())
+    {
+        return Some(format!("Issue team startup failed: {}", failure.message));
+    }
     match entry.session.last_meerkat_message.as_deref() {
         Some(message) if !is_stale_native_startup_delivery_message(message) => {
             Some(message.to_string())
@@ -8833,6 +8962,7 @@ fn workspace_cleanliness_label(dirty: bool) -> &'static str {
 fn native_recovery_status_row(native_run: &NativeRunHandle) -> NativeRecoveryStatusRow {
     let recovery = &native_run.recovery;
     NativeRecoveryStatusRow {
+        launch_failure: native_run.launch_failure.clone(),
         run_id: native_run.run_id.0.clone(),
         workspace_path: recovery
             .workspace
@@ -10268,6 +10398,9 @@ mod tests {
         spawned_inputs: std::sync::Mutex<Vec<SpawnOrResumeExecutionInput>>,
         plan_inputs: std::sync::Mutex<Vec<SpawnOrResumeExecutionInput>>,
         status_override: std::sync::Mutex<Option<MobRunSnapshot>>,
+        list_override: std::sync::Mutex<Option<Vec<MobRunSnapshot>>>,
+        restore_error: std::sync::Mutex<Option<String>>,
+        launch_failure_override: std::sync::Mutex<Option<crate::tools::NativeLaunchFailure>>,
         cleanup_calls: std::sync::Mutex<Vec<(MobRunId, String)>>,
     }
 
@@ -10344,7 +10477,31 @@ mod tests {
     }
 
     impl NativeMobExecutionHost for RecordingNativeMobExecutionHost {
+        fn restore_persisted_runtimes(
+            &self,
+            _runtime_keys: Vec<String>,
+            _max_successes: usize,
+        ) -> std::result::Result<(), String> {
+            match self.restore_error.lock().expect("restore error").clone() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
         fn list_runs(&self, input: crate::tools::ListRunsInput) -> FugueToolResult {
+            if let Some(runs) = self.list_override.lock().expect("list override").as_ref() {
+                return FugueToolResult::Ok {
+                    output: FugueToolOutput::MobListRuns(crate::tools::ListRunsOutput {
+                        runs: runs
+                            .iter()
+                            .filter(|run| input.status.is_none_or(|status| run.status == status))
+                            .cloned()
+                            .collect(),
+                        next_cursor: None,
+                    }),
+                    metadata: ToolExecutionMetadata::default(),
+                };
+            }
             self.inner.list_runs(input)
         }
 
@@ -10356,6 +10513,11 @@ mod tests {
                 return FugueToolResult::Ok {
                     output: FugueToolOutput::MobInspectRun(crate::tools::InspectRunOutput {
                         run: run.clone(),
+                        launch_failure: self
+                            .launch_failure_override
+                            .lock()
+                            .expect("failure override")
+                            .clone(),
                     }),
                     metadata: ToolExecutionMetadata::default(),
                 };
@@ -11456,6 +11618,7 @@ mod tests {
             completed_at: None,
         };
         let native_run = NativeRunHandle {
+            launch_failure: None,
             run_id: run.run_id.clone(),
             observed_events: vec![MobEventSnapshot {
                 sequence: 1,
@@ -11998,6 +12161,7 @@ worker:
 
         let (recovered_issue, entry) = recover_native_running_entry(
             &run,
+            None,
             std::slice::from_ref(&issue),
             &config,
             &workspace,
@@ -12102,6 +12266,7 @@ worker:
 
         let (recovered_issue, entry) = recover_native_running_entry(
             &run,
+            None,
             std::slice::from_ref(&issue),
             &config,
             &workspace,
@@ -12180,6 +12345,7 @@ worker:
 
         assert!(recovery.review.is_none());
         let row = native_recovery_status_row(&NativeRunHandle {
+            launch_failure: None,
             run_id,
             observed_events: events,
             recovery,
@@ -12241,6 +12407,7 @@ worker:
             Some(2),
         );
         let row = native_recovery_status_row(&NativeRunHandle {
+            launch_failure: None,
             run_id,
             observed_events: Vec::new(),
             recovery,
@@ -12305,6 +12472,7 @@ worker:
             Some(2),
         );
         let row = native_recovery_status_row(&NativeRunHandle {
+            launch_failure: None,
             run_id,
             observed_events: events,
             recovery,
@@ -12377,6 +12545,7 @@ worker:
 
         assert!(recovery.review.is_some());
         let row = native_recovery_status_row(&NativeRunHandle {
+            launch_failure: None,
             run_id,
             observed_events: events,
             recovery,
@@ -12428,6 +12597,7 @@ worker:
             Some(3),
         );
         let native_run = NativeRunHandle {
+            launch_failure: None,
             run_id,
             observed_events: Vec::new(),
             recovery,
@@ -12461,6 +12631,7 @@ worker:
             handle: None,
             termination: None,
             native_run: Some(NativeRunHandle {
+                launch_failure: None,
                 run_id: MobRunId("native-execution:native-execution:LUC-277:attempt-5".to_string()),
                 observed_events: Vec::new(),
                 recovery: NativeStatusRecovery::default(),
@@ -14112,6 +14283,7 @@ worker:
             Some(2),
         );
         let row = native_recovery_status_row(&NativeRunHandle {
+            launch_failure: None,
             run_id,
             observed_events: Vec::new(),
             recovery,
@@ -14344,6 +14516,7 @@ worker:
         issue.state = "Reviewing".to_string();
         let workpad = "## Fugue Workpad\n\n#### Reviewer gate\n- [x] Reviewer decision: red / return to Planning.\n\n#### Reviewer findings requiring focused rework\n- [ ] Source: focused finding.\n";
         let native_run = NativeRunHandle {
+            launch_failure: None,
             run_id: run_id.clone(),
             observed_events: Vec::new(),
             recovery: native_status_recovery(
@@ -14380,6 +14553,7 @@ worker:
     #[test]
     fn structured_reviewer_red_gate_requests_replan_without_workpad_magic() {
         let native_run = NativeRunHandle {
+            launch_failure: None,
             run_id: MobRunId("native-execution:native-execution:LUC-401".to_string()),
             observed_events: vec![native_event(
                 1,
@@ -14451,6 +14625,7 @@ worker:
         issue.state = "Reviewing".to_string();
         let red_workpad = "## Fugue Workpad\n\nReviewer decision: red / return to Planning.";
         let native_run = NativeRunHandle {
+            launch_failure: None,
             run_id: MobRunId("native-execution:native-execution:LUC-401".to_string()),
             observed_events: vec![native_event(
                 1,
@@ -14492,6 +14667,7 @@ worker:
         let mut issue = active_issue_with_labels(&["native"]);
         issue.state = "In Progress".to_string();
         let native_run = NativeRunHandle {
+            launch_failure: None,
             run_id: MobRunId("native-execution:native-execution:LUC-264".to_string()),
             observed_events: vec![MobEventSnapshot {
                 sequence: 1,
@@ -14630,6 +14806,7 @@ worker:
         let mut issue = active_issue_with_labels(&["native"]);
         issue.state = "Reviewing".to_string();
         let mut native_run = NativeRunHandle {
+            launch_failure: None,
             run_id,
             observed_events: Vec::new(),
             recovery: native_status_recovery(
@@ -14716,6 +14893,7 @@ worker:
             handle: None,
             termination: None,
             native_run: Some(NativeRunHandle {
+                launch_failure: None,
                 run_id,
                 observed_events: Vec::new(),
                 recovery: NativeStatusRecovery::default(),
@@ -14926,6 +15104,7 @@ worker:
             None,
         );
         let row = native_recovery_status_row(&NativeRunHandle {
+            launch_failure: None,
             run_id,
             observed_events: events,
             recovery: refreshed,
@@ -15044,6 +15223,7 @@ worker:
                 handle: None,
                 termination: None,
                 native_run: Some(NativeRunHandle {
+                    launch_failure: None,
                     run_id,
                     observed_events: events,
                     recovery,
@@ -15410,6 +15590,169 @@ worker:
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn launch_failure_restart_reporting_survives_native_restore_error() {
+        let (_workspace, mut orchestrator, native_host, issue) =
+            dispatched_terminal_fixture("Planning").await;
+        let run_id = orchestrator.state.read().await.running[&issue.id]
+            .native_run
+            .as_ref()
+            .expect("run")
+            .run_id
+            .clone();
+        let FugueToolResult::Ok {
+            output: FugueToolOutput::MobInspectRun(mut inspected),
+            ..
+        } = native_host.status(crate::tools::InspectRunInput { run_id })
+        else {
+            panic!("run")
+        };
+        inspected.run.status = MobRunStatus::Failed;
+        *native_host.list_override.lock().expect("list") = Some(vec![inspected.run.clone()]);
+        native_host.set_status_override(inspected.run);
+        *native_host.launch_failure_override.lock().expect("failure") =
+            Some(crate::tools::NativeLaunchFailure {
+                occurred_at: Utc::now(),
+                message: "planner wiring failed".to_owned(),
+            });
+        *native_host.restore_error.lock().expect("restore") =
+            Some("shared native runtime is unavailable".to_owned());
+        {
+            let mut state = orchestrator.state.write().await;
+            state.running.clear();
+            state.claimed.clear();
+        }
+        orchestrator
+            .recover_native_running_entries_after_restart()
+            .await;
+        let state = orchestrator.state.read().await;
+        let entry = state
+            .running
+            .get(&issue.id)
+            .expect("failed admission must stay visible even when native restoration fails");
+        assert_eq!(
+            serde_json::to_value(running_row(&issue.id, entry)).expect("row")["lifecycle"]["status"],
+            "launch_failed"
+        );
+        assert!(
+            state
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("shared native runtime is unavailable"))
+        );
+        assert_eq!(entry.issue.state, "Planning");
+        assert_eq!(native_host.spawn_call_count(), 1);
+        assert!(native_host.cleanup_calls().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn launch_failure_notifies_coordinator_and_surfaces_without_lane_mutation() {
+        let (_workspace, mut orchestrator, native_host, issue) =
+            dispatched_terminal_fixture("Planning").await;
+        let run_id = {
+            let state = orchestrator.state.read().await;
+            state.running[&issue.id]
+                .native_run
+                .as_ref()
+                .expect("native run")
+                .run_id
+                .clone()
+        };
+        let FugueToolResult::Ok {
+            output: FugueToolOutput::MobInspectRun(mut inspected),
+            ..
+        } = native_host.status(crate::tools::InspectRunInput { run_id })
+        else {
+            panic!("run")
+        };
+        inspected.run.status = MobRunStatus::Failed;
+        inspected.run.completed_at = Some(Utc::now());
+        let failed_run = inspected.run.clone();
+        native_host.set_status_override(inspected.run);
+        *native_host.launch_failure_override.lock().expect("failure") =
+            Some(crate::tools::NativeLaunchFailure {
+                occurred_at: Utc::now(),
+                message: "wire planner -> specialist: wire requires comms runtime".to_owned(),
+            });
+        for _ in 0..2 {
+            orchestrator
+                .reconcile_native_mob_events_with_tools(None, None)
+                .await;
+        }
+        let state = orchestrator.state.read().await;
+        let entry = &state.running[&issue.id];
+        let row = running_row(&issue.id, entry);
+        let value = serde_json::to_value(&row).expect("serialize projection");
+        assert_eq!(value["lifecycle"]["status"], "launch_failed");
+        assert!(
+            row.last_message
+                .as_deref()
+                .is_some_and(|text| text.contains("requires comms runtime"))
+        );
+        assert_eq!(entry.issue.state, "Planning");
+        assert!(state.retry_attempts.is_empty());
+        assert!(native_host.cleanup_calls().is_empty());
+        assert_eq!(native_host.spawn_call_count(), 1);
+        let manager = WorkspaceManager::for_service(orchestrator.config.effective());
+        let failure = native_host
+            .launch_failure_override
+            .lock()
+            .expect("failure")
+            .clone();
+        let (_, recovered) = recover_native_running_entry(
+            &failed_run,
+            failure.as_ref(),
+            std::slice::from_ref(&issue),
+            orchestrator.config.effective(),
+            &manager,
+            None,
+        )
+        .expect("preserve failed admission after restart");
+        assert_eq!(
+            serde_json::to_value(running_row(&issue.id, &recovered)).expect("recovered row")["lifecycle"]
+                ["status"],
+            "launch_failed"
+        );
+        let mut newer = failed_run.clone();
+        newer.run_id.0.push_str(":attempt-2");
+        newer.status = MobRunStatus::Succeeded;
+        let newest = newest_native_runs_by_issue(vec![failed_run.clone(), newer.clone()]);
+        assert_eq!(
+            newest,
+            vec![newer],
+            "a newer completed attempt supersedes old admission failure"
+        );
+        assert!(
+            recover_native_running_entry(
+                &failed_run,
+                None,
+                std::slice::from_ref(&issue),
+                orchestrator.config.effective(),
+                &manager,
+                None
+            )
+            .is_none(),
+            "ordinary terminal native runs are not admission failures"
+        );
+        let messages = orchestrator
+            .captured_native_signal_messages
+            .as_ref()
+            .expect("capture")
+            .lock()
+            .expect("messages");
+        let failures = messages
+            .iter()
+            .filter(|message| message.contains("requires comms runtime"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            failures.len(),
+            1,
+            "one failure signal across repeated observations"
+        );
+        assert!(failures[0].contains("infrastructure_unavailable"));
+        assert!(failures[0].contains("\"retry_scheduled\": false"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn kapellmeister_native_terminal_event_keeps_nonterminal_issue_running() {
         let (_workspace, mut orchestrator, native_host, issue) =
             dispatched_terminal_fixture("Planning").await;
@@ -15695,6 +16038,7 @@ worker:
                 handle: None,
                 termination: None,
                 native_run: Some(NativeRunHandle {
+                    launch_failure: None,
                     run_id: MobRunId("final-pr-gate:meerkat-fugue:191:6bb24de3".to_string()),
                     observed_events: Vec::new(),
                     recovery: NativeStatusRecovery {
