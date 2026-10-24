@@ -118,7 +118,7 @@ impl HostSignalBinding {
                     if session_id.trim().is_empty() || input_id.trim().is_empty() {
                         return Err(failure("native admission requires a session and input"));
                     }
-                    self.open()?.acknowledge(&key, &receipt.delivery_id)?;
+                    self.open()?.acknowledge(&key, &receipt)?;
                     progress.acknowledged += 1;
                 }
                 meerkat_contracts::WireContinuationStatus::Pending => {

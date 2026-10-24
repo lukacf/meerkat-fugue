@@ -735,7 +735,25 @@ async fn workspace_enrollment_proof() {
         .await
         .unwrap()
         .unwrap();
-    drop(workspace);
+    // Axum signals connection completion before dropping its connection
+    // future. That future still owns router state until its task returns.
+    // Take the final owner and finish its destructor before reopening; a zero
+    // weak strong-count alone can be observed before the destructor finishes.
+    tokio::time::timeout(Duration::from_secs(10), async move {
+        let mut workspace = workspace;
+        loop {
+            workspace = match Arc::try_unwrap(workspace) {
+                Ok(workspace) => {
+                    drop(workspace);
+                    break;
+                }
+                Err(workspace) => workspace,
+            };
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("HTTP connection tasks must release repository ownership");
     let restored = super::workspace::Workspace::open_with_client(path, llm);
     restored.start().await.unwrap();
     let app = super::http::workspace_router(Arc::clone(&restored), true).unwrap();

@@ -19,10 +19,15 @@ use crate::linear_lane_state::{
 };
 
 const APPLICATION_ID: i64 = 0x46554753;
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 mod binding;
+mod reconciliation;
 pub use binding::{HOST_SIGNAL_BINDING_ENV, HostSignalBinding};
+pub use reconciliation::{
+    AdmittedSignal, InputAttention, InputUnavailable, NativeInputObservation,
+    ReconciliationProgress,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -227,15 +232,26 @@ fn create_if_missing(path: &Path, scope: &HostSignalScope) -> Result<()> {
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             scope TEXT NOT NULL,
             observations TEXT NOT NULL,
-            revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision >= 0)
+            revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision >= 0),
+            reconciliation_revision INTEGER NOT NULL DEFAULT 0 CHECK(typeof(reconciliation_revision) = 'integer' AND reconciliation_revision >= 0)
         );
         CREATE TABLE deliveries (
             sequence INTEGER PRIMARY KEY AUTOINCREMENT,
             source_event TEXT NOT NULL UNIQUE,
             delivery_key TEXT NOT NULL UNIQUE,
             envelope TEXT NOT NULL,
-            accepted_delivery_id TEXT UNIQUE
+            accepted_delivery_id TEXT UNIQUE,
+            admitted_receipt TEXT,
+            consumed INTEGER NOT NULL DEFAULT 0 CHECK(consumed IN (0, 1)),
+            terminal_input_state TEXT,
+            unresolvable TEXT,
+            last_checked INTEGER NOT NULL DEFAULT 0,
+            CHECK((accepted_delivery_id IS NULL) = (admitted_receipt IS NULL)),
+            CHECK(consumed = 0 OR admitted_receipt IS NOT NULL),
+            CHECK(unresolvable IS NULL OR admitted_receipt IS NOT NULL)
         );
+        CREATE INDEX outstanding_admissions ON deliveries(last_checked, sequence)
+            WHERE accepted_delivery_id IS NOT NULL AND consumed = 0 AND unresolvable IS NULL;
         CREATE TABLE replacements (
             previous_key TEXT PRIMARY KEY NOT NULL,
             replacement_key TEXT NOT NULL UNIQUE,
@@ -429,18 +445,22 @@ impl HostSignalJournal {
         Ok(replacement)
     }
 
-    /// Call only after native keyed admission returns its canonical receipt.
-    pub fn acknowledge(&mut self, key: &DeliveryKey, native_delivery_id: &str) -> Result<()> {
-        if native_delivery_id.trim().is_empty() {
-            return Err(failure("native delivery receipt is empty"));
-        }
+    /// Save the complete native admission atomically. Admission does not remove
+    /// the notification from consumption/restart reconciliation.
+    pub fn acknowledge(
+        &mut self,
+        key: &DeliveryKey,
+        receipt: &meerkat_contracts::WireContinuationReceipt,
+    ) -> Result<()> {
+        reconciliation::validate_admission(receipt)?;
+        let encoded = encode(receipt)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(failure)?;
         let accepted: Option<Option<String>> = transaction
             .query_row(
-                "SELECT accepted_delivery_id FROM deliveries WHERE delivery_key = ?1",
+                "SELECT admitted_receipt FROM deliveries WHERE delivery_key = ?1",
                 [&key.0],
                 |row| row.get(0),
             )
@@ -448,16 +468,34 @@ impl HostSignalJournal {
             .map_err(failure)?;
         match accepted {
             None => return Err(failure("delivery key is not recorded in this journal")),
-            Some(Some(saved)) if saved != native_delivery_id => {
+            Some(Some(saved)) if saved != encoded => {
                 return Err(failure("conflicting native delivery receipt"));
             }
             Some(Some(_)) => return Ok(()),
             Some(None) => {}
         }
+        // Join the observation queue at its tail. Permanent priority zero
+        // would let sustained new admissions starve older pending inputs.
+        let revision: i64 = transaction
+            .query_row(
+                "SELECT reconciliation_revision FROM metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(failure)?;
+        let next = revision
+            .checked_add(1)
+            .ok_or_else(|| failure("reconciliation revision exhausted"))?;
         transaction
             .execute(
-                "UPDATE deliveries SET accepted_delivery_id = ?1 WHERE delivery_key = ?2",
-                params![native_delivery_id, key.0],
+                "UPDATE deliveries SET accepted_delivery_id = ?1, admitted_receipt = ?2, last_checked = ?4 WHERE delivery_key = ?3",
+                params![receipt.delivery_id, encoded, key.0, next],
+            )
+            .map_err(failure)?;
+        transaction
+            .execute(
+                "UPDATE metadata SET reconciliation_revision = ?1 WHERE singleton = 1",
+                [next],
             )
             .map_err(failure)?;
         transaction.commit().map_err(failure)

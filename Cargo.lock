@@ -2101,6 +2101,7 @@ dependencies = [
  "meerkat-mob",
  "meerkat-models",
  "meerkat-providers",
+ "meerkat-runtime",
  "meerkat-tools",
  "minijinja",
  "nix 0.29.0",

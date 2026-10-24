@@ -1778,6 +1778,52 @@ impl Orchestrator {
                 warn!(error);
             }
         }
+        // Reconciliation is independent of admission. An unresolved receipt
+        // must not prevent newer completion or steering messages from arriving.
+        let reconcile =
+            self.host_signal_binding
+                .reconcile_admitted(limit, |scope, receipt| async move {
+                    self.meta_runtime_registry
+                        .observe_repo_kapellmeister_input(&scope, &receipt)
+                        .await
+                        .map_err(FugueError::Workspace)
+                });
+        match tokio::time::timeout(HOST_SIGNAL_DRAIN_TIMEOUT, reconcile).await {
+            Ok(Ok(progress)) => {
+                if progress.requeued != 0 {
+                    info!(
+                        count = progress.requeued,
+                        "saved host notifications stopped before execution are ready for readmission"
+                    );
+                    self.host_signal_wake.notify_one();
+                }
+                if let Some(unresolvable) = progress.unresolvable.first() {
+                    let error = format!(
+                        "host notification needs attention: {} (delivery {})",
+                        unresolvable.reason, unresolvable.admission.receipt.delivery_id
+                    );
+                    self.state.write().await.last_error = Some(error.clone());
+                    warn!(%error, "native input cannot be resolved; receipt retained without resend");
+                }
+                if let Some(attention) = progress.attention.first() {
+                    let error = format!(
+                        "host notification needs attention: native input {:?}, outcome {:?} (delivery {})",
+                        attention.phase, attention.outcome, attention.admission.receipt.delivery_id
+                    );
+                    self.state.write().await.last_error = Some(error.clone());
+                    warn!(%error, "native terminal input retained without automatic resend");
+                }
+            }
+            Ok(Err(error)) => {
+                self.state.write().await.last_error = Some(error.to_string());
+                warn!(%error, "native input reconciliation failed; admission receipts retained");
+            }
+            Err(_) => {
+                let error = "native input reconciliation timed out; admission receipts retained";
+                self.state.write().await.last_error = Some(error.to_owned());
+                warn!(error);
+            }
+        }
     }
 
     async fn reload_workflow_if_needed(&mut self) -> bool {
