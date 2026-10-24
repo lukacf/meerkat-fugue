@@ -26,6 +26,9 @@ pub enum LinearGraphqlFailure {
 
 #[derive(Debug, Error)]
 pub enum FugueError {
+    #[error("tracker observations changed during the fetch; retry with a fresh snapshot")]
+    HostObservationChanged,
+
     #[error("missing_workflow_file: {0}")]
     MissingWorkflowFile(PathBuf),
 

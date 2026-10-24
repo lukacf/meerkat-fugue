@@ -2480,6 +2480,44 @@ mod tests {
             0,
             "unchanged revision must stay idle after restart"
         );
+        // A default branch can revisit an earlier commit. Each newly observed
+        // transition must notify subscribers, even when the SHA pair repeats.
+        let root = &ensemble.config.repositories[&repo].path;
+        let branch_output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["symbolic-ref", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(branch_output.status.success());
+        let branch = String::from_utf8(branch_output.stdout).unwrap();
+        let branch = branch.trim();
+        git(
+            root,
+            &["push", "--force", "origin", &format!("HEAD~1:{branch}")],
+        );
+        entry.events.poll(&entry.runtime).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while next.calls.load(Ordering::SeqCst) != 1 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("rewinding the default branch must notify its subscriber");
+        git(
+            root,
+            &["push", "--force", "origin", &format!("HEAD:{branch}")],
+        );
+        entry.events.poll(&entry.runtime).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while next.calls.load(Ordering::SeqCst) != 2 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("repeating an earlier SHA transition must notify again");
+        entry.events.poll(&entry.runtime).await.unwrap();
+        assert_eq!(next.calls.load(Ordering::SeqCst), 2);
         ensemble.shutdown().await.unwrap();
     }
 

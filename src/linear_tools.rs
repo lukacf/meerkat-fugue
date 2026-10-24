@@ -8,11 +8,12 @@ use std::path::{Path, PathBuf};
 use crate::config::TrackerConfig;
 use crate::error::{FugueError, LinearGraphqlFailure, Result};
 use crate::fugue_ims::FugueImsStore;
+use crate::host_signal_journal::HostSignalBinding;
 use crate::ims::{
     ImsCommentAttachmentSnapshot, ImsCommentId, ImsCommentSnapshot, ImsIssueId, ImsIssueKey,
     ImsIssueRef, ImsIssueSnapshot, ImsRepoIssueQuery, ImsStageName, IssueManagementSystem,
 };
-use crate::linear_lane_state::{LinearCommentSnapshot, record_internal_lane_change_from_env};
+use crate::linear_lane_state::LinearCommentSnapshot;
 use crate::tools::{
     AddCommentInput, AddCommentOutput, BranchName, ClaimIssueInput, ClaimIssueOutput, Cursor,
     EnsureWorkflowState, EnsureWorkflowStatesInput, EnsureWorkflowStatesOutput, FugueToolError,
@@ -252,17 +253,6 @@ impl<'a> LinearToolExecutor<'a> {
             ));
         }
         if current.issue.state.id == target.id {
-            if let Err(error) = record_internal_lane_change_from_env(
-                &current.issue.identifier.0,
-                &current.issue.state.name,
-            ) {
-                tracing::warn!(
-                    error = %error,
-                    issue_identifier = %current.issue.identifier.0,
-                    lane = %current.issue.state.name,
-                    "failed to record internal Linear lane no-op"
-                );
-            }
             return Ok(MoveIssueOutput {
                 issue: current.issue,
                 changed: false,
@@ -273,16 +263,6 @@ impl<'a> LinearToolExecutor<'a> {
         let issue = self
             .update_issue(&current.issue.id.0, json!({ "stateId": target.id.0 }))
             .await?;
-        if let Err(error) =
-            record_internal_lane_change_from_env(&issue.identifier.0, &issue.state.name)
-        {
-            tracing::warn!(
-                error = %error,
-                issue_identifier = %issue.identifier.0,
-                lane = %issue.state.name,
-                "failed to record internal Linear lane change"
-            );
-        }
         Ok(MoveIssueOutput {
             issue,
             changed: true,
@@ -904,6 +884,31 @@ pub async fn execute_linear_fugue_tool_with_review_handoff_states(
     arguments: &Value,
     review_handoff_states: &[String],
 ) -> (bool, String) {
+    let binding = match HostSignalBinding::from_environment() {
+        Ok(binding) => binding,
+        Err(error) => {
+            return raw_tool_error(name, FugueToolErrorCode::InvalidInput, error.to_string());
+        }
+    };
+    execute_linear_fugue_tool_bound(
+        config,
+        name,
+        arguments,
+        review_handoff_states,
+        binding.as_ref(),
+    )
+    .await
+}
+
+/// An embedded runtime passes its own binding explicitly. It must never inherit
+/// another repository's process environment.
+pub async fn execute_linear_fugue_tool_bound(
+    config: &TrackerConfig,
+    name: &str,
+    arguments: &Value,
+    review_handoff_states: &[String],
+    binding: Option<&HostSignalBinding>,
+) -> (bool, String) {
     let operation = match name.parse::<FugueToolOperation>() {
         Ok(operation) => operation,
         Err(err) => {
@@ -914,20 +919,79 @@ pub async fn execute_linear_fugue_tool_with_review_handoff_states(
             );
         }
     };
+    let lane_move = match crate::workgraph_gate::lane_move_for_tool(operation, arguments) {
+        Ok(input) => input,
+        Err(error) => {
+            return raw_tool_error(name, FugueToolErrorCode::InvalidInput, error.to_string());
+        }
+    };
+    // Refuse an invalid or retargeted journal before touching the tracker. The
+    // connection closes here; no SQLite lock is held during a network request.
+    if lane_move.is_some()
+        && let Some(binding) = binding
+        && let Err(error) = binding
+            .validate_tracker(config)
+            .and_then(|()| binding.open().map(|_| ()))
+    {
+        return raw_tool_error(
+            name,
+            FugueToolErrorCode::PreconditionFailed,
+            error.to_string(),
+        );
+    }
+    let result =
+        execute_tracker_tool_result(config, operation, name, arguments, review_handoff_states)
+            .await;
+    if lane_move.is_some()
+        && let Some(binding) = binding
+        && let FugueToolResult::Ok { output, .. } = &result
+    {
+        let issue = match output {
+            FugueToolOutput::LinearMoveIssue(output) => Some(&output.issue),
+            FugueToolOutput::LinearClaimIssue(output) => Some(&output.issue),
+            _ => None,
+        };
+        if let Some(issue) = issue
+            && let Err(error) = binding.record_internal_lane(&issue.identifier.0, &issue.state.name)
+        {
+            return tool_result_to_callback(FugueToolResult::Err {
+                error: FugueToolError {
+                    operation,
+                    code: FugueToolErrorCode::ExecutionFailed,
+                    message: format!(
+                        "Tracker mutation succeeded but recording its observation failed: {error}. Inspect the current issue before retrying."
+                    ),
+                    retry: RetryAdvice::RefreshStateThenRetry,
+                    idempotency_key: idempotency_key(arguments),
+                },
+                metadata: ToolExecutionMetadata::default(),
+            });
+        }
+    }
+    tool_result_to_callback(result)
+}
+
+async fn execute_tracker_tool_result(
+    config: &TrackerConfig,
+    operation: FugueToolOperation,
+    name: &str,
+    arguments: &Value,
+    review_handoff_states: &[String],
+) -> FugueToolResult {
     if config.kind == "fugue-ims" {
         return execute_fugue_ims_linear_tool(config, operation, name, arguments).await;
     }
     if config.kind == "jira" {
-        return crate::jira::execute_tool(config, operation, arguments).await;
+        return crate::jira::execute_tool_result(config, operation, arguments).await;
     }
     let client = match LinearClient::from_config(config) {
         Ok(client) => client,
         Err(err) => {
             let failure = LinearToolFailure::from(err).into_error(operation);
-            return tool_result_to_callback(FugueToolResult::Err {
+            return FugueToolResult::Err {
                 error: failure,
                 metadata: ToolExecutionMetadata::default(),
-            });
+            };
         }
     };
     let executor = if review_handoff_states.is_empty() {
@@ -1016,14 +1080,14 @@ pub async fn execute_linear_fugue_tool_with_review_handoff_states(
         )),
     };
     match result {
-        Ok(output) => tool_result_to_callback(FugueToolResult::Ok {
+        Ok(output) => FugueToolResult::Ok {
             output,
             metadata: ToolExecutionMetadata::default(),
-        }),
-        Err(error) => tool_result_to_callback(FugueToolResult::Err {
+        },
+        Err(error) => FugueToolResult::Err {
             error: error.into_error(operation),
             metadata: ToolExecutionMetadata::default(),
-        }),
+        },
     }
 }
 
@@ -1032,14 +1096,14 @@ async fn execute_fugue_ims_linear_tool(
     operation: FugueToolOperation,
     name: &str,
     arguments: &Value,
-) -> (bool, String) {
+) -> FugueToolResult {
     let store = match FugueImsStore::from_config(config) {
         Ok(store) => store,
         Err(err) => {
-            return tool_result_to_callback(FugueToolResult::Err {
+            return FugueToolResult::Err {
                 error: LinearToolFailure::from(err).into_error(operation),
                 metadata: ToolExecutionMetadata::default(),
-            });
+            };
         }
     };
     let result = match operation {
@@ -1111,18 +1175,18 @@ async fn execute_fugue_ims_linear_tool(
         )),
     };
     match result {
-        Ok(output) => tool_result_to_callback(FugueToolResult::Ok {
+        Ok(output) => FugueToolResult::Ok {
             output,
             metadata: ToolExecutionMetadata::default(),
-        }),
-        Err(error) => tool_result_to_callback(FugueToolResult::Err {
+        },
+        Err(error) => FugueToolResult::Err {
             error: error.into_error(operation),
             metadata: ToolExecutionMetadata::default(),
-        }),
+        },
     }
 }
 
-fn tool_result_to_callback(result: FugueToolResult) -> (bool, String) {
+pub(crate) fn tool_result_to_callback(result: FugueToolResult) -> (bool, String) {
     let is_error = matches!(result, FugueToolResult::Err { .. });
     let content = serde_json::to_string(&result)
         .unwrap_or_else(|err| json!({ "error": err.to_string() }).to_string());

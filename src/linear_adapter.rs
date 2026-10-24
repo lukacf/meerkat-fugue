@@ -11,14 +11,15 @@ use crate::control_plane::{
 use crate::domain::{Issue, normalize_state, sanitize_workspace_key};
 use crate::error::{FugueError, Result};
 use crate::fugue_ims::{CreateFugueIssue, FugueImsStore};
+use crate::host_signal_journal::{HostSignalBinding, ObservationRevision};
 use crate::ims::ImsStageName;
 use crate::kapellmeister::{
     CursorPartition, DurableCursorKey, DurableCursorPosition, DurableCursorSource,
     KapellmeisterRunningMobObservation, KapellmeisterShadowSignal,
 };
 use crate::linear_lane_state::{
-    LINEAR_LANE_STATE_PATH_ENV, LinearCommentSnapshot, LinearLaneState,
-    lane_state_path_for_workflow, legacy_linear_lane_repair, record_internal_lane_change_from_env,
+    LINEAR_LANE_STATE_PATH_ENV, LinearCommentSnapshot, legacy_linear_lane_repair,
+    record_internal_lane_change_from_env,
 };
 pub use crate::linear_lane_state::{
     LinearCommentChange as IssueCommentChange, LinearCommentObservation as IssueCommentObservation,
@@ -54,14 +55,27 @@ pub fn record_internal_lane_from_env(identifier: &str, lane: &str) -> Result<()>
 }
 
 pub fn record_internal_lane_for_workflow(
-    workflow_dir: &Path,
+    config: &ServiceConfig,
     identifier: &str,
     lane: &str,
 ) -> Result<()> {
-    let path = lane_state_path_for_workflow(workflow_dir);
-    let mut state = LinearLaneState::read(&path)?;
-    state.observe_lane(identifier, lane);
-    state.write(&path)
+    HostSignalBinding::from_config(config)?.record_internal_lane(identifier, lane)
+}
+
+/// Host-owned projection records its observed result before reporting success.
+/// Operator board mutations use the ordinary adapter path so polling can notify
+/// the coordinator about the operator's intent.
+pub async fn move_issue_with_observation(
+    config: &ServiceConfig,
+    input: MoveIssueInput,
+) -> Result<MoveIssueOutput> {
+    let binding = HostSignalBinding::from_config(config)?;
+    binding.open()?;
+    let output = IssueAdapter::from_config(&config.tracker)?
+        .move_issue(input)
+        .await?;
+    binding.record_internal_lane(&output.issue.identifier.0, &output.issue.state.name)?;
+    Ok(output)
 }
 
 pub fn issue_lane_state_path_for_workflow(workflow_dir: &Path) -> std::path::PathBuf {
@@ -135,22 +149,26 @@ pub struct IssueLaneRuntimeObservation {
 }
 
 pub fn reconcile_issue_lane_observation_state(
-    workflow_dir: &Path,
     config: &ServiceConfig,
+    revision: ObservationRevision,
     observations: Vec<IssueLaneRuntimeObservation>,
 ) -> Result<Vec<KapellmeisterShadowSignal>> {
-    let path = issue_lane_state_path_for_workflow(workflow_dir);
-    let mut state = IssueLaneState::read(&path)?;
+    let mut journal = HostSignalBinding::from_config(config)?.open()?;
+    let mut update = journal.begin_at(revision)?;
     let mut signals = Vec::new();
     for observation in observations {
-        signals.extend(issue_lane_control_plane_signals(
+        let change = update.observe_lane(&observation.issue.identifier, &observation.issue.state);
+        let new_occurrence = !matches!(change, IssueLaneObservation::Unchanged);
+        let mut observed = issue_lane_control_plane_signals(
             config,
             &observation.issue,
-            state.observe_issue(&observation.issue),
+            change,
             observation.running_mob,
-        ));
+        );
+        update.retain_signals(config, &mut observed, new_occurrence)?;
+        signals.extend(observed);
     }
-    state.write(&path)?;
+    update.commit()?;
     Ok(signals)
 }
 
@@ -645,28 +663,34 @@ impl IssueAdapter {
 
     pub async fn reconcile_issue_comment_observation_state(
         &self,
-        workflow_dir: &Path,
+        config: &ServiceConfig,
         issues: &[Issue],
     ) -> Result<Vec<KapellmeisterShadowSignal>> {
-        let path = issue_comment_state_path_for_workflow(workflow_dir);
-        let mut state = IssueCommentState::read(&path)?;
-        let mut signals = Vec::new();
+        // Do not hold a SQLite transaction across tracker requests. A partial
+        // fetch cannot advance any observation or hide an undelivered change.
+        let binding = HostSignalBinding::from_config(config)?;
+        let revision = binding.open()?.revision()?;
+        let mut snapshots = Vec::with_capacity(issues.len());
         for issue in issues {
             let comments = self
                 .issue_comment_snapshots(&issue_ref_for_identifier(&issue.identifier))
                 .await?;
+            snapshots.push((issue, comments));
+        }
+        let mut journal = binding.open()?;
+        let mut update = journal.begin_at(revision)?;
+        let mut signals = Vec::new();
+        for (issue, comments) in snapshots {
             if let IssueCommentObservation::Changed { changes } =
-                state.observe_issue_comments(&issue.identifier, comments)
+                update.observe_comments(&issue.identifier, comments)
             {
                 let observed_at = issue.updated_at.unwrap_or_else(Utc::now);
-                signals.extend(issue_comment_control_plane_signals(
-                    issue,
-                    changes,
-                    observed_at,
-                ));
+                let mut observed = issue_comment_control_plane_signals(issue, changes, observed_at);
+                update.retain_signals(config, &mut observed, true)?;
+                signals.extend(observed);
             }
         }
-        state.write(&path)?;
+        update.commit()?;
         Ok(signals)
     }
 

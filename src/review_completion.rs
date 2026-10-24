@@ -366,7 +366,7 @@ pub(crate) async fn record_review_projection(
         .guard_terminal_move(&config.tracker, &movement)
         .await
         .map_err(anyhow::Error::msg)?;
-    adapter.move_issue(movement).await?;
+    crate::linear_adapter::move_issue_with_observation(config, movement).await?;
 
     Ok(IndependentReviewProjectionResult {
         target_lane,

@@ -771,7 +771,7 @@ impl FugueImsStore {
     }
 }
 
-fn fugue_ims_path(endpoint: &str) -> Result<PathBuf> {
+pub(crate) fn fugue_ims_path(endpoint: &str) -> Result<PathBuf> {
     endpoint
         .strip_prefix("sqlite://")
         .map(PathBuf::from)

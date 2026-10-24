@@ -170,6 +170,23 @@ fn exited_without_reaping(child: &Child) -> io::Result<bool> {
 }
 
 #[cfg(target_os = "macos")]
+fn wait_for_exited_child_after_signal_refusal(child: &Child) -> io::Result<bool> {
+    // Darwin can refuse the group signal during exit before waitid exposes the
+    // waitable child. Preserve PID ownership throughout this bounded observation;
+    // never turn a live or inaccessible group into a successful cleanup.
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        if exited_without_reaping(child)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn group_has_no_other_members(pid: i32) -> io::Result<bool> {
     // Darwin reports EPERM for a group containing only an exited leader.
     // Do not waive EPERM if another member remains, including one that changed
@@ -234,7 +251,8 @@ impl OwnedProcess {
                 Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
                 #[cfg(target_os = "macos")]
                 Err(nix::errno::Errno::EPERM)
-                    if exited_without_reaping(child)? && group_has_no_other_members(pid)? => {}
+                    if wait_for_exited_child_after_signal_refusal(child)?
+                        && group_has_no_other_members(pid)? => {}
                 Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
             }
         }
@@ -315,6 +333,30 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             ),
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn signal_refusal_wait_is_bounded_and_does_not_reap_or_accept_a_live_child() {
+        let mut capture = CapturedProcess::start(shell("sleep 10")).unwrap();
+        let child = capture.process.child.as_ref().unwrap();
+        let started = Instant::now();
+        assert!(!wait_for_exited_child_after_signal_refusal(child).unwrap());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!exited_without_reaping(child).unwrap());
+        capture.process.finish().unwrap();
+        assert!(capture.process.child.is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn signal_refusal_wait_keeps_an_exited_child_waitable() {
+        let mut capture = CapturedProcess::start(shell("exit 7")).unwrap();
+        let child = capture.process.child.as_ref().unwrap();
+        assert!(wait_for_exited_child_after_signal_refusal(child).unwrap());
+        assert!(exited_without_reaping(child).unwrap());
+        assert_eq!(capture.process.finish().unwrap().unwrap().code(), Some(7));
+        assert!(capture.process.child.is_none());
     }
 
     #[test]

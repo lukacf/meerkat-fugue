@@ -127,7 +127,7 @@ async fn run(
     }
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     let (refresh_tx, refresh_rx) = tokio::sync::mpsc::channel(8);
-    let mut orchestrator = crate::orchestrator::Orchestrator::new(manager, refresh_rx);
+    let mut orchestrator = crate::orchestrator::Orchestrator::new(manager, refresh_rx)?;
     let registry = orchestrator.meta_runtime_registry();
     registry
         .use_console(console.clone())

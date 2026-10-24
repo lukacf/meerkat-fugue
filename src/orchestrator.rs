@@ -1,11 +1,16 @@
+use crate::host_signal_journal::HostSignalBinding;
+#[cfg(test)]
+use crate::kapellmeister::repo_kapellmeister_signal_message_with_lanes;
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -45,7 +50,7 @@ use crate::kapellmeister::{
     KapellmeisterHostDecision, KapellmeisterHostObservation, KapellmeisterRepoScope,
     KapellmeisterRunningMobObservation, KapellmeisterShadowHost, KapellmeisterShadowInspection,
     KapellmeisterShadowSignal, KapellmeisterToolAuthority, KapellmeisterWorkspaceEvidence,
-    PrHandoffMonitorDecision, RkatKapellmeisterShadowRuntime, ShadowDecisionId, ShadowSignalId,
+    PrHandoffMonitorDecision, RkatKapellmeisterShadowRuntime, ShadowDecisionId,
     ShadowWorkerFailure, ShadowWorkerFailureReason, ShadowWorkerOutcome, inspect_shadow_state,
 };
 use crate::kapellmeister_host::{
@@ -57,8 +62,7 @@ use crate::linear_adapter::{
     active_projection_phase_labels_for_template, classify_issue_lane, evaluate_issue_projection,
     issue_lane_state_path_for_workflow, lane_state_path_env_name,
     projected_terminal_lane_for_template_status, projection_lane_for_template_node,
-    reconcile_issue_lane_observation_state, record_internal_lane_for_workflow,
-    terminal_states_env_name,
+    reconcile_issue_lane_observation_state, terminal_states_env_name,
 };
 use crate::linear_tools::{LINEAR_ACTION_STATES_ENV, LINEAR_REVIEW_HANDOFF_STATES_ENV};
 use crate::meta_runtime::{
@@ -94,9 +98,8 @@ use crate::workspace::WorkspaceManager;
 pub type SharedState = Arc<RwLock<OrchestratorState>>;
 
 const KAPELLMEISTER_SHADOW_RECONCILE_TIMEOUT_MS: u64 = 10_000;
-const KAPELLMEISTER_REPO_SIGNAL_PENDING_LOG_MS: u64 = 15_000;
+const HOST_SIGNAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_STALL_TIMEOUT_STEP_GRACE_MS: i64 = 60_000;
-const KAPELLMEISTER_SIGNAL_DEDUP_LIMIT: usize = 2048;
 
 pub struct Orchestrator {
     config: WorkflowConfigManager,
@@ -109,10 +112,13 @@ pub struct Orchestrator {
     native_event_observer: NativeMobEventObserver,
     native_worker_execution: bool,
     terminal_issue_refresh: bool,
-    kapellmeister_signal_deduper: Arc<Mutex<RecentSignalDeduper>>,
+    host_signal_binding: HostSignalBinding,
+    host_signal_wake: tokio::sync::Notify,
     #[cfg(test)]
     captured_native_signal_messages: Option<Mutex<Vec<String>>>,
     linear_backoff_until: Option<DateTime<Utc>>,
+    #[cfg(test)]
+    test_directory: Option<tempfile::TempDir>,
 }
 
 #[derive(Debug)]
@@ -178,37 +184,6 @@ struct NativeRunHandle {
     run_id: MobRunId,
     observed_events: Vec<MobEventSnapshot>,
     recovery: NativeStatusRecovery,
-}
-
-#[derive(Debug)]
-struct RecentSignalDeduper {
-    seen: HashSet<ShadowSignalId>,
-    order: VecDeque<ShadowSignalId>,
-    limit: usize,
-}
-
-impl RecentSignalDeduper {
-    fn new(limit: usize) -> Self {
-        Self {
-            seen: HashSet::new(),
-            order: VecDeque::new(),
-            limit,
-        }
-    }
-
-    fn accept(&mut self, id: &ShadowSignalId) -> bool {
-        if self.seen.contains(id) {
-            return false;
-        }
-        self.seen.insert(id.clone());
-        self.order.push_back(id.clone());
-        while self.order.len() > self.limit {
-            if let Some(evicted) = self.order.pop_front() {
-                self.seen.remove(&evicted);
-            }
-        }
-        true
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -440,23 +415,17 @@ impl KapellmeisterHostToolExecutor for OrchestratorFinalPrGateStartExecutor {
             &self.config.independent_review.orchestrator_profile,
         );
         let repository = Some(request.pr.repo.clone());
-        let plan = match NativeMobLaunchPlan::new(
-            request.spawn_input,
-            template.clone(),
-            native_member_mcp_servers_for_issue(
-                &self.config.mob.mcp_servers,
-                &self.config.workflow_dir,
-                &template,
-                &self.issue,
-                repository.as_ref(),
-                &self.config.tracker.terminal_states,
-                &native_issue_review_handoff_states(&self.config, &self.issue),
-                &native_action_lanes(&self.config),
-            ),
-            native_member_direct_tool_servers(&self.config.tracker, &template),
-            self.config.tracker.project_slug.clone(),
-            repository,
-        ) {
+        let plan = match (|| {
+            NativeMobLaunchPlan::new(
+                request.spawn_input,
+                template.clone(),
+                bound_member_mcp_servers(&self.config, &template, &self.issue, repository.as_ref())
+                    .map_err(host_signal_launch_error)?,
+                native_member_direct_tool_servers(&self.config.tracker, &template),
+                self.config.tracker.project_slug.clone(),
+                repository,
+            )
+        })() {
             Ok(plan) => plan,
             Err(error) => {
                 return FugueToolResult::Err {
@@ -490,23 +459,17 @@ impl KapellmeisterHostToolExecutor for OrchestratorFinalPrGateStartExecutor {
         let mcp_tools = agent_visible_mcp_tool_names(&self.config.mob.mcp_servers);
         let template = independent_review_native_launch_template(&request, &mcp_tools);
         let repository = Some(request.pull_request.repo.clone());
-        let plan = match NativeMobLaunchPlan::new(
-            request.spawn_input,
-            template.clone(),
-            native_member_mcp_servers_for_issue(
-                &self.config.mob.mcp_servers,
-                &self.config.workflow_dir,
-                &template,
-                &self.issue,
-                repository.as_ref(),
-                &self.config.tracker.terminal_states,
-                &native_issue_review_handoff_states(&self.config, &self.issue),
-                &native_action_lanes(&self.config),
-            ),
-            native_member_direct_tool_servers(&self.config.tracker, &template),
-            self.config.tracker.project_slug.clone(),
-            repository,
-        ) {
+        let plan = match (|| {
+            NativeMobLaunchPlan::new(
+                request.spawn_input,
+                template.clone(),
+                bound_member_mcp_servers(&self.config, &template, &self.issue, repository.as_ref())
+                    .map_err(host_signal_launch_error)?,
+                native_member_direct_tool_servers(&self.config.tracker, &template),
+                self.config.tracker.project_slug.clone(),
+                repository,
+            )
+        })() {
             Ok(plan) => plan,
             Err(error) => {
                 return FugueToolResult::Err {
@@ -589,30 +552,18 @@ impl KapellmeisterHostToolExecutor for FinalPrGateProjectionExecutor {
                 metadata: ToolExecutionMetadata::default(),
             };
         }
-        match IssueAdapter::from_config(&self.config.tracker) {
-            Ok(adapter) => match adapter.move_issue(input).await {
-                Ok(output) => FugueToolResult::Ok {
-                    output: FugueToolOutput::LinearMoveIssue(output),
-                    metadata: ToolExecutionMetadata::default(),
-                },
-                Err(error) => FugueToolResult::Err {
-                    error: FugueToolError {
-                        operation: FugueToolOperation::LinearMoveIssue,
-                        code: FugueToolErrorCode::ExecutionFailed,
-                        message: error.to_string(),
-                        retry: RetryAdvice::DoNotRetry,
-                        idempotency_key: Some(idempotency_key),
-                    },
-                    metadata: ToolExecutionMetadata::default(),
-                },
+        match crate::linear_adapter::move_issue_with_observation(&self.config, input).await {
+            Ok(output) => FugueToolResult::Ok {
+                output: FugueToolOutput::LinearMoveIssue(output),
+                metadata: ToolExecutionMetadata::default(),
             },
             Err(error) => FugueToolResult::Err {
                 error: FugueToolError {
                     operation: FugueToolOperation::LinearMoveIssue,
-                    code: FugueToolErrorCode::BackendUnavailable,
+                    code: FugueToolErrorCode::ExecutionFailed,
                     message: error.to_string(),
-                    retry: RetryAdvice::SafeToRetry,
-                    idempotency_key: Some(input.idempotency_key),
+                    retry: RetryAdvice::DoNotRetry,
+                    idempotency_key: Some(idempotency_key),
                 },
                 metadata: ToolExecutionMetadata::default(),
             },
@@ -758,10 +709,12 @@ fn agent_visible_mcp_tool_names(
 }
 
 impl Orchestrator {
-    pub fn new(config: WorkflowConfigManager, refresh_rx: mpsc::Receiver<()>) -> Self {
+    pub fn new(config: WorkflowConfigManager, refresh_rx: mpsc::Receiver<()>) -> Result<Self> {
         let (internal_tx, internal_rx) = mpsc::channel(256);
         let effective = config.effective();
         let meerkat_config = effective.meerkat.clone();
+        let host_signal_binding = HostSignalBinding::from_config(effective)?;
+        let tracker_servers = host_signal_mcp_servers(effective)?;
         let fugue_host_api_url = fugue_host_api_url_from_config(effective);
         let fugue_host_api_auth = fugue_host_api_auth_from_config(effective);
         let meta_runtime_registry = MetaRuntimeRegistry::with_config(
@@ -770,7 +723,7 @@ impl Orchestrator {
             fugue_host_api_url.clone(),
             fugue_host_api_auth,
             native_repo_kapellmeister_mcp_servers(
-                &effective.mob.mcp_servers,
+                &tracker_servers,
                 &effective.workflow_dir,
                 repository_scope_from_config(effective).as_ref(),
                 effective.tracker.project_slug.as_deref(),
@@ -783,6 +736,7 @@ impl Orchestrator {
             ),
             effective.mob.templates.clone(),
         )
+        .with_host_signal_binding(host_signal_binding.clone())
         .with_final_review_config(effective.final_review.clone())
         .with_independent_review_config(effective.independent_review.clone());
         let native_event_observer = NativeMobEventObserver::for_config(effective);
@@ -799,7 +753,7 @@ impl Orchestrator {
             last_error: None,
             recent_events: HashMap::new(),
         }));
-        Self {
+        Ok(Self {
             config,
             state,
             refresh_rx,
@@ -812,13 +766,14 @@ impl Orchestrator {
             native_event_observer,
             native_worker_execution: false,
             terminal_issue_refresh: true,
-            kapellmeister_signal_deduper: Arc::new(Mutex::new(RecentSignalDeduper::new(
-                KAPELLMEISTER_SIGNAL_DEDUP_LIMIT,
-            ))),
+            host_signal_binding,
+            host_signal_wake: tokio::sync::Notify::new(),
             #[cfg(test)]
             captured_native_signal_messages: None,
             linear_backoff_until: None,
-        }
+            #[cfg(test)]
+            test_directory: None,
+        })
     }
 
     #[cfg(test)]
@@ -828,7 +783,7 @@ impl Orchestrator {
         refresh_rx: mpsc::Receiver<()>,
         native_execution_host: Arc<dyn NativeMobExecutionHost + Send + Sync>,
     ) -> Self {
-        let mut orchestrator = Self::new(config, refresh_rx);
+        let mut orchestrator = Self::new(config, refresh_rx).unwrap();
         orchestrator.native_execution_host = native_execution_host;
         orchestrator.native_worker_execution = false;
         // A fake worker host must not bootstrap a real coordinator as a side
@@ -892,6 +847,7 @@ impl Orchestrator {
 
     pub async fn run_until_shutdown(&mut self, shutdown: CancellationToken) -> anyhow::Result<()> {
         self.spawn_autonomous_host_bootstrap();
+        self.drain_host_signals().await;
         self.startup_terminal_workspace_cleanup().await;
         self.reconcile_kapellmeister_shadow_host().await;
         self.tick().await;
@@ -904,6 +860,9 @@ impl Orchestrator {
                 }
                 Some(_) = self.refresh_rx.recv() => {
                     self.tick().await;
+                }
+                _ = self.host_signal_wake.notified() => {
+                    self.drain_host_signals().await;
                 }
                 Some(message) = self.internal_rx.recv() => {
                     self.handle_internal(message).await;
@@ -981,6 +940,8 @@ impl Orchestrator {
     }
 
     async fn tick(&mut self) {
+        // Saved intent is independent of tracker availability and dispatch policy.
+        self.drain_host_signals().await;
         if self.linear_backoff_is_active() {
             debug!("dispatch skipped while Linear rate-limit backoff is active");
             return;
@@ -1016,6 +977,19 @@ impl Orchestrator {
             warn!(error = %err, "Linear projection lane preflight failed");
             return;
         }
+        let observation_revision = match crate::host_signal_journal::HostSignalBinding::from_config(
+            self.config.effective(),
+        )
+        .and_then(|binding| binding.open())
+        .and_then(|journal| journal.revision())
+        {
+            Ok(revision) => revision,
+            Err(error) => {
+                self.state.write().await.last_error = Some(error.to_string());
+                warn!(%error, "cannot capture tracker observation revision");
+                return;
+            }
+        };
         let mut candidates = match adapter.fetch_candidate_issues().await {
             Ok(issues) => issues,
             Err(err) => {
@@ -1043,7 +1017,7 @@ impl Orchestrator {
             let mut state = self.state.write().await;
             state.last_error = None;
         }
-        self.reconcile_linear_lane_observations(&pr_handoff_candidates)
+        self.reconcile_linear_lane_observations(&pr_handoff_candidates, observation_revision)
             .await;
         if native_kapellmeister_prompt_control_enabled(self.config.effective()) {
             self.reconcile_native_deploy_lane(&adapter, &pr_handoff_candidates)
@@ -1167,7 +1141,8 @@ impl Orchestrator {
                     self.deliver_kapellmeister_shadow_signal(native_pr_handoff_missing_pr_signal(
                         &issue.identifier,
                         Utc::now(),
-                    ));
+                    ))
+                    .await;
                     let mut state = self.state.write().await;
                     state.last_error = Some(format!(
                         "native PR handoff monitor reported {} to Kapellmeister because Workpad/Linear claims PR handoff but durable GitHub PR evidence is missing; Linear lane was not moved by the host",
@@ -1564,7 +1539,8 @@ impl Orchestrator {
                 &handoff,
                 ci.as_ref(),
                 action,
-            );
+            )
+            .await;
             if let Some(final_gate_start) = final_gate_start.as_ref() {
                 match self
                     .deliver_native_final_pr_gate_request_to_kapellmeister(issue, final_gate_start)
@@ -1591,7 +1567,11 @@ impl Orchestrator {
             .await
     }
 
-    async fn reconcile_linear_lane_observations(&self, issues: &[Issue]) {
+    async fn reconcile_linear_lane_observations(
+        &self,
+        issues: &[Issue],
+        revision: crate::host_signal_journal::ObservationRevision,
+    ) {
         let mut observations = Vec::new();
         for issue in issues {
             observations.push(IssueLaneRuntimeObservation {
@@ -1600,8 +1580,8 @@ impl Orchestrator {
             });
         }
         let signals = match reconcile_issue_lane_observation_state(
-            &self.config.effective().workflow_dir,
             self.config.effective(),
+            revision,
             observations,
         ) {
             Ok(signals) => signals,
@@ -1617,7 +1597,7 @@ impl Orchestrator {
                 count = signals.len(),
                 "observed external issue lane changes"
             );
-            self.deliver_kapellmeister_shadow_signals(signals);
+            self.deliver_kapellmeister_shadow_signals(signals).await;
         }
         self.reconcile_linear_comment_observations(issues).await;
     }
@@ -1631,10 +1611,7 @@ impl Orchestrator {
             }
         };
         let signals = match adapter
-            .reconcile_issue_comment_observation_state(
-                &self.config.effective().workflow_dir,
-                issues,
-            )
+            .reconcile_issue_comment_observation_state(self.config.effective(), issues)
             .await
         {
             Ok(signals) => signals,
@@ -1650,7 +1627,7 @@ impl Orchestrator {
                 count = signals.len(),
                 "delivering issue comment control-plane observations to Kapellmeister"
             );
-            self.deliver_kapellmeister_shadow_signals(signals);
+            self.deliver_kapellmeister_shadow_signals(signals).await;
         }
     }
 
@@ -1712,114 +1689,141 @@ impl Orchestrator {
         }
     }
 
-    fn deliver_kapellmeister_shadow_signal(&self, signal: KapellmeisterShadowSignal) {
-        self.deliver_kapellmeister_shadow_signals(vec![signal]);
+    async fn deliver_kapellmeister_shadow_signal(&self, signal: KapellmeisterShadowSignal) {
+        self.deliver_kapellmeister_shadow_signals(vec![signal])
+            .await;
     }
 
-    fn deliver_kapellmeister_shadow_signals(&self, signals: Vec<KapellmeisterShadowSignal>) {
-        let original_count = signals.len();
-        if original_count == 0 {
-            return;
+    async fn deliver_kapellmeister_shadow_signals(&self, signals: Vec<KapellmeisterShadowSignal>) {
+        if let Err(error) = self.enqueue_host_signals(&signals) {
+            self.state.write().await.last_error = Some(error.to_string());
+            warn!(%error, "host notifications could not be saved; delivery is not acknowledged");
         }
-        let signals = match self.kapellmeister_signal_deduper.lock() {
-            Ok(mut deduper) => signals
-                .into_iter()
-                .filter(|signal| deduper.accept(&signal.id))
-                .collect::<Vec<_>>(),
-            Err(_) => {
-                warn!("kapellmeister signal deduper lock is poisoned; dropping signal batch");
-                Vec::new()
-            }
-        };
-        if signals.is_empty() {
-            debug!(
-                skipped_duplicate_count = original_count,
-                "suppressed duplicate Fugue host signal batch for repo Kapellmeister"
-            );
-            return;
-        }
-        let signal_ids = signals
-            .iter()
-            .map(|signal| signal.id.0.clone())
-            .collect::<Vec<_>>();
-        match repo_kapellmeister_signal_message_with_lanes(
-            &signals,
-            &self.config.effective().linear.lanes.success,
-            self.config.effective().linear.lanes.review_ready.as_deref(),
-            self.config
-                .effective()
-                .independent_review
-                .enabled
-                .then_some(self.config.effective().independent_review.lane.as_str()),
-        ) {
-            Ok(message) => {
-                #[cfg(test)]
-                if let Some(messages) = &self.captured_native_signal_messages {
-                    messages.lock().expect("test signal recorder").push(message);
-                    return;
-                }
-                let registry = self.meta_runtime_registry.clone();
-                tokio::spawn(async move {
-                    for attempt in 1..=3 {
-                        let mut delivery = Box::pin(
-                            registry.deliver_repo_kapellmeister_signal_batch(message.clone()),
-                        );
-                        let mut pending_logs = 0_u64;
-                        loop {
-                            let pending_log = tokio::time::sleep(Duration::from_millis(
-                                KAPELLMEISTER_REPO_SIGNAL_PENDING_LOG_MS,
-                            ));
-                            tokio::pin!(pending_log);
-                            tokio::select! {
-                                result = &mut delivery => {
-                                    match result {
-                                        Ok(accepted) => {
-                                            info!(
-                                                interaction_id = %accepted.interaction_id,
-                                                identity = %accepted.identity,
-                                                attempt,
-                                                signal_ids = ?signal_ids,
-                                                "accepted Fugue host signal batch for repo Kapellmeister delivery"
-                                            );
-                                            return;
-                                        }
-                                        Err(error) => {
-                                            warn!(
-                                                error = %error,
-                                                attempt,
-                                                signal_ids = ?signal_ids,
-                                                "failed to deliver Fugue host signal batch to repo Kapellmeister"
-                                            );
-                                            break;
-                                        }
-                                    }
-                                }
-                                () = &mut pending_log => {
-                                    pending_logs = pending_logs.saturating_add(1);
-                                    warn!(
-                                        pending_for_ms = pending_logs.saturating_mul(KAPELLMEISTER_REPO_SIGNAL_PENDING_LOG_MS),
-                                        pending_log_interval_ms = KAPELLMEISTER_REPO_SIGNAL_PENDING_LOG_MS,
-                                        attempt,
-                                        signal_ids = ?signal_ids,
-                                        "delivery still pending for Fugue host signal batch to repo Kapellmeister"
-                                    );
-                                }
-                            }
-                        }
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                    }
-                });
-            }
-            Err(error) => warn!(
-                error = %error,
-                "failed to encode Fugue host signal batch for repo Kapellmeister"
-            ),
-        }
+    }
 
-        // Host signals have one canonical live path: the Meta repo Kapellmeister.
-        // The Kapellmeister shadow runtime is only reconciled at startup for persisted-state
-        // delivering every signal through both paths spawns duplicate
-        // rkat-rpc clients and can starve the service of file descriptors.
+    fn enqueue_host_signals(&self, signals: &[KapellmeisterShadowSignal]) -> Result<()> {
+        if signals.is_empty() {
+            return Ok(());
+        }
+        if HostSignalBinding::from_config(self.config.effective())? != self.host_signal_binding {
+            return Err(FugueError::Workspace(
+                "host signal routing changed; restart with the intended repository configuration"
+                    .into(),
+            ));
+        }
+        let mut journal = self.host_signal_binding.open()?;
+        let mut update = journal.begin()?;
+        #[cfg(test)]
+        let mut recorded = Vec::new();
+        for signal in signals {
+            update.enqueue_once(&signal.id.0, || {
+                let envelope = crate::host_signal_journal::SignalEnvelope::for_signals(
+                    self.config.effective(),
+                    std::slice::from_ref(signal),
+                )?;
+                #[cfg(test)]
+                recorded.push(envelope.content.clone());
+                Ok(envelope)
+            })?;
+        }
+        update.commit()?;
+        #[cfg(test)]
+        if let Some(messages) = &self.captured_native_signal_messages {
+            messages
+                .lock()
+                .expect("test signal recorder")
+                .extend(recorded);
+        }
+        // The run loop owns the drain. Signals arriving during a drain remain
+        // in SQLite; cancellation, shutdown or process loss cannot drop them.
+        self.host_signal_wake.notify_one();
+        Ok(())
+    }
+
+    async fn drain_host_signals(&self) {
+        #[cfg(test)]
+        if self.captured_native_signal_messages.is_some() {
+            return;
+        }
+        let limit = std::num::NonZeroU32::MIN.saturating_add(31);
+        let drain = self
+            .host_signal_binding
+            .drain_pending(limit, |scope, signal| async move {
+                self.meta_runtime_registry
+                    .deliver_repo_kapellmeister_signal(&scope, &signal)
+                    .await
+                    .map_err(FugueError::Workspace)
+            });
+        match tokio::time::timeout(HOST_SIGNAL_DRAIN_TIMEOUT, drain).await {
+            Ok(Ok(progress)) => {
+                if progress.acknowledged != 0 {
+                    info!(
+                        count = progress.acknowledged,
+                        "native admission acknowledged saved host notifications"
+                    );
+                }
+                if let Some(deferred) = progress.deferred {
+                    debug!(delivery_id = %deferred.receipt.delivery_id,
+                        status = ?deferred.receipt.status,
+                        "host notification retained for the next native admission check");
+                }
+            }
+            Ok(Err(error)) => {
+                self.state.write().await.last_error = Some(error.to_string());
+                warn!(%error, "host notification remains saved for retry");
+            }
+            Err(_) => {
+                let error = "native notification admission timed out; saved intent will be retried";
+                self.state.write().await.last_error = Some(error.to_owned());
+                warn!(error);
+            }
+        }
+        // Reconciliation is independent of admission. An unresolved receipt
+        // must not prevent newer completion or steering messages from arriving.
+        let reconcile =
+            self.host_signal_binding
+                .reconcile_admitted(limit, |scope, receipt| async move {
+                    self.meta_runtime_registry
+                        .observe_repo_kapellmeister_input(&scope, &receipt)
+                        .await
+                        .map_err(FugueError::Workspace)
+                });
+        match tokio::time::timeout(HOST_SIGNAL_DRAIN_TIMEOUT, reconcile).await {
+            Ok(Ok(progress)) => {
+                if progress.requeued != 0 {
+                    info!(
+                        count = progress.requeued,
+                        "saved host notifications stopped before execution are ready for readmission"
+                    );
+                    self.host_signal_wake.notify_one();
+                }
+                if let Some(unresolvable) = progress.unresolvable.first() {
+                    let error = format!(
+                        "host notification needs attention: {} (delivery {})",
+                        unresolvable.reason, unresolvable.admission.receipt.delivery_id
+                    );
+                    self.state.write().await.last_error = Some(error.clone());
+                    warn!(%error, "native input cannot be resolved; receipt retained without resend");
+                }
+                if let Some(attention) = progress.attention.first() {
+                    let error = format!(
+                        "host notification needs attention: native input {:?}, outcome {:?} (delivery {})",
+                        attention.phase, attention.outcome, attention.admission.receipt.delivery_id
+                    );
+                    self.state.write().await.last_error = Some(error.clone());
+                    warn!(%error, "native terminal input retained without automatic resend");
+                }
+            }
+            Ok(Err(error)) => {
+                self.state.write().await.last_error = Some(error.to_string());
+                warn!(%error, "native input reconciliation failed; admission receipts retained");
+            }
+            Err(_) => {
+                let error = "native input reconciliation timed out; admission receipts retained";
+                self.state.write().await.last_error = Some(error.to_owned());
+                warn!(error);
+            }
+        }
     }
 
     async fn reload_workflow_if_needed(&mut self) -> bool {
@@ -2334,7 +2338,8 @@ impl Orchestrator {
                         &issue,
                         &run,
                         entry.native_run.as_ref(),
-                    ));
+                    ))
+                    .await;
                 }
                 if let Some(native_run) = entry.native_run.as_mut() {
                     native_run.recovery = refresh_native_status_recovery(
@@ -2684,19 +2689,26 @@ impl Orchestrator {
                 }
             }
             let observed_at = Utc::now();
-            self.deliver_kapellmeister_shadow_signal(KapellmeisterShadowSignal::worker_started(
-                observed_at,
-                Some(worker_cursor(
-                    &identifier,
-                    "native_mob_structural_event",
-                    1,
+            if let Err(error) =
+                self.enqueue_host_signals(&[KapellmeisterShadowSignal::worker_started(
                     observed_at,
-                )),
-                issue_ref_for_identifier(&identifier),
-                workspace_key_for_identifier(&identifier),
-                1,
-                Some(run_id.0.clone()),
-            ));
+                    Some(worker_cursor(
+                        &identifier,
+                        "native_mob_structural_event",
+                        1,
+                        observed_at,
+                    )),
+                    issue_ref_for_identifier(&identifier),
+                    workspace_key_for_identifier(&identifier),
+                    1,
+                    Some(run_id.0.clone()),
+                )])
+            {
+                self.state.write().await.last_error = Some(error.to_string());
+                warn!(%error, "native observation cursor retained because its notification could not be saved");
+                continue;
+            }
+
             let Some(inspected_run) = inspected_run else {
                 let mut state = self.state.write().await;
                 state.last_error = Some(format!(
@@ -2904,7 +2916,8 @@ impl Orchestrator {
                     message: Some(format!("Issue team startup failed: {}", failure.message)),
                     retry_scheduled: false,
                 },
-            ));
+            ))
+            .await;
         }
     }
 
@@ -3504,26 +3517,24 @@ impl Orchestrator {
         issue: &Issue,
         final_gate_start: &FinalPrGateStartRequest,
     ) -> Result<bool> {
-        self.deliver_kapellmeister_shadow_signal(
-            KapellmeisterShadowSignal::final_pr_gate_requested(
-                Utc::now(),
-                None,
-                issue_ref_for_identifier(&issue.identifier),
-                final_gate_start.pr.clone(),
-                final_gate_start.clone(),
-            ),
-        );
+        self.enqueue_host_signals(&[KapellmeisterShadowSignal::final_pr_gate_requested(
+            Utc::now(),
+            None,
+            issue_ref_for_identifier(&issue.identifier),
+            final_gate_start.pr.clone(),
+            final_gate_start.clone(),
+        )])?;
         info!(
             issue_identifier = %issue.identifier,
             pull_request = final_gate_start.pr.number.0,
             head_sha = %final_gate_start.pr.head_sha.0,
             trigger_mode = ?final_gate_start.trigger_mode,
-            "delivered final PR gate request observation to repo Kapellmeister"
+            "saved final PR gate request observation to repo Kapellmeister"
         );
         Ok(true)
     }
 
-    fn deliver_native_pr_handoff_monitor_signal_to_kapellmeister(
+    async fn deliver_native_pr_handoff_monitor_signal_to_kapellmeister(
         &self,
         issue: &Issue,
         handoff: &RecoveredGitHubEvidence,
@@ -3541,14 +3552,15 @@ impl Orchestrator {
                 decision,
                 detail.to_string(),
             ),
-        );
+        )
+        .await;
         info!(
             issue_identifier = %issue.identifier,
             pull_request = handoff.pull_request.number.0,
             head_sha = %handoff.pull_request.head_sha.0,
             ci_status = ?ci.map(|output| output.status),
             decision = ?decision,
-            "delivered PR handoff monitor observation to repo Kapellmeister"
+            "processed PR handoff monitor observation for repo Kapellmeister"
         );
     }
 
@@ -3732,7 +3744,8 @@ impl Orchestrator {
             detail.as_deref(),
             entry.retry_attempt.unwrap_or(0),
             observed_at,
-        ));
+        ))
+        .await;
         warn!(
             issue_identifier = %entry.identifier,
             reason = ?reason,
@@ -3949,20 +3962,9 @@ impl Orchestrator {
         lane: &str,
         idempotency_suffix: &str,
     ) -> bool {
-        let adapter = match IssueAdapter::from_config(&self.config.effective().tracker) {
-            Ok(adapter) => adapter,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    issue_identifier = %identifier,
-                    target_lane = %lane,
-                    "native compact lane transition skipped because issue adapter is unavailable"
-                );
-                return false;
-            }
-        };
-        let result = adapter
-            .move_issue(MoveIssueInput {
+        let result = crate::linear_adapter::move_issue_with_observation(
+            self.config.effective(),
+            MoveIssueInput {
                 issue: issue_ref_for_identifier(identifier),
                 state: LinearStateRef::Name {
                     name: lane.to_string(),
@@ -3971,18 +3973,11 @@ impl Orchestrator {
                 idempotency_key: IdempotencyKey(format!(
                     "{idempotency_suffix}:{identifier}:{lane}"
                 )),
-            })
-            .await;
+            },
+        )
+        .await;
         match result {
-            Ok(output) => {
-                if native_lane_move_satisfied(&output) {
-                    self.record_internal_linear_lane(identifier, &output.issue.state.name)
-                        .await;
-                    true
-                } else {
-                    false
-                }
-            }
+            Ok(output) => native_lane_move_satisfied(&output),
             Err(err) => {
                 warn!(
                     error = %err,
@@ -3992,24 +3987,6 @@ impl Orchestrator {
                 );
                 false
             }
-        }
-    }
-
-    async fn record_internal_linear_lane(&self, identifier: &str, lane: &str) {
-        let result = record_internal_lane_for_workflow(
-            &self.config.effective().workflow_dir,
-            identifier,
-            lane,
-        );
-        if let Err(err) = result {
-            let mut state = self.state.write().await;
-            state.last_error = Some(err.to_string());
-            warn!(
-                error = %err,
-                issue_identifier = %identifier,
-                lane = %lane,
-                "failed to record internal Linear lane"
-            );
         }
     }
 
@@ -4188,7 +4165,7 @@ impl Orchestrator {
                     issue_id: _,
                     signals,
                 } => {
-                    self.deliver_kapellmeister_shadow_signals(signals);
+                    self.deliver_kapellmeister_shadow_signals(signals).await;
                 }
             },
             InternalMessage::RetryDue { issue_id } => self.handle_retry_due(issue_id).await,
@@ -4661,7 +4638,8 @@ impl Orchestrator {
                 .tracker
                 .is_terminal_state(&outcome.final_issue.state),
             observed_at,
-        ));
+        ))
+        .await;
         match outcome.exit {
             WorkerExit::Normal => {
                 if let Some(plan) = entry.termination.clone() {
@@ -5080,7 +5058,8 @@ impl Orchestrator {
             workspace_key_for_identifier(&identifier),
             attempt.unwrap_or(0).saturating_add(1),
             None,
-        ));
+        ))
+        .await;
         info!(issue_id = %issue_id, issue_identifier = %identifier, "dispatch started");
     }
 
@@ -5201,30 +5180,32 @@ impl Orchestrator {
             }
         };
         let idempotency_key = native_execution_idempotency_key(&identifier, native_run_generation);
-        let plan = match NativeMobLaunchPlan::new(
-            SpawnOrResumeExecutionInput {
-                issue: issue_ref_for_identifier(&identifier),
-                workspace_key: workspace_key_for_identifier(&identifier),
-                template_id: selected.template_id.clone(),
-                worktree_path: Some(workspace_path.clone()),
-                instructions: Some(instructions),
-                idempotency_key,
-            },
-            selected.template.clone(),
-            native_member_mcp_servers_for_issue(
-                &self.config.effective().mob.mcp_servers,
-                &self.config.effective().workflow_dir,
-                selected.template,
-                &issue,
-                repository_scope_from_config(self.config.effective()).as_ref(),
-                &self.config.effective().tracker.terminal_states,
-                &native_issue_review_handoff_states(self.config.effective(), &issue),
-                &native_action_lanes(self.config.effective()),
-            ),
-            native_member_direct_tool_servers(&self.config.effective().tracker, selected.template),
-            self.config.effective().tracker.project_slug.clone(),
-            repository_scope_from_config(self.config.effective()),
-        ) {
+        let plan = match (|| {
+            NativeMobLaunchPlan::new(
+                SpawnOrResumeExecutionInput {
+                    issue: issue_ref_for_identifier(&identifier),
+                    workspace_key: workspace_key_for_identifier(&identifier),
+                    template_id: selected.template_id.clone(),
+                    worktree_path: Some(workspace_path.clone()),
+                    instructions: Some(instructions),
+                    idempotency_key,
+                },
+                selected.template.clone(),
+                bound_member_mcp_servers(
+                    self.config.effective(),
+                    selected.template,
+                    &issue,
+                    repository_scope_from_config(self.config.effective()).as_ref(),
+                )
+                .map_err(host_signal_launch_error)?,
+                native_member_direct_tool_servers(
+                    &self.config.effective().tracker,
+                    selected.template,
+                ),
+                self.config.effective().tracker.project_slug.clone(),
+                repository_scope_from_config(self.config.effective()),
+            )
+        })() {
             Ok(plan) => plan,
             Err(error) => {
                 self.block_native_issue_for_host_failure(
@@ -5400,7 +5381,8 @@ impl Orchestrator {
             workspace_key_for_identifier(&identifier),
             attempt.unwrap_or(0).saturating_add(1),
             None,
-        ));
+        ))
+        .await;
         info!(
             issue_id = %issue_id,
             issue_identifier = %identifier,
@@ -5614,7 +5596,8 @@ impl Orchestrator {
             self.deliver_kapellmeister_shadow_signal(native_pr_handoff_missing_pr_signal(
                 &issue.identifier,
                 Utc::now(),
-            ));
+            ))
+            .await;
             let mut state = self.state.write().await;
             state.last_error = Some(format!(
                 "native dispatch reported {} to Kapellmeister because durable Workpad/Linear evidence points to a PR handoff but no matching GitHub PR exists; Linear lane was not moved by the host",
@@ -6767,6 +6750,50 @@ fn native_runtime_restore_keys(
             .then_with(|| left.2.cmp(&right.2))
     });
     candidates.into_iter().map(|(_, _, key)| key).collect()
+}
+
+fn host_signal_mcp_servers(
+    config: &ServiceConfig,
+) -> Result<BTreeMap<String, NativeMcpServerConfig>> {
+    let binding = HostSignalBinding::from_config(config)?.encode()?;
+    let mut servers = config.mob.mcp_servers.clone();
+    for (name, server) in &mut servers {
+        if is_native_linear_mcp_server(name, server) {
+            server.env.insert(
+                crate::host_signal_journal::HOST_SIGNAL_BINDING_ENV.to_owned(),
+                binding.clone(),
+            );
+        }
+    }
+    Ok(servers)
+}
+
+fn bound_member_mcp_servers(
+    config: &ServiceConfig,
+    template: &MaterializedMobTemplate,
+    issue: &Issue,
+    repository: Option<&GitHubRepoRef>,
+) -> Result<BTreeMap<String, NativeMcpServerConfig>> {
+    Ok(native_member_mcp_servers_for_issue(
+        &host_signal_mcp_servers(config)?,
+        &config.workflow_dir,
+        template,
+        issue,
+        repository,
+        &config.tracker.terminal_states,
+        &native_issue_review_handoff_states(config, issue),
+        &native_action_lanes(config),
+    ))
+}
+
+fn host_signal_launch_error(error: FugueError) -> FugueToolError {
+    FugueToolError {
+        operation: FugueToolOperation::MobSpawnOrResumeExecution,
+        code: FugueToolErrorCode::PreconditionFailed,
+        message: error.to_string(),
+        retry: RetryAdvice::DoNotRetry,
+        idempotency_key: None,
+    }
 }
 
 fn native_runtime_key_for_issue(config: &ServiceConfig, issue: &Issue) -> Option<String> {
@@ -9064,85 +9091,6 @@ fn repo_kapellmeister_signal_message(
     repo_kapellmeister_signal_message_with_lanes(signals, "Done", None, Some("Review"))
 }
 
-fn repo_kapellmeister_signal_message_with_lanes(
-    signals: &[KapellmeisterShadowSignal],
-    success: &str,
-    review_ready: Option<&str>,
-    independent_review_lane: Option<&str>,
-) -> std::result::Result<String, serde_json::Error> {
-    let payload = serde_json::to_string_pretty(signals)?;
-    let handoff_instruction = match review_ready {
-        Some(lane)
-            if independent_review_lane.is_some_and(|review| same_issue_lane(review, lane)) =>
-        {
-            format!(
-                "When implementation and its issue-team review are ready, record the PR evidence and move the issue to {lane} for independent specialist review. This shared holding status is a review request, never proof of approval. On first-seen, recovered or changed observations in {lane}, inspect the PR and current native review: admit or resume the required independent review, and retain an already completed current review instead of starting it again. Do not start a new implementation mob from this observation. Only an explicit merge action with verified review and merge evidence may project to {success}."
-            )
-        }
-        Some(lane) => format!(
-            "When reviewer and WorkGraph obligations are satisfied, move the issue to {lane} to await operator review. This is a holding lane, not a review action trigger. Keep it there until an explicit merge action; only verified merge completion projects to {success}."
-        ),
-        None => format!(
-            "When reviewer and WorkGraph obligations are satisfied, move the issue to {success}. In this workspace that lane records accepted development; merging still requires a separate explicit action."
-        ),
-    };
-    let review_instruction = if independent_review_lane.is_some() {
-        "For a configured Review action or shared review holding status, inspect the issue/PR and current native review evidence, then use fugue_start_independent_review with a typed IndependentReviewStartRequest when review is required. The review coordinator must select the configured quorum from existing repository specialists through native admission; never create substitute reviewers. Reuse the same request identity after an uncertain response."
-    } else {
-        "The independent Review action is disabled in this workspace. Review is a holding lane only; do not start an independent review orchestrator or create three-reviewer quorum obligations. Ordinary issue-mob review still applies."
-    };
-    Ok(format!(
-        "Fugue host signal batch for the repo-scoped Kapellmeister.\n\
-         Treat this JSON as authoritative host-observed lifecycle input. \
-         Use it to coordinate issue mobs, PR handoff, and operator guidance. \
-         Do not depend on Linear lanes as lifecycle authority; Linear remains a projection. \
-         Use one tool call at a time; do not issue parallel or batched tool calls in this signal turn. \
-         If a linear_issue_first_seen or open_issue_without_runtime observation reports an intake, \
-         control_active, or unexpected_nonterminal lane with no running_mob, call \
-         fugue_start_issue_mob for that issue immediately unless the payload is a configured \
-         Review action lane, Deploy lane, terminal, blocked, duplicate, or explicit pause reason. \
-         If a lane observation is classified as attention_or_terminal, do not start an issue mob \
-         from that observation alone. For a configured final-review/merge lane, wait for or act on \
-         a final_pr_gate_requested signal and use fugue_start_final_pr_gate with its exact typed \
-         request; do not substitute fugue_start_issue_mob. \
-         {review_instruction} \
-         For a configured Deploy lane, do not start the implementation mob and do not try to \
-         orchestrate merge/OTA yourself; Fugue host handles Deploy as a guarded mechanical \
-         transaction after verifying durable PR evidence, CI, WorkGraph blockers, and deploy \
-         policy. \
-         If a pr_handoff_monitor_changed signal reports ready_for_done, the PR is eligible for handoff. Inspect reviewer/WorkGraph evidence. {handoff_instruction} Report CI evidence literally: an empty check list means no checks were reported, not that checks ran successfully. \
-         Do not wait for an external flow-step feeder. If an active issue reports missing concrete handoff, stale worker_started signals, or offline issue peers, actively inspect/ask the issue mob for status or decide resume/replan through Kapellmeister-owned coordination. \
-         A linear_issue_moved signal means Fugue observed external projection drift from the \
-         issue lane map. It is not proof that lifecycle work completed, but it is an \
-         operator-visible intent/change that must be reconciled through Kapellmeister and \
-         the issue lead rather than ignored as mere projection noise. \
-         If a linear_issue_commented or linear_issue_comment_changed signal includes \
-         operator_review_finding, treat that field as concrete issue rework input from an \
-         operator/repo reviewer. Tell the issue lead to replan and drive worker changes from \
-         that finding; do not classify it as a passive final-gate wait, acceptance hold, or \
-         standby condition. \
-         When writing Linear Workpad/status evidence from repo scope, pass the explicit issue \
-         identifier from the signal payload to the Linear tool call. \
-         You do not have shell/worktree authority. If reviewer-green evidence has no pushed \
-         branch/head SHA yet, ask the issue lead to have the coder commit and push the reviewed \
-         scoped changes before you call github_create_pr. If a runtime_recovered signal carries \
-         workspace.branch, workspace.head_sha, workspace.upstream_branch, matching \
-         workspace.upstream_head_sha, and dirty=false, treat that as durable pushed-branch \
-         evidence. When that pushed-branch evidence is present and no PR exists for the branch, \
-         create or update the PR yourself with github_create_pr; do not ask the issue lead for an \
-         extra PR creation request. If github_create_pr returns an open PR, newly created or \
-         already existing, tell the issue lead the PR number/URL/head branch and ask it to record \
-         PR handoff evidence while keeping ordinary issue-mob work on the active projection lane. \
-         Do not ask issue agents to move issues into configured Review, Deploy, or \
-         final-review action lanes; those lanes are operator or host-observed control inputs. \
-         Merge is not implicit repo authority: accepted review and CI evidence supports a handoff, \
-         but it is not merge authorization. Do not merge a PR unless Deploy policy or an operator \
-         explicitly approves that specific PR merge in the current session. \
-         If a Meerkat mob operator tool such as list_members returns access_denied, treat that as a scope boundary and continue from these signals and comms peers.\n\n\
-         ```json\n{payload}\n```"
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(dead_code)]
@@ -11050,7 +10998,9 @@ mod tests {
             )
             .without_native_worker_execution()
         } else {
-            Orchestrator::new(manager, refresh_rx).without_native_worker_execution()
+            Orchestrator::new(manager, refresh_rx)
+                .unwrap()
+                .without_native_worker_execution()
         }
     }
 
@@ -11066,6 +11016,43 @@ mod tests {
             }),
         );
         definition
+    }
+
+    #[test]
+    fn tracker_modules_share_the_resolved_host_signal_binding() {
+        let mut config = native_control_plane_config();
+        config.meerkat.state_root = Some(PathBuf::from("/tmp/example-repository-runtime"));
+        config.mob.mcp_servers = BTreeMap::from([
+            (
+                "linear".to_owned(),
+                NativeMcpServerConfig {
+                    command: vec!["fugue-linear-mcp".to_owned()],
+                    url: None,
+                    env: BTreeMap::new(),
+                },
+            ),
+            (
+                "linear_projection".to_owned(),
+                NativeMcpServerConfig {
+                    command: vec!["fugue-linear-mcp".to_owned()],
+                    url: None,
+                    env: BTreeMap::new(),
+                },
+            ),
+        ]);
+        let expected = HostSignalBinding::from_config(&config).unwrap();
+        let servers = host_signal_mcp_servers(&config).unwrap();
+        for name in ["linear", "linear_projection"] {
+            let encoded = &servers[name].env[crate::host_signal_journal::HOST_SIGNAL_BINDING_ENV];
+            assert_eq!(HostSignalBinding::decode(encoded).unwrap(), expected);
+            assert!(!encoded.contains("token"));
+        }
+        assert!(
+            expected
+                .scope
+                .runtime_path
+                .starts_with("/tmp/example-repository-runtime")
+        );
     }
 
     fn native_control_plane_config() -> ServiceConfig {
@@ -11120,16 +11107,140 @@ mod tests {
     ) -> (Orchestrator, Arc<RecordingNativeMobExecutionHost>) {
         let (refresh_tx, refresh_rx) = mpsc::channel(1);
         drop(refresh_tx);
+        let directory = tempfile::tempdir().unwrap();
         let manager = WorkflowConfigManager::from_definition_for_test(
-            PathBuf::from("/tmp/fugue.yaml"),
+            directory.path().join("fugue.yaml"),
             definition,
         )
         .unwrap();
         let native_host = Arc::new(RecordingNativeMobExecutionHost::default());
-        (
-            Orchestrator::new_with_native_execution_host(manager, refresh_rx, native_host.clone()),
-            native_host,
-        )
+        let mut orchestrator =
+            Orchestrator::new_with_native_execution_host(manager, refresh_rx, native_host.clone());
+        orchestrator.test_directory = Some(directory);
+        (orchestrator, native_host)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_signal_tick_drains_saved_work_before_tracker_backoff_and_missing_auth() {
+        const TEST: &str = "orchestrator::tests::host_signal_tick_drains_saved_work_before_tracker_backoff_and_missing_auth";
+        const MARKER: &str = "FUGUE_SIGNAL_TICK_FIXTURE";
+        if std::env::var(MARKER).ok().as_deref() != Some(TEST) {
+            let output = StdCommand::new(std::env::current_exe().unwrap())
+                .env(MARKER, TEST)
+                .args([TEST, "--exact", "--nocapture"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut definition = native_kapellmeister_workflow_definition();
+        definition.config.insert(
+            "meerkat".to_owned(),
+            json!({
+                "command": "true", "state_root": directory.path().join("native"),
+            }),
+        );
+        definition.config.insert(
+            "tracker".to_owned(),
+            json!({
+                "kind": "linear", "endpoint": "http://127.0.0.1:1/graphql",
+                "project_slug": "fixture", "api_key": "",
+            }),
+        );
+        let make = || {
+            let manager = WorkflowConfigManager::from_definition_for_test(
+                directory.path().join("fugue.yaml"),
+                definition.clone(),
+            )
+            .unwrap();
+            let (_, receiver) = mpsc::channel(1);
+            let mut orchestrator = Orchestrator::new(manager, receiver).unwrap();
+            // Keep the real native runtime and sender; omit irrelevant network tools.
+            orchestrator.meta_runtime_registry = MetaRuntimeRegistry::with_templates(
+                orchestrator.config.effective().meerkat.clone(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .with_host_signal_binding(orchestrator.host_signal_binding.clone());
+            orchestrator
+        };
+        let first = make();
+        let signal =
+            worker_finished_signal("TEST-1", WorkerExit::Normal, None, 1, false, Utc::now());
+        first
+            .enqueue_host_signals(std::slice::from_ref(&signal))
+            .unwrap();
+        let saved = first
+            .host_signal_binding
+            .open()
+            .unwrap()
+            .pending(10)
+            .unwrap();
+        assert_eq!(saved.len(), 1);
+        drop(first);
+        let mut restored = make();
+        restored.enqueue_host_signals(&[signal]).unwrap();
+        assert_eq!(
+            restored
+                .host_signal_binding
+                .open()
+                .unwrap()
+                .pending(10)
+                .unwrap(),
+            saved
+        );
+        restored.linear_backoff_until = Some(Utc::now() + chrono::Duration::hours(1));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                restored.tick().await;
+                if restored
+                    .host_signal_binding
+                    .open()
+                    .unwrap()
+                    .pending(10)
+                    .unwrap()
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("backoff must not strand saved work");
+        let second =
+            worker_finished_signal("TEST-2", WorkerExit::Normal, None, 1, false, Utc::now());
+        restored.enqueue_host_signals(&[second]).unwrap();
+        restored.linear_backoff_until = None;
+        assert!(
+            restored.config.validate_dispatch().is_err(),
+            "tracker authentication remains missing"
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                restored.tick().await;
+                if restored
+                    .host_signal_binding
+                    .open()
+                    .unwrap()
+                    .pending(10)
+                    .unwrap()
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("missing tracker auth must not strand saved work");
+        restored.meta_runtime_registry.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -11399,20 +11510,6 @@ mod tests {
             classify_issue_lane(&config, "In Progress"),
             IssueLaneClassification::UnexpectedNonterminal
         );
-    }
-
-    #[test]
-    fn recent_signal_deduper_accepts_once_per_signal_id() {
-        let mut deduper = RecentSignalDeduper::new(2);
-        let first = ShadowSignalId("sig-first".to_string());
-        let second = ShadowSignalId("sig-second".to_string());
-        let third = ShadowSignalId("sig-third".to_string());
-
-        assert!(deduper.accept(&first));
-        assert!(!deduper.accept(&first));
-        assert!(deduper.accept(&second));
-        assert!(deduper.accept(&third));
-        assert!(deduper.accept(&first));
     }
 
     #[test]
@@ -15889,7 +15986,7 @@ worker:
             definition,
         )
         .unwrap();
-        let orchestrator = Orchestrator::new(manager, refresh_rx);
+        let orchestrator = Orchestrator::new(manager, refresh_rx).unwrap();
 
         orchestrator
             .schedule_retry(

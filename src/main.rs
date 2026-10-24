@@ -483,7 +483,7 @@ async fn run() -> anyhow::Result<()> {
     }
 
     let (refresh_tx, refresh_rx) = mpsc::channel(8);
-    let mut orchestrator = Orchestrator::new(manager, refresh_rx);
+    let mut orchestrator = Orchestrator::new(manager, refresh_rx)?;
     let state = orchestrator.shared_state();
     let internal_tx = orchestrator.internal_sender();
     let meta_runtime_registry = orchestrator.meta_runtime_registry();

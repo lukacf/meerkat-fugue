@@ -1,3 +1,4 @@
+use crate::host_signal_journal::HostSignalBinding;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -43,8 +44,8 @@ use crate::independent_review::{
     independent_review_completion_input_schema,
 };
 use crate::linear_tools::{
-    LINEAR_ACTION_STATES_ENV, LINEAR_REVIEW_HANDOFF_STATES_ENV,
-    execute_linear_fugue_tool_with_review_handoff_states, is_linear_fugue_tool_name,
+    LINEAR_ACTION_STATES_ENV, LINEAR_REVIEW_HANDOFF_STATES_ENV, execute_linear_fugue_tool_bound,
+    is_linear_fugue_tool_name,
 };
 use crate::mob_tools::{NativeMobExecutionHost, NativeMobLaunchPlan, ObserveStructuralEventsInput};
 use crate::tools::{
@@ -62,9 +63,8 @@ use crate::workgraph_gate::{
 #[cfg(test)]
 use crate::tools::{LinearStateRef, MoveIssueInput};
 
-const RUNTIME_KEY: &str = "fugue";
 const MOB_ID: &str = crate::native_mob_contract::FUGUE_MOB_ID;
-const KAPELLMEISTER: &str = "kapellmeister";
+pub(crate) const KAPELLMEISTER: &str = "kapellmeister";
 const ISSUE_LEAD: &str = "issue_lead";
 const FUGUE_CONTEXT_KEY: &str = "fugue";
 const FUGUE_CONTEXT_WORKTREE_PATH_KEY: &str = "worktree_path";
@@ -74,12 +74,6 @@ const META_EVENT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_NATIVE_MAX_ORPHANED_TURNS: u32 = 128;
 const TURN_LIMIT_PHASE: &str = "turn_limit_reached";
 const MEMBER_TERMINAL_FAILURE_PHASE: &str = "member_terminal_failure";
-
-#[derive(Debug, Clone)]
-pub struct FugueHostSignalAccepted {
-    pub interaction_id: String,
-    pub identity: String,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -189,6 +183,7 @@ pub struct MetaRuntimeRegistry {
     meerkat: MeerkatConfig,
     repo_mcp_servers: BTreeMap<String, NativeMcpServerConfig>,
     tracker: TrackerConfig,
+    host_signal_binding: Option<HostSignalBinding>,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
     templates: BTreeMap<String, MaterializedMobTemplate>,
@@ -422,6 +417,7 @@ impl MetaRuntimeRegistry {
             review_orchestrator_profile: self.independent_review.orchestrator_profile.clone(),
             independent_review_enabled: self.reviews_enabled(),
             tracker: self.tracker.clone(),
+            host_signal_binding: self.host_signal_binding.clone(),
             host_api_url: self.host_api_url.clone(),
             host_api_auth: self.host_api_auth.clone(),
             github_repo: github_repo_from_mcp_servers(&self.repo_mcp_servers)?,
@@ -489,6 +485,7 @@ impl MetaRuntimeRegistry {
             meerkat,
             repo_mcp_servers,
             tracker,
+            host_signal_binding: None,
             host_api_url,
             host_api_auth,
             templates,
@@ -505,6 +502,11 @@ impl MetaRuntimeRegistry {
             stopping: Arc::new(AtomicBool::new(false)),
             launch_tasks: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub fn with_host_signal_binding(mut self, binding: HostSignalBinding) -> Self {
+        self.host_signal_binding = Some(binding);
+        self
     }
 
     pub fn with_repo_mcp_servers(
@@ -647,33 +649,117 @@ impl MetaRuntimeRegistry {
         )
     }
 
-    pub async fn deliver_repo_kapellmeister_signal_batch(
+    pub async fn deliver_repo_kapellmeister_signal(
         &self,
-        content: String,
-    ) -> Result<FugueHostSignalAccepted, String> {
+        scope: &crate::host_signal_journal::HostSignalScope,
+        signal: &crate::host_signal_journal::PendingSignal,
+    ) -> Result<meerkat_contracts::WireContinuationReceipt, String> {
+        self.validate_host_signal_scope(scope)?;
         let runtime = self.runtime().await?;
         {
             let _bootstrap_guard = self.kapellmeister_bootstrap.lock().await;
             self.ensure_repo_kapellmeister_member(&runtime).await?;
         }
-        // A host observation must reach the coordinator even when another
-        // member's wiring is the failure being reported. Admission owns wiring.
+        let handle = runtime.mob_handle();
+        if handle.mob_id().as_str() != scope.mob_id {
+            return Err("host signal mob does not match the active native owner".into());
+        }
+        let mode = match signal.envelope.mode {
+            crate::host_signal_journal::SignalHandlingMode::Steer => HandlingMode::Steer,
+        };
+        // This is the public native admission door also used by Meta's keyed
+        // identity sender. Use the original spawn identity for this Core member.
+        // Native continuation service owns admission, replay and lifecycle.
         runtime
-            .mob_handle()
-            .member(&AgentIdentity::from(KAPELLMEISTER))
+            .mob_runtime()
+            .agent_mob_mcp_state()
+            .ok_or("native member continuation service is unavailable")?
+            .mob_member_send_keyed(
+                handle.mob_id(),
+                AgentIdentity::from(scope.member.as_str()),
+                signal.envelope.content.clone().into(),
+                mode,
+                &signal.key.0,
+            )
             .await
-            .map_err(|err| format!("resolve Kapellmeister member: {err}"))?
-            .send(content, HandlingMode::Steer)
-            .await
-            .map_err(|err| format!("deliver Kapellmeister host signal: {err}"))?;
-        let interaction_id = format!(
-            "fugue-host-signal-repo-kapellmeister-{}",
-            Utc::now().timestamp_millis()
-        );
-        Ok(FugueHostSignalAccepted {
-            interaction_id,
-            identity: format!("{RUNTIME_KEY}/{KAPELLMEISTER}"),
-        })
+            .map_err(|error| format!("admit coordinator host signal: {error}"))
+    }
+
+    fn validate_host_signal_scope(
+        &self,
+        scope: &crate::host_signal_journal::HostSignalScope,
+    ) -> Result<(), String> {
+        let binding = self
+            .host_signal_binding
+            .as_ref()
+            .ok_or("host signal routing is not configured")?;
+        if scope != &binding.scope
+            || scope.member != KAPELLMEISTER
+            || scope.mob_id != self.meerkat.mob_id()
+            || scope.runtime_path
+                != std::path::absolute(self.state_path()).map_err(|error| error.to_string())?
+        {
+            return Err("host signal scope does not match the coordinator runtime".into());
+        }
+        Ok(())
+    }
+
+    pub async fn observe_repo_kapellmeister_input(
+        &self,
+        scope: &crate::host_signal_journal::HostSignalScope,
+        receipt: &meerkat_contracts::WireContinuationReceipt,
+    ) -> Result<crate::host_signal_journal::NativeInputObservation, String> {
+        use crate::host_signal_journal::{InputUnavailable, NativeInputObservation};
+        use meerkat_contracts::WireContinuationStatus;
+        use meerkat_runtime::{RuntimeDriverError, RuntimeState, SessionServiceRuntimeExt};
+        self.validate_host_signal_scope(scope)?;
+        let WireContinuationStatus::Admitted {
+            session_id,
+            input_id,
+        } = &receipt.status
+        else {
+            return Err("input observation requires native admission".into());
+        };
+        let session =
+            meerkat_core::SessionId::parse(session_id).map_err(|error| error.to_string())?;
+        let input = uuid::Uuid::parse_str(input_id)
+            .map(meerkat_core::lifecycle::InputId)
+            .map_err(|error| error.to_string())?;
+        let runtime = self.runtime().await?;
+        if runtime.mob_handle().mob_id().as_str() != scope.mob_id {
+            return Err("host signal mob does not match the active native owner".into());
+        }
+        let Some(service) = runtime.mob_runtime().session_service() else {
+            return Ok(NativeInputObservation::Unresolvable(
+                InputUnavailable::MissingSessionService,
+            ));
+        };
+        let Some(machine) = service
+            .acquire_runtime_adapter(None)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(NativeInputObservation::Unresolvable(
+                InputUnavailable::MissingRuntimeAdapter,
+            ));
+        };
+        match machine.input_state(&session, &input).await {
+            Ok(Some(state)) => Ok(NativeInputObservation::Present(Box::new(state))),
+            Ok(None) => Ok(NativeInputObservation::Unresolvable(
+                InputUnavailable::MissingInput,
+            )),
+            Err(RuntimeDriverError::NotFound { .. }) => Ok(NativeInputObservation::Unresolvable(
+                InputUnavailable::MissingRuntime,
+            )),
+            Err(
+                RuntimeDriverError::Destroyed
+                | RuntimeDriverError::NotReady {
+                    state: RuntimeState::Destroyed,
+                },
+            ) => Ok(NativeInputObservation::Unresolvable(
+                InputUnavailable::DestroyedRuntime,
+            )),
+            Err(error) => Err(format!("observe native coordinator input: {error}")),
+        }
     }
 
     pub fn use_console(&self, console: Arc<crate::console::ConsoleHub>) -> Result<(), String> {
@@ -736,6 +822,7 @@ impl MetaRuntimeRegistry {
             self.review_runtime_config(),
             self.repo_mcp_servers.clone(),
             self.tracker.clone(),
+            self.host_signal_binding.clone(),
             self.host_api_url.clone(),
             self.host_api_auth.clone(),
         )?;
@@ -961,6 +1048,7 @@ struct FugueDirectToolSessionHook {
     review_orchestrator_profile: String,
     independent_review_enabled: bool,
     tracker: TrackerConfig,
+    host_signal_binding: Option<HostSignalBinding>,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
     github_repo: Option<GitHubRepoRef>,
@@ -1041,6 +1129,7 @@ impl SessionHook for FugueDirectToolSessionHook {
             self.workgraph_gate.clone(),
             self.independent_review_enabled,
             self.connections.clone(),
+            self.host_signal_binding.clone(),
         );
         let existing_tools = build.external_tools.take();
         let fugue_tools = match workspace_root {
@@ -1231,6 +1320,7 @@ impl HostToolAuthority {
 struct FugueDirectToolDispatcher {
     github: crate::github_tools::GitHubToolHost,
     tracker: TrackerConfig,
+    host_signal_binding: Option<HostSignalBinding>,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
     allow_issue_mutation: bool,
@@ -1332,11 +1422,12 @@ impl AgentToolDispatcher for FugueDirectToolDispatcher {
                     .into());
                 }
             }
-            let (is_error, content) = execute_linear_fugue_tool_with_review_handoff_states(
+            let (is_error, content) = execute_linear_fugue_tool_bound(
                 &self.tracker,
                 call.name,
                 &arguments,
                 &self.review_handoff_states,
+                self.host_signal_binding.as_ref(),
             )
             .await;
             return Ok(ToolResult::new(call.id.to_string(), content, is_error).into());
@@ -1432,6 +1523,7 @@ fn direct_tool_dispatcher(
     workgraph_gate: WorkGraphTerminalGate,
     independent_review_enabled: bool,
     connections: Option<Arc<crate::setup::connections::Connections>>,
+    host_signal_binding: Option<HostSignalBinding>,
 ) -> Arc<dyn AgentToolDispatcher> {
     let allow_issue_mutation = authority.can_move_issue();
     let tracker = tracker.clone();
@@ -1535,6 +1627,7 @@ fn direct_tool_dispatcher(
     Arc::new(FugueDirectToolDispatcher {
         github: crate::github_tools::GitHubToolHost::with_connections(connections),
         tracker,
+        host_signal_binding,
         host_api_url,
         host_api_auth,
         allow_issue_mutation,
@@ -1680,6 +1773,7 @@ fn build_unified_runtime(
     independent_review: IndependentReviewConfig,
     servers: BTreeMap<String, NativeMcpServerConfig>,
     tracker: TrackerConfig,
+    host_signal_binding: Option<HostSignalBinding>,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
 ) -> Result<(UnifiedRuntime, Option<tokio::runtime::Runtime>), String> {
@@ -1723,6 +1817,7 @@ fn build_unified_runtime(
                 review_orchestrator_profile: independent_review.orchestrator_profile,
                 independent_review_enabled: independent_review.enabled,
                 tracker,
+                host_signal_binding,
                 host_api_url,
                 host_api_auth,
                 github_repo,
@@ -1733,7 +1828,7 @@ fn build_unified_runtime(
             .timeout(Duration::from_secs(30))
             .max_sessions(max_sessions);
         #[cfg(test)]
-        let builder = builder.default_llm_client(Arc::new(meerkat_llm_core::TestClient::default()));
+        let builder = builder.default_llm_client(tests::runtime_test_llm_client());
         builder
             .build()
             .await
@@ -4041,6 +4136,15 @@ pub(crate) mod tests {
             )
             .expect("retain isolated runtime stderr");
         }
+        if name.starts_with("admitted_host_signal_")
+            && let Some(directory) = std::env::var_os("FUGUE_TEST_EVIDENCE_DIR")
+        {
+            let directory = PathBuf::from(directory);
+            std::fs::write(directory.join(format!("{name}.stdout.log")), &output.stdout)
+                .expect("retain host signal stdout");
+            std::fs::write(directory.join(format!("{name}.stderr.log")), &output.stderr)
+                .expect("retain host signal stderr");
+        }
         assert!(
             output.status.success(),
             "isolated {name} failed:\n{}\n{}",
@@ -4212,6 +4316,7 @@ pub(crate) mod tests {
             WorkGraphTerminalGate::new("/unused/workgraph.sqlite3", Vec::new(), Vec::new()),
             true,
             None,
+            None,
         )
     }
 
@@ -4228,6 +4333,7 @@ pub(crate) mod tests {
             Vec::new(),
             WorkGraphTerminalGate::new("/unused/workgraph.sqlite3", Vec::new(), Vec::new()),
             false,
+            None,
             None,
         );
         assert!(!tools.tools().iter().any(|tool| {
@@ -4521,6 +4627,7 @@ pub(crate) mod tests {
                     gate.clone(),
                     false,
                     None,
+                    None,
                 );
                 let mut input = json!({
                     "issue": issue_ref, "assignee": {"kind":"id", "id":"operator"},
@@ -4758,6 +4865,7 @@ pub(crate) mod tests {
             review_orchestrator_profile: IndependentReviewConfig::default().orchestrator_profile,
             independent_review_enabled: false,
             tracker: tracker_with_key(),
+            host_signal_binding: None,
             host_api_url: None,
             host_api_auth: None,
             github_repo: None,
@@ -4885,6 +4993,7 @@ pub(crate) mod tests {
             review_orchestrator_profile: IndependentReviewConfig::default().orchestrator_profile,
             independent_review_enabled: false,
             tracker: tracker_with_key(),
+            host_signal_binding: None,
             host_api_url: None,
             host_api_auth: None,
             github_repo: None,
@@ -5059,6 +5168,76 @@ pub(crate) mod tests {
         assert_eq!(
             arguments.pointer("/head_branch").and_then(Value::as_str),
             Some("luka/luc-619-find-3-bugs-and-fix-them")
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_tracker_dispatch_records_the_repository_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let definition = crate::config::WorkflowDefinition {
+            config: json!({"tracker": {
+                "kind": "fugue-ims", "endpoint": temp.path().join("issues.sqlite3"),
+                "project_slug": "example/app", "active_states": ["Queued", "Active"],
+                "terminal_states": ["Done"]
+            }})
+            .as_object()
+            .unwrap()
+            .clone(),
+            prompt_template: String::new(),
+        };
+        let config = crate::config::ServiceConfig::from_definition(
+            temp.path().join("fugue.yaml"),
+            &definition,
+        )
+        .unwrap();
+        let store = crate::fugue_ims::FugueImsStore::from_config(&config.tracker).unwrap();
+        store
+            .create_issue(crate::fugue_ims::CreateFugueIssue {
+                key: crate::ims::ImsIssueKey("APP-1".into()),
+                repo: "example/app".into(),
+                title: "Embedded journal dispatch".into(),
+                description: None,
+                stage: crate::ims::ImsStageName("Queued".into()),
+                labels: Vec::new(),
+            })
+            .unwrap();
+        let binding = HostSignalBinding::from_config(&config).unwrap();
+        binding.record_internal_lane("APP-1", "Queued").unwrap();
+        let before = binding.open().unwrap().revision().unwrap();
+        let dispatcher = direct_tool_dispatcher(
+            &config.tracker,
+            None,
+            None,
+            HostToolAuthority::IssueLead,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            WorkGraphTerminalGate::for_service(&config),
+            false,
+            None,
+            Some(binding.clone()),
+        );
+        let args = serde_json::value::to_raw_value(&json!({
+            "issue": {"kind": "identifier", "identifier": "APP-1"},
+            "state": {"kind": "name", "name": "Active"}, "idempotency_key": "embedded-move"
+        }))
+        .unwrap();
+        let outcome = dispatcher
+            .dispatch(ToolCallView {
+                id: "move",
+                name: "linear_move_issue",
+                args: &args,
+            })
+            .await
+            .unwrap();
+        assert!(!outcome.result.is_error, "{:?}", outcome.result.content);
+        let mut journal = binding.open().unwrap();
+        assert_ne!(journal.revision().unwrap(), before);
+        assert!(journal.pending(10).unwrap().is_empty());
+        assert_eq!(
+            journal.begin().unwrap().observe_lane("APP-1", "Active"),
+            crate::linear_lane_state::LinearLaneObservation::Unchanged
         );
     }
 
@@ -5582,21 +5761,42 @@ pub(crate) mod tests {
             .bootstrap_repo_kapellmeister()
             .await
             .expect("initial coordinator");
-        // Reuse the same native owner but require an absent representative. A
-        // failed repository wiring pass must not prevent host diagnostics.
+        // A failed peer-wiring pass must not prevent subsequent diagnostics.
+        let original_meerkat = registry.meerkat.clone();
         registry.meerkat.repository_runtime = Some(crate::config::RepositoryRuntimeBinding {
             repository: crate::ensemble::config::RepoId::try_from("unavailable-peer".to_owned())
                 .expect("repo id"),
             state_path: temp.path().join("state"),
         });
         assert!(registry.bootstrap_repo_kapellmeister().await.is_err());
+        registry.meerkat = original_meerkat;
         let message = "Fugue host signal fixture: worker completed fixture-123";
+        let scope = crate::host_signal_journal::HostSignalScope {
+            repository_path: temp.path().to_owned(),
+            runtime_path: std::path::absolute(registry.state_path()).unwrap(),
+            mob_id: registry.meerkat.mob_id().into_owned(),
+            member: KAPELLMEISTER.to_owned(),
+            tracker: crate::host_signal_journal::TrackerScope::Linear {
+                endpoint: "https://api.linear.app/graphql".to_owned(),
+                project: "fixture".to_owned(),
+            },
+        };
+        registry.host_signal_binding = Some(HostSignalBinding {
+            path: temp.path().join("signals.sqlite3"),
+            scope: scope.clone(),
+        });
+        let signal = crate::host_signal_journal::PendingSignal {
+            key: crate::host_signal_journal::DeliveryKey("fugue-history-fixture".to_owned()),
+            envelope: crate::host_signal_journal::SignalEnvelope {
+                content: message.to_owned(),
+                mode: crate::host_signal_journal::SignalHandlingMode::Steer,
+            },
+        };
         let accepted = registry
-            .deliver_repo_kapellmeister_signal_batch(message.to_owned())
+            .deliver_repo_kapellmeister_signal(&scope, &signal)
             .await
             .expect("native signal acceptance");
-        assert_eq!(accepted.identity, format!("{RUNTIME_KEY}/{KAPELLMEISTER}"));
-        assert!(!accepted.interaction_id.is_empty());
+        assert!(!accepted.delivery_id.is_empty());
         let runtime = registry.runtime().await.expect("runtime");
         let member = runtime
             .mob_handle()
@@ -5626,28 +5826,584 @@ pub(crate) mod tests {
         delivered.expect("host signal must reach the native coordinator session");
     }
 
+    static HOST_SIGNAL_BLOCKING_CLIENT: OnceLock<Arc<HostSignalBlockingClient>> = OnceLock::new();
+
+    pub(super) fn runtime_test_llm_client() -> Arc<dyn meerkat_llm_core::LlmClient> {
+        match HOST_SIGNAL_BLOCKING_CLIENT.get() {
+            Some(client) => Arc::clone(client) as Arc<dyn meerkat_llm_core::LlmClient>,
+            None => Arc::new(meerkat_llm_core::TestClient::default()),
+        }
+    }
+
+    #[derive(Default)]
+    struct HostSignalBlockingClient {
+        block: AtomicBool,
+        entered: tokio::sync::Notify,
+        normal: meerkat_llm_core::TestClient,
+    }
+
+    #[async_trait]
+    impl meerkat_llm_core::LlmClient for HostSignalBlockingClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_llm_core::LlmError> {
+            self.normal.project_replay_messages(messages)
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a meerkat_llm_core::LlmRequest,
+        ) -> meerkat_llm_core::LlmStream<'a> {
+            if self.block.load(Ordering::SeqCst) {
+                self.entered.notify_one();
+                Box::pin(futures::stream::pending())
+            } else {
+                self.normal.stream(request)
+            }
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Other
+        }
+
+        async fn health_check(&self) -> Result<(), meerkat_llm_core::LlmError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admitted_host_signal_queued_at_stop_remains_recoverable() {
+        const NAME: &str = "admitted_host_signal_queued_at_stop_remains_recoverable";
+        if !isolated_runtime_test(NAME) {
+            return;
+        }
+        assert_queued_host_signal_recovery(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admitted_host_signal_acknowledged_at_stop_remains_recoverable() {
+        const NAME: &str = "admitted_host_signal_acknowledged_at_stop_remains_recoverable";
+        if !isolated_runtime_test(NAME) {
+            return;
+        }
+        assert_queued_host_signal_recovery(true).await;
+    }
+
+    async fn assert_queued_host_signal_recovery(acknowledge_before_stop: bool) {
+        use crate::host_signal_journal::{
+            HostSignalScope, SignalEnvelope, SignalHandlingMode, TrackerScope,
+        };
+        use meerkat_contracts::WireContinuationStatus;
+        use meerkat_runtime::{
+            InputAbandonReason, InputLifecycleState, InputTerminalOutcome, SessionServiceRuntimeExt,
+        };
+        let evidence = host_signal_evidence("host-signal-queued-stop-");
+        let root = evidence.0.as_ref().unwrap().path();
+        let client = Arc::new(HostSignalBlockingClient::default());
+        client.block.store(true, Ordering::SeqCst);
+        assert!(HOST_SIGNAL_BLOCKING_CLIENT.set(Arc::clone(&client)).is_ok());
+        let config = test_meerkat_config(root.join("state"));
+        let scope = HostSignalScope {
+            repository_path: root.to_owned(),
+            runtime_path: meta_runtime_state_path(&config),
+            mob_id: config.mob_id().into_owned(),
+            member: KAPELLMEISTER.to_owned(),
+            tracker: TrackerScope::Internal {
+                database: root.join("issues.sqlite3"),
+                repository: "fixture".into(),
+            },
+        };
+        let binding = HostSignalBinding {
+            path: root.join("signals.sqlite3"),
+            scope: scope.clone(),
+        };
+        let registry =
+            MetaRuntimeRegistry::with_templates(config.clone(), BTreeMap::new(), BTreeMap::new())
+                .with_host_signal_binding(binding.clone());
+        registry.bootstrap_repo_kapellmeister().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), client.entered.notified())
+            .await
+            .expect("bootstrap provider request must be in flight");
+        let mut journal = binding.open().unwrap();
+        let mut update = journal.begin().unwrap();
+        update
+            .enqueue_once("queued-stop-fixture", || {
+                Ok(SignalEnvelope {
+                    content: "notification queued during a provider request".into(),
+                    mode: SignalHandlingMode::Steer,
+                })
+            })
+            .unwrap();
+        update.commit().unwrap();
+        drop(journal);
+        let saved = binding.open().unwrap().pending(1).unwrap().remove(0);
+        let admitted = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let receipt = registry
+                    .deliver_repo_kapellmeister_signal(&scope, &saved)
+                    .await
+                    .unwrap();
+                match receipt.status {
+                    WireContinuationStatus::Admitted { .. } => break receipt,
+                    WireContinuationStatus::Pending => {
+                        tokio::time::sleep(Duration::from_millis(20)).await
+                    }
+                    _ => panic!("unexpected terminal native admission: {receipt:?}"),
+                }
+            }
+        })
+        .await
+        .expect("native admission while the bootstrap provider request is held");
+        let (session_id, input_id) = match &admitted.status {
+            WireContinuationStatus::Admitted {
+                session_id,
+                input_id,
+            } => (
+                meerkat_core::SessionId::parse(session_id).unwrap(),
+                meerkat_core::lifecycle::InputId(uuid::Uuid::parse_str(input_id).unwrap()),
+            ),
+            other => panic!("expected native admission: {other:?}"),
+        };
+        let runtime = registry.runtime().await.unwrap();
+        let machine = runtime
+            .mob_runtime()
+            .session_service()
+            .unwrap()
+            .acquire_runtime_adapter(None)
+            .unwrap()
+            .unwrap();
+        let queued = machine
+            .input_state(&session_id, &input_id)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(
+            root.join("native-queued-input.json"),
+            serde_json::to_vec_pretty(&queued).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(queued.seed.phase, InputLifecycleState::Queued);
+        assert_eq!(queued.seed.last_run_id, None);
+        assert_eq!(queued.seed.attempt_count, 0);
+        if acknowledge_before_stop {
+            binding
+                .open()
+                .unwrap()
+                .acknowledge(&saved.key, &admitted)
+                .unwrap();
+        }
+        registry.shutdown().await.unwrap();
+        let stopped = machine
+            .input_state(&session_id, &input_id)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(
+            root.join("native-stopped-input.json"),
+            serde_json::to_vec_pretty(&stopped).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("native-admission.json"),
+            serde_json::to_vec_pretty(&admitted).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stopped.seed.phase, InputLifecycleState::Abandoned);
+        assert_eq!(
+            stopped.seed.terminal_outcome,
+            Some(InputTerminalOutcome::Abandoned {
+                reason: InputAbandonReason::Stopped,
+            })
+        );
+        assert_eq!(stopped.seed.last_run_id, None);
+        assert_eq!(stopped.seed.attempt_count, 0);
+        assert_eq!(stopped.state.stop_requeue, None);
+        drop(machine);
+        drop(runtime);
+        drop(registry);
+        client.block.store(false, Ordering::SeqCst);
+        let registry =
+            MetaRuntimeRegistry::with_templates(config, BTreeMap::new(), BTreeMap::new())
+                .with_host_signal_binding(binding.clone());
+        assert_eq!(
+            registry
+                .deliver_repo_kapellmeister_signal(&scope, &saved)
+                .await
+                .unwrap(),
+            admitted,
+            "native keyed replay still returns the original receipt after restart"
+        );
+        let result = binding
+            .drain_pending(std::num::NonZeroU32::MIN, |scope, signal| {
+                let registry = &registry;
+                let admitted = admitted.clone();
+                async move {
+                    let replay = registry
+                        .deliver_repo_kapellmeister_signal(&scope, &signal)
+                        .await
+                        .map_err(crate::error::FugueError::Workspace)?;
+                    assert_eq!(replay, admitted);
+                    Ok(replay)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            result.acknowledged,
+            u32::from(!acknowledge_before_stop),
+            "native admission remains distinct from consumption"
+        );
+        let runtime = registry.runtime().await.unwrap();
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let history = runtime
+                    .mob_runtime()
+                    .read_session_history(&session_id.to_string(), 0, None)
+                    .await
+                    .unwrap();
+                if serde_json::to_string(&history.messages)
+                    .unwrap()
+                    .contains(&saved.envelope.content)
+                {
+                    assert_eq!(
+                        history
+                            .messages
+                            .iter()
+                            .filter(|entry| serde_json::to_string(entry)
+                                .unwrap()
+                                .contains(&saved.envelope.content))
+                            .count(),
+                        1
+                    );
+                    if binding.open().unwrap().pending(1).unwrap().is_empty()
+                        && binding
+                            .open()
+                            .unwrap()
+                            .admitted_for_reconciliation(1)
+                            .unwrap()
+                            .is_empty()
+                    {
+                        return;
+                    }
+                }
+                reconcile_host_signal_fixture(&binding, &registry).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        registry.shutdown().await.unwrap();
+        recovered.expect(
+            "a queued notification must survive graceful stop and reach canonical history once",
+        );
+        let journal = rusqlite::Connection::open(&binding.path).unwrap();
+        assert_eq!(
+            journal
+                .query_row("SELECT count(*) FROM replacements", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            1,
+            "exactly one proven stopped input gets a successor key"
+        );
+        let final_receipt: String = journal
+            .query_row("SELECT admitted_receipt FROM deliveries", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        std::fs::write(root.join("native-recovered-admission.json"), &final_receipt).unwrap();
+        let final_receipt: meerkat_contracts::WireContinuationReceipt =
+            serde_json::from_str(&final_receipt).unwrap();
+        assert_ne!(final_receipt.delivery_id, admitted.delivery_id);
+    }
+
+    async fn reconcile_host_signal_fixture(
+        binding: &HostSignalBinding,
+        registry: &MetaRuntimeRegistry,
+    ) {
+        let progress = binding
+            .reconcile_admitted(std::num::NonZeroU32::MIN, |scope, receipt| async move {
+                registry
+                    .observe_repo_kapellmeister_input(&scope, &receipt)
+                    .await
+                    .map_err(crate::error::FugueError::Workspace)
+            })
+            .await
+            .unwrap();
+        assert!(
+            progress.attention.is_empty(),
+            "unexpected native terminal: {:?}",
+            progress.attention
+        );
+        assert!(
+            progress.unresolvable.is_empty(),
+            "unresolvable native input: {:?}",
+            progress.unresolvable
+        );
+        binding
+            .drain_pending(std::num::NonZeroU32::MIN, |scope, signal| async move {
+                registry
+                    .deliver_repo_kapellmeister_signal(&scope, &signal)
+                    .await
+                    .map_err(crate::error::FugueError::Workspace)
+            })
+            .await
+            .unwrap();
+    }
+
+    struct RuntimeFailureEvidence(Option<tempfile::TempDir>);
+    impl Drop for RuntimeFailureEvidence {
+        fn drop(&mut self) {
+            // An external qualifier can reject a zero exit after inspecting
+            // its transcript. It owns cleanup when an evidence root is set.
+            if (std::thread::panicking() || std::env::var_os("FUGUE_TEST_EVIDENCE_DIR").is_some())
+                && let Some(directory) = self.0.take()
+            {
+                eprintln!(
+                    "Retained runtime state for qualification: {}",
+                    directory.keep().display()
+                );
+            }
+        }
+    }
+    fn host_signal_evidence(prefix: &str) -> RuntimeFailureEvidence {
+        let directory = match std::env::var_os("FUGUE_TEST_EVIDENCE_DIR") {
+            Some(parent) => tempfile::Builder::new().prefix(prefix).tempdir_in(parent),
+            None => tempfile::Builder::new().prefix(prefix).tempdir(),
+        }
+        .expect("host signal evidence directory");
+        RuntimeFailureEvidence(Some(directory))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admitted_host_signal_replays_after_restart_without_duplicate_input() {
+        if !isolated_runtime_test(
+            "admitted_host_signal_replays_after_restart_without_duplicate_input",
+        ) {
+            return;
+        }
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let evidence = host_signal_evidence("host-signal-restart-");
+        let directory = evidence.0.as_ref().expect("host signal evidence owner");
+        assert_native_host_signal_replay(directory.path(), false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admitted_host_signal_replays_after_process_loss_without_duplicate_input() {
+        const NAME: &str =
+            "admitted_host_signal_replays_after_process_loss_without_duplicate_input";
+        if !isolated_runtime_test(NAME) {
+            return;
+        }
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        const ROOT: &str = "FUGUE_SIGNAL_CRASH_ROOT";
+        if let Some(root) = std::env::var_os(ROOT) {
+            assert_native_host_signal_replay(Path::new(&root), true, false).await;
+            panic!("child must exit before acknowledgement and runtime shutdown");
+        }
+        let evidence = host_signal_evidence("host-signal-process-loss-");
+        let directory = evidence.0.as_ref().expect("host signal evidence owner");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(ROOT, directory.path())
+            .env("FUGUE_ISOLATED_RUNTIME_TEST", NAME)
+            .arg(format!("meta_runtime::tests::{NAME}"))
+            .args(["--exact", "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_native_host_signal_replay(directory.path(), false, true).await;
+    }
+
+    async fn assert_native_host_signal_replay(
+        root: &Path,
+        exit_before_ack: bool,
+        restore_after_exit: bool,
+    ) {
+        use crate::host_signal_journal::{
+            HostSignalScope, SignalEnvelope, SignalHandlingMode, TrackerScope,
+        };
+        use meerkat_contracts::WireContinuationStatus;
+        let config = test_meerkat_config(root.join("state"));
+        let scope = HostSignalScope {
+            repository_path: root.to_owned(),
+            runtime_path: meta_runtime_state_path(&config),
+            mob_id: config.mob_id().into_owned(),
+            member: KAPELLMEISTER.to_owned(),
+            tracker: TrackerScope::Linear {
+                endpoint: "https://api.linear.app/graphql".to_owned(),
+                project: "fixture".to_owned(),
+            },
+        };
+        let binding = HostSignalBinding {
+            path: root.join("signals.sqlite3"),
+            scope: scope.clone(),
+        };
+        let message = "host notification survives native admission before journal acknowledgement";
+        {
+            let mut journal = binding.open().unwrap();
+            let mut update = journal.begin().unwrap();
+            update
+                .enqueue_once("fixture-completion", || {
+                    Ok(SignalEnvelope {
+                        content: message.to_owned(),
+                        mode: SignalHandlingMode::Steer,
+                    })
+                })
+                .unwrap();
+            update.commit().unwrap();
+        }
+        let accepted: meerkat_contracts::WireContinuationReceipt = if restore_after_exit {
+            serde_json::from_slice(&std::fs::read(root.join("native-admission.json")).unwrap())
+                .unwrap()
+        } else {
+            let registry = MetaRuntimeRegistry::with_templates(
+                config.clone(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .with_host_signal_binding(binding.clone());
+            let saved = binding.open().unwrap().pending(1).unwrap().remove(0);
+            let accepted = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let receipt = registry
+                        .deliver_repo_kapellmeister_signal(&scope, &saved)
+                        .await
+                        .unwrap();
+                    match receipt.status {
+                        WireContinuationStatus::Admitted { .. } => break receipt,
+                        WireContinuationStatus::Pending => {
+                            tokio::time::sleep(Duration::from_millis(20)).await
+                        }
+                        _ => panic!("unexpected terminal admission: {receipt:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("native admission");
+            // Native has admitted the input, but the host has not committed its ack.
+            assert_eq!(
+                binding.open().unwrap().pending(1).unwrap(),
+                vec![saved.clone()]
+            );
+            let mut conflict = saved.clone();
+            conflict.envelope.content.push_str(" changed");
+            assert!(
+                registry
+                    .deliver_repo_kapellmeister_signal(&scope, &conflict)
+                    .await
+                    .is_err(),
+                "the same key cannot commit changed content"
+            );
+            if exit_before_ack {
+                let path = root.join("native-admission.json");
+                let file = std::fs::File::create(path).unwrap();
+                serde_json::to_writer(&file, &accepted).unwrap();
+                file.sync_all().unwrap();
+                std::fs::File::open(root).unwrap().sync_all().unwrap();
+                std::process::exit(0);
+            }
+            registry.shutdown().await.unwrap();
+            // Keep the original admission-to-shutdown timing; only persist this
+            // diagnostic copy after the graceful shutdown under test.
+            std::fs::write(
+                root.join("native-admission.json"),
+                serde_json::to_vec_pretty(&accepted).unwrap(),
+            )
+            .unwrap();
+            drop(registry);
+            accepted
+        };
+        let saved = binding.open().unwrap().pending(1).unwrap().remove(0);
+        let registry =
+            MetaRuntimeRegistry::with_templates(config, BTreeMap::new(), BTreeMap::new())
+                .with_host_signal_binding(binding.clone());
+        let replayed = Arc::new(Mutex::new(None));
+        let progress = binding
+            .drain_pending(std::num::NonZeroU32::MIN, |scope, signal| {
+                let registry = &registry;
+                let replayed = Arc::clone(&replayed);
+                async move {
+                    let receipt = registry
+                        .deliver_repo_kapellmeister_signal(&scope, &signal)
+                        .await
+                        .map_err(crate::error::FugueError::Workspace)?;
+                    *replayed.lock().unwrap() = Some(receipt.clone());
+                    Ok(receipt)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            replayed.lock().unwrap().as_ref(),
+            Some(&accepted),
+            "restart must reuse the original native receipt and input"
+        );
+        std::fs::write(
+            root.join("native-replay.json"),
+            serde_json::to_vec_pretty(&*replayed.lock().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(progress.acknowledged, 1);
+        assert!(binding.open().unwrap().pending(1).unwrap().is_empty());
+        let runtime = registry.runtime().await.unwrap();
+        let session_id = match accepted.status {
+            WireContinuationStatus::Admitted { session_id, .. } => session_id,
+            _ => unreachable!(),
+        };
+        let mut last_history = None;
+        let history_result = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                reconcile_host_signal_fixture(&binding, &registry).await;
+                let history = runtime
+                    .mob_runtime()
+                    .read_session_history(&session_id, 0, None)
+                    .await
+                    .unwrap();
+                let serialized = serde_json::to_string(&history.messages).unwrap();
+                let contains_input = serialized.contains(message);
+                last_history = Some(serialized);
+                if contains_input {
+                    break history;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        std::fs::write(
+            root.join("canonical-history.json"),
+            last_history.as_deref().unwrap_or("null"),
+        )
+        .unwrap();
+        let history = history_result.expect("admitted input in canonical history");
+        assert_eq!(
+            history
+                .messages
+                .iter()
+                .filter(|entry| serde_json::to_string(entry).unwrap().contains(message))
+                .count(),
+            1
+        );
+        let mut wrong_scope = scope;
+        wrong_scope.mob_id = "other-repository".into();
+        assert!(
+            registry
+                .deliver_repo_kapellmeister_signal(&wrong_scope, &saved)
+                .await
+                .is_err()
+        );
+        registry.shutdown().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn runtime_members_emit_canonical_structural_events() {
         if !isolated_runtime_test("runtime_members_emit_canonical_structural_events") {
             return;
         }
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-        struct RuntimeFailureEvidence(Option<tempfile::TempDir>);
-        impl Drop for RuntimeFailureEvidence {
-            fn drop(&mut self) {
-                // An external qualifier can reject a zero exit after inspecting
-                // its transcript. It owns cleanup when an evidence root is set.
-                if (std::thread::panicking()
-                    || std::env::var_os("FUGUE_TEST_EVIDENCE_DIR").is_some())
-                    && let Some(directory) = self.0.take()
-                {
-                    eprintln!(
-                        "Retained runtime state for qualification: {}",
-                        directory.keep().display()
-                    );
-                }
-            }
-        }
         let directory = match std::env::var_os("FUGUE_TEST_EVIDENCE_DIR") {
             Some(parent) => tempfile::Builder::new()
                 .prefix("runtime-")

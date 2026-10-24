@@ -52,7 +52,7 @@ async fn run_real_e2e(config: &RealE2eConfig, context: &mut RealE2eContext) -> R
     manager.validate_dispatch()?;
 
     let (_refresh_tx, refresh_rx) = mpsc::channel(8);
-    let mut orchestrator = Orchestrator::new(manager, refresh_rx);
+    let mut orchestrator = Orchestrator::new(manager, refresh_rx).unwrap();
     let shutdown = CancellationToken::new();
     let orchestrator_shutdown = shutdown.clone();
     let orchestrator_handle =

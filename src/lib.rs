@@ -14,6 +14,7 @@ mod file_lease;
 pub mod final_pr_gate;
 pub mod fugue_ims;
 pub mod github_tools;
+pub mod host_signal_journal;
 pub mod http;
 pub mod ims;
 pub mod independent_review;

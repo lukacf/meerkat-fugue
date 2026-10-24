@@ -5282,7 +5282,7 @@ async fn record_deploy_projection(
         .guard_terminal_move(&config.tracker, &movement)
         .await
         .map_err(anyhow::Error::msg)?;
-    adapter.move_issue(movement).await?;
+    crate::linear_adapter::move_issue_with_observation(config, movement).await?;
     Ok(())
 }
 
@@ -6133,7 +6133,7 @@ mod tests {
         )
         .unwrap();
         let (refresh, receiver) = mpsc::channel(8);
-        let owner = crate::orchestrator::Orchestrator::new(manager, receiver);
+        let owner = crate::orchestrator::Orchestrator::new(manager, receiver).unwrap();
         let app = router(
             owner.shared_state(),
             owner.config().effective().clone(),
@@ -8563,7 +8563,7 @@ mod tests {
             prompt_template: "hi".to_string(),
         };
         let config =
-            ServiceConfig::from_definition(PathBuf::from("/tmp/fugue.yaml"), &definition).unwrap();
+            ServiceConfig::from_definition(temp.path().join("fugue.yaml"), &definition).unwrap();
         crate::fugue_ims::create_issue_for_config(
             &config.tracker,
             CreateFugueIssue {
@@ -9066,7 +9066,7 @@ mod tests {
             prompt_template: "hi".to_string(),
         };
         let config =
-            ServiceConfig::from_definition(PathBuf::from("/tmp/fugue.yaml"), &definition).unwrap();
+            ServiceConfig::from_definition(temp.path().join("fugue.yaml"), &definition).unwrap();
         crate::fugue_ims::create_issue_for_config(
             &config.tracker,
             CreateFugueIssue {
