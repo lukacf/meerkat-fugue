@@ -27,8 +27,8 @@
     const identity = make('div', 'portfolio-issue-title', '');
     identity.append(make('span', 'portfolio-identifier', issue.identifier), make('strong', '', issue.title));
     const text = make('div', 'portfolio-issue-content', '');
-    text.append(identity, make('small', '', issue.runtime?.kind === 'retrying' ? issue.runtime.error || 'Waiting to retry' : issue.runtime?.last_message || issue.runtime?.last_event || workspace.name));
-    row.append(make('span', `portfolio-state ${lane.kind === 'attention' ? 'attention' : ''}`, lane.name), text, make('span', 'portfolio-open', 'Open →'));
+    text.append(identity, make('small', '', issue.runtime?.launch_failure ? issue.runtime.launch_failure.message : issue.runtime?.kind === 'retrying' ? issue.runtime.error || 'Waiting to retry' : issue.runtime?.last_message || issue.runtime?.last_event || workspace.name));
+    row.append(make('span', `portfolio-state ${lane.kind === 'attention' || issue.runtime?.launch_failure ? 'attention' : ''}`, issue.runtime?.launch_failure ? 'Team startup failed' : lane.name), text, make('span', 'portfolio-open', 'Open →'));
     return row;
   }
   function message(text, action) {
@@ -54,7 +54,7 @@
     heading.id = `portfolio-${workspace.id || 'local'}`;
     card.setAttribute('aria-labelledby', heading.id);
     title.append(heading);
-    const status = !workspace.running ? 'Stopped' : !workspace.configured ? 'Configuration needed' : workspace.setupError ? 'Team preparation needs attention' : workspace.setupPhase === 'preparing' ? 'Preparing team' : workspace.board ? `${workspace.board.totals.running} running · ${workspace.board.totals.retrying} awaiting retry` : 'Board unavailable';
+    const status = !workspace.running ? 'Stopped' : !workspace.configured ? 'Configuration needed' : workspace.setupError ? 'Team preparation needs attention' : workspace.setupPhase === 'preparing' ? 'Preparing team' : workspace.board ? `${workspace.board.totals.running} running · ${workspace.board.totals.retrying} awaiting retry${workspace.board.totals.launch_failed ? ` · ${workspace.board.totals.launch_failed} team startup failed` : ''}` : 'Board unavailable';
     title.append(make('p', 'portfolio-repository-status', status));
     const target = workspace.running ? workspace.configured ? `${workspace.prefix}/issues` : `${workspace.prefix}/setup` : '/ensemble#repositoryWorkspacesPanel';
     header.append(title, link(!workspace.running ? 'Open repository' : workspace.configured ? 'Open board' : 'Continue setup', target));
@@ -128,7 +128,7 @@
             problems.push(problem);
           }
           for (const lane of workspace.board?.lanes || []) for (const issue of lane.issues) {
-            if (lane.kind === 'attention' || issue.runtime?.kind === 'retrying') attention.push({workspace, issue, lane});
+            if (lane.kind === 'attention' || issue.runtime?.kind === 'retrying' || issue.runtime?.launch_failure) attention.push({workspace, issue, lane});
             if (lane.kind === 'terminal') recent.push({workspace, issue, lane});
           }
         }

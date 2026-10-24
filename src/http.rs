@@ -1449,6 +1449,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
 
     const runtimePill = (runtime) => {
       if (!runtime) return "";
+      if (runtime.launch_failure) return `<span class="pill retry" title="${escapeHtml(runtime.launch_failure.message)}">Team startup failed</span>`;
       if (runtime.kind === "running") {
         const turns = runtime.turn_count === 1 ? "1 turn" : `${runtime.turn_count} turns`;
         return `<span class="pill run">Running &middot; ${escapeHtml(turns)}</span>`;
@@ -1459,7 +1460,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       return "";
     };
 
-    const runtimeKind = (runtime) => runtime ? runtime.kind : "none";
+    const runtimeKind = (runtime) => runtime?.launch_failure ? "launch_failed" : runtime ? runtime.kind : "none";
     const newtype = (value) => value && typeof value === "object" && "0" in value ? value["0"] : value;
     const issueByIdentifier = (identifier) => app.flatIssues.find((issue) => issue.identifier === identifier);
     const selectedIssueList = () => [...app.selectedIssues].map(issueByIdentifier).filter(Boolean);
@@ -1480,13 +1481,13 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       const selected = issue.identifier === app.selected ? " selected" : "";
       const multiSelected = app.selectedIssues.has(issue.identifier) ? " multi-selected" : "";
       // rework-note: non-running issue cards do not have measured turn evidence in this payload; avoid rendering a fabricated zero-turn count.
-      const turns = issue.runtime?.kind === "running" ? `${escapeHtml(issue.runtime.turn_count)}t` : "";
+      const turns = running ? `${escapeHtml(issue.runtime.turn_count)}t` : "";
       return `
         <button class="card${selected}${multiSelected}" data-issue="${escapeHtml(issue.identifier)}" data-runtime="${runtimeKind(issue.runtime)}" draggable="true" type="button">
           <div class="keyrow"><span class="key">${escapeHtml(issue.identifier)}</span>${priority}</div>
           <div class="title">${escapeHtml(issue.title)}</div>
           <div class="meta">${labels}</div>
-          <div class="footer"><span class="${running ? "run-state" : ""}">${running ? '<span class="run-dot"></span>Running · ' : ""}${turns}</span><span>${updated ? escapeHtml(updated) : ""}</span></div>
+          <div class="footer"><span class="${running ? "run-state" : ""}">${issue.runtime?.launch_failure ? "Team startup failed" : running ? '<span class="run-dot"></span>Running · ' : ""}${turns}</span><span>${updated ? escapeHtml(updated) : ""}</span></div>
         </button>
       `;
     };
@@ -2371,7 +2372,7 @@ const ISSUE_DETAIL_HTML: &str = r#"<!doctype html>
   const clearNotice = () => { $("notice").textContent = ""; $("notice").style.display = "none"; };
   const laneGlyph = (name) => ({Backlog:"○", Queue:"◉", Active:"◐", Review:"◇", Deploy:"↑", Blocked:"!", Done:"✓", Canceled:"×"}[name] || "○");
   const isAction = (lane) => detail?.lane_actions?.[lane];
-  const renderKpis = () => { const runtime = detail.runtime; $("kpiTime").textContent = "unavailable"; $("kpiShadow").textContent = "unavailable"; if (!runtime) { $("kpiRun").textContent = "unavailable"; $("kpiRetry").textContent = "unavailable"; $("kpiTok").textContent = "unavailable"; return; } if (runtime.kind === "running") { $("kpiRun").textContent = "1"; $("kpiRetry").textContent = "0"; $("kpiTok").textContent = String(runtime.token_total ?? "unavailable"); return; } if (runtime.kind === "retrying") { $("kpiRun").textContent = "0"; $("kpiRetry").textContent = String(runtime.attempt ?? "1"); $("kpiTok").textContent = "unavailable"; return; } $("kpiRun").textContent = "unavailable"; $("kpiRetry").textContent = "unavailable"; $("kpiTok").textContent = "unavailable"; };
+  const renderKpis = () => { const runtime = detail.runtime; $("kpiTime").textContent = "unavailable"; $("kpiShadow").textContent = "unavailable"; if (!runtime) { $("kpiRun").textContent = "unavailable"; $("kpiRetry").textContent = "unavailable"; $("kpiTok").textContent = "unavailable"; return; } if (runtime.launch_failure) { $("kpiRun").textContent = "0"; $("kpiRetry").textContent = "0"; $("kpiTok").textContent = String(runtime.token_total ?? "unavailable"); return; } if (runtime.kind === "running") { $("kpiRun").textContent = "1"; $("kpiRetry").textContent = "0"; $("kpiTok").textContent = String(runtime.token_total ?? "unavailable"); return; } if (runtime.kind === "retrying") { $("kpiRun").textContent = "0"; $("kpiRetry").textContent = String(runtime.attempt ?? "1"); $("kpiTok").textContent = "unavailable"; return; } $("kpiRun").textContent = "unavailable"; $("kpiRetry").textContent = "unavailable"; $("kpiTok").textContent = "unavailable"; };
   const formatFileSize = (bytes) => bytes < 1024 ? `${bytes} B` : bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KiB` : `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
   const attachmentCommentId = (attachment) => newtype(attachment?.source?.Comment?.comment_id ?? attachment?.source?.comment?.comment_id ?? attachment?.source?.comment_id ?? null);
   const persistedCommentAttachments = (commentId) => (detail.attachments || []).filter((attachment) => attachmentCommentId(attachment) === commentId);
@@ -2493,7 +2494,7 @@ const ISSUE_DETAIL_HTML: &str = r#"<!doctype html>
     });
   };
   document.addEventListener("dragover", (event) => { if (dataTransferHasFiles(event)) event.preventDefault(); }, true); document.addEventListener("drop", (event) => { if (dataTransferHasFiles(event)) event.preventDefault(); }, true);
-  const render = () => { const commentDraft = $("commentEditor")?.value ?? recoveredCommentDraft; const workpadOpen = $("agentWorkpad")?.open || false; renderKpis(); const issue = detail.issue; const id = newtype(issue.identifier); const current = issue.state.name; targetLane = targetLane || current; $("issueId").textContent = id; $("title").textContent = issue.title; $("stateChip").textContent = `${laneGlyph(current)} ${current.toUpperCase()}`; const dirty = targetLane !== current; $("dirtyFlag").hidden = !dirty; $("save").disabled = !dirty; $("save").innerHTML = dirty && isAction(targetLane) ? `SAVE & RUN ${escapeHtml(isAction(targetLane).toUpperCase())} <span class="meta">⌘S</span>` : `SAVE CHANGES <span class="meta">⌘S</span>`; $("diff").innerHTML = dirty ? `● 1 UNSAVED CHANGE&nbsp;&nbsp; Lane: ${escapeHtml(current)} → ${escapeHtml(targetLane)} ${isAction(targetLane) ? `<span class="trigger">▸ triggers ${escapeHtml(isAction(targetLane))} procedure</span>` : ""}` : "No changes"; $("props").innerHTML = `<div class="field ${dirty ? "dirty" : ""}"><div class="field-head"><span>LANE</span>${dirty ? "<span>● CHANGED</span>" : ""}</div><div class="value">${dirty ? `<del>${escapeHtml(current)}</del> → <strong>${escapeHtml(targetLane)}</strong>` : escapeHtml(current)}</div></div><div class="field"><div class="field-head"><span>LABELS</span></div><div>${issue.labels.map((l) => `<span class="label-chip">${escapeHtml(l)}</span>`).join("")}</div></div><div class="field"><div class="field-head"><span>ASSIGNEE</span></div><div>${escapeHtml(issue.assignee?.name || "Unassigned")}</div></div><div class="field"><div class="field-head"><span>BRANCH</span></div><div>${escapeHtml(newtype(issue.branch_name) || "None")}</div></div>`; $("middle").innerHTML = `<h2 class="section-title mono">DESCRIPTION</h2><div class="description">${escapeHtml(issue.description || "No description")}</div><h2 class="section-title mono">ACTIVITY</h2>${detail.comments.filter(comment => newtype(comment.comment_id) !== newtype(detail.workpad?.comment_id)).map(renderComment).join("") || '<div class="meta">No comments</div>'}<h2 class="section-title mono">ATTACHMENTS</h2><section class="attachment-drop-zone" id="issueAttachmentDropZone" data-attachment-drop-zone aria-label="Drop files to attach them to this issue"><label class="attachment-input-label" for="issueAttachmentInput"><span>Choose files</span><input id="issueAttachmentInput" type="file" multiple></label><div class="attachment-drop-affordance" aria-hidden="true">Drop files here to attach them to this issue</div><div class="attachment-list" id="issueAttachmentList" aria-live="polite"></div><div class="attachment-error meta" id="issueAttachmentError" role="alert"></div><button id="resolveIssueUpload" type="button" hidden>I've checked the issue</button></section><h2 class="section-title mono">NEW COMMENT</h2><section class="comment-composer" aria-label="New comment"><textarea id="commentEditor" class="issue-markdown-editor" spellcheck="true" placeholder="Add a comment…"></textarea><label class="attachment-input-label" for="commentAttachmentInput"><span>Attach files to this comment</span><input id="commentAttachmentInput" type="file" multiple></label><div class="attachment-list" id="commentAttachmentList" aria-live="polite"></div><div class="comment-actions"><div class="comment-error meta" id="commentError" role="alert"></div><button id="resolveComment" type="button" hidden>I've checked the issue</button><button class="comment-submit" id="postComment" type="button">POST COMMENT <span class="meta">C</span></button></div></section><details id="agentWorkpad" ${workpadOpen ? "open" : ""}><summary class="section-title mono">AGENT WORKPAD</summary><p class="meta">Execution notes and validation evidence maintained by the agents.</p><textarea id="workpadEditor" class="issue-markdown-editor" aria-label="Agent workpad" readonly>${escapeHtml(detail.workpad?.body_markdown || "No workpad yet.")}</textarea></details>`; $("lanePicker").innerHTML = detail.lanes.map((lane) => `<button class="lane-row ${targetLane === lane ? "target" : ""}" data-lane="${escapeHtml(lane)}" type="button"><span>${laneGlyph(lane)}</span><span>${escapeHtml(lane)}${isAction(lane) ? `<span class="sub">▸ runs ${escapeHtml(isAction(lane))} procedure</span>` : ""}</span><span class="meta">${lane === current ? "FROM" : targetLane === lane ? "NEW LANE" : ""}</span></button>`).join(""); $("commentEditor").value = commentDraft; renderIssueAttachments(); renderCommentAttachments(); installAttachmentDropTarget(); installCommentAttachmentInput(); renderCommentAvailability(); renderUploadAvailability(); };
+  const render = () => { const commentDraft = $("commentEditor")?.value ?? recoveredCommentDraft; const workpadOpen = $("agentWorkpad")?.open || false; renderKpis(); const issue = detail.issue; const id = newtype(issue.identifier); const current = issue.state.name; targetLane = targetLane || current; $("issueId").textContent = id; $("title").textContent = issue.title; $("stateChip").textContent = `${laneGlyph(current)} ${current.toUpperCase()}`; const dirty = targetLane !== current; $("dirtyFlag").hidden = !dirty; $("save").disabled = !dirty; $("save").innerHTML = dirty && isAction(targetLane) ? `SAVE & RUN ${escapeHtml(isAction(targetLane).toUpperCase())} <span class="meta">⌘S</span>` : `SAVE CHANGES <span class="meta">⌘S</span>`; $("diff").innerHTML = dirty ? `● 1 UNSAVED CHANGE&nbsp;&nbsp; Lane: ${escapeHtml(current)} → ${escapeHtml(targetLane)} ${isAction(targetLane) ? `<span class="trigger">▸ triggers ${escapeHtml(isAction(targetLane))} procedure</span>` : ""}` : "No changes"; $("props").innerHTML = `<div class="field ${dirty ? "dirty" : ""}"><div class="field-head"><span>LANE</span>${dirty ? "<span>● CHANGED</span>" : ""}</div><div class="value">${dirty ? `<del>${escapeHtml(current)}</del> → <strong>${escapeHtml(targetLane)}</strong>` : escapeHtml(current)}</div></div><div class="field"><div class="field-head"><span>LABELS</span></div><div>${issue.labels.map((l) => `<span class="label-chip">${escapeHtml(l)}</span>`).join("")}</div></div><div class="field"><div class="field-head"><span>ASSIGNEE</span></div><div>${escapeHtml(issue.assignee?.name || "Unassigned")}</div></div><div class="field"><div class="field-head"><span>BRANCH</span></div><div>${escapeHtml(newtype(issue.branch_name) || "None")}</div></div>`; $("middle").innerHTML = `${detail.runtime?.launch_failure ? `<section role="alert"><h2 class="section-title">Team startup failed</h2><p class="description">${escapeHtml(detail.runtime.launch_failure.message)}</p></section>` : ""}<h2 class="section-title mono">DESCRIPTION</h2><div class="description">${escapeHtml(issue.description || "No description")}</div><h2 class="section-title mono">ACTIVITY</h2>${detail.comments.filter(comment => newtype(comment.comment_id) !== newtype(detail.workpad?.comment_id)).map(renderComment).join("") || '<div class="meta">No comments</div>'}<h2 class="section-title mono">ATTACHMENTS</h2><section class="attachment-drop-zone" id="issueAttachmentDropZone" data-attachment-drop-zone aria-label="Drop files to attach them to this issue"><label class="attachment-input-label" for="issueAttachmentInput"><span>Choose files</span><input id="issueAttachmentInput" type="file" multiple></label><div class="attachment-drop-affordance" aria-hidden="true">Drop files here to attach them to this issue</div><div class="attachment-list" id="issueAttachmentList" aria-live="polite"></div><div class="attachment-error meta" id="issueAttachmentError" role="alert"></div><button id="resolveIssueUpload" type="button" hidden>I've checked the issue</button></section><h2 class="section-title mono">NEW COMMENT</h2><section class="comment-composer" aria-label="New comment"><textarea id="commentEditor" class="issue-markdown-editor" spellcheck="true" placeholder="Add a comment…"></textarea><label class="attachment-input-label" for="commentAttachmentInput"><span>Attach files to this comment</span><input id="commentAttachmentInput" type="file" multiple></label><div class="attachment-list" id="commentAttachmentList" aria-live="polite"></div><div class="comment-actions"><div class="comment-error meta" id="commentError" role="alert"></div><button id="resolveComment" type="button" hidden>I've checked the issue</button><button class="comment-submit" id="postComment" type="button">POST COMMENT <span class="meta">C</span></button></div></section><details id="agentWorkpad" ${workpadOpen ? "open" : ""}><summary class="section-title mono">AGENT WORKPAD</summary><p class="meta">Execution notes and validation evidence maintained by the agents.</p><textarea id="workpadEditor" class="issue-markdown-editor" aria-label="Agent workpad" readonly>${escapeHtml(detail.workpad?.body_markdown || "No workpad yet.")}</textarea></details>`; $("lanePicker").innerHTML = detail.lanes.map((lane) => `<button class="lane-row ${targetLane === lane ? "target" : ""}" data-lane="${escapeHtml(lane)}" type="button"><span>${laneGlyph(lane)}</span><span>${escapeHtml(lane)}${isAction(lane) ? `<span class="sub">▸ runs ${escapeHtml(isAction(lane))} procedure</span>` : ""}</span><span class="meta">${lane === current ? "FROM" : targetLane === lane ? "NEW LANE" : ""}</span></button>`).join(""); $("commentEditor").value = commentDraft; renderIssueAttachments(); renderCommentAttachments(); installAttachmentDropTarget(); installCommentAttachmentInput(); renderCommentAvailability(); renderUploadAvailability(); };
   const load = async (preserveTarget = false) => { const previousTarget = targetLane; try { detail = await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}`); targetLane = preserveTarget && previousTarget ? previousTarget : detail.issue.state.name; render(); } catch (error) { showNotice(error.message); } };
   const postComment = async () => {
     const editor = $("commentEditor");
@@ -2613,6 +2614,7 @@ struct IssueBoardSnapshot {
 
 #[derive(Debug, Serialize)]
 struct IssueBoardTotals {
+    launch_failed: usize,
     issues: usize,
     running: usize,
     retrying: usize,
@@ -2706,6 +2708,8 @@ struct IssueBoardBlocker {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum IssueBoardRuntimeStatus {
     Running {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        launch_failure: Option<crate::tools::NativeLaunchFailure>,
         backend: String,
         policy_mode: String,
         turn_count: u64,
@@ -3785,12 +3789,21 @@ fn issue_board_snapshot_from_rows(
         .collect::<Vec<_>>();
     // Keep empty lanes visible so operators can move tickets into them.
     let issue_count = lanes.iter().map(|lane| lane.issues.len()).sum();
+    let launch_failed = running
+        .iter()
+        .filter(|row| {
+            row.native_recovery
+                .as_ref()
+                .is_some_and(|run| run.launch_failure.is_some())
+        })
+        .count();
     IssueBoardSnapshot {
         generated_at: Utc::now(),
         lanes,
         totals: IssueBoardTotals {
             issues: issue_count,
-            running: running_count,
+            launch_failed,
+            running: running_count.saturating_sub(launch_failed),
             retrying: retrying_count,
         },
     }
@@ -3952,6 +3965,10 @@ fn bad_request(code: &str, message: &str) -> axum::response::Response {
 
 fn running_issue_board_status(row: &RunningRow) -> IssueBoardRuntimeStatus {
     IssueBoardRuntimeStatus::Running {
+        launch_failure: row
+            .native_recovery
+            .as_ref()
+            .and_then(|run| run.launch_failure.clone()),
         backend: format!("{:?}", row.backend),
         policy_mode: format!("{:?}", row.policy_mode),
         turn_count: row.turn_count,

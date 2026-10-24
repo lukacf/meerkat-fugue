@@ -87,6 +87,8 @@ struct FugueMobJob {
     run: MobRunSnapshot,
     member_identities: Vec<String>,
     notified_member_failure_cursors: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_failure: Option<crate::tools::NativeLaunchFailure>,
 }
 
 impl FugueMobJob {
@@ -95,6 +97,7 @@ impl FugueMobJob {
             run,
             member_identities,
             notified_member_failure_cursors: BTreeSet::new(),
+            launch_failure: None,
         }
     }
 }
@@ -554,8 +557,16 @@ impl MetaRuntimeRegistry {
     pub async fn bootstrap_repo_kapellmeister(&self) -> Result<(), String> {
         let _bootstrap_guard = self.kapellmeister_bootstrap.lock().await;
         let runtime = self.runtime().await?;
+        self.ensure_repo_kapellmeister_member(&runtime).await?;
+        self.wire_repository_members(&runtime).await
+    }
+
+    async fn ensure_repo_kapellmeister_member(
+        &self,
+        runtime: &UnifiedRuntime,
+    ) -> Result<(), String> {
         ensure_member(
-            &runtime,
+            runtime,
             KAPELLMEISTER,
             KAPELLMEISTER,
             Some("You are the repo-scoped Fugue Kapellmeister. Startup rule: do not inspect Linear, call tools, send peer messages, start issue mobs, mutate lifecycle lanes, or infer work from this initial autonomous wake. Reply briefly that you are idle and waiting for explicit Fugue host signals, issue-lead messages, or operator messages. When a Fugue host signal arrives, treat that signal payload as the task context and then coordinate through the provided tools one call at a time."),
@@ -567,9 +578,7 @@ impl MetaRuntimeRegistry {
             None,
             self.meerkat.auth_binding.as_ref(),
         )
-        .await?;
-        self.wire_repository_members(&runtime).await?;
-        Ok(())
+        .await
     }
 
     pub(crate) async fn wire_repository_members(
@@ -642,8 +651,13 @@ impl MetaRuntimeRegistry {
         &self,
         content: String,
     ) -> Result<FugueHostSignalAccepted, String> {
-        self.bootstrap_repo_kapellmeister().await?;
         let runtime = self.runtime().await?;
+        {
+            let _bootstrap_guard = self.kapellmeister_bootstrap.lock().await;
+            self.ensure_repo_kapellmeister_member(&runtime).await?;
+        }
+        // A host observation must reach the coordinator even when another
+        // member's wiring is the failure being reported. Admission owns wiring.
         runtime
             .mob_handle()
             .member(&AgentIdentity::from(KAPELLMEISTER))
@@ -2484,6 +2498,7 @@ impl NativeMobExecutionHost for MetaRuntimeNativeMobExecutionHost {
                 Some(job) => ok(FugueToolOutput::MobInspectRun(
                     crate::tools::InspectRunOutput {
                         run: job.run.clone(),
+                        launch_failure: job.launch_failure.clone(),
                     },
                 )),
                 None => err(
@@ -2569,7 +2584,7 @@ impl NativeMobExecutionHost for MetaRuntimeNativeMobExecutionHost {
                                 error = %message,
                                 "Meta runtime issue launch failed"
                             );
-                            if let Err(error) = host.set_run_status(&run_id, MobRunStatus::Failed) {
+                            if let Err(error) = host.set_launch_failure(&run_id, message.clone()) {
                                 warn!(%error, "persist failed Fugue launch");
                             }
                         }
@@ -2600,7 +2615,7 @@ impl NativeMobExecutionHost for MetaRuntimeNativeMobExecutionHost {
                         block_on(self.complete_spawn_or_resume_plan_async(plan, run_id.clone()))
                             .and_then(|result| result)
                     {
-                        if let Err(error) = self.set_run_status(&run_id, MobRunStatus::Failed) {
+                        if let Err(error) = self.set_launch_failure(&run_id, message.clone()) {
                             return err(FugueToolOperation::MobSpawnOrResumeExecution, &error);
                         }
                         return err(FugueToolOperation::MobSpawnOrResumeExecution, &message);
@@ -2887,7 +2902,20 @@ impl MetaRuntimeNativeMobExecutionHost {
         Ok(())
     }
 
+    fn set_launch_failure(&self, run_id: &MobRunId, message: String) -> Result<(), String> {
+        self.update_run_status(run_id, MobRunStatus::Failed, Some(message))
+    }
+
     fn set_run_status(&self, run_id: &MobRunId, status: MobRunStatus) -> Result<(), String> {
+        self.update_run_status(run_id, status, None)
+    }
+
+    fn update_run_status(
+        &self,
+        run_id: &MobRunId,
+        status: MobRunStatus,
+        launch_error: Option<String>,
+    ) -> Result<(), String> {
         let mut jobs = self
             .registry
             .jobs
@@ -2899,6 +2927,10 @@ impl MetaRuntimeNativeMobExecutionHost {
         };
         job.run.status = status;
         job.run.updated_at = Utc::now();
+        job.launch_failure = launch_error.map(|message| crate::tools::NativeLaunchFailure {
+            occurred_at: job.run.updated_at,
+            message,
+        });
         if matches!(
             status,
             MobRunStatus::Succeeded | MobRunStatus::Failed | MobRunStatus::Cancelled
@@ -5536,11 +5568,23 @@ pub(crate) mod tests {
             return;
         }
         let temp = tempfile::tempdir().expect("tempdir");
-        let registry = MetaRuntimeRegistry::with_templates(
+        let mut registry = MetaRuntimeRegistry::with_templates(
             test_meerkat_config(temp.path().join("state")),
             BTreeMap::new(),
             BTreeMap::new(),
         );
+        registry
+            .bootstrap_repo_kapellmeister()
+            .await
+            .expect("initial coordinator");
+        // Reuse the same native owner but require an absent representative. A
+        // failed repository wiring pass must not prevent host diagnostics.
+        registry.meerkat.repository_runtime = Some(crate::config::RepositoryRuntimeBinding {
+            repository: crate::ensemble::config::RepoId::try_from("unavailable-peer".to_owned())
+                .expect("repo id"),
+            state_path: temp.path().join("state"),
+        });
+        assert!(registry.bootstrap_repo_kapellmeister().await.is_err());
         let message = "Fugue host signal fixture: worker completed fixture-123";
         let accepted = registry
             .deliver_repo_kapellmeister_signal_batch(message.to_owned())
@@ -5787,6 +5831,130 @@ pub(crate) mod tests {
             MetaRuntimeNativeMobExecutionHost::from_registry(registry),
             run_id,
         )
+    }
+
+    #[test]
+    fn launch_failure_restart_listing_reads_past_first_page_and_keeps_terminal_evidence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = MetaRuntimeRegistry::new(test_meerkat_config(temp.path().join("state")));
+        let plan = launch_plan();
+        let jobs = (0..205)
+            .map(|index| {
+                let run_id = MobRunId(format!("run-{index:03}"));
+                let mut run = meta_runtime_run_snapshot_from_plan(&run_id, &plan, Utc::now());
+                run.status = if index == 204 {
+                    MobRunStatus::Succeeded
+                } else {
+                    MobRunStatus::Failed
+                };
+                (
+                    run_id.0,
+                    FugueMobJob::new(run, member_identities_for_plan(&plan)),
+                )
+            })
+            .collect();
+        registry.persist_jobs(&jobs).expect("persist pages");
+        let host = MetaRuntimeNativeMobExecutionHost::from_registry(registry);
+        let runs = crate::orchestrator::list_native_runs_for_restart(&host).expect("all pages");
+        assert_eq!(runs.len(), 205);
+        assert_eq!(runs.last().expect("last page").run_id.0, "run-204");
+        assert_eq!(
+            runs.last().expect("terminal evidence").status,
+            MobRunStatus::Succeeded
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_failure_from_async_admission_is_inspectable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = test_meerkat_config(temp.path().join("state"));
+        config.repository_runtime = Some(crate::config::RepositoryRuntimeBinding {
+            repository: crate::ensemble::config::RepoId::try_from("not-attached".to_owned())
+                .expect("repo id"),
+            state_path: temp.path().join("state"),
+        });
+        let registry = MetaRuntimeRegistry::new(config);
+        let host = MetaRuntimeNativeMobExecutionHost::from_registry(registry.clone());
+        let plan = launch_plan();
+        let run_id = MobRunId(plan.input.idempotency_key.0.clone());
+        assert!(matches!(
+            host.spawn_or_resume_plan(plan),
+            FugueToolResult::Ok { .. }
+        ));
+        let failure = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let FugueToolResult::Ok {
+                    output: FugueToolOutput::MobInspectRun(output),
+                    ..
+                } = host.status(InspectRunInput {
+                    run_id: run_id.clone(),
+                }) && let Some(failure) = output.launch_failure
+                {
+                    assert_eq!(output.run.status, MobRunStatus::Failed);
+                    break failure;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("async failure should be published");
+        assert_eq!(
+            failure.message,
+            "Repository formation has not attached its shared mob yet"
+        );
+        assert!(
+            registry.runtime.lock().await.is_none(),
+            "no replacement runtime"
+        );
+    }
+
+    #[test]
+    fn launch_failure_write_error_preserves_last_durable_status() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = test_meerkat_config(temp.path().join("state"));
+        let (host, run_id) = persisted_failure_test_host(config.clone());
+        let db = rusqlite::Connection::open(host.registry.state_path().join("fugue-runs.sqlite3"))
+            .expect("store");
+        db.execute_batch("CREATE TRIGGER reject_update BEFORE DELETE ON fugue_runs BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").expect("inject failure");
+        assert!(
+            host.set_launch_failure(&run_id, "wiring failed".to_owned())
+                .is_err()
+        );
+        let job = host.registry.jobs.lock().expect("jobs")[&run_id.0].clone();
+        assert_eq!(job.run.status, MobRunStatus::Running);
+        assert!(job.launch_failure.is_none());
+        let restarted = MetaRuntimeRegistry::new(config);
+        restarted.restore_jobs().expect("restore");
+        assert!(
+            restarted.jobs.lock().expect("jobs")[&run_id.0]
+                .launch_failure
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn launch_failure_survives_restart_with_its_original_detail() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = test_meerkat_config(temp.path().join("state"));
+        let (host, run_id) = persisted_failure_test_host(config.clone());
+        let detail = "wire planner -> specialist: wire requires comms runtime";
+        host.set_launch_failure(&run_id, detail.to_owned())
+            .expect("persist failure");
+        let restarted =
+            MetaRuntimeNativeMobExecutionHost::from_registry(MetaRuntimeRegistry::new(config));
+        let FugueToolResult::Ok {
+            output: FugueToolOutput::MobInspectRun(output),
+            ..
+        } = restarted.status(InspectRunInput { run_id })
+        else {
+            panic!("inspect restored run")
+        };
+        assert_eq!(output.run.status, MobRunStatus::Failed);
+        let failure = output
+            .launch_failure
+            .expect("admission error must remain inspectable");
+        assert_eq!(failure.message, detail);
+        assert_eq!(output.run.completed_at, Some(failure.occurred_at));
     }
 
     #[test]

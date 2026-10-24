@@ -245,3 +245,18 @@ test('explicit reconciliation enables a new comment without resending the uncert
   await expect(page.locator('#postComment')).toBeEnabled();
   expect(posts).toBe(1);
 });
+
+
+test('failed team admission shows its escaped diagnostic and no running worker',async({page})=>{
+  const message='wire planner -> specialist: missing comms <script>throw new Error("unsafe")</script>';
+  const detail={issue:{identifier:'TEST-1',title:'Partial launch',state:{name:'In Development'},labels:[],description:'Preserve the current issue'},comments:[],attachments:[],workpad:null,runtime:{kind:'running',launch_failure:{occurred_at:'2026-10-23T00:00:00Z',message}},lanes:['In Development'],lane_actions:{}};
+  const errors=[];
+  page.on('pageerror',error=>errors.push(error.message));
+  await page.route('http://fugue.test/**',route=>route.request().url().includes('/api/')?route.fulfill({json:detail}):route.fulfill({contentType:'text/html',body:browserDocument(html)}));
+  await page.goto('http://fugue.test/issues/TEST-1');
+  await expect(page.getByRole('heading',{name:'Team startup failed'})).toBeVisible();
+  await expect(page.locator('#middle section[role="alert"]')).toContainText(message);
+  await expect(page.locator('#kpiRun')).toHaveText('0');
+  await expect(page.locator('#stateChip')).toContainText('In Development',{ignoreCase:true});
+  expect(errors).toEqual([]);
+});

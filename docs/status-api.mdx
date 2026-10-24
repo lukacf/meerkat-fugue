@@ -53,6 +53,20 @@ access; they do not encrypt credentials.
 | `/api/v1/meta/rpc` | `POST` | Forward a typed JSON body to `FUGUE_META_RPC_TCP_ADDR` as a Meta JSON-RPC request. Requires `Authorization: Bearer $TOKEN` from `FUGUE_META_RPC_BEARER_TOKEN`. |
 | `/api/v1/ota-update` | `POST` | Trigger configured authorized OTA fetch/staging-build/deploy flow. |
 
+## Team startup failures
+
+A failure while admitting an issue team is recorded separately from native
+member or flow outcomes. `mob_inspect_run.launch_failure` retains its timestamp
+and diagnostic message across restart. The issue status exposes the same
+object as `native_recovery.launch_failure`, and its lifecycle status becomes
+`launch_failed`.
+
+The board exposes `runtime.launch_failure` and `totals.launch_failed`. Failed
+admissions are excluded from the board's running total and appear under Home's
+attention section, even when the issue remains in an active Jira status. The
+tracker lane stays under coordinator control. A failure observation does not
+schedule a replacement team or claim that existing members have been retired.
+
 ## Meta console
 
 Open `/console` from the Fugue status server to load the configured stock Meta
