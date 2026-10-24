@@ -2596,6 +2596,87 @@ fn parse_flexible_recommended_action(
     }
 }
 
+pub(crate) fn repo_kapellmeister_signal_message_with_lanes(
+    signals: &[KapellmeisterShadowSignal],
+    success: &str,
+    review_ready: Option<&str>,
+    independent_review_lane: Option<&str>,
+) -> std::result::Result<String, serde_json::Error> {
+    let payload = serde_json::to_string_pretty(signals)?;
+    let handoff_instruction = match review_ready {
+        Some(lane)
+            if independent_review_lane.is_some_and(|review| {
+                crate::domain::normalize_state(review) == crate::domain::normalize_state(lane)
+            }) =>
+        {
+            format!(
+                "When implementation and its issue-team review are ready, record the PR evidence and move the issue to {lane} for independent specialist review. This shared holding status is a review request, never proof of approval. On first-seen, recovered or changed observations in {lane}, inspect the PR and current native review: admit or resume the required independent review, and retain an already completed current review instead of starting it again. Do not start a new implementation mob from this observation. Only an explicit merge action with verified review and merge evidence may project to {success}."
+            )
+        }
+        Some(lane) => format!(
+            "When reviewer and WorkGraph obligations are satisfied, move the issue to {lane} to await operator review. This is a holding lane, not a review action trigger. Keep it there until an explicit merge action; only verified merge completion projects to {success}."
+        ),
+        None => format!(
+            "When reviewer and WorkGraph obligations are satisfied, move the issue to {success}. In this workspace that lane records accepted development; merging still requires a separate explicit action."
+        ),
+    };
+    let review_instruction = if independent_review_lane.is_some() {
+        "For a configured Review action or shared review holding status, inspect the issue/PR and current native review evidence, then use fugue_start_independent_review with a typed IndependentReviewStartRequest when review is required. The review coordinator must select the configured quorum from existing repository specialists through native admission; never create substitute reviewers. Reuse the same request identity after an uncertain response."
+    } else {
+        "The independent Review action is disabled in this workspace. Review is a holding lane only; do not start an independent review orchestrator or create three-reviewer quorum obligations. Ordinary issue-mob review still applies."
+    };
+    Ok(format!(
+        "Fugue host signal batch for the repo-scoped Kapellmeister.\n\
+         Treat this JSON as authoritative host-observed lifecycle input. \
+         Use it to coordinate issue mobs, PR handoff, and operator guidance. \
+         Do not depend on Linear lanes as lifecycle authority; Linear remains a projection. \
+         Use one tool call at a time; do not issue parallel or batched tool calls in this signal turn. \
+         If a linear_issue_first_seen or open_issue_without_runtime observation reports an intake, \
+         control_active, or unexpected_nonterminal lane with no running_mob, call \
+         fugue_start_issue_mob for that issue immediately unless the payload is a configured \
+         Review action lane, Deploy lane, terminal, blocked, duplicate, or explicit pause reason. \
+         If a lane observation is classified as attention_or_terminal, do not start an issue mob \
+         from that observation alone. For a configured final-review/merge lane, wait for or act on \
+         a final_pr_gate_requested signal and use fugue_start_final_pr_gate with its exact typed \
+         request; do not substitute fugue_start_issue_mob. \
+         {review_instruction} \
+         For a configured Deploy lane, do not start the implementation mob and do not try to \
+         orchestrate merge/OTA yourself; Fugue host handles Deploy as a guarded mechanical \
+         transaction after verifying durable PR evidence, CI, WorkGraph blockers, and deploy \
+         policy. \
+         If a pr_handoff_monitor_changed signal reports ready_for_done, the PR is eligible for handoff. Inspect reviewer/WorkGraph evidence. {handoff_instruction} Report CI evidence literally: an empty check list means no checks were reported, not that checks ran successfully. \
+         Do not wait for an external flow-step feeder. If an active issue reports missing concrete handoff, stale worker_started signals, or offline issue peers, actively inspect/ask the issue mob for status or decide resume/replan through Kapellmeister-owned coordination. \
+         A linear_issue_moved signal means Fugue observed external projection drift from the \
+         issue lane map. It is not proof that lifecycle work completed, but it is an \
+         operator-visible intent/change that must be reconciled through Kapellmeister and \
+         the issue lead rather than ignored as mere projection noise. \
+         If a linear_issue_commented or linear_issue_comment_changed signal includes \
+         operator_review_finding, treat that field as concrete issue rework input from an \
+         operator/repo reviewer. Tell the issue lead to replan and drive worker changes from \
+         that finding; do not classify it as a passive final-gate wait, acceptance hold, or \
+         standby condition. \
+         When writing Linear Workpad/status evidence from repo scope, pass the explicit issue \
+         identifier from the signal payload to the Linear tool call. \
+         You do not have shell/worktree authority. If reviewer-green evidence has no pushed \
+         branch/head SHA yet, ask the issue lead to have the coder commit and push the reviewed \
+         scoped changes before you call github_create_pr. If a runtime_recovered signal carries \
+         workspace.branch, workspace.head_sha, workspace.upstream_branch, matching \
+         workspace.upstream_head_sha, and dirty=false, treat that as durable pushed-branch \
+         evidence. When that pushed-branch evidence is present and no PR exists for the branch, \
+         create or update the PR yourself with github_create_pr; do not ask the issue lead for an \
+         extra PR creation request. If github_create_pr returns an open PR, newly created or \
+         already existing, tell the issue lead the PR number/URL/head branch and ask it to record \
+         PR handoff evidence while keeping ordinary issue-mob work on the active projection lane. \
+         Do not ask issue agents to move issues into configured Review, Deploy, or \
+         final-review action lanes; those lanes are operator or host-observed control inputs. \
+         Merge is not implicit repo authority: accepted review and CI evidence supports a handoff, \
+         but it is not merge authorization. Do not merge a PR unless Deploy policy or an operator \
+         explicitly approves that specific PR merge in the current session. \
+         If a Meerkat mob operator tool such as list_members returns access_denied, treat that as a scope boundary and continue from these signals and comms peers.\n\n\
+         ```json\n{payload}\n```"
+    ))
+}
+
 #[cfg(test)]
 fn parse_decision_response(value: &Value) -> Result<KapellmeisterDecisionResponse> {
     parse_decision_response_inner(value, None)

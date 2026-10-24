@@ -16,7 +16,7 @@ use crate::tools::{LinearCommentId, LinearIssueIdentifier, LinearIssueRef, Linea
 pub const LINEAR_LANE_STATE_PATH_ENV: &str = "FUGUE_LINEAR_LANE_STATE_PATH";
 pub const LINEAR_COMMENT_STATE_FILE: &str = "linear-comments.json";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinearLaneState {
     #[serde(default)]
@@ -327,7 +327,7 @@ pub struct LinearCommentSnapshot {
     pub body_markdown: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinearCommentState {
     #[serde(default)]

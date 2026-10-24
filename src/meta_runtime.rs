@@ -64,7 +64,7 @@ use crate::tools::{LinearStateRef, MoveIssueInput};
 
 const RUNTIME_KEY: &str = "fugue";
 const MOB_ID: &str = crate::native_mob_contract::FUGUE_MOB_ID;
-const KAPELLMEISTER: &str = "kapellmeister";
+pub(crate) const KAPELLMEISTER: &str = "kapellmeister";
 const ISSUE_LEAD: &str = "issue_lead";
 const FUGUE_CONTEXT_KEY: &str = "fugue";
 const FUGUE_CONTEXT_WORKTREE_PATH_KEY: &str = "worktree_path";

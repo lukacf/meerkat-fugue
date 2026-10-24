@@ -163,41 +163,68 @@ impl std::fmt::Display for JqlValues<'_> {
     }
 }
 
+pub(crate) struct JiraRoutingScope {
+    pub base: Url,
+    pub project: String,
+    pub query: Option<String>,
+}
+
+/// Resolve exactly the same routing coordinates for the client and durable
+/// notification scope without requiring credentials or contacting the server.
+pub(crate) fn routing_scope(tracker: &TrackerConfig) -> Result<JiraRoutingScope> {
+    let endpoint = env_value(&tracker.endpoint)
+        .ok_or_else(|| invalid("Jira requires tracker.endpoint or JIRA_BASE_URL"))?;
+    let mut base =
+        Url::parse(&endpoint).map_err(|_| invalid("tracker.endpoint must be a Jira site URL"))?;
+    if !matches!(base.scheme(), "http" | "https")
+        || base.host_str().is_none()
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.query().is_some()
+        || base.fragment().is_some()
+    {
+        return Err(invalid(
+            "Jira site URL must be HTTP(S) without credentials, query, or fragment",
+        ));
+    }
+    base.set_path(&format!("{}/", base.path().trim_end_matches('/')));
+    let project = tracker
+        .project_slug
+        .as_deref()
+        .and_then(env_value)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(FugueError::MissingTrackerProjectSlug)?;
+    let query = tracker
+        .jira
+        .as_ref()
+        .and_then(|config| config.jql.as_deref())
+        .map(|jql| {
+            env_value(jql).ok_or_else(|| {
+                invalid("tracker.jira.jql references a missing or empty environment variable")
+            })
+        })
+        .transpose()?;
+    Ok(JiraRoutingScope {
+        base,
+        project,
+        query,
+    })
+}
+
 impl JiraClient {
     pub fn from_config(tracker: &TrackerConfig) -> Result<Self> {
-        let endpoint = env_value(&tracker.endpoint)
-            .ok_or_else(|| invalid("Jira requires tracker.endpoint or JIRA_BASE_URL"))?;
-        let mut base = Url::parse(&endpoint)
-            .map_err(|_| invalid("tracker.endpoint must be a Jira site URL"))?;
-        if !matches!(base.scheme(), "http" | "https")
-            || base.host_str().is_none()
-            || !base.username().is_empty()
-            || base.password().is_some()
-            || base.query().is_some()
-            || base.fragment().is_some()
-        {
-            return Err(invalid(
-                "Jira site URL must be HTTP(S) without credentials, query, or fragment",
-            ));
-        }
-        base.set_path(&format!("{}/", base.path().trim_end_matches('/')));
-        let project = tracker
-            .project_slug
-            .as_deref()
-            .and_then(env_value)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(FugueError::MissingTrackerProjectSlug)?;
+        let JiraRoutingScope {
+            base,
+            project,
+            query,
+        } = routing_scope(tracker)?;
         let token = tracker
             .api_key
             .as_deref()
             .and_then(env_value)
             .ok_or(FugueError::MissingTrackerApiKey)?;
         let mut config = tracker.jira.clone().unwrap_or_default();
-        if let Some(jql) = &config.jql {
-            config.jql = Some(env_value(jql).ok_or_else(|| {
-                invalid("tracker.jira.jql references a missing or empty environment variable")
-            })?);
-        }
+        config.jql = query;
         if let Some(issue_type) = &config.issue_type {
             config.issue_type = Some(env_value(issue_type).ok_or_else(|| {
                 invalid(
