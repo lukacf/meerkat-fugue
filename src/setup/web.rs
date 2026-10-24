@@ -107,7 +107,7 @@ async fn prepare(
     State(setup): State<Arc<Setup>>,
     request: Result<Json<super::workflow::WorkflowSetup>, JsonRejection>,
 ) -> Response {
-    let Ok(Json(request)) = request else {
+    let Ok(Json(mut request)) = request else {
         return error(
             StatusCode::BAD_REQUEST,
             "Invalid repository or workflow settings",
@@ -131,6 +131,10 @@ async fn prepare(
     ) {
         return error(StatusCode::BAD_REQUEST, cause);
     }
+    request.lane_configuration = match connections.tracker.as_ref() {
+        Some(tracker) => super::workflow::LaneConfiguration::for_tracker(tracker),
+        None => return error(StatusCode::BAD_REQUEST, "Connect an issue tracker first"),
+    };
     let saved = super::save_json(&setup.root.join("workflow-draft.json"), &request);
     if saved.is_err() {
         return error(
@@ -474,6 +478,67 @@ mod tests {
         http::Request,
     };
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn saved_workflow_retains_its_tracker_after_connection_change_and_reopen() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let setup = Setup::open(directory.path(), 8788)?;
+        let app = router(Arc::clone(&setup));
+        let post = |path: &str, body: &str| {
+            Request::post(path)
+                .header("Host", "127.0.0.1:8788")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body.to_owned()))
+        };
+        let response = app.clone().oneshot(post(
+            "/api/setup/connections",
+            r#"{"connection":"tracker","value":{"kind":"jira","site":"https://example.atlassian.net","email":"test@example.com","api_token":"test-token"}}"#,
+        )?).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let request = serde_json::json!({
+            "owner": "example", "repository": "application",
+            "lanes": crate::config::TrackerLaneRoles::default()
+        });
+        let response = app
+            .clone()
+            .oneshot(post("/api/setup/preparation", &request.to_string())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        // Missing AI access stops before repository/provider access. The
+        // submitted workflow is still a deliberate, durable configuration.
+        let operation = setup
+            .operation
+            .lock()
+            .await
+            .take()
+            .context("preparation task")?;
+        operation.await?;
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/setup/connections",
+                r#"{"connection":"tracker","value":{"kind":"local"}}"#,
+            )?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(app);
+        drop(setup);
+
+        let reopened = Setup::open(directory.path(), 8788)?;
+        let response = router(reopened)
+            .oneshot(
+                Request::get("/api/setup/workflow")
+                    .header("Host", "127.0.0.1:8788")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16384).await?)?;
+        assert_eq!(body["lane_configuration"], "jira");
+        assert_eq!(body["lanes"]["intake"], "Queue");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn registered_repository_cannot_be_retargeted_by_preparation() {

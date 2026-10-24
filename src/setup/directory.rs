@@ -244,6 +244,7 @@ impl Directory {
             port,
         };
         let draft = super::workflow::WorkflowSetup {
+            lane_configuration: super::workflow::LaneConfiguration::Generated,
             commit_identity: Default::default(),
             allow_no_ci_checks: false,
             jira_transition_fields: BTreeMap::new(),

@@ -7,15 +7,23 @@ description: "Configure Jira issue workflows and GitHub Enterprise repositories 
 
 Fugue supports Jira Cloud through REST API v3, Jira Server/Data Center through
 REST API v2, and GitHub Enterprise Server through the authenticated `gh` CLI.
-Use [fugue.jira.example.yaml](../fugue.jira.example.yaml) as a complete starting
+
+For browser setup, follow [Your first repository](./getting-started.mdx): add
+the repository's full HTTPS URL, choose Jira, save its access details and map
+the project's existing statuses. Each repository keeps its own tracker scope
+and queue. You do not need to create a local checkout or write a YAML file.
+
+For a manually configured service, use
+[fugue.jira.example.yaml](../fugue.jira.example.yaml) as a complete starting
 configuration. Store organization-specific configuration outside your public
 checkout, for example under `~/.config/meerkat-fugue/`.
 
 ## Authentication
 
-Export `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN` in the environment that
-launches Fugue. The adapter never sources a shell profile. It uses the active
-environment; it does not read commented-out or legacy tokens.
+For a manually configured service, export `JIRA_BASE_URL`, `JIRA_EMAIL`, and
+`JIRA_API_TOKEN` in the environment that launches Fugue. The adapter never sources
+a shell profile. It uses the active environment; it does not read commented-out
+or legacy tokens.
 
 ```yaml
 tracker:
@@ -94,8 +102,13 @@ existing workpad, and fail if duplicate workpads require human resolution.
 
 Attachments are downloaded from the configured Jira origin with the queue's
 existing file count and byte limits. Redirected or cross-origin attachments
-fail explicitly. Local file uploads through comments are currently unsupported;
-publicly reachable attachment URLs can be included as links. Changelog tools
+fail explicitly.
+
+The **Board** uploads selected files as native Jira issue attachments. If an
+upload or comment has an uncertain result, inspect the existing issue before
+retrying; [Daily work](./daily-work.mdx#work-from-the-board) explains the form's
+recovery controls. The Jira MCP comment tool accepts attachment URLs as links
+and rejects local file paths; it does not upload those files. Changelog tools
 require a scoped issue and REST API v3.
 
 ## Required custom fields
