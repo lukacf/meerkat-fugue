@@ -38,3 +38,4 @@ secrets.env
 scripts/release/__pycache__/
 scripts/distribution/__pycache__/
 scripts/ci/__pycache__/
+scripts/public-readiness/__pycache__/

@@ -14,6 +14,10 @@ Do not rerun an unchanged release build to obtain a second copy of its result.
 The checkout pins Rust in `rust-toolchain.toml`. Browser tests use Node.js 22,
 the locked npm dependencies and Playwright Chromium. Release and installer
 tests use Python 3 on Linux or macOS, plus `lsof` for the release safeguards.
+The process-group harness also requires Python's `os.waitid` and `os.WNOWAIT`;
+it reports skips when those are unavailable. Check the test summaries: a zero
+command exit with skipped cases does not qualify those checks. Use a compatible
+Python on your PATH and rerun the skipped suite before reporting it as passed.
 
 ```sh
 npm ci
