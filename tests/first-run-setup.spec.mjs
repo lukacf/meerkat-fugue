@@ -89,6 +89,48 @@ test('Jira credentials are separate from repository workflow scope',async({page}
   await expect(page.getByRole('button',{name:'Start Fugue'})).toBeDisabled();
 });
 
+test('saved Jira access restores its defaults when no workflow exists yet',async({page})=>{
+  await setup(page,{...connected,tracker:{kind:'jira',site:'https://example.atlassian.net',email:'test@example.com'}});
+  for(let attempt=0;attempt<2;attempt++) {
+    await expect(page.getByLabel('Issue tracker',{exact:true})).toHaveValue('jira');
+    await expect(page.getByLabel('Ready to start',{exact:true})).toHaveValue('Open');
+    await expect(page.getByLabel('Awaiting review',{exact:true})).toHaveValue('Resolved');
+    await expect(page.getByLabel('Merge',{exact:true})).toHaveValue('Reopened');
+    if(attempt===0) await page.reload();
+  }
+});
+
+test('saved Jira workflow mappings survive a slower connection restore',async({page})=>{
+  await setup(page,{...connected,tracker:{kind:'jira',site:'https://example.atlassian.net',email:'test@example.com'}});
+  await page.getByLabel('Repository URL',{exact:true}).fill('https://github.com/example/application');
+  await page.getByLabel('Tracker project',{exact:true}).fill('EXAMPLE');
+  await page.getByLabel('Jira ticket filter',{exact:true}).fill('labels = "fugue-app"');
+  await page.getByText('Workflow statuses',{exact:true}).click();
+  await page.getByLabel('Ready to start',{exact:true}).fill('Ready for work');
+  await page.getByLabel('Awaiting review',{exact:true}).fill('Peer review');
+  await page.getByLabel('Merge',{exact:true}).fill('Awaiting merge');
+  await page.getByRole('button',{name:'Check and prepare repository'}).click();
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeEnabled();
+  await page.route('**/api/setup/connections',async route=>{
+    await new Promise(resolve=>setTimeout(resolve,150));
+    await route.fallback();
+  });
+  await page.reload();
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeEnabled();
+  await expect(page.getByLabel('Ready to start',{exact:true})).toHaveValue('Ready for work');
+  await expect(page.getByLabel('Awaiting review',{exact:true})).toHaveValue('Peer review');
+  await expect(page.getByLabel('Merge',{exact:true})).toHaveValue('Awaiting merge');
+});
+
+test('failed workflow restore keeps preparation disabled',async({page})=>{
+  await setup(page,connected);
+  await page.route('**/api/setup/workflow',route=>route.fulfill({status:500,json:{error:'Saved workflow is temporarily unavailable.'}}));
+  await page.reload();
+  await expect(page.locator('#pageError')).toContainText('Saved workflow is temporarily unavailable.');
+  await expect(page.getByRole('button',{name:'Check and prepare repository'})).toBeDisabled();
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeDisabled();
+});
+
 test('one repository selection produces preparation and a same-origin handoff',async({page})=>{
   const {writes}=await setup(page,connected);
   await page.getByLabel('Repository URL',{exact:true}).fill('https://github.com/example/application');
