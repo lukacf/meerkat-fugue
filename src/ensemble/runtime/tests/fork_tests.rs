@@ -16,6 +16,7 @@ struct ForkAdmission {
 struct ForkScript {
     parent_returned: AtomicBool,
     child_verified: AtomicBool,
+    release_child: AtomicBool,
     completion_delivered: AtomicBool,
     failure: Mutex<Option<String>>,
 }
@@ -58,6 +59,7 @@ impl LlmClient for ForkScript {
         };
         let mut call = None;
         let mut answer = "Ready.";
+        let mut await_context_probe = false;
         if let Some(error) = results.iter().find(|result| result.is_error) {
             *self.failure.lock().unwrap() = Some(error.text_content());
             answer = "Tool failed.";
@@ -75,6 +77,7 @@ impl LlmClient for ForkScript {
                     read.text_content()
                 );
                 self.child_verified.store(true, Ordering::SeqCst);
+                await_context_probe = true;
                 answer = CHILD_REPLY;
             } else {
                 call = Some((
@@ -153,7 +156,7 @@ impl LlmClient for ForkScript {
                 meta: None,
             }
         };
-        Box::pin(futures::stream::iter(vec![
+        let events = vec![
             Ok(event),
             Ok(LlmEvent::UsageUpdate {
                 usage: TurnUsage::host_declared(Provider::OpenAI, &request.model, Usage::default()),
@@ -161,7 +164,19 @@ impl LlmClient for ForkScript {
             Ok(LlmEvent::Done {
                 outcome: LlmDoneOutcome::success(stop),
             }),
-        ]))
+        ];
+        Box::pin(async_stream::stream! {
+            // Keep the real child alive after its tool round so the test can
+            // inspect its committed native build context before retirement.
+            if await_context_probe {
+                while !self.release_child.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            for event in events {
+                yield event;
+            }
+        })
     }
 
     fn provider(&self) -> Provider {
@@ -230,11 +245,15 @@ mob_templates:
     let runtime = ensemble.repository(&repo).unwrap();
     let handle = runtime.mob_handle();
     let identity = meerkat_mob::AgentIdentity::from("issue_DEMO-1__reviewer");
+    let context = json!({
+        "fugue": {"worktree_path": worktree},
+        "qualification": {"domain": "review-domain", "grant": "review-scope"}
+    });
     handle
         .ensure_member(
             meerkat_mob::SpawnMemberSpec::new("ticket_reviewer", identity.clone())
                 .with_runtime_mode(MobRuntimeMode::TurnDriven)
-                .with_context(json!({"fugue":{"worktree_path":worktree}})),
+                .with_context(context.clone()),
         )
         .await
         .unwrap();
@@ -245,6 +264,42 @@ mob_templates:
         .send(PARENT, meerkat_core::HandlingMode::Steer)
         .await
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !client.child_verified.load(Ordering::SeqCst) {
+            assert!(
+                client.failure.lock().unwrap().is_none(),
+                "the native fork must reach its child tool round"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("native fork must reach the context inspection boundary");
+    let service = runtime.mob_runtime().session_service().unwrap();
+    for member in [
+        identity,
+        meerkat_mob::AgentIdentity::from("neutral-review-helper"),
+    ] {
+        let snapshot = tokio::time::timeout(Duration::from_secs(10), handle.member_status(&member))
+            .await
+            .unwrap()
+            .unwrap();
+        let session_id = snapshot.current_session_id.unwrap();
+        let session = tokio::time::timeout(
+            Duration::from_secs(10),
+            service.load_persisted_session_tolerating_tail(&session_id),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            session.try_build_state().unwrap().unwrap().app_context,
+            Some(context.clone()),
+            "{member} must retain the exact application context, not only a working shell"
+        );
+    }
+    client.release_child.store(true, Ordering::SeqCst);
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let failure = client.failure.lock().unwrap().clone();
