@@ -21,7 +21,7 @@ fn message(text: &str) -> SignalEnvelope {
     }
 }
 
-fn binding(temp: &tempfile::TempDir) -> HostSignalBinding {
+pub(super) fn binding(temp: &tempfile::TempDir) -> HostSignalBinding {
     HostSignalBinding {
         path: temp.path().join("signals.sqlite3"),
         scope: scope(),
@@ -29,13 +29,17 @@ fn binding(temp: &tempfile::TempDir) -> HostSignalBinding {
 }
 
 // Controlled sender results qualify journal mechanics only, not native delivery.
-fn admitted(id: &str) -> meerkat_contracts::WireContinuationReceipt {
+pub(super) fn admitted(id: &str) -> meerkat_contracts::WireContinuationReceipt {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(id.as_bytes());
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&hash[..16]);
     meerkat_contracts::WireContinuationReceipt {
         delivery_id: id.into(),
         committed_at_ms: 1,
         status: meerkat_contracts::WireContinuationStatus::Admitted {
-            session_id: "test-session".into(),
-            input_id: "test-input".into(),
+            session_id: uuid::Uuid::from_u128(1).to_string(),
+            input_id: uuid::Uuid::from_bytes(bytes).to_string(),
         },
     }
 }
@@ -97,7 +101,7 @@ async fn native_receipts_without_admission_preserve_pending_work_and_their_statu
     }
 }
 
-fn enqueue(binding: &HostSignalBinding, event: &str) -> PendingSignal {
+pub(super) fn enqueue(binding: &HostSignalBinding, event: &str) -> PendingSignal {
     let mut journal = binding.open().unwrap();
     let mut update = journal.begin().unwrap();
     let key = update.enqueue_once(event, || Ok(message(event))).unwrap();
@@ -145,7 +149,7 @@ fn replacement_is_durable_idempotent_and_requires_a_terminal_non_admission() {
             .is_err()
     );
     reopened
-        .acknowledge(&replacement, "native-replacement")
+        .acknowledge(&replacement, &admitted("native-replacement"))
         .unwrap();
     assert_eq!(
         reopened.replace_unadmitted(&first.key, &receipt).unwrap(),
@@ -442,17 +446,24 @@ fn acknowledging_one_delivery_preserves_newer_observations_and_refuses_conflicts
         .enqueue_once("event-2", || Ok(message("second")))
         .unwrap();
     update.commit().unwrap();
-    sender.acknowledge(&first, "native-delivery-1").unwrap();
-    sender.acknowledge(&first, "native-delivery-1").unwrap();
+    sender
+        .acknowledge(&first, &admitted("native-delivery-1"))
+        .unwrap();
+    sender
+        .acknowledge(&first, &admitted("native-delivery-1"))
+        .unwrap();
     assert!(
         sender
-            .acknowledge(&first, "different-native-delivery")
+            .acknowledge(&first, &admitted("different-native-delivery"))
             .is_err()
     );
-    assert!(sender.acknowledge(&second, "").is_err());
+    assert!(sender.acknowledge(&second, &admitted("")).is_err());
     assert!(
         sender
-            .acknowledge(&DeliveryKey("unknown".into()), "native-delivery-2")
+            .acknowledge(
+                &DeliveryKey("unknown".into()),
+                &admitted("native-delivery-2")
+            )
             .is_err()
     );
     let pending = observer.pending(10).unwrap();

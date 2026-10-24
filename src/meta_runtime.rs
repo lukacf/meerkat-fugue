@@ -654,18 +654,7 @@ impl MetaRuntimeRegistry {
         scope: &crate::host_signal_journal::HostSignalScope,
         signal: &crate::host_signal_journal::PendingSignal,
     ) -> Result<meerkat_contracts::WireContinuationReceipt, String> {
-        let binding = self
-            .host_signal_binding
-            .as_ref()
-            .ok_or("host signal routing is not configured")?;
-        if scope != &binding.scope
-            || scope.member != KAPELLMEISTER
-            || scope.mob_id != self.meerkat.mob_id()
-            || scope.runtime_path
-                != std::path::absolute(self.state_path()).map_err(|error| error.to_string())?
-        {
-            return Err("host signal scope does not match the coordinator runtime".into());
-        }
+        self.validate_host_signal_scope(scope)?;
         let runtime = self.runtime().await?;
         {
             let _bootstrap_guard = self.kapellmeister_bootstrap.lock().await;
@@ -694,6 +683,83 @@ impl MetaRuntimeRegistry {
             )
             .await
             .map_err(|error| format!("admit coordinator host signal: {error}"))
+    }
+
+    fn validate_host_signal_scope(
+        &self,
+        scope: &crate::host_signal_journal::HostSignalScope,
+    ) -> Result<(), String> {
+        let binding = self
+            .host_signal_binding
+            .as_ref()
+            .ok_or("host signal routing is not configured")?;
+        if scope != &binding.scope
+            || scope.member != KAPELLMEISTER
+            || scope.mob_id != self.meerkat.mob_id()
+            || scope.runtime_path
+                != std::path::absolute(self.state_path()).map_err(|error| error.to_string())?
+        {
+            return Err("host signal scope does not match the coordinator runtime".into());
+        }
+        Ok(())
+    }
+
+    pub async fn observe_repo_kapellmeister_input(
+        &self,
+        scope: &crate::host_signal_journal::HostSignalScope,
+        receipt: &meerkat_contracts::WireContinuationReceipt,
+    ) -> Result<crate::host_signal_journal::NativeInputObservation, String> {
+        use crate::host_signal_journal::{InputUnavailable, NativeInputObservation};
+        use meerkat_contracts::WireContinuationStatus;
+        use meerkat_runtime::{RuntimeDriverError, RuntimeState, SessionServiceRuntimeExt};
+        self.validate_host_signal_scope(scope)?;
+        let WireContinuationStatus::Admitted {
+            session_id,
+            input_id,
+        } = &receipt.status
+        else {
+            return Err("input observation requires native admission".into());
+        };
+        let session =
+            meerkat_core::SessionId::parse(session_id).map_err(|error| error.to_string())?;
+        let input = uuid::Uuid::parse_str(input_id)
+            .map(meerkat_core::lifecycle::InputId)
+            .map_err(|error| error.to_string())?;
+        let runtime = self.runtime().await?;
+        if runtime.mob_handle().mob_id().as_str() != scope.mob_id {
+            return Err("host signal mob does not match the active native owner".into());
+        }
+        let Some(service) = runtime.mob_runtime().session_service() else {
+            return Ok(NativeInputObservation::Unresolvable(
+                InputUnavailable::MissingSessionService,
+            ));
+        };
+        let Some(machine) = service
+            .acquire_runtime_adapter(None)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(NativeInputObservation::Unresolvable(
+                InputUnavailable::MissingRuntimeAdapter,
+            ));
+        };
+        match machine.input_state(&session, &input).await {
+            Ok(Some(state)) => Ok(NativeInputObservation::Present(Box::new(state))),
+            Ok(None) => Ok(NativeInputObservation::Unresolvable(
+                InputUnavailable::MissingInput,
+            )),
+            Err(RuntimeDriverError::NotFound { .. }) => Ok(NativeInputObservation::Unresolvable(
+                InputUnavailable::MissingRuntime,
+            )),
+            Err(
+                RuntimeDriverError::Destroyed
+                | RuntimeDriverError::NotReady {
+                    state: RuntimeState::Destroyed,
+                },
+            ) => Ok(NativeInputObservation::Unresolvable(
+                InputUnavailable::DestroyedRuntime,
+            )),
+            Err(error) => Err(format!("observe native coordinator input: {error}")),
+        }
     }
 
     pub fn use_console(&self, console: Arc<crate::console::ConsoleHub>) -> Result<(), String> {
@@ -1762,7 +1828,7 @@ fn build_unified_runtime(
             .timeout(Duration::from_secs(30))
             .max_sessions(max_sessions);
         #[cfg(test)]
-        let builder = builder.default_llm_client(Arc::new(meerkat_llm_core::TestClient::default()));
+        let builder = builder.default_llm_client(tests::runtime_test_llm_client());
         builder
             .build()
             .await
@@ -5760,6 +5826,330 @@ pub(crate) mod tests {
         delivered.expect("host signal must reach the native coordinator session");
     }
 
+    static HOST_SIGNAL_BLOCKING_CLIENT: OnceLock<Arc<HostSignalBlockingClient>> = OnceLock::new();
+
+    pub(super) fn runtime_test_llm_client() -> Arc<dyn meerkat_llm_core::LlmClient> {
+        match HOST_SIGNAL_BLOCKING_CLIENT.get() {
+            Some(client) => Arc::clone(client) as Arc<dyn meerkat_llm_core::LlmClient>,
+            None => Arc::new(meerkat_llm_core::TestClient::default()),
+        }
+    }
+
+    #[derive(Default)]
+    struct HostSignalBlockingClient {
+        block: AtomicBool,
+        entered: tokio::sync::Notify,
+        normal: meerkat_llm_core::TestClient,
+    }
+
+    #[async_trait]
+    impl meerkat_llm_core::LlmClient for HostSignalBlockingClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_llm_core::LlmError> {
+            self.normal.project_replay_messages(messages)
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a meerkat_llm_core::LlmRequest,
+        ) -> meerkat_llm_core::LlmStream<'a> {
+            if self.block.load(Ordering::SeqCst) {
+                self.entered.notify_one();
+                Box::pin(futures::stream::pending())
+            } else {
+                self.normal.stream(request)
+            }
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Other
+        }
+
+        async fn health_check(&self) -> Result<(), meerkat_llm_core::LlmError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admitted_host_signal_queued_at_stop_remains_recoverable() {
+        const NAME: &str = "admitted_host_signal_queued_at_stop_remains_recoverable";
+        if !isolated_runtime_test(NAME) {
+            return;
+        }
+        assert_queued_host_signal_recovery(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admitted_host_signal_acknowledged_at_stop_remains_recoverable() {
+        const NAME: &str = "admitted_host_signal_acknowledged_at_stop_remains_recoverable";
+        if !isolated_runtime_test(NAME) {
+            return;
+        }
+        assert_queued_host_signal_recovery(true).await;
+    }
+
+    async fn assert_queued_host_signal_recovery(acknowledge_before_stop: bool) {
+        use crate::host_signal_journal::{
+            HostSignalScope, SignalEnvelope, SignalHandlingMode, TrackerScope,
+        };
+        use meerkat_contracts::WireContinuationStatus;
+        use meerkat_runtime::{
+            InputAbandonReason, InputLifecycleState, InputTerminalOutcome, SessionServiceRuntimeExt,
+        };
+        let evidence = host_signal_evidence("host-signal-queued-stop-");
+        let root = evidence.0.as_ref().unwrap().path();
+        let client = Arc::new(HostSignalBlockingClient::default());
+        client.block.store(true, Ordering::SeqCst);
+        assert!(HOST_SIGNAL_BLOCKING_CLIENT.set(Arc::clone(&client)).is_ok());
+        let config = test_meerkat_config(root.join("state"));
+        let scope = HostSignalScope {
+            repository_path: root.to_owned(),
+            runtime_path: meta_runtime_state_path(&config),
+            mob_id: config.mob_id().into_owned(),
+            member: KAPELLMEISTER.to_owned(),
+            tracker: TrackerScope::Internal {
+                database: root.join("issues.sqlite3"),
+                repository: "fixture".into(),
+            },
+        };
+        let binding = HostSignalBinding {
+            path: root.join("signals.sqlite3"),
+            scope: scope.clone(),
+        };
+        let registry =
+            MetaRuntimeRegistry::with_templates(config.clone(), BTreeMap::new(), BTreeMap::new())
+                .with_host_signal_binding(binding.clone());
+        registry.bootstrap_repo_kapellmeister().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), client.entered.notified())
+            .await
+            .expect("bootstrap provider request must be in flight");
+        let mut journal = binding.open().unwrap();
+        let mut update = journal.begin().unwrap();
+        update
+            .enqueue_once("queued-stop-fixture", || {
+                Ok(SignalEnvelope {
+                    content: "notification queued during a provider request".into(),
+                    mode: SignalHandlingMode::Steer,
+                })
+            })
+            .unwrap();
+        update.commit().unwrap();
+        drop(journal);
+        let saved = binding.open().unwrap().pending(1).unwrap().remove(0);
+        let admitted = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let receipt = registry
+                    .deliver_repo_kapellmeister_signal(&scope, &saved)
+                    .await
+                    .unwrap();
+                match receipt.status {
+                    WireContinuationStatus::Admitted { .. } => break receipt,
+                    WireContinuationStatus::Pending => {
+                        tokio::time::sleep(Duration::from_millis(20)).await
+                    }
+                    _ => panic!("unexpected terminal native admission: {receipt:?}"),
+                }
+            }
+        })
+        .await
+        .expect("native admission while the bootstrap provider request is held");
+        let (session_id, input_id) = match &admitted.status {
+            WireContinuationStatus::Admitted {
+                session_id,
+                input_id,
+            } => (
+                meerkat_core::SessionId::parse(session_id).unwrap(),
+                meerkat_core::lifecycle::InputId(uuid::Uuid::parse_str(input_id).unwrap()),
+            ),
+            other => panic!("expected native admission: {other:?}"),
+        };
+        let runtime = registry.runtime().await.unwrap();
+        let machine = runtime
+            .mob_runtime()
+            .session_service()
+            .unwrap()
+            .acquire_runtime_adapter(None)
+            .unwrap()
+            .unwrap();
+        let queued = machine
+            .input_state(&session_id, &input_id)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(
+            root.join("native-queued-input.json"),
+            serde_json::to_vec_pretty(&queued).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(queued.seed.phase, InputLifecycleState::Queued);
+        assert_eq!(queued.seed.last_run_id, None);
+        assert_eq!(queued.seed.attempt_count, 0);
+        if acknowledge_before_stop {
+            binding
+                .open()
+                .unwrap()
+                .acknowledge(&saved.key, &admitted)
+                .unwrap();
+        }
+        registry.shutdown().await.unwrap();
+        let stopped = machine
+            .input_state(&session_id, &input_id)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(
+            root.join("native-stopped-input.json"),
+            serde_json::to_vec_pretty(&stopped).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("native-admission.json"),
+            serde_json::to_vec_pretty(&admitted).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stopped.seed.phase, InputLifecycleState::Abandoned);
+        assert_eq!(
+            stopped.seed.terminal_outcome,
+            Some(InputTerminalOutcome::Abandoned {
+                reason: InputAbandonReason::Stopped,
+            })
+        );
+        assert_eq!(stopped.seed.last_run_id, None);
+        assert_eq!(stopped.seed.attempt_count, 0);
+        assert_eq!(stopped.state.stop_requeue, None);
+        drop(machine);
+        drop(runtime);
+        drop(registry);
+        client.block.store(false, Ordering::SeqCst);
+        let registry =
+            MetaRuntimeRegistry::with_templates(config, BTreeMap::new(), BTreeMap::new())
+                .with_host_signal_binding(binding.clone());
+        assert_eq!(
+            registry
+                .deliver_repo_kapellmeister_signal(&scope, &saved)
+                .await
+                .unwrap(),
+            admitted,
+            "native keyed replay still returns the original receipt after restart"
+        );
+        let result = binding
+            .drain_pending(std::num::NonZeroU32::MIN, |scope, signal| {
+                let registry = &registry;
+                let admitted = admitted.clone();
+                async move {
+                    let replay = registry
+                        .deliver_repo_kapellmeister_signal(&scope, &signal)
+                        .await
+                        .map_err(crate::error::FugueError::Workspace)?;
+                    assert_eq!(replay, admitted);
+                    Ok(replay)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            result.acknowledged,
+            u32::from(!acknowledge_before_stop),
+            "native admission remains distinct from consumption"
+        );
+        let runtime = registry.runtime().await.unwrap();
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let history = runtime
+                    .mob_runtime()
+                    .read_session_history(&session_id.to_string(), 0, None)
+                    .await
+                    .unwrap();
+                if serde_json::to_string(&history.messages)
+                    .unwrap()
+                    .contains(&saved.envelope.content)
+                {
+                    assert_eq!(
+                        history
+                            .messages
+                            .iter()
+                            .filter(|entry| serde_json::to_string(entry)
+                                .unwrap()
+                                .contains(&saved.envelope.content))
+                            .count(),
+                        1
+                    );
+                    if binding.open().unwrap().pending(1).unwrap().is_empty()
+                        && binding
+                            .open()
+                            .unwrap()
+                            .admitted_for_reconciliation(1)
+                            .unwrap()
+                            .is_empty()
+                    {
+                        return;
+                    }
+                }
+                reconcile_host_signal_fixture(&binding, &registry).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        registry.shutdown().await.unwrap();
+        recovered.expect(
+            "a queued notification must survive graceful stop and reach canonical history once",
+        );
+        let journal = rusqlite::Connection::open(&binding.path).unwrap();
+        assert_eq!(
+            journal
+                .query_row("SELECT count(*) FROM replacements", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            1,
+            "exactly one proven stopped input gets a successor key"
+        );
+        let final_receipt: String = journal
+            .query_row("SELECT admitted_receipt FROM deliveries", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        std::fs::write(root.join("native-recovered-admission.json"), &final_receipt).unwrap();
+        let final_receipt: meerkat_contracts::WireContinuationReceipt =
+            serde_json::from_str(&final_receipt).unwrap();
+        assert_ne!(final_receipt.delivery_id, admitted.delivery_id);
+    }
+
+    async fn reconcile_host_signal_fixture(
+        binding: &HostSignalBinding,
+        registry: &MetaRuntimeRegistry,
+    ) {
+        let progress = binding
+            .reconcile_admitted(std::num::NonZeroU32::MIN, |scope, receipt| async move {
+                registry
+                    .observe_repo_kapellmeister_input(&scope, &receipt)
+                    .await
+                    .map_err(crate::error::FugueError::Workspace)
+            })
+            .await
+            .unwrap();
+        assert!(
+            progress.attention.is_empty(),
+            "unexpected native terminal: {:?}",
+            progress.attention
+        );
+        assert!(
+            progress.unresolvable.is_empty(),
+            "unresolvable native input: {:?}",
+            progress.unresolvable
+        );
+        binding
+            .drain_pending(std::num::NonZeroU32::MIN, |scope, signal| async move {
+                registry
+                    .deliver_repo_kapellmeister_signal(&scope, &signal)
+                    .await
+                    .map_err(crate::error::FugueError::Workspace)
+            })
+            .await
+            .unwrap();
+    }
+
     struct RuntimeFailureEvidence(Option<tempfile::TempDir>);
     impl Drop for RuntimeFailureEvidence {
         fn drop(&mut self) {
@@ -5967,6 +6357,7 @@ pub(crate) mod tests {
         let mut last_history = None;
         let history_result = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
+                reconcile_host_signal_fixture(&binding, &registry).await;
                 let history = runtime
                     .mob_runtime()
                     .read_session_history(&session_id, 0, None)
