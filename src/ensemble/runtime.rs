@@ -1972,6 +1972,8 @@ pub(crate) fn write_fixture_teams(config: &EnsembleConfig) {
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
+
     use super::*;
     use meerkat_core::{Message, Provider, StopReason, TurnUsage, Usage};
     use meerkat_llm_core::{LlmClient, LlmDoneOutcome, LlmError, LlmEvent, LlmRequest, LlmStream};
