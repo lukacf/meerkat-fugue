@@ -4,6 +4,7 @@ body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 var(--bs-
 .setup-header { padding:20px 32px; background:white; border-bottom:1px solid var(--hair); }
 .setup-header a { text-decoration:none; }
 .setup-page { max-width:1000px; margin:auto; padding:42px 24px 72px; }
+#setupFields { border:0; margin:0; padding:0; min-width:0; }
 h1 { font-size:34px; letter-spacing:-1px; margin:8px 0 12px; } p { color:var(--muted); }
 .steps { display:flex; gap:12px; margin:28px 0; padding:0; list-style:none; flex-wrap:wrap; }
 .steps li { padding:8px 14px; border:1px solid var(--hair); border-radius:20px; background:white; color:var(--muted); }
@@ -25,6 +26,8 @@ h1 { font-size:34px; letter-spacing:-1px; margin:8px 0 12px; } p { color:var(--m
 <main class="setup-page"><div class="fugue-kicker">REPOSITORY CONFIGURATION</div><h1>Connect your repository.</h1><p>One repository, its own issue tracker and work queue. Configure access here, then let Fugue map the code and prepare its team.</p>
 <ol class="steps" aria-label="Setup steps"><li class="active">1. Repository</li><li>2. Tickets</li><li>3. AI access and start</li></ol>
 <div id="pageError" class="fugue-message fugue-error" role="alert" hidden></div>
+<p id="setupLoading" role="status">Loading saved configuration...</p>
+<fieldset id="setupFields" aria-label="Repository configuration" disabled>
 <form id="githubForm" class="fugue-panel connection"><div class="fugue-kicker">1. REPOSITORY</div><h2>Where is the code?</h2><p>Paste a GitHub.com or GitHub Enterprise URL. Fugue manages the checkout.</p>
 <label for="repositoryUrl">Repository URL</label><input id="repositoryUrl" required form="workflowForm" placeholder="https://github.com/owner/repository" autocomplete="off"><input id="repoOwner" type="hidden"><input id="repoName" type="hidden">
 <div class="fields"><div><label for="githubHost">Hostname</label><input id="githubHost" value="github.com" required readonly></div><div><label for="githubMethod">Repository access</label><select id="githubMethod"><option value="gh_cli">GitHub CLI account on this machine</option><option value="token">Personal access token</option></select></div></div>
@@ -47,7 +50,7 @@ h1 { font-size:34px; letter-spacing:-1px; margin:8px 0 12px; } p { color:var(--m
 <div id="modelKeyFields" hidden><label for="modelKey">API key</label><input id="modelKey" type="password" autocomplete="new-password"><p class="helper">Passed to rkat through standard input. Stored by rkat, never by Fugue or in the repository. This updates rkat's default API-key account for the selected provider.</p></div>
 <div class="fugue-actions"><button class="fugue-button primary">Save AI selection</button><span id="modelResult" class="result" role="status"></span></div></form>
 <section class="fugue-panel connection" id="launchSection"><h2>Prepare, then start.</h2><p>First check repository and tracker access. Starting Fugue then maps the codebase and creates its team using your selected model. Work starts when a ticket matches the configured filter and ready status.</p><div class="fugue-actions"><button id="prepareWorkspace" form="workflowForm" class="fugue-button">Check and prepare repository</button><button class="fugue-button primary" id="startWorkspace" disabled>Start Fugue</button></div><p id="workflowResult" class="result" role="status"></p><p id="launchResult" class="result" role="status"></p></section>
-</main><script>
+</fieldset></main><script>
 'use strict';
 const $=id=>document.getElementById(id);
 const recommendedModels={openai:'__OPENAI_MODEL__',anthropic:'__ANTHROPIC_MODEL__',gemini:'__GEMINI_MODEL__'};
@@ -128,9 +131,11 @@ Promise.all([restoreWorkflow(),api('/api/setup/connections').then(restore),refre
     for(const [key,value]of Object.entries(defaults))$('lane-'+key).value=value;
   }
   setupReady=true;
+  $('setupFields').disabled=false;
+  $('setupLoading').hidden=true;
   workflowVisibility();
   if(!$('repositoryUrl').value&&$('repoOwner').value&&current?.github)$('repositoryUrl').value=`https://${current.github.host}/${$('repoOwner').value}/${$('repoName').value}`;
   return pollPreparation();
-}).catch(error=>{$('pageError').hidden=false;$('pageError').textContent=error.message;});visibility();
+}).catch(error=>{$('setupLoading').hidden=true;$('pageError').hidden=false;$('pageError').textContent='Could not load saved configuration. Reload this page to retry. '+error.message;});visibility();
 
 </script></body></html>

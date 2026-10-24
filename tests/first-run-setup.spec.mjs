@@ -136,6 +136,38 @@ test('saved Jira workflow mappings survive a slower connection restore',async({p
   await expect(page.getByLabel('Merge',{exact:true})).toHaveValue('Awaiting merge');
 });
 
+for(const endpoint of ['connections','workflow']) test(`setup waits for saved ${endpoint} before accepting edits`,async({page})=>{
+  await setup(page,{...connected,tracker:{kind:'jira',site:'https://example.atlassian.net',email:'test@example.com'}});
+  let release,started;
+  const pending=new Promise(resolve=>release=resolve);
+  const requested=new Promise(resolve=>started=resolve);
+  await page.route(`**/api/setup/${endpoint}`,async route=>{
+    started();
+    await pending;
+    await route.fallback();
+  });
+  await page.reload();
+  await requested;
+  try {
+    // Late saved values must not replace edits made on an apparently ready form.
+    await expect(page.getByLabel('Repository URL',{exact:true})).toBeDisabled();
+    await expect(page.getByLabel('Issue tracker',{exact:true})).toBeDisabled();
+    await expect(page.locator('#model')).toBeDisabled();
+    await expect(page.locator('#lane-intake')).toBeDisabled();
+    await expect(page.getByRole('button',{name:'Save tracker access'})).toBeDisabled();
+    await expect(page.getByRole('button',{name:'Check account access'})).toBeDisabled();
+    await expect(page.getByText('Loading saved configuration...',{exact:true})).toBeVisible();
+  } finally {
+    release();
+  }
+  await expect(page.getByLabel('Issue tracker',{exact:true})).toBeEnabled();
+  await expect(page.getByLabel('Issue tracker',{exact:true})).toHaveValue('jira');
+  await expect(page.getByLabel('Ready to start',{exact:true})).toHaveValue('Open');
+  await expect(page.getByText('Loading saved configuration...',{exact:true})).toBeHidden();
+  await page.getByLabel('Repository URL',{exact:true}).fill('https://github.com/example/new-selection');
+  await expect(page.getByLabel('Repository URL',{exact:true})).toHaveValue('https://github.com/example/new-selection');
+});
+
 test('failed workflow restore keeps preparation disabled',async({page})=>{
   await setup(page,connected);
   await page.route('**/api/setup/workflow',route=>route.fulfill({status:500,json:{error:'Saved workflow is temporarily unavailable.'}}));
@@ -143,6 +175,13 @@ test('failed workflow restore keeps preparation disabled',async({page})=>{
   await expect(page.locator('#pageError')).toContainText('Saved workflow is temporarily unavailable.');
   await expect(page.getByRole('button',{name:'Check and prepare repository'})).toBeDisabled();
   await expect(page.getByRole('button',{name:'Start Fugue'})).toBeDisabled();
+  await expect(page.getByLabel('Repository URL',{exact:true})).toBeDisabled();
+  await expect(page.getByRole('button',{name:'Save tracker access'})).toBeDisabled();
+  await expect(page.locator('#pageError')).toContainText('Reload this page to retry.');
+  await page.unroute('**/api/setup/workflow');
+  await page.reload();
+  await expect(page.getByLabel('Repository URL',{exact:true})).toBeEnabled();
+  await expect(page.getByRole('button',{name:'Save tracker access'})).toBeEnabled();
 });
 
 for(const tracker of ['local','linear']) test(`switching from Jira to ${tracker} restores that tracker's workflow defaults`,async({page})=>{

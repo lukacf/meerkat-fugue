@@ -42,9 +42,10 @@ existing issue. For older explicit workflow file locations, see
 
 ## Setup will not prepare or start
 
-Save repository access, tracker access and model access before preparing the
-workspace. If loading saved settings fails, restore access and reload setup;
-Fugue keeps preparation disabled until it can read the existing configuration.
+Wait for saved configuration to load before editing connections or workflow
+settings. Save repository access, tracker access and model access before
+preparing the workspace. If loading saved settings fails, restore access and
+reload setup; the forms remain disabled until the existing configuration loads.
 An error loading settings does not mean the repository needs to be added again.
 
 If you edit a connection while its save is pending, the page may say **Earlier
