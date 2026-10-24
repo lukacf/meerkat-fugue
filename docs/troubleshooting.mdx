@@ -99,6 +99,26 @@ which can include partial issue data. Check the account and project for access
 failures, follow retry advice for rate limits, and refresh state before retrying
 a conflict.
 
+## Coordinator notifications are waiting
+
+Check the service log for the error accompanying **host notification remains
+saved for retry**. Restore native runtime or disk access, then allow the running
+service to retry. Saved notifications also resume at startup. A tracker outage
+prevents observing new changes but does not prevent retrying work already saved.
+
+If the log says **host signal routing changed**, restart through the service's
+normal managed procedure after checking the intended repository configuration.
+If it says **journal belongs to another repository, runtime or tracker scope**,
+preserve the journal and restore its matching configuration/state. Do not reuse
+that journal for a different project or Jira filter. A corrupt or unrecognized
+journal must also be preserved for diagnosis, rather than replaced with an empty
+file.
+
+An acknowledged native input is not proof that the coordinator completed its
+work. Inspect its conversation and Work Graph before retrying an operator
+action. See [saved notification recovery](./operations.mdx#recover-saved-notifications)
+for the admission and backup contract.
+
 ## Hook fails before worker launch
 
 Hook failures are usually repository, credentials, or host setup problems.

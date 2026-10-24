@@ -1,104 +1,125 @@
+---
+title: "Architecture"
+description: "Repository isolation, native agent authority, tracker projections and durable notifications."
+---
+
 # Architecture
 
-Fugue is a single Tokio service with typed configuration, a Linear tracker,
-workspace management, native mob launch, reconciliation, and an optional Axum
-status surface.
+Fugue hosts persistent Meerkat teams for software repositories. Each repository
+has its own checkout, tracker/project, queue, credentials and native mob. Jira,
+built-in Fugue tickets and Linear use the same issue workflow boundary. GitHub
+and GitHub Enterprise provide repository and PR operations.
+
+The managed service exposes one operator application and a shared native Meta
+console. Repository preparation forms and initializes domain specialists.
+Issue leads and execution members work in that same repository mob and consult
+those specialists as work reaches their domains.
 
 ## Component diagram
 
 ```mermaid
 flowchart LR
-    Linear[Linear] <--> Fugue[Fugue issue orchestration]
-    Fugue --> Workspace[Isolated issue workspaces]
-    Fugue --> Meta[Meta unified runtime]
-    Meta --> Core[Meerkat native mob and sessions]
-    Fugue --> Runs[Fugue issue/run records]
-    Core --> Journal[Native journal and session stores]
-    Meta --> Console[Meta console]
+    Tracker["Jira, Fugue tickets or Linear"] <--> Host["Fugue host mechanisms"]
+    Git["GitHub or GitHub Enterprise"] <--> Host
+    Host --> Workspace["Isolated issue workspaces"]
+    Host --> Signals["Saved coordinator notifications"]
+    Signals --> Meta["Meta unified runtime"]
+    Host <--> Meta
+    Meta --> Core["Meerkat mob, members and sessions"]
+    Core --> State["Native durable state"]
+    Meta --> Console["Shared agent console"]
 ```
 
-## Source tree map
+## Authority and boundaries
 
-- `src/main.rs` — CLI, logging, HTTP server startup, orchestrator task, and
-  shutdown.
-- `src/config.rs` — typed config parsing, native defaults, prompt
-  rendering, and validation.
-- `src/orchestrator.rs` — poll loop, dispatch, retries, backoff, recovery, and
-  handoff reconciliation.
-- `src/tracker.rs` and `src/linear_tools.rs` — Linear GraphQL client and typed
-  Linear tool layer.
-- `src/workspace.rs` and `src/workspace_tools.rs` — workspace path invariants,
-  hook execution, and cleanup provenance.
-- `src/meta_runtime.rs` — persistent Meta composition, native member tools, and durable issue/run records.
-- `src/mob_tools.rs`, `src/mob_event_observer.rs`, and
-  `src/native_mob_contract.rs` — native Meta execution, event observation,
-  and lifecycle evidence checks.
-- `src/kapellmeister*.rs` — shadow/guarded policy contracts and host plumbing.
-- `src/github_tools.rs` — typed GitHub operations used for PR handoff and CI.
-- `src/http.rs` — dashboard and JSON status routes.
-- `tests/` — integration and source-only contract tests. `real_e2e` is ignored
-  unless explicitly enabled.
+| Owner | Responsibility |
+| --- | --- |
+| Repository coordinator (Kapellmeister) | Coordinate repository work, issue leads and final PR handoff through scoped native tools. |
+| Issue leads and execution members | Plan, implement and review bounded work; consult specialists and report evidence. |
+| Domain specialists | Retain repository knowledge and respond to relevant questions and subscribed path changes. |
+| Meerkat and Meta | Native execution, member identity, input admission, session history, lifecycle events, persistence and console state. |
+| Fugue host | Poll external systems, prepare workspaces, provide scoped tools, save notifications, enforce delivery safeguards and project typed lifecycle evidence. |
+| Tracker | Expose issues, operator actions and configured workflow lanes. The Workpad records human-readable progress and evidence. |
 
-## Issue lifecycle
+The host does not run a planner/coder/reviewer turn loop or reconstruct native
+session history. Tracker status and Workpad prose cannot establish native
+completion. A successful merge requires current review, PR, CI and Work Graph
+evidence for the actual repository and PR head.
 
-1. **Poll** — fetch issues from configured intake and active lanes.
-2. **Filter** — skip blocked, terminal, already running, claimed, or backing-off
-   issues.
-3. **Select template** — choose a mob template from labels and defaults.
-4. **Prepare workspace** — create/reuse the issue workspace and run hooks.
-5. **Launch worker** — configs launch a native Meerkat mob.
-6. **Observe** — collect Meta events, workspace facts, Linear Workpad state,
-   and GitHub PR state.
-7. **Reconcile** — validate handoff invariants and move to retry, review, or
-   completion.
-8. **Cleanup** — remove terminal workspaces through replay-safe cleanup.
+## From issue to delivery
+
+Fugue observes the configured queue and applies admission constraints, including
+blockers, existing claims and retry backoff. An eligible issue receives an
+isolated workspace and native execution using its selected template. The
+repository coordinator and issue team own coordination within that execution.
+
+The host observes native events and external facts, then exposes the configured
+tracker projection and guarded repository actions. Children report their work
+and review results. Final handoff checks the current evidence before merge and,
+if configured, deployment. A tracker lane change alone does not advance native
+execution or prove successful delivery.
+
+## Durable notifications
+
+`host_signal_journal` records observations and delivery intent atomically. Its
+scope binds the workflow path, runtime path, mob, coordinator and tracker. Jira
+scope also includes the query. A saved notification cannot be redirected by
+changing a connection or by moving the journal to another repository.
+
+The service drains pending work through native keyed member admission. A lost
+or pending response retains the original delivery key and content. Only an
+`Admitted` native receipt acknowledges the host record. Native admission supplies
+the session/input identity and deduplicates ambiguous retries; the host journal
+does not invent a delivery receipt or own agent completion.
+
+If native admission reports terminal non-admission, Fugue records that receipt
+and a deterministic replacement key before another attempt. An uncertain result
+does not authorize a new key. Database transactions finish before awaiting
+native delivery, and saved work can retry independently of tracker reads.
+
+Repository path subscriptions are a separate mechanism: specialists register
+their interests, and Fugue observes default-branch changes and notifies matching
+members. The coordinator journal does not replace native memory, Work Graph or
+the specialist subscription store.
 
 ## Recovery model
 
-The optional status API exposes in-memory state plus durable recovery evidence.
-Native running rows include:
+Fugue retains issue/run associations and delivery evidence; Meerkat and Meta own
+native recovery. Diagnostics compare native run identity, workspace branch and
+head, Workpad evidence, and the remote PR. Incomplete or contradictory evidence
+requires review, not silent completion.
 
-- Meta run id;
-- workspace path, branch, head SHA, and dirty flag;
-- Linear branch and Workpad run evidence;
-- PR mentions from Linear;
-- GitHub PR URL, state, and head SHA;
-- `review_required` when evidence is incomplete or inconsistent.
+Back up workflow configuration, issue workspaces, host journals and native state
+together while the service is stopped or through a supported consistent snapshot.
+Reopening a coordinator input after a crash does not authorize repeating an
+uncertain merge or deployment. Those actions have their own remote evidence and
+durable attempt contracts. See [operations and recovery](./operations.mdx).
 
-Fugue requires human review instead of silent completion when, for example, the
-Workpad run id differs from the Meta run id, Linear and GitHub disagree on PR
-head, the workspace SHA differs from PR head, or a successful native run lacks
-PR handoff evidence.
+## Source tree map
 
-## Policy boundaries
-
-Fugue separates three concerns:
-
-- **Execution backend** — native Meerkat mobs.
-- **Policy owner** — Rust orchestrator by default, with Kapellmeister shadow or
-  guarded modes depending on config.
-- **Human workflow** — Linear states, Workpad rules, and PR handoff encoded in
-  prompts and operator policy.
-
-Kapellmeister shadow mode is read-only. Guarded authority must be narrowed with
-safe selectors. Production decisions either execute through guarded native host
-tools or stop.
+| Source | Purpose |
+| --- | --- |
+| `src/main.rs` | CLI, server startup and service lifecycle. |
+| `src/config.rs`, `src/setup/` | Typed configuration, onboarding and validation. |
+| `src/orchestrator.rs` | Observation loop, workspace dispatch, retry mechanisms and handoff checks. |
+| `src/tracker.rs`, `src/jira.rs`, `src/fugue_ims.rs` | Tracker adapters and scoped issue operations. |
+| `src/host_signal_journal.rs` | Durable observations, delivery intent and native admission acknowledgement. |
+| `src/ensemble/` | Team formation, specialist study and repository subscriptions. |
+| `src/meta_runtime.rs` | Native runtime composition, member tools and persistent issue/run associations. |
+| `src/mob_event_observer.rs`, `src/native_mob_contract.rs` | Typed native lifecycle and handoff evidence. |
+| `src/kapellmeister.rs`, `src/kapellmeister_host.rs` | Coordinator signal contracts and guarded host actions. |
+| `src/github_tools.rs` | GitHub/GHE PR and check operations. |
+| `src/workspace.rs`, `src/workspace_tools.rs` | Issue workspace creation, hooks and cleanup provenance. |
+| `src/http.rs` | Operator pages, status API and native console integration. |
 
 ## Trust model
 
-Fugue enforces application-level invariants: typed config, path normalization,
-under-root workspace checks, replay-safe cleanup, and evidence reconciliation.
-It does not sandbox shell commands, repository code, Meerkat tools, or
-credentials.
+Every admitted browser user is a full operator. Repository code, hooks and agent
+tools run with the service account's permissions. Typed inputs, scoped tools,
+path checks and delivery gates protect application invariants; Fugue does not
+provide an operating-system sandbox. Use trusted repositories, an authenticated
+gateway, appropriately scoped credentials and separate instances where operator
+authority must be isolated.
 
-## Related docs
-
-- [Native Mobs](./native-mobs.mdx)
-- [Status Api](./status-api.mdx)
-
-## Runtime ownership in 0.9.3
-
-Fugue stores issue/run associations separately from Meta's member and session
-state. The root mob journal and its composition manifest are explicitly durable;
-Meta owns restoring them. Meerkat owns execution and tool authority. See the
-[upgrade guide](./upgrading-0.9.3.mdx) for state layout and configuration changes.
+See [native mobs](./native-mobs.mdx), [the status API](./status-api.mdx) and
+[development and testing](./development.mdx) for the detailed contracts.

@@ -175,10 +175,14 @@ label use `default_template`.
 
 Defines reusable Meerkat agent profiles referenced by mob members.
 
+Omit `model` to use the recommendation in Fugue's pinned Meerkat catalog. An
+explicit model is an override and remains selected when that recommendation
+changes. The current default is `gpt-6-astra`.
+
 ```yaml
 agents:
   coder:
-    model: gpt-5.5
+    model: gpt-6-astra
     provider: openai
     max_tokens: 8000
     tools: [mob, shell, git, mcp:linear, mcp:github]
@@ -193,13 +197,13 @@ output retries, provider params, tool/skill lists, and extra instructions. Repo
 tools such as Linear and GitHub must be packaged as MCP servers and referenced
 with `mcp:<server-name>`; bare `linear`/`github` tool strings are rejected so a
 member cannot silently start with an empty tool catalog. The helper MCP binaries
-are part of the issue-mob runtime contract: `fugue-linear-mcp` owns Linear
-Workpad updates, `fugue-github-mcp` owns GitHub PR/check handoff evidence,
-and `fugue-host-mcp` owns host-level Fugue control-plane actions. It hides
-`github_merge_pr` by default; expose merge only for an explicit repo-level merge
-authority by setting `FUGUE_GITHUB_ALLOW_MERGE=true` on that MCP server. Deploy
-or restart them with `meerkat-fugue`, and include all four binary hashes in
-post-deploy evidence. The special `mob` tool means
+are part of the runtime contract: `fugue-linear-mcp` and `fugue-jira-mcp` provide
+their tracker tools, `fugue-github-mcp` provides GitHub PR/check evidence,
+and `fugue-host-mcp` provides repository control-plane actions. Merge goes
+through the Fugue host action, which checks current review and delivery
+authority; the standalone GitHub tool server does not offer merge. Deploy all
+five Fugue binaries together with the bundle's pinned rkat, and retain their
+checksums in post-deploy evidence. The special `mob` tool means
 Meerkat-provided mob tooling (`tools.mob=true`), not a Fugue-defined pseudo-tool.
 
 Fugue provides Playwright MCP to native agents by default. The default server is:
@@ -327,7 +331,7 @@ Low-level Meerkat/Meta session settings.
 meerkat:
   command: rkat-rpc
   realm_backend: sqlite
-  model: gpt-5.5
+  model: gpt-6-astra
   max_sessions: 4096
   enable_shell: true
   enable_builtins: true

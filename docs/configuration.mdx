@@ -208,10 +208,14 @@ available to the Fugue service user.
 
 Defines reusable Meerkat member profiles.
 
+Omit `model` to use the recommendation in Fugue's pinned Meerkat catalog. An
+explicit model is an override and remains selected when that recommendation
+changes. The current default is `gpt-6-astra`.
+
 ```yaml
 agents:
   coder:
-    model: gpt-5.5
+    model: gpt-6-astra
     provider: openai
     max_tokens: 8000
     tools: [mob, shell, git, mcp:linear, mcp:github]
@@ -331,7 +335,7 @@ Low-level Meerkat and Meta settings.
 meerkat:
   command: rkat-rpc
   realm_backend: sqlite
-  model: gpt-5.5
+  model: gpt-6-astra
   max_sessions: 4096
   enable_shell: true
   enable_builtins: true
