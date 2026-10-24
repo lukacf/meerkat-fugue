@@ -6,10 +6,10 @@ const html = (await readFile(new URL('../src/setup/setup.html',import.meta.url),
   .replaceAll('__DEFAULT_MODEL__','gpt-6-astra').replaceAll('__OPENAI_MODEL__','gpt-6-astra').replaceAll('__ANTHROPIC_MODEL__','claude-test').replaceAll('__GEMINI_MODEL__','gemini-test')
   .replace('__APP_CSS__',await readFile(new URL('../src/ui/app.css',import.meta.url),'utf8'));
 
-async function setup(page, initial={}, prefix='') {
+async function setup(page, initial={}, prefix='', initialWorkflow=null) {
   const state={model:null,github:null,tracker:null,environment_providers:['openai'],...initial};
   const writes=[];
-  let workflow=null;
+  let workflow=initialWorkflow;
   let preparation={phase:'draft'};
   await page.route('http://fugue.test/**',async route=>{
     const url=new URL(route.request().url());
@@ -29,7 +29,7 @@ async function setup(page, initial={}, prefix='') {
     }
     if(url.pathname==='/api/setup/workflow') return route.fulfill({body:JSON.stringify(workflow),contentType:'application/json'});
     if(url.pathname==='/api/setup/preparation') {
-      if(route.request().method()==='POST') {workflow=route.request().postDataJSON();writes.push({connection:'workflow',value:workflow});preparation={phase:'ready'};}
+      if(route.request().method()==='POST') {workflow={...route.request().postDataJSON(),lane_configuration:state.tracker.kind};writes.push({connection:'workflow',value:workflow});preparation={phase:'ready'};}
       return route.fulfill({json:preparation});
     }
     if(url.pathname==='/api/setup/check/jira-states') return route.fulfill({json:{states:[{name:'Open'},{name:'In Progress'},{name:'Resolved'},{name:'Reopened'},{name:'Closed'}]}});
@@ -112,6 +112,89 @@ test('saved Jira access restores its defaults when no workflow exists yet',async
     await expect(page.getByLabel('Merge',{exact:true})).toHaveValue('Reopened');
     if(attempt===0) await page.reload();
   }
+});
+
+// Add repository writes this workflow before the user chooses a tracker.
+const managedDraft={
+  repository_url:'https://github.com/example/application',owner:'example',repository:'application',
+  checkout:null,tracker_project:null,tracker_team:null,jira_issue_type:'Task',jira_jql:null,
+  jira_issue_labels:[],lane_configuration:'generated',
+  lanes:{parked:'Backlog',intake:'Queue',active:'Active',review_action:'Review',deploy_action:'Deploy',blocked:'Blocked',success:'Done',canceled:'Canceled'},
+};
+
+test('managed Jira setup retains tracker defaults after reload before preparation',async({page})=>{
+  await setup(page,connected,'',structuredClone(managedDraft));
+  await page.getByLabel('Issue tracker',{exact:true}).selectOption('jira');
+  await page.getByLabel('Jira site',{exact:true}).fill('https://example.atlassian.net');
+  await page.getByLabel('Account email',{exact:true}).fill('test@example.com');
+  await page.getByLabel('API token',{exact:true}).fill('jira-secret-sentinel');
+  await page.getByRole('button',{name:'Save tracker access'}).click();
+  await expect(page.locator('#trackerResult')).toHaveText('Saved privately.');
+  await page.reload();
+  await expect(page.getByLabel('Ready to start',{exact:true})).toHaveValue('Open');
+  await expect(page.getByLabel('Awaiting review',{exact:true})).toHaveValue('Resolved');
+  await expect(page.getByLabel('Merge',{exact:true})).toHaveValue('Reopened');
+  await expect(page.getByLabel('Repository URL',{exact:true})).toHaveValue(managedDraft.repository_url);
+});
+
+for(const tracker of ['local','linear']) test(`managed Jira workflow switches to ${tracker} across reload before preparation`,async({page})=>{
+  const jiraDraft={...structuredClone(managedDraft),lane_configuration:'jira',tracker_project:'EXAMPLE',jira_jql:'labels = "fugue-app"',
+    lanes:{parked:'Open',intake:'Open',active:'In Progress',review_action:'Resolved',deploy_action:'Reopened',blocked:'In Progress',success:'Closed',canceled:'Closed'}};
+  await setup(page,{...connected,tracker:{kind:'jira',site:'https://example.atlassian.net',email:'test@example.com'}},'',jiraDraft);
+  await page.getByLabel('Issue tracker',{exact:true}).selectOption(tracker);
+  if(tracker==='linear') await page.getByLabel('API token',{exact:true}).fill('linear-secret-sentinel');
+  await page.getByRole('button',{name:'Save tracker access'}).click();
+  await expect(page.locator('#trackerResult')).toHaveText('Saved privately.');
+  await page.reload();
+  await expect(page.getByLabel('Draft tickets',{exact:true})).toHaveValue('Backlog');
+  await expect(page.getByLabel('Ready to start',{exact:true})).toHaveValue('Queue');
+  await expect(page.getByLabel('Review',{exact:true})).toHaveValue('Review');
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeDisabled();
+});
+
+test('unannotated saved workflows preserve custom mappings on reload',async({page})=>{
+  const draft={...structuredClone(managedDraft),lanes:{...managedDraft.lanes,intake:'Triage accepted'}};
+  delete draft.lane_configuration;
+  await setup(page,connected,'',draft);
+  await page.reload();
+  await expect(page.getByLabel('Ready to start',{exact:true})).toHaveValue('Triage accepted');
+});
+
+for(const failure of ['client','server']) test(`stale ready status cannot undo ${failure} preparation rejection`,async({page})=>{
+  const {writes}=await setup(page,connected,'',structuredClone(managedDraft));
+  await page.getByRole('button',{name:'Check and prepare repository'}).click();
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeEnabled();
+  let release,started;
+  const pending=new Promise(resolve=>release=resolve),requested=new Promise(resolve=>started=resolve);
+  await page.route('**/api/setup/preparation',async route=>{
+    if(route.request().method()==='POST') return route.fulfill({status:400,json:{error:'Repository preparation refused'}});
+    started();await pending;return route.fulfill({json:{phase:'ready'}});
+  });
+  await page.reload();await requested;
+  await expect(page.getByLabel('Repository URL',{exact:true})).toBeEnabled();
+  await page.getByLabel('Repository URL',{exact:true}).fill(failure==='client'?'invalid repository':'https://github.com/example/another');
+  await page.getByRole('button',{name:'Check and prepare repository'}).click();
+  const error=failure==='client'?'Enter a GitHub or GitHub Enterprise repository URL.':'Repository preparation refused';
+  await expect(page.locator('#workflowResult')).toHaveText(error);
+  const response=page.waitForResponse(r=>r.url().endsWith('/api/setup/preparation')&&r.request().method()==='GET');
+  release();await (await response).finished();
+  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeDisabled();
+  await expect(page.locator('#workflowResult')).toHaveText(error);
+  expect(writes.filter(write=>write.connection==='start')).toHaveLength(0);
+});
+
+for(const [label,value]of [['Commit author name','New Author'],['Repository URL','https://github.com/example/another']]) test(`pending GitHub save does not dirty access after editing ${label}`,async({page})=>{
+  await setup(page,connected,'',structuredClone(managedDraft));
+  if(label==='Commit author name') await page.getByText('Commit author',{exact:true}).click();
+  const pending=await holdConnectionSave(page,'github');
+  await page.getByRole('button',{name:'Save repository access'}).click();await pending.requested;
+  await page.getByLabel(label,{exact:true}).fill(value);
+  pending.release();
+  await expect(page.locator('#githubResult')).toHaveText('Saved privately.');
+  await expect(page.getByLabel(label,{exact:true})).toHaveValue(value);
+  await expect(page.getByRole('button',{name:'Check and prepare repository'})).toBeEnabled();
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeDisabled();
 });
 
 test('saved Jira workflow mappings survive a slower connection restore',async({page})=>{

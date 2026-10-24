@@ -41,6 +41,31 @@ pub struct WorkflowSetup {
     pub jira_transition_fields:
         BTreeMap<String, BTreeMap<String, Box<serde_json::value::RawValue>>>,
     pub lanes: TrackerLaneRoles,
+    /// Records which tracker the operator configured these lanes for. Generated
+    /// drafts have no tracker yet; older unannotated workflows retain their maps.
+    #[serde(default)]
+    pub lane_configuration: LaneConfiguration,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneConfiguration {
+    #[default]
+    Unspecified,
+    Generated,
+    Local,
+    Linear,
+    Jira,
+}
+
+impl LaneConfiguration {
+    pub fn for_tracker(tracker: &TrackerConnection) -> Self {
+        match tracker {
+            TrackerConnection::Local => Self::Local,
+            TrackerConnection::Linear { .. } => Self::Linear,
+            TrackerConnection::Jira { .. } => Self::Jira,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -651,6 +676,7 @@ mod tests {
             tracker: Some(serde_json::from_str(r#"{"kind":"jira","site":"https://example.atlassian.net","email":"test@example.com","api_token":"test-token"}"#).unwrap()),
         };
         let request = WorkflowSetup {
+            lane_configuration: LaneConfiguration::Unspecified,
             commit_identity: Default::default(),
             allow_no_ci_checks: false,
             repository_url: None,
@@ -770,6 +796,7 @@ mod tests {
             tracker: Some(TrackerConnection::Local),
         };
         let request = WorkflowSetup {
+            lane_configuration: LaneConfiguration::Unspecified,
             commit_identity: Default::default(),
             allow_no_ci_checks: false,
             repository_url: None,
