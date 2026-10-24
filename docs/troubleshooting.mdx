@@ -106,6 +106,16 @@ saved for retry**. Restore native runtime or disk access, then allow the running
 service to retry. Saved notifications also resume at startup. A tracker outage
 prevents observing new changes but does not prevent retrying work already saved.
 
+If the message is **host notification needs attention**, the input was admitted
+but its native state does not permit a safe automatic retry. The message names
+the missing input/runtime or the terminal outcome. Keep the saved receipt and
+matching runtime state; ask the host operator to diagnose that delivery before
+repeating the tracker action. Other notifications continue independently.
+
+An ordinary graceful stop is handled automatically when native state proves a
+queued notification never ran. Fugue does not automatically resend a consumed,
+canceled, previously attempted or held-tail-repaired input.
+
 If the log says **host signal routing changed**, restart through the service's
 normal managed procedure after checking the intended repository configuration.
 If it says **journal belongs to another repository, runtime or tracker scope**,

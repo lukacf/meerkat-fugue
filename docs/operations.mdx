@@ -151,9 +151,25 @@ An admission timeout can mean that Meerkat accepted the input but Fugue did not
 receive the result. The retry keeps the same delivery key, so native admission
 can return the original receipt instead of adding a second input. Fugue marks
 the saved notification acknowledged only when the native receipt is `Admitted`.
-That means the coordinator has received an input, not that it has finished the
-work or merged a PR. Check the conversation, Work Graph and delivery evidence
-for the outcome.
+That means Meerkat has queued an input for the coordinator. It does not prove
+that the coordinator has processed it, finished the work or merged a PR. Fugue
+retains the full admission receipt and checks the native input separately, so
+an in-flight turn does not block newer notifications. Check the conversation,
+Work Graph and delivery evidence for the task outcome.
+
+If a graceful stop abandons a queued notification before any execution, Fugue
+can submit a replacement after native state proves it never ran. The replacement
+key and proof are saved together, so another restart cannot create another copy.
+Notifications already consumed, associated with a run, canceled, or affected by
+held-tail repair are not automatically resubmitted.
+
+**Host notification needs attention** means Fugue cannot safely establish a
+retry. For example, the admitted native input may be missing or its runtime may
+have been destroyed. Its receipt stays saved, and later notifications can still
+arrive. Preserve the workflow's `.fugue/host-signals.sqlite3`, the matching native
+runtime state and the service log for diagnosis. A missing input is not proof
+that its earlier work had no effect. Do not clear the journal or repeat the
+tracker action to manufacture progress.
 
 If logs report **host notification remains saved for retry**, inspect the
 associated runtime or storage error and restore that dependency. Leave the
