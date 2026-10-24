@@ -3817,7 +3817,7 @@ fn issue_lead_prompt_for_tracker(
         .map(|projection| projection.terminal_lanes.succeeded.as_str())
         .unwrap_or("the configured development handoff lane");
     format!(
-        "You are the Fugue issue lead for {issue}. Coordinate visible worker peers through Meta comms. You own issue-level Jira lane projection: inspect the issue, update the Workpad, and use linear_move_issue with the configured Jira status names. Kapellmeister owns repo-level startup/resume/retire coordination. Once intake is accepted, project the issue to {active}. Record internal planner/coder/reviewer/remediation phases in labels, WorkGraph, Workpad, and Meta evidence. Follow the template's configured node and terminal projections; never invent tracker statuses or enter operator action lanes from inside the issue mob. Successful development projects to {handoff} after review and WorkGraph obligations are satisfied. A configured review holding lane may be entered for this handoff; it is distinct from operator action lanes. Do not substitute the tracker completion lane for this projection. Merging requires a separate explicit action and verified merge completion follows its configured success projection. Red review, failed checks, or actionable operator findings must create or update WorkGraph blockers and keep or return the issue to {active} for focused replanning. Use labels `fugue`, `issue:{issue}`, and `blocking`. Deleted comments do not clear obligations without explicit newer acceptance. Use the default WorkGraph scope: omit realm_id and namespace unless following an exact returned item reference; never invent a realm or namespace from the issue identifier. Planner/coder may claim, update, and add evidence, but only reviewer-role agents may close completed review obligations. Before terminal success, query WorkGraph yourself and verify every blocking `issue:{issue}` item is terminal. Execute actual transition calls before reporting lane movement complete.\n\n{}",
+        "You are the Fugue issue lead for {issue}. Coordinate visible worker peers through Meta comms. You own issue-level Jira lane projection: inspect the issue, update the Workpad, and use linear_move_issue with the configured Jira status names. Kapellmeister owns repo-level startup/resume/retire coordination. Once intake is accepted, project the issue to {active}. Record internal planner/coder/reviewer/remediation phases in labels, WorkGraph, Workpad, and Meta evidence. Follow the template's configured node and terminal projections; never invent tracker statuses or enter operator action lanes from inside the issue mob. Successful development projects to {handoff} after its issue-team review and implementation obligations are satisfied. The issue lead owns this development handoff projection; Kapellmeister coordinates the downstream repository review. When the configured handoff also requests repository independent review, entering it does not require the result of the subsequent repository review. Resolve current implementation findings first. Do not close future review or merge obligations to permit this handoff. This shared holding status requests review and is not terminal acceptance or review approval. A configured review holding lane may be entered for this handoff; other operator action lanes remain forbidden. Do not substitute the tracker completion lane for this projection. Merging requires a separate explicit action and verified merge completion follows its configured success projection. Red review, failed checks, or actionable operator findings must create or update WorkGraph blockers and keep or return the issue to {active} for focused replanning. Use labels `fugue`, `issue:{issue}`, and `blocking`. Deleted comments do not clear obligations without explicit newer acceptance. Use the default WorkGraph scope: omit realm_id and namespace unless following an exact returned item reference; never invent a realm or namespace from the issue identifier. Planner/coder may claim, update, and add evidence, but only reviewer-role agents may close completed review obligations. Before terminal success, query WorkGraph yourself and verify every blocking `issue:{issue}` item is terminal. Execute actual transition calls before reporting lane movement complete.\n\n{}",
         instructions.unwrap_or_default()
     )
 }
@@ -4487,6 +4487,37 @@ pub(crate) mod tests {
         assert!(prompt.contains("fork_off with message_count: 0"));
         assert!(prompt.contains("verify its working directory first"));
         assert!(prompt.contains("it must not delegate further"));
+    }
+
+    #[test]
+    fn hosted_acceptance_review_handoff_does_not_wait_for_its_own_review_result() {
+        let mut tracker = tracker_with_key();
+        tracker.kind = "jira".into();
+        tracker.in_flight_states = vec!["Working".into()];
+        let projection = crate::config::MaterializedLinearProjection {
+            id: "development".into(),
+            node_lanes: BTreeMap::new(),
+            node_phase_labels: BTreeMap::new(),
+            aggregate: crate::config::NativeLinearProjectionAggregate {
+                precedence: vec![],
+                fallback: Some("Working".into()),
+            },
+            terminal_lanes: crate::config::NativeLinearProjectionTerminals {
+                succeeded: "Awaiting review".into(),
+                failed: "Working".into(),
+                cancelled: "Closed".into(),
+            },
+        };
+        let prompt = issue_lead_prompt_for_tracker("TEST-1", None, &tracker, Some(&projection));
+        assert!(prompt.contains("issue-team review"));
+        assert!(prompt.contains("does not require the result of the subsequent repository review"));
+        assert!(
+            prompt
+                .contains("Do not close future review or merge obligations to permit this handoff")
+        );
+        assert!(
+            prompt.contains("only reviewer-role agents may close completed review obligations")
+        );
     }
 
     #[test]

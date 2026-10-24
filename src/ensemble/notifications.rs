@@ -137,6 +137,7 @@ pub(crate) struct RepositoryEvents {
     root: PathBuf,
     path: PathBuf,
     journal: Mutex<Journal>,
+    revision_fetch: Mutex<()>,
     health: Mutex<NotificationHealth>,
     connections: Option<Arc<crate::setup::connections::Connections>>,
 }
@@ -162,6 +163,7 @@ impl RepositoryEvents {
             path,
             connections,
             journal: Mutex::new(journal),
+            revision_fetch: Mutex::new(()),
             health: Mutex::new(NotificationHealth::default()),
         }))
     }
@@ -277,7 +279,7 @@ impl RepositoryEvents {
         bail!("specialist {identity} did not register repository subscriptions: {outcome:?}")
     }
 
-    async fn git(&self, args: &[&str]) -> Result<Vec<u8>> {
+    async fn git_output(&self, args: &[&str]) -> Result<std::process::Output> {
         let mut command = tokio::process::Command::new("git");
         if let Some(connections) = &self.connections {
             command.envs(connections.github_environment());
@@ -290,9 +292,14 @@ impl RepositoryEvents {
             .env("GH_PROMPT_DISABLED", "1")
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
-        let output = tokio::time::timeout(Duration::from_secs(45), command.output())
+        tokio::time::timeout(Duration::from_secs(45), command.output())
             .await
-            .context("repository change check timed out")??;
+            .context("repository change check timed out")?
+            .context("could not run repository Git command")
+    }
+
+    async fn git(&self, args: &[&str]) -> Result<Vec<u8>> {
+        let output = self.git_output(args).await?;
         if !output.status.success() {
             bail!(
                 "repository change check failed (git {}): check repository access",
@@ -300,6 +307,32 @@ impl RepositoryEvents {
             );
         }
         Ok(output.stdout)
+    }
+
+    async fn ensure_inspection_revision(&self, revision: &str) -> Result<()> {
+        let _fetch = self.revision_fetch.lock().await;
+        let commit = format!("{revision}^{{commit}}");
+        let present = self
+            .git_output(&["rev-parse", "--verify", "--quiet", &commit])
+            .await?;
+        match present.status.code() {
+            Some(0) => return Ok(()),
+            Some(1) => {}
+            _ => bail!("could not inspect the local repository revision"),
+        }
+        // Ticket worktrees and specialists may use separate clones. Fetch only
+        // the validated exact SHA from this repository's existing origin, keeping
+        // the working tree, index, branch and shared FETCH_HEAD untouched.
+        self.git(&[
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "origin",
+            &format!("{revision}:refs/fugue/inspections/{revision}"),
+        ])
+        .await?;
+        self.git(&["rev-parse", "--verify", &commit]).await?;
+        Ok(())
     }
 
     async fn fetch_revision(&self) -> Result<(String, String)> {
@@ -467,7 +500,7 @@ impl SubscriptionTools {
             input_schema: json!({"type":"object","properties":{"paths":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"string"}}},"required":["paths"],"additionalProperties":false}),
             provenance: Some(meerkat_core::ToolProvenance::new(meerkat_core::ToolSourceKind::Callback, "fugue-repository-events")), audience: Default::default()
         }), Arc::new(ToolDef {
-            name: "repository_read_revision".into(), description: "Read a file at the exact Git revision from a repository change notification without changing the checkout.".into(),
+            name: "repository_read_revision".into(), description: "Read a file at an exact commit SHA from a repository notification or issue handoff. Missing commits are fetched from this repository's configured origin without changing the checkout.".into(),
             input_schema: json!({"type":"object","properties":{"revision":{"type":"string"},"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":65536}},"required":["revision","path"],"additionalProperties":false}),
             provenance: Some(meerkat_core::ToolProvenance::new(meerkat_core::ToolSourceKind::Callback, "fugue-repository-events")), audience: Default::default()
         })];
@@ -568,7 +601,7 @@ impl AgentToolDispatcher for SubscriptionTools {
                     if !matches!(input.revision.len(), 40 | 64)
                         || !input.revision.bytes().all(|byte| byte.is_ascii_hexdigit())
                     {
-                        bail!("Use the full commit SHA from the notification");
+                        bail!("Use the full commit SHA from the notification or issue handoff");
                     }
                     let path = SubscriptionPath::parse(input.path)?;
                     if super::repository_tools::protected_path(&path.0) {
@@ -596,6 +629,9 @@ impl AgentToolDispatcher for SubscriptionTools {
                             bail!("Configured runtime state is not exposed by repository tools");
                         }
                     }
+                    self.events
+                        .ensure_inspection_revision(&input.revision)
+                        .await?;
                     let object = format!("{}:{}", input.revision, path.0.display());
                     let size =
                         String::from_utf8(self.events.git(&["cat-file", "-s", &object]).await?)?
@@ -751,6 +787,110 @@ mod tests {
         AncestorLink,
         #[cfg(unix)]
         LinkChain,
+    }
+
+    #[tokio::test]
+    async fn hosted_acceptance_reads_pushed_issue_revision_without_changing_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let origin = temp.path().join("origin");
+        let checkout = temp.path().join("specialist");
+        let state = temp.path().join("state");
+        std::fs::create_dir(&origin).unwrap();
+        let git = |root: &Path, args: &[&str]| {
+            let result = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            String::from_utf8(result.stdout).unwrap().trim().to_owned()
+        };
+        git(&origin, &["init", "-q", "-b", "main"]);
+        std::fs::write(origin.join("public.txt"), "baseline").unwrap();
+        git(&origin, &["add", "."]);
+        git(
+            &origin,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "baseline",
+            ],
+        );
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "-q",
+                "--no-local",
+                origin.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+        let baseline = git(&checkout, &["rev-parse", "HEAD"]);
+        std::fs::write(checkout.join("public.txt"), "keep local edits").unwrap();
+        git(&origin, &["checkout", "-qb", "feature/probe"]);
+        std::fs::write(origin.join("public.txt"), "review this exact candidate").unwrap();
+        git(&origin, &["add", "."]);
+        git(
+            &origin,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "candidate",
+            ],
+        );
+        let revision = git(&origin, &["rev-parse", "HEAD"]);
+        let events = RepositoryEvents::open(
+            super::super::config::RepoId::try_from("test".to_owned()).unwrap(),
+            checkout.clone(),
+            &state,
+            None,
+        )
+        .unwrap();
+        let tools = SubscriptionTools::new(
+            events,
+            MemberId::try_from("reader".to_owned()).unwrap(),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        let args = serde_json::value::RawValue::from_string(
+            json!({"revision":revision,"path":"public.txt"}).to_string(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let result = tools
+                .dispatch(ToolCallView {
+                    id: "read",
+                    name: "repository_read_revision",
+                    args: &args,
+                })
+                .await
+                .unwrap();
+            assert!(!result.result.is_error, "{:?}", result.result.content);
+            assert!(
+                serde_json::to_string(&result.result.content)
+                    .unwrap()
+                    .contains("review this exact candidate")
+            );
+        }
+        assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), baseline);
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("public.txt")).unwrap(),
+            "keep local edits"
+        );
+        assert!(!checkout.join(".git/FETCH_HEAD").exists());
     }
 
     async fn historical_state_exclusion(case: StatePathCase) {
