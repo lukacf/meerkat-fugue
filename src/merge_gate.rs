@@ -23,16 +23,20 @@ pub(crate) enum MergePurpose {
 /// forge operation. No serialized boolean or caller input can mint this value.
 pub(crate) struct AuthorizedMerge {
     input: MergePrInput,
+    expected_base: crate::tools::BranchName,
 }
 
 impl AuthorizedMerge {
-    pub(crate) fn into_input(self) -> MergePrInput {
-        self.input
+    pub(crate) fn into_parts(self) -> (MergePrInput, crate::tools::BranchName) {
+        (self.input, self.expected_base)
     }
 
     #[cfg(test)]
     pub(crate) fn for_adapter_fixture(input: MergePrInput) -> Self {
-        Self { input }
+        Self {
+            input,
+            expected_base: crate::tools::BranchName("main".into()),
+        }
     }
 }
 
@@ -105,6 +109,7 @@ fn verify_candidate(
 ) -> Result<(), &'static str> {
     if input.expected_head_sha.as_ref() != Some(&candidate.head_sha)
         || current.head_sha != candidate.head_sha
+        || current.base_branch != candidate.base_branch
         || current.number != candidate.pull_request
         || !crate::native_review::same_repo(&current.repo, &candidate.repo)
         || !crate::native_review::same_repo(&input.repo, &candidate.repo)
@@ -244,7 +249,7 @@ pub(crate) async fn merge_review_with_host(
             return refused(&input, "The repository's native WorkGraph database is unavailable.");
         }
         graph.merge_pr_with(&config.tracker, &canonical_issue, input, |input| {
-            host.merge_authorized(AuthorizedMerge { input })
+            host.merge_authorized(AuthorizedMerge { input, expected_base: candidate.base_branch })
         }).await
     })).await.unwrap_or_else(|_| refused(&error_input, "The review request changed or its authority could not be verified before merge."))
 }

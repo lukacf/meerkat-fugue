@@ -1,4 +1,4 @@
-mod process;
+use crate::process;
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -110,7 +110,7 @@ impl GitHubToolHost {
         &self,
         authorization: crate::merge_gate::AuthorizedMerge,
     ) -> FugueToolResult {
-        let mut input = authorization.into_input();
+        let (mut input, expected_base) = authorization.into_parts();
         let operation = FugueToolOperation::GitHubMergePr;
         let idempotency_key = input.idempotency_key.clone();
         run_tool(operation, Some(idempotency_key), || {
@@ -133,6 +133,13 @@ impl GitHubToolHost {
                     RetryAdvice::RefreshStateThenRetry,
                 ));
             }
+            if current.base_branch != expected_base {
+                return Err(GitHubToolFailure::new(
+                    FugueToolErrorCode::PreconditionFailed,
+                    "pull request base branch no longer matches the reviewed candidate",
+                    RetryAdvice::RefreshStateThenRetry,
+                ));
+            }
             // Bind branch selectors to the PR number observed before mutation.
             input.pull_request = GitHubPullRequestRef::Number {
                 number: current.number,
@@ -151,7 +158,9 @@ impl GitHubToolHost {
             } else {
                 current
             };
-            if pull_request.state != PullRequestState::Merged || pull_request.head_sha != *expected
+            if pull_request.state != PullRequestState::Merged
+                || pull_request.head_sha != *expected
+                || pull_request.base_branch != expected_base
             {
                 return Err(GitHubToolFailure::new(
                     FugueToolErrorCode::PreconditionFailed,
@@ -1373,6 +1382,34 @@ mod tests {
                     .any(|args| args.get(1).is_some_and(|arg| arg == "merge"))
             );
         }
+    }
+
+    #[test]
+    fn merge_pr_refuses_newly_observed_base_drift() {
+        let pr = serde_json::json!({"number":11, "title":"Change", "url":"https://github.com/example/app/pull/11",
+            "state":"OPEN", "isDraft":false, "headRefName":"feature", "baseRefName":"release", "headRefOid":"abc123"});
+        let runner = FakeRunner::with_outputs(vec![output(&pr.to_string())]);
+        let host = GitHubToolHost::with_runner(Box::new(runner.clone()));
+        let result = merge_adapter_fixture(
+            &host,
+            MergePrInput {
+                repo: repo(),
+                pull_request: GitHubPullRequestRef::Number {
+                    number: GitHubPullRequestNumber(11),
+                },
+                method: MergeMethod::Squash,
+                expected_head_sha: Some(GitSha("abc123".into())),
+                idempotency_key: IdempotencyKey("base-drift".into()),
+            },
+        );
+        assert!(matches!(result, FugueToolResult::Err { .. }));
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|args| args.get(1).is_some_and(|arg| arg == "merge")),
+            "a retargeted PR must not reach the forge merge command"
+        );
     }
 
     #[test]

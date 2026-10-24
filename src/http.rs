@@ -5221,19 +5221,34 @@ async fn record_deploy_projection(
             )),
         })
         .await?;
-    adapter
-        .move_issue(MoveIssueInput {
-            issue: request.issue.clone(),
-            state: LinearStateRef::Name {
-                name: target_lane.to_string(),
-            },
-            expected_updated_at: None,
-            idempotency_key: IdempotencyKey(format!(
-                "{}:{}:{}",
-                move_key_prefix, outcome.issue_identifier, request.idempotency_key.0
-            )),
-        })
-        .await?;
+    let movement = MoveIssueInput {
+        issue: request.issue.clone(),
+        state: LinearStateRef::Name {
+            name: target_lane.to_string(),
+        },
+        expected_updated_at: None,
+        idempotency_key: IdempotencyKey(format!(
+            "{}:{}:{}",
+            move_key_prefix, outcome.issue_identifier, request.idempotency_key.0
+        )),
+    };
+    let mut graph = crate::workgraph_gate::WorkGraphTerminalGate::for_service(config);
+    graph
+        .terminal_states
+        .push(config.deploy.success_lane.clone());
+    graph
+        .allowed_terminal_states
+        .push(config.deploy.blocked_lane.clone());
+    if outcome.status == DeployOutcomeStatus::Succeeded && !graph.state_path.is_file() {
+        anyhow::bail!(
+            "The repository's native WorkGraph database is unavailable before completion"
+        );
+    }
+    graph
+        .guard_terminal_move(&config.tracker, &movement)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    adapter.move_issue(movement).await?;
     Ok(())
 }
 
@@ -8250,8 +8265,18 @@ mod tests {
             .clone(),
             prompt_template: "hi".to_string(),
         };
-        let config =
-            ServiceConfig::from_definition(PathBuf::from("/tmp/fugue.yaml"), &definition).unwrap();
+        let mut config =
+            ServiceConfig::from_definition(temp.path().join("fugue.yaml"), &definition).unwrap();
+        config.meerkat =
+            crate::meta_runtime::tests::test_meerkat_config(temp.path().join("runtime"));
+        let gate = crate::workgraph_gate::WorkGraphTerminalGate::for_service(&config);
+        std::fs::create_dir_all(gate.state_path.parent().unwrap()).unwrap();
+        let store = meerkat::SqliteWorkGraphStore::open(&gate.state_path).unwrap();
+        let graph = meerkat::WorkGraphService::with_scope(
+            std::sync::Arc::new(store),
+            meerkat_core::mob_realm_id(&gate.mob_id).unwrap().as_str(),
+            meerkat::WorkNamespace::default(),
+        );
         crate::fugue_ims::create_issue_for_config(
             &config.tracker,
             CreateFugueIssue {
@@ -8368,6 +8393,64 @@ mod tests {
             deploy_idempotency_already_recorded(&config, &request.issue, &request.idempotency_key)
                 .await
                 .expect("idempotency check")
+        );
+        graph
+            .create(meerkat::CreateWorkItemRequest {
+                realm_id: None,
+                namespace: None,
+                title: "New post-merge finding".into(),
+                description: None,
+                priority: meerkat::WorkPriority::High,
+                completion_policy: meerkat::WorkCompletionPolicy::SelfAttest,
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                labels: std::collections::BTreeSet::from([
+                    "fugue".into(),
+                    "blocking".into(),
+                    "issue:LUC-631".into(),
+                ]),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: Some(meerkat::WorkStatus::Open),
+            })
+            .await
+            .unwrap();
+        adapter
+            .move_issue(MoveIssueInput {
+                issue: request.issue.clone(),
+                state: LinearStateRef::Name {
+                    name: "Deploy".into(),
+                },
+                expected_updated_at: None,
+                idempotency_key: IdempotencyKey("reopen-for-projection".into()),
+            })
+            .await
+            .unwrap();
+        // A custom success lane is terminal for this operation even if the
+        // tracker's generic terminal list does not include it.
+        config.deploy.success_lane = "Shipped".into();
+        let refused = record_successful_deploy_projection(&config, &request, &outcome)
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("unresolved Fugue WorkGraph obligation"),
+            "{refused}"
+        );
+        let blocked = adapter
+            .inspect_issue(InspectIssueInput {
+                issue: request.issue.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(blocked.issue.state.name, "Deploy");
+        assert!(
+            blocked.workpad.unwrap().body_markdown.contains("def456"),
+            "successful merge/deploy evidence remains available after projection refusal"
         );
         // A historical receipt is useful evidence, but cannot authorize a
         // changed request with the same key or bypass current policy.

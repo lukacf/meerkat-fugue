@@ -192,6 +192,26 @@ when the independent Review action is disabled. The host reads durable native
 results; transient completion events and caller-supplied verdicts cannot approve
 this gate.
 
+Review admission and both merge procedures share the repository allowlist and
+base branch currently stored under `deploy`. Set them even for a review-only
+installation; starting an enabled review procedure with no allowlist is refused.
+The Deploy action itself may remain disabled:
+
+```yaml
+deploy:
+  enabled: false
+  allowed_repositories:
+    - owner: example
+      name: app
+  base_branch: main
+  allow_no_ci_checks: false
+```
+
+The final gate uses its own merge strategy and CI-required setting. Its explicit
+no-checks exception is `deploy.allow_no_ci_checks`. Repository setup generates
+an enabled independent Review action and the same scoped policy for Jira,
+built-in tickets and Linear.
+
 `final_review.reviewers[].profile` selects an existing native specialist profile
 from the repository roster. Every required entry needs a distinct eligible member;
 two required entries for one profile need two members of that profile. At least
@@ -210,8 +230,13 @@ reads the existing merge without issuing a second merge command.
 
 The configured deploy and final-review paths use the same merge gate. It resolves
 the canonical tracker issue, reads the current native review and checks that all
-selected reviewers approved the exact candidate. It then holds the current-request
-lock while refreshing the PR, checking all CI pages, rechecking reviewer eligibility
+selected reviewers approved the exact candidate, including its base branch.
+Changing the head or base invalidates that request, and a producer verdict must
+name the same base. The adapter checks the latest observed base again before
+merge and verifies it in the returned merge evidence. GitHub's merge command
+provides an atomic head check; it does not provide an atomic base-branch check.
+The gate holds the current-request lock while refreshing the PR, checking all
+CI pages, rechecking reviewer eligibility
 and checking native WorkGraph obligations before calling GitHub. Review completion
 holds the same lock while publishing its results, so replacement admission cannot
 race that publication.

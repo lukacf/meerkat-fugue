@@ -16,7 +16,7 @@ use meerkat_mob::{
 use serde::{Deserialize, Serialize};
 
 use crate::independent_review::{IndependentReviewVerdict, IndependentReviewVerdictStatus};
-use crate::tools::{GitHubPullRequestNumber, GitHubRepoRef, GitSha, LinearIssueId};
+use crate::tools::{BranchName, GitHubPullRequestNumber, GitHubRepoRef, GitSha, LinearIssueId};
 
 pub(crate) const SCHEMA: &str = "fugue.native-review.v1";
 const STEP: &str = "review";
@@ -29,6 +29,7 @@ pub struct ReviewCandidate {
     pub issue_identifier: String,
     pub repo: GitHubRepoRef,
     pub pull_request: GitHubPullRequestNumber,
+    pub base_branch: BranchName,
     pub head_sha: GitSha,
 }
 
@@ -103,6 +104,7 @@ impl ReviewIntent {
             || self.candidate.repo.owner.0.trim().is_empty()
             || self.candidate.repo.name.0.trim().is_empty()
             || self.candidate.pull_request.0 == 0
+            || self.candidate.base_branch.0.trim().is_empty()
             || !matches!(self.candidate.head_sha.0.len(), 40 | 64)
             || !self
                 .candidate
@@ -148,6 +150,7 @@ pub fn flow(role: &ProfileName) -> FlowSpec {
                         "Repository: {{ params.candidate.repo }} (an omitted host means github.com)\n",
                         "Pull request: {{ params.candidate.pull_request }}\n",
                         "Immutable head: {{ params.candidate.head_sha }}\n",
+                        "Required base branch: {{ params.candidate.base_branch }}\n",
                         "Issue: {{ params.candidate.issue_identifier }} ({{ params.candidate.issue_id }})\n",
                         "Tracker scope: {{ params.candidate.tracker_context }}\n",
                         "Review round: {{ params.round }}\n",
@@ -156,7 +159,8 @@ pub fn flow(role: &ProfileName) -> FlowSpec {
                         "merge, deploy, or recruit another reviewer. Return a JSON object with ",
                         "schema_version 'fugue.review.v1', reviewer_id equal to your native agent ",
                         "identity, focus, verdict ('green', 'red', or 'blocked'), summary, findings ",
-                        "and evidence {base, head_sha, commands, checked_paths}. Green requires no ",
+                        "and evidence {base, head_sha, commands, checked_paths}. Set evidence.base ",
+                        "to the exact required base branch name. Green requires no ",
                         "findings. Red requires findings with severity, title and detail. If evidence ",
                         "is incomplete, return blocked. Your native flow records the final result; ",
                         "do not rely on a peer message as a completion receipt."
@@ -436,6 +440,7 @@ where
             || (matches!(purpose, CandidateUse::Merge)
                 && pr.state == crate::tools::PullRequestState::Merged))
         || pr.draft
+        || pr.base_branch.0 != config.deploy.base_branch
     {
         return Err(ReviewProofError::ScopeMismatch);
     }
@@ -446,6 +451,7 @@ where
             issue_identifier: issue.identifier.0,
             repo,
             pull_request: pr.number,
+            base_branch: pr.base_branch.clone(),
             head_sha: pr.head_sha.clone(),
         },
         pr,
@@ -738,6 +744,7 @@ fn verify(
                 || verdict.reviewer_id
                     != meerkat_meta::member_comms_id::runtime_alias_str(target.identity.as_str())
                 || verdict.evidence.head_sha != candidate.head_sha
+                || verdict.evidence.base != candidate.base_branch.0
             {
                 return Err(ReviewProofError::NotApproved);
             }

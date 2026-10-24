@@ -70,7 +70,15 @@ async fn native_review_candidate_uses_canonical_issue_and_configured_repository(
     assert_eq!(candidate.tracker_context, config.tracker_context_id());
     assert_eq!(candidate.head_sha, snapshot.head_sha);
 
-    for change in ["host", "owner", "repository", "number", "closed", "draft"] {
+    for change in [
+        "host",
+        "owner",
+        "repository",
+        "number",
+        "closed",
+        "draft",
+        "base",
+    ] {
         let mut different = pr.clone();
         match change {
             "host" => different.repo.host = Some("ghe.example.test".to_owned().try_into().unwrap()),
@@ -78,6 +86,7 @@ async fn native_review_candidate_uses_canonical_issue_and_configured_repository(
             "repository" => different.repo.name.0 = "other".into(),
             "number" => different.number.0 += 1,
             "closed" => different.state = crate::tools::PullRequestState::Closed,
+            "base" => different.base_branch.0 = "release".into(),
             _ => different.draft = true,
         }
         let result = resolve_candidate_with(
@@ -176,6 +185,7 @@ impl Fixture {
                     name: crate::tools::GitHubRepoName("app".into()),
                 },
                 pull_request: GitHubPullRequestNumber(1),
+                base_branch: BranchName("main".into()),
                 head_sha: GitSha("a".repeat(40)),
             },
             reviewers,
@@ -352,6 +362,7 @@ fn native_review_rejects_candidate_scope_changes() {
         "issue_id",
         "issue_identifier",
         "head_sha",
+        "base_branch",
         "pull_request",
         "repo",
     ] {
@@ -453,6 +464,7 @@ fn native_review_rejects_forged_reviewer_name_or_stale_head_in_accepted_output()
     for (field, value) in [
         ("reviewer_id", json!("different-reviewer")),
         ("head_sha", json!("b".repeat(40))),
+        ("base", json!("release")),
     ] {
         let mut fixture = Fixture::new();
         let (run, events) = &mut fixture.runs[0];
@@ -462,7 +474,7 @@ fn native_review_rejects_forged_reviewer_name_or_stale_head_in_accepted_output()
             ..
         } = &mut events[1].kind
         {
-            if field == "head_sha" {
+            if field == "head_sha" || field == "base" {
                 output["evidence"][field] = value;
             } else {
                 output[field] = value;

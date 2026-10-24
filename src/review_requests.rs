@@ -277,6 +277,7 @@ mod tests {
                 )
                 .unwrap(),
                 pull_request: GitHubPullRequestNumber(1),
+                base_branch: crate::tools::BranchName("main".into()),
                 head_sha: GitSha("a".repeat(40)),
             },
             reviewers: FlowRoleTargets::new([(
@@ -302,11 +303,12 @@ mod tests {
                 .unwrap(),
             first
         );
-        for change in ["task", "head", "reviewers"] {
+        for change in ["task", "head", "base", "reviewers"] {
             let mut other = draft("first");
             match change {
                 "task" => other.task.push_str(" differently"),
                 "head" => other.candidate.head_sha = GitSha("b".repeat(40)),
+                "base" => other.candidate.base_branch.0 = "release".into(),
                 _ => {
                     other.reviewers = FlowRoleTargets::new([(
                         "other-domain",

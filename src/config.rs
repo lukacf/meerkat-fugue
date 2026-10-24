@@ -1677,6 +1677,14 @@ impl ServiceConfig {
                 self.tracker.kind.clone(),
             ));
         }
+        if (self.independent_review.enabled || self.final_review.enabled)
+            && self.deploy.allowed_repositories.is_empty()
+        {
+            return Err(FugueError::InvalidConfig(
+                "Review requires deploy.allowed_repositories to scope the candidate; deploy.enabled may remain false. Set deploy.base_branch to the branch being reviewed."
+                    .into(),
+            ));
+        }
         if self.tracker.kind == "fugue-ims" {
             if self
                 .tracker
@@ -4560,6 +4568,51 @@ mod tests {
             .to_string();
 
         assert!(err.contains("independent_review.enabled requires reviewer_count = 3"));
+    }
+
+    #[test]
+    fn review_only_dispatch_requires_explicit_repository_scope_but_not_deployment() {
+        let native = parse_native_workflow(
+            Path::new("/tmp/fugue.yaml"),
+            include_str!("../fugue.jira.example.yaml"),
+        )
+        .unwrap();
+        for review in ["independent_review", "final_review"] {
+            let mut raw = json!({
+                "tracker":{"kind":"fugue-ims", "project_slug":"example/app", "endpoint":"/tmp/review-policy.sqlite"},
+                "deploy":{"enabled":false}
+            });
+            raw["mob"] = native.config["mob"].clone();
+            raw[review] = if review == "independent_review" {
+                json!({"enabled":true})
+            } else {
+                json!({"enabled":true,"reviewers":[{"id":"domain","profile":"domain","required":true}]})
+            };
+            let definition = WorkflowDefinition {
+                config: raw.as_object().unwrap().clone(),
+                prompt_template: "test".into(),
+            };
+            let config =
+                ServiceConfig::from_definition(PathBuf::from("/tmp/fugue.yaml"), &definition)
+                    .unwrap();
+            assert!(
+                config
+                    .validate_dispatch()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("deploy.allowed_repositories")
+            );
+            raw["deploy"]["allowed_repositories"] = json!([{"owner":"example","name":"app"}]);
+            let definition = WorkflowDefinition {
+                config: raw.as_object().unwrap().clone(),
+                prompt_template: "test".into(),
+            };
+            let config =
+                ServiceConfig::from_definition(PathBuf::from("/tmp/fugue.yaml"), &definition)
+                    .unwrap();
+            assert!(!config.deploy.enabled);
+            config.validate_dispatch().unwrap();
+        }
     }
 
     #[test]

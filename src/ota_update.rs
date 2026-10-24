@@ -1,20 +1,17 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+#[cfg(test)]
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::process::Command;
-use tokio::time;
 
 use crate::config::OtaUpdateConfig;
 use crate::error::{FugueError, Result};
-
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -474,16 +471,10 @@ async fn command_output(
 ) -> Result<String> {
     let command_display = display_command(program, args);
     let mut child = Command::new(program);
-    child
-        .args(args)
-        .current_dir(cwd)
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    child.args(args).current_dir(cwd);
     for (key, value) in envs {
         child.env(key, value);
     }
-    configure_child_process_group(&mut child);
     run_child(child, command_display, timeout, steps, name).await
 }
 
@@ -496,58 +487,32 @@ async fn shell_output(
     name: &str,
 ) -> Result<String> {
     let mut child = Command::new("sh");
-    child
-        .arg("-lc")
-        .arg(command)
-        .current_dir(cwd)
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    child.arg("-lc").arg(command).current_dir(cwd);
     for (key, value) in envs {
         child.env(key, value);
     }
-    configure_child_process_group(&mut child);
     run_child(child, command.to_string(), timeout, steps, name).await
 }
 
-#[cfg(unix)]
-fn configure_child_process_group(child: &mut Command) {
-    child.as_std_mut().process_group(0);
-}
-
-#[cfg(not(unix))]
-fn configure_child_process_group(_child: &mut Command) {}
-
 async fn run_child(
-    mut child: Command,
+    child: Command,
     command_display: String,
     timeout: Duration,
     steps: &mut Vec<OtaUpdateStep>,
     name: &str,
 ) -> Result<String> {
-    let child = child
-        .spawn()
-        .map_err(|err| FugueError::HookFailed(format!("ota_update {name}: spawn failed: {err}")))?;
-    let mut cleanup = ChildCleanup::new(child.id());
-    let output = match time::timeout(timeout, child.wait_with_output()).await {
-        Ok(result) => {
-            cleanup.disarm();
-            result.map_err(|err| {
-                FugueError::HookFailed(format!("ota_update {name}: wait failed: {err}"))
-            })?
-        }
-        Err(_) => {
+    let output = match crate::process::run_async(child, timeout).await {
+        Ok(output) => output,
+        Err(error) => {
             steps.push(OtaUpdateStep {
                 name: name.to_string(),
                 command: command_display,
                 exit_code: None,
                 stdout_excerpt: String::new(),
-                stderr_excerpt: format!("timed out after {} ms", timeout.as_millis()),
+                stderr_excerpt: error.to_string(),
             });
-            cleanup.kill_now();
             return Err(FugueError::HookFailed(format!(
-                "ota_update {name}: timed out after {} ms",
-                timeout.as_millis()
+                "ota_update {name}: {error}"
             )));
         }
     };
@@ -568,47 +533,6 @@ async fn run_child(
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
-
-struct ChildCleanup {
-    pid: Option<u32>,
-}
-
-impl ChildCleanup {
-    fn new(pid: Option<u32>) -> Self {
-        Self { pid }
-    }
-
-    fn disarm(&mut self) {
-        self.pid = None;
-    }
-
-    fn kill_now(&mut self) {
-        kill_child_tree(self.pid);
-        self.pid = None;
-    }
-}
-
-impl Drop for ChildCleanup {
-    fn drop(&mut self) {
-        kill_child_tree(self.pid);
-    }
-}
-
-#[cfg(unix)]
-fn kill_child_tree(pid: Option<u32>) {
-    let Some(pid) = pid else {
-        return;
-    };
-    let pgid = format!("-{pid}");
-    let _ = std::process::Command::new("kill")
-        .args(["-TERM", "--", &pgid])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(not(unix))]
-fn kill_child_tree(_pid: Option<u32>) {}
 
 async fn cleanup_staging(
     repo_path: &Path,
@@ -1142,6 +1066,55 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("timed out waiting for pid file {}", path.display());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ota_timeout_and_cancellation_stop_term_resistant_late_effects() {
+        for cancel in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let ready = temp.path().join("ready.pid");
+            let effect = temp.path().join("late-effect");
+            let command = format!(
+                "sh -c 'trap \"\" TERM; echo $$ > \"$1\"; sleep 1; echo leaked > \"$2\"' helper {} {} & wait",
+                shell_quote(&ready.display().to_string()),
+                shell_quote(&effect.display().to_string())
+            );
+            let cwd = temp.path().to_owned();
+            let task = tokio::spawn(async move {
+                shell_output(
+                    &cwd,
+                    &command,
+                    if cancel {
+                        Duration::from_secs(30)
+                    } else {
+                        Duration::from_millis(300)
+                    },
+                    &[],
+                    &mut Vec::new(),
+                    "resistant_child",
+                )
+                .await
+            });
+            wait_for_pid_file(&ready).await;
+            if cancel {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(
+                    task.await
+                        .unwrap()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("timed out")
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            assert!(
+                !effect.exists(),
+                "cleanup must finish before operation ownership is released (cancel={cancel})"
+            );
+        }
     }
 
     #[cfg(unix)]

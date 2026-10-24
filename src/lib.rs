@@ -37,6 +37,7 @@ pub mod onboarding;
 pub mod orchestrator;
 pub mod ota_update;
 mod pr_handoff;
+mod process;
 mod review_completion;
 pub mod review_findings;
 mod review_requests;

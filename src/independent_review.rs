@@ -276,7 +276,7 @@ pub fn independent_review_completion_input_schema() -> Value {
             },
             "native_review": {
                 "type": "object", "properties": {
-                    "runs": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": true,
+                    "runs": {"type": "array", "minItems": 1, "maxItems": 255, "uniqueItems": true,
                         "items": {"type": "string", "format": "uuid"}}
                 },
                 "required": ["runs"], "additionalProperties": false
@@ -601,6 +601,22 @@ mod tests {
                 .pointer("/required")
                 .and_then(Value::as_array)
                 .is_some_and(|required| required.iter().any(|value| value == "workgraph_scope"))
+        );
+    }
+
+    #[test]
+    fn completion_schema_accepts_four_distinct_profile_runs() {
+        let schema = independent_review_completion_input_schema();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let input = json!({
+            "issue": {"kind":"id", "id":"10001"}, "pull_request": {},
+            "head_sha":"a".repeat(40), "idempotency_key":"four-profiles",
+            "workgraph_scope":{"realm_id":"repository", "namespace":"default"},
+            "native_review":{"runs":(1..=4).map(uuid::Uuid::from_u128).collect::<Vec<_>>()}
+        });
+        assert!(
+            validator.is_valid(&input),
+            "four configured profiles need four native run references"
         );
     }
 

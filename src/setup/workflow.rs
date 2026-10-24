@@ -389,6 +389,14 @@ impl WorkflowSetup {
             allow_no_ci_checks: self.allow_no_ci_checks,
             ..Default::default()
         });
+        config.independent_review = Some(IndependentReviewConfig {
+            enabled: true,
+            lane: lanes.review_action.clone(),
+            success_lane: lanes.review_action.clone(),
+            rework_lane: lanes.intake.clone(),
+            blocked_lane: lanes.blocked.clone(),
+            ..Default::default()
+        });
         config.worker.prompt_template = Some(include_str!("worker.md").into());
         config.meerkat = Some(NativeMeerkatConfig {
             repository_runtime: Some(crate::config::RepositoryRuntimeBinding {
@@ -689,6 +697,14 @@ mod tests {
         assert_eq!(config.linear.lanes.blocked, None);
         assert_eq!(config.deploy.lane, "Reopened");
         assert_eq!(config.deploy.success_lane, "Closed");
+        assert!(
+            config.independent_review.enabled,
+            "new Jira queues need an admissible review before merge"
+        );
+        assert_eq!(config.independent_review.lane, "Resolved");
+        assert_eq!(config.independent_review.success_lane, "Resolved");
+        assert_eq!(config.independent_review.rework_lane, "Open");
+        assert_eq!(config.independent_review.blocked_lane, "In Progress");
         assert!(!config.deploy.allow_no_ci_checks);
         assert!(config.linear.required_states.iter().all(|state| {
             ["Open", "In Progress", "Resolved", "Reopened", "Closed"].contains(&state.name.as_str())
@@ -759,6 +775,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(config.tracker.kind, "fugue-ims");
+        assert!(
+            config.independent_review.enabled,
+            "new built-in queues need an admissible review before merge"
+        );
         assert_eq!(
             config
                 .kapellmeister

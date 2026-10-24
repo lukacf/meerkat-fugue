@@ -3660,6 +3660,7 @@ mod tests {
                     name: GitHubRepoName("app".into()),
                 },
                 pull_request: GitHubPullRequestNumber(1),
+                base_branch: crate::tools::BranchName("main".into()),
                 head_sha: GitSha("a".repeat(40)),
             },
             reviewers: FlowRoleTargets::new(["planner", "coder", "reviewer"].map(|role| {
