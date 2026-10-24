@@ -27,6 +27,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install publication scan dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ripgrep
+          rg --version
+
       - name: Install Node
         uses: actions/setup-node@v4
         with:
@@ -51,6 +57,12 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install publication scan dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ripgrep
+          rg --version
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.97.0
