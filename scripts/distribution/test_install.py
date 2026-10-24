@@ -1,3 +1,5 @@
+import copy
+from contextlib import redirect_stderr
 import hashlib
 import importlib.util
 import io
@@ -17,7 +19,7 @@ installer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(installer)
 
 
-def bundle(root, commit='a', invalid=None):
+def bundle(root, commit='a', invalid=None, transform=lambda manifest: manifest):
     identity = {'version': '0.1.0', 'commit': commit * 40, 'tree': 'c' * 40, 'dirty': False,
                 'runtime_storage': 'meta_native_v1'}
     files = {f'bin/{name}': b'#!/bin/sh\necho rkat 0.9.4\n' for name in installer.BINARIES}
@@ -34,7 +36,7 @@ def bundle(root, commit='a', invalid=None):
         name = 'fugue-jira-mcp' if invalid == 'identity' else 'rkat'
         files['bin/' + name] = b'#!/bin/sh\necho "{}"\n'
         manifest['files']['bin/' + name] = hashlib.sha256(files['bin/' + name]).hexdigest()
-    files['manifest.json'] = json.dumps(manifest).encode()
+    files['manifest.json'] = json.dumps(transform(manifest)).encode()
     if invalid == 'path':
         files['../../outside'] = b'bad'
     if invalid == 'missing':
@@ -54,12 +56,93 @@ def bundle(root, commit='a', invalid=None):
     return path, installer.digest(path)
 
 
+def malformed_manifests(manifest):
+    yield 'root-array', []
+    for name, path, value in (
+        ('schema-boolean', ('schema',), True),
+        ('identity-array', ('fugue',), []),
+        ('identity-empty', ('fugue',), {}),
+        ('commit-number', ('fugue', 'commit'), 123),
+        ('tree-null', ('fugue', 'tree'), None),
+        ('version-empty', ('fugue', 'version'), ''),
+        ('dirty-number', ('fugue', 'dirty'), 0),
+        ('native-array', ('rkat',), []),
+        ('native-empty', ('rkat',), {}),
+        ('native-version-number', ('rkat', 'version'), 123),
+        ('files-array', ('files',), list(manifest['files'])),
+        ('checksum-array', ('files', 'bin/rkat'), []),
+    ):
+        candidate = copy.deepcopy(manifest)
+        parent = candidate
+        for field in path[:-1]:
+            parent = parent[field]
+        parent[path[-1]] = value
+        yield name, candidate
+
+
 class InstallTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.prefix = self.root / 'install'
+
+    def assert_cli_rejects_before_execution(self, archive, checksum):
+        stderr = io.StringIO()
+        with mock.patch.object(sys, 'argv', ['install.py', '--archive', str(archive),
+                                             '--sha256', checksum, '--prefix', str(self.prefix)]), \
+                mock.patch.object(installer.subprocess, 'check_output',
+                                  side_effect=AssertionError('candidate executed before validation')) as execute, \
+                redirect_stderr(stderr), self.assertRaises(SystemExit) as stopped:
+            installer.main()
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertIn('Installation stopped:', stderr.getvalue())
+        self.assertNotIn('Traceback', stderr.getvalue())
+        execute.assert_not_called()
+
+    def test_malformed_candidate_manifest_preserves_current_rollback_and_state(self):
+        installer.install(*bundle(self.root), self.prefix)
+        installer.install(*bundle(self.root, 'b'), self.prefix)
+        links = {name: (self.prefix / name).readlink() for name in ('current', 'previous')}
+        versions = set((self.prefix / 'versions').iterdir())
+        state = self.root / 'private-state'
+        state.write_bytes(b'private credentials and sessions')
+        valid_archive, _ = bundle(self.root, 'c')
+        with tarfile.open(valid_archive) as archive:
+            manifest = json.load(archive.extractfile('manifest.json'))
+        for name, malformed in malformed_manifests(manifest):
+            with self.subTest(manifest=name):
+                candidate = bundle(self.root, 'c', transform=lambda _: malformed)
+                self.assert_cli_rejects_before_execution(*candidate)
+                self.assertEqual({name: (self.prefix / name).readlink() for name in links}, links)
+                self.assertEqual(set((self.prefix / 'versions').iterdir()), versions)
+                self.assertEqual(state.read_bytes(), b'private credentials and sessions')
+                self.assertEqual(list(self.prefix.glob('.unpack-*')), [])
+        installer.install(*bundle(self.root, 'c'), self.prefix)
+        self.assertEqual((self.prefix / 'previous').readlink(), links['current'])
+
+    def test_malformed_current_manifest_cannot_replace_rollback_or_run_candidate(self):
+        installer.install(*bundle(self.root), self.prefix)
+        installer.install(*bundle(self.root, 'b'), self.prefix)
+        links = {name: (self.prefix / name).readlink() for name in ('current', 'previous')}
+        versions = set((self.prefix / 'versions').iterdir())
+        manifest_path = self.prefix / 'current/manifest.json'
+        original = manifest_path.read_bytes()
+        candidate = bundle(self.root, 'c')
+        try:
+            for name, malformed in malformed_manifests(json.loads(original)):
+                with self.subTest(manifest=name):
+                    damaged = json.dumps(malformed).encode()
+                    manifest_path.write_bytes(damaged)
+                    self.assert_cli_rejects_before_execution(*candidate)
+                    self.assertEqual(manifest_path.read_bytes(), damaged)
+                    self.assertEqual({name: (self.prefix / name).readlink() for name in links}, links)
+                    self.assertEqual(set((self.prefix / 'versions').iterdir()), versions)
+                    self.assertEqual(list(self.prefix.glob('.unpack-*')), [])
+        finally:
+            manifest_path.write_bytes(original)
+        installer.install(*candidate, self.prefix)
+        self.assertEqual((self.prefix / 'previous').readlink(), links['current'])
 
     def test_install_repeat_and_atomic_upgrade_retain_previous(self):
         first = bundle(self.root)

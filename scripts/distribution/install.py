@@ -16,6 +16,7 @@ import tempfile
 
 BINARIES = {'meerkat-fugue', 'fugue-linear-mcp', 'fugue-jira-mcp',
             'fugue-github-mcp', 'fugue-host-mcp', 'rkat'}
+PAYLOAD_FILES = {'LICENSE-MIT', 'LICENSE-APACHE'} | {'bin/' + name for name in BINARIES}
 
 
 def digest(path):
@@ -34,10 +35,37 @@ def target():
     return f'{machine}-{system}'
 
 
+def validate_manifest(manifest):
+    """Validate incoming and installed metadata before trusting its fields."""
+    if not isinstance(manifest, dict):
+        raise ValueError('Release manifest must be a JSON object.')
+    if type(manifest.get('schema')) is not int or manifest['schema'] != 1:
+        raise ValueError('Unsupported release manifest schema.')
+    if manifest.get('target') != target():
+        raise ValueError('This release is not compatible with this computer.')
+    identity = manifest.get('fugue')
+    if (not isinstance(identity, dict) or identity.get('dirty') is not False
+            or any(not isinstance(identity.get(field), str)
+                   or not re.fullmatch('[0-9a-f]{40}', identity[field])
+                   for field in ('commit', 'tree'))):
+        raise ValueError('The release does not identify a clean source commit and tree.')
+    for name in ('fugue', 'rkat'):
+        metadata = manifest.get(name)
+        if (not isinstance(metadata, dict) or not isinstance(metadata.get('version'), str)
+                or not metadata['version'].strip()):
+            raise ValueError(f'Release manifest is missing a valid {name} version.')
+    files = manifest.get('files')
+    if not isinstance(files, dict) or set(files) != PAYLOAD_FILES:
+        raise ValueError('Release file manifest is incomplete.')
+    if any(not isinstance(checksum, str) or not re.fullmatch('[0-9a-f]{64}', checksum)
+           for checksum in files.values()):
+        raise ValueError('Release file manifest contains an invalid checksum.')
+
+
 def unpack(archive_path, expected, destination):
     if not re.fullmatch('[0-9a-f]{64}', expected) or digest(archive_path) != expected:
         raise ValueError('Download checksum mismatch. The current installation has not changed.')
-    allowed = {'manifest.json', 'LICENSE-MIT', 'LICENSE-APACHE'} | {'bin/' + name for name in BINARIES}
+    allowed = PAYLOAD_FILES | {'manifest.json'}
     with tarfile.open(archive_path) as archive:
         members = archive.getmembers()
         names = [member.name for member in members]
@@ -52,16 +80,10 @@ def unpack(archive_path, expected, destination):
                 shutil.copyfileobj(source, output)
             path.chmod(0o755 if member.name.startswith('bin/') else 0o644)
     manifest = json.loads((destination / 'manifest.json').read_text())
-    if manifest.get('schema') != 1 or manifest.get('target') != target():
-        raise ValueError('This release is not compatible with this computer.')
-    if set(manifest.get('files', {})) != allowed - {'manifest.json'}:
-        raise ValueError('Release file manifest is incomplete.')
+    validate_manifest(manifest)
     for name, expected_file in manifest['files'].items():
         if digest(destination / name) != expected_file:
             raise ValueError('Release file checksum mismatch.')
-    identity = manifest['fugue']
-    if identity.get('dirty') is not False or not re.fullmatch('[0-9a-f]{40}', identity.get('commit', '')):
-        raise ValueError('The release does not identify a clean source commit.')
     return manifest
 
 
@@ -95,11 +117,12 @@ def verify_installed_release(prefix, relative):
     manifest_path = release / 'manifest.json'
     if manifest_path.is_symlink():
         raise ValueError('Existing release manifest has changed; installation stopped.')
-    manifest = json.loads(manifest_path.read_text())
-    expected_names = {'LICENSE-MIT', 'LICENSE-APACHE'} | {'bin/' + name for name in BINARIES}
-    if (manifest.get('schema') != 1 or manifest.get('target') != target()
-            or set(manifest.get('files', {})) != expected_names
-            or manifest.get('fugue', {}).get('commit') != release.name.split('-')[0]):
+    try:
+        manifest = json.loads(manifest_path.read_text())
+        validate_manifest(manifest)
+    except ValueError as error:
+        raise ValueError('Existing release manifest is invalid; installation stopped. Restore the verified current release before upgrading; the previous release is preserved.') from error
+    if manifest['fugue']['commit'] != release.name.split('-')[0]:
         raise ValueError('Existing release manifest has changed; installation stopped.')
     for name, checksum in manifest['files'].items():
         path = release / name
