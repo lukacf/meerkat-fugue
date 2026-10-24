@@ -872,10 +872,6 @@ impl JiraClient {
                 "Jira accepted the transition but the requested status was not observed",
             ));
         }
-        crate::linear_lane_state::record_internal_lane_change_from_env(
-            &issue.key,
-            &updated.fields.status.name,
-        )?;
         Ok(MoveIssueOutput {
             issue: self.snapshot(&updated),
             changed: true,
@@ -1154,12 +1150,21 @@ pub async fn execute_tool(
     operation: FugueToolOperation,
     arguments: &serde_json::Value,
 ) -> (bool, String) {
+    let result = execute_tool_result(config, operation, arguments).await;
+    crate::linear_tools::tool_result_to_callback(result)
+}
+
+pub(crate) async fn execute_tool_result(
+    config: &TrackerConfig,
+    operation: FugueToolOperation,
+    arguments: &serde_json::Value,
+) -> FugueToolResult {
     let result = execute_typed_tool(config, operation, arguments).await;
     let key = arguments
         .get("idempotency_key")
         .and_then(serde_json::Value::as_str)
         .map(|value| IdempotencyKey(value.to_string()));
-    let result = match result {
+    match result {
         Ok(output) => FugueToolResult::Ok {
             output,
             metadata: ToolExecutionMetadata::default(),
@@ -1209,11 +1214,6 @@ pub async fn execute_tool(
                 metadata: ToolExecutionMetadata::default(),
             }
         }
-    };
-    let is_error = matches!(result, FugueToolResult::Err { .. });
-    match serde_json::to_string(&result) {
-        Ok(content) => (is_error, content),
-        Err(error) => (true, error.to_string()),
     }
 }
 

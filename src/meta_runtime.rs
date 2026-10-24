@@ -1,3 +1,4 @@
+use crate::host_signal_journal::HostSignalBinding;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -43,8 +44,8 @@ use crate::independent_review::{
     independent_review_completion_input_schema,
 };
 use crate::linear_tools::{
-    LINEAR_ACTION_STATES_ENV, LINEAR_REVIEW_HANDOFF_STATES_ENV,
-    execute_linear_fugue_tool_with_review_handoff_states, is_linear_fugue_tool_name,
+    LINEAR_ACTION_STATES_ENV, LINEAR_REVIEW_HANDOFF_STATES_ENV, execute_linear_fugue_tool_bound,
+    is_linear_fugue_tool_name,
 };
 use crate::mob_tools::{NativeMobExecutionHost, NativeMobLaunchPlan, ObserveStructuralEventsInput};
 use crate::tools::{
@@ -189,6 +190,7 @@ pub struct MetaRuntimeRegistry {
     meerkat: MeerkatConfig,
     repo_mcp_servers: BTreeMap<String, NativeMcpServerConfig>,
     tracker: TrackerConfig,
+    host_signal_binding: Option<HostSignalBinding>,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
     templates: BTreeMap<String, MaterializedMobTemplate>,
@@ -422,6 +424,7 @@ impl MetaRuntimeRegistry {
             review_orchestrator_profile: self.independent_review.orchestrator_profile.clone(),
             independent_review_enabled: self.reviews_enabled(),
             tracker: self.tracker.clone(),
+            host_signal_binding: self.host_signal_binding.clone(),
             host_api_url: self.host_api_url.clone(),
             host_api_auth: self.host_api_auth.clone(),
             github_repo: github_repo_from_mcp_servers(&self.repo_mcp_servers)?,
@@ -489,6 +492,7 @@ impl MetaRuntimeRegistry {
             meerkat,
             repo_mcp_servers,
             tracker,
+            host_signal_binding: None,
             host_api_url,
             host_api_auth,
             templates,
@@ -505,6 +509,11 @@ impl MetaRuntimeRegistry {
             stopping: Arc::new(AtomicBool::new(false)),
             launch_tasks: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub fn with_host_signal_binding(mut self, binding: HostSignalBinding) -> Self {
+        self.host_signal_binding = Some(binding);
+        self
     }
 
     pub fn with_repo_mcp_servers(
@@ -736,6 +745,7 @@ impl MetaRuntimeRegistry {
             self.review_runtime_config(),
             self.repo_mcp_servers.clone(),
             self.tracker.clone(),
+            self.host_signal_binding.clone(),
             self.host_api_url.clone(),
             self.host_api_auth.clone(),
         )?;
@@ -961,6 +971,7 @@ struct FugueDirectToolSessionHook {
     review_orchestrator_profile: String,
     independent_review_enabled: bool,
     tracker: TrackerConfig,
+    host_signal_binding: Option<HostSignalBinding>,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
     github_repo: Option<GitHubRepoRef>,
@@ -1041,6 +1052,7 @@ impl SessionHook for FugueDirectToolSessionHook {
             self.workgraph_gate.clone(),
             self.independent_review_enabled,
             self.connections.clone(),
+            self.host_signal_binding.clone(),
         );
         let existing_tools = build.external_tools.take();
         let fugue_tools = match workspace_root {
@@ -1231,6 +1243,7 @@ impl HostToolAuthority {
 struct FugueDirectToolDispatcher {
     github: crate::github_tools::GitHubToolHost,
     tracker: TrackerConfig,
+    host_signal_binding: Option<HostSignalBinding>,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
     allow_issue_mutation: bool,
@@ -1332,11 +1345,12 @@ impl AgentToolDispatcher for FugueDirectToolDispatcher {
                     .into());
                 }
             }
-            let (is_error, content) = execute_linear_fugue_tool_with_review_handoff_states(
+            let (is_error, content) = execute_linear_fugue_tool_bound(
                 &self.tracker,
                 call.name,
                 &arguments,
                 &self.review_handoff_states,
+                self.host_signal_binding.as_ref(),
             )
             .await;
             return Ok(ToolResult::new(call.id.to_string(), content, is_error).into());
@@ -1432,6 +1446,7 @@ fn direct_tool_dispatcher(
     workgraph_gate: WorkGraphTerminalGate,
     independent_review_enabled: bool,
     connections: Option<Arc<crate::setup::connections::Connections>>,
+    host_signal_binding: Option<HostSignalBinding>,
 ) -> Arc<dyn AgentToolDispatcher> {
     let allow_issue_mutation = authority.can_move_issue();
     let tracker = tracker.clone();
@@ -1535,6 +1550,7 @@ fn direct_tool_dispatcher(
     Arc::new(FugueDirectToolDispatcher {
         github: crate::github_tools::GitHubToolHost::with_connections(connections),
         tracker,
+        host_signal_binding,
         host_api_url,
         host_api_auth,
         allow_issue_mutation,
@@ -1680,6 +1696,7 @@ fn build_unified_runtime(
     independent_review: IndependentReviewConfig,
     servers: BTreeMap<String, NativeMcpServerConfig>,
     tracker: TrackerConfig,
+    host_signal_binding: Option<HostSignalBinding>,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
 ) -> Result<(UnifiedRuntime, Option<tokio::runtime::Runtime>), String> {
@@ -1723,6 +1740,7 @@ fn build_unified_runtime(
                 review_orchestrator_profile: independent_review.orchestrator_profile,
                 independent_review_enabled: independent_review.enabled,
                 tracker,
+                host_signal_binding,
                 host_api_url,
                 host_api_auth,
                 github_repo,
@@ -4212,6 +4230,7 @@ pub(crate) mod tests {
             WorkGraphTerminalGate::new("/unused/workgraph.sqlite3", Vec::new(), Vec::new()),
             true,
             None,
+            None,
         )
     }
 
@@ -4228,6 +4247,7 @@ pub(crate) mod tests {
             Vec::new(),
             WorkGraphTerminalGate::new("/unused/workgraph.sqlite3", Vec::new(), Vec::new()),
             false,
+            None,
             None,
         );
         assert!(!tools.tools().iter().any(|tool| {
@@ -4521,6 +4541,7 @@ pub(crate) mod tests {
                     gate.clone(),
                     false,
                     None,
+                    None,
                 );
                 let mut input = json!({
                     "issue": issue_ref, "assignee": {"kind":"id", "id":"operator"},
@@ -4758,6 +4779,7 @@ pub(crate) mod tests {
             review_orchestrator_profile: IndependentReviewConfig::default().orchestrator_profile,
             independent_review_enabled: false,
             tracker: tracker_with_key(),
+            host_signal_binding: None,
             host_api_url: None,
             host_api_auth: None,
             github_repo: None,
@@ -4885,6 +4907,7 @@ pub(crate) mod tests {
             review_orchestrator_profile: IndependentReviewConfig::default().orchestrator_profile,
             independent_review_enabled: false,
             tracker: tracker_with_key(),
+            host_signal_binding: None,
             host_api_url: None,
             host_api_auth: None,
             github_repo: None,
@@ -5059,6 +5082,76 @@ pub(crate) mod tests {
         assert_eq!(
             arguments.pointer("/head_branch").and_then(Value::as_str),
             Some("luka/luc-619-find-3-bugs-and-fix-them")
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_tracker_dispatch_records_the_repository_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let definition = crate::config::WorkflowDefinition {
+            config: json!({"tracker": {
+                "kind": "fugue-ims", "endpoint": temp.path().join("issues.sqlite3"),
+                "project_slug": "example/app", "active_states": ["Queued", "Active"],
+                "terminal_states": ["Done"]
+            }})
+            .as_object()
+            .unwrap()
+            .clone(),
+            prompt_template: String::new(),
+        };
+        let config = crate::config::ServiceConfig::from_definition(
+            temp.path().join("fugue.yaml"),
+            &definition,
+        )
+        .unwrap();
+        let store = crate::fugue_ims::FugueImsStore::from_config(&config.tracker).unwrap();
+        store
+            .create_issue(crate::fugue_ims::CreateFugueIssue {
+                key: crate::ims::ImsIssueKey("APP-1".into()),
+                repo: "example/app".into(),
+                title: "Embedded journal dispatch".into(),
+                description: None,
+                stage: crate::ims::ImsStageName("Queued".into()),
+                labels: Vec::new(),
+            })
+            .unwrap();
+        let binding = HostSignalBinding::from_config(&config).unwrap();
+        binding.record_internal_lane("APP-1", "Queued").unwrap();
+        let before = binding.open().unwrap().revision().unwrap();
+        let dispatcher = direct_tool_dispatcher(
+            &config.tracker,
+            None,
+            None,
+            HostToolAuthority::IssueLead,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            WorkGraphTerminalGate::for_service(&config),
+            false,
+            None,
+            Some(binding.clone()),
+        );
+        let args = serde_json::value::to_raw_value(&json!({
+            "issue": {"kind": "identifier", "identifier": "APP-1"},
+            "state": {"kind": "name", "name": "Active"}, "idempotency_key": "embedded-move"
+        }))
+        .unwrap();
+        let outcome = dispatcher
+            .dispatch(ToolCallView {
+                id: "move",
+                name: "linear_move_issue",
+                args: &args,
+            })
+            .await
+            .unwrap();
+        assert!(!outcome.result.is_error, "{:?}", outcome.result.content);
+        let mut journal = binding.open().unwrap();
+        assert_ne!(journal.revision().unwrap(), before);
+        assert!(journal.pending(10).unwrap().is_empty());
+        assert_eq!(
+            journal.begin().unwrap().observe_lane("APP-1", "Active"),
+            crate::linear_lane_state::LinearLaneObservation::Unchanged
         );
     }
 

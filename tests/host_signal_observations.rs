@@ -332,3 +332,199 @@ async fn repeated_comment_edits_have_distinct_durable_occurrence_ids() {
         "restoring the same comment text is a new operator observation"
     );
 }
+
+#[tokio::test]
+async fn tracker_tool_process_records_internal_moves_in_the_host_journal() {
+    const CHILD: &str = "FUGUE_TEST_HOST_JOURNAL_TOOL_CHILD";
+    if let Some(root) = std::env::var_os(CHILD) {
+        let definition = WorkflowDefinition {
+            config: json!({"tracker": {
+                "kind": "fugue-ims", "endpoint": std::path::PathBuf::from(root).join("issues.sqlite3"),
+                "project_slug": "example/app", "active_states": ["Queued", "Active"],
+                "terminal_states": ["Done"]
+            }}).as_object().unwrap().clone(),
+            prompt_template: String::new(),
+        };
+        let config = ServiceConfig::from_definition("fugue.yaml".into(), &definition).unwrap();
+        let (failed, _) = meerkat_fugue::linear_tools::execute_linear_fugue_tool(
+            &config.tracker,
+            "linear_move_issue",
+            &json!({"issue": {"kind": "identifier", "identifier": "APP-1"},
+                "state": {"kind": "name", "name": "Done"}, "idempotency_key": "test-internal-move"}),
+        ).await;
+        assert!(!failed, "the internal tracker move should succeed");
+        return;
+    }
+    let (temp, config, _) = fixture();
+    let store = FugueImsStore::from_config(&config.tracker).unwrap();
+    store
+        .create_issue(CreateFugueIssue {
+            key: ImsIssueKey("APP-1".into()),
+            repo: "example/app".into(),
+            title: "Move through the real tool boundary".into(),
+            description: None,
+            stage: ImsStageName("Queued".into()),
+            labels: Vec::new(),
+        })
+        .unwrap();
+    let issue = store.fetch_candidate_issues().await.unwrap().remove(0);
+    observe(&config, &issue).unwrap();
+    let binding = HostSignalBinding::from_config(&config).unwrap();
+    let before = binding.open().unwrap().pending(100).unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tracker_tool_process_records_internal_moves_in_the_host_journal",
+            "--nocapture",
+        ])
+        .env(CHILD, temp.path())
+        .env(
+            "FUGUE_HOST_SIGNAL_BINDING",
+            serde_json::to_string(&binding).unwrap(),
+        )
+        .env_remove("FUGUE_LINEAR_LANE_STATE_PATH")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let mut moved = issue;
+    moved.state = "Done".into();
+    assert!(
+        observe(&config, &moved).unwrap().is_empty(),
+        "the tool's own move must not be misreported as an external operator action"
+    );
+    assert_eq!(binding.open().unwrap().pending(100).unwrap(), before);
+}
+
+#[tokio::test]
+async fn bound_tracker_tools_refuse_cross_repository_routing_before_mutation() {
+    let (_one, config_a, _) = fixture();
+    let (_two, config_b, _) = fixture();
+    for config in [&config_a, &config_b] {
+        let store = FugueImsStore::from_config(&config.tracker).unwrap();
+        store
+            .create_issue(CreateFugueIssue {
+                key: ImsIssueKey("APP-1".into()),
+                repo: "example/app".into(),
+                title: "The same key in different repositories".into(),
+                description: None,
+                stage: ImsStageName("Queued".into()),
+                labels: Vec::new(),
+            })
+            .unwrap();
+        observe(
+            config,
+            &store.fetch_candidate_issues().await.unwrap().remove(0),
+        )
+        .unwrap();
+    }
+    let binding_a = HostSignalBinding::from_config(&config_a).unwrap();
+    let binding_b = HostSignalBinding::from_config(&config_b).unwrap();
+    let revision_b = binding_b.open().unwrap().revision().unwrap();
+    let pending_a = binding_a.open().unwrap().pending(100).unwrap();
+    let input = json!({"issue": {"kind": "identifier", "identifier": "APP-1"},
+        "state": {"kind": "name", "name": "Done"}, "idempotency_key": "scoped-move"});
+    let (failed, _) = meerkat_fugue::linear_tools::execute_linear_fugue_tool_bound(
+        &config_a.tracker,
+        "linear_move_issue",
+        &input,
+        &[],
+        Some(&binding_b),
+    )
+    .await;
+    assert!(failed);
+    let store_a = FugueImsStore::from_config(&config_a.tracker).unwrap();
+    assert_eq!(
+        store_a.fetch_candidate_issues().await.unwrap()[0].state,
+        "Queued"
+    );
+    assert_eq!(binding_a.open().unwrap().pending(100).unwrap(), pending_a);
+    assert_eq!(binding_b.open().unwrap().revision().unwrap(), revision_b);
+
+    let (failed, _) = meerkat_fugue::linear_tools::execute_linear_fugue_tool_bound(
+        &config_a.tracker,
+        "linear_move_issue",
+        &input,
+        &[],
+        Some(&binding_a),
+    )
+    .await;
+    assert!(!failed);
+    let moved = store_a
+        .inspect_issue_tool(meerkat_fugue::tools::InspectIssueInput {
+            issue: meerkat_fugue::tools::LinearIssueRef::Identifier {
+                identifier: meerkat_fugue::tools::LinearIssueIdentifier("APP-1".into()),
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(moved.issue.state.name, "Done");
+    assert_eq!(binding_a.open().unwrap().pending(100).unwrap(), pending_a);
+    assert_eq!(binding_b.open().unwrap().revision().unwrap(), revision_b);
+}
+
+#[tokio::test]
+async fn tracker_mutation_is_not_reported_successful_when_observation_commit_fails() {
+    let (_temp, config, _) = fixture();
+    let store = FugueImsStore::from_config(&config.tracker).unwrap();
+    store
+        .create_issue(CreateFugueIssue {
+            key: ImsIssueKey("APP-1".into()),
+            repo: "example/app".into(),
+            title: "Recover a failed observation write".into(),
+            description: None,
+            stage: ImsStageName("Queued".into()),
+            labels: Vec::new(),
+        })
+        .unwrap();
+    let mut issue = store.fetch_candidate_issues().await.unwrap().remove(0);
+    observe(&config, &issue).unwrap();
+    let binding = HostSignalBinding::from_config(&config).unwrap();
+    let before = binding.open().unwrap().pending(100).unwrap();
+    let connection = rusqlite::Connection::open(&binding.path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_tool_observation BEFORE UPDATE ON metadata
+        BEGIN SELECT RAISE(ABORT, 'test observation failure'); END;",
+        )
+        .unwrap();
+    let input = json!({"issue": {"kind": "identifier", "identifier": "APP-1"},
+        "state": {"kind": "name", "name": "Done"}, "idempotency_key": "retry-observation"});
+    let (failed, content) = meerkat_fugue::linear_tools::execute_linear_fugue_tool_bound(
+        &config.tracker,
+        "linear_move_issue",
+        &input,
+        &[],
+        Some(&binding),
+    )
+    .await;
+    assert!(failed);
+    let result: meerkat_fugue::tools::FugueToolResult = serde_json::from_str(&content).unwrap();
+    match result {
+        meerkat_fugue::tools::FugueToolResult::Err { error, .. } => {
+            assert!(error.message.contains("Tracker mutation succeeded"));
+            assert_eq!(
+                error.retry,
+                meerkat_fugue::tools::RetryAdvice::RefreshStateThenRetry
+            );
+            assert_eq!(error.idempotency_key.unwrap().0, "retry-observation");
+        }
+        _ => panic!("a failed journal commit must be an explicit tool error"),
+    }
+    assert_eq!(binding.open().unwrap().pending(100).unwrap(), before);
+    connection
+        .execute_batch("DROP TRIGGER reject_tool_observation")
+        .unwrap();
+    drop(connection);
+    let (failed, _) = meerkat_fugue::linear_tools::execute_linear_fugue_tool_bound(
+        &config.tracker,
+        "linear_move_issue",
+        &input,
+        &[],
+        Some(&binding),
+    )
+    .await;
+    assert!(!failed);
+    issue.state = "Done".into();
+    assert!(observe(&config, &issue).unwrap().is_empty());
+    assert_eq!(binding.open().unwrap().pending(100).unwrap(), before);
+}

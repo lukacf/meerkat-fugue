@@ -442,7 +442,7 @@ server:
     let manager = crate::config::WorkflowConfigManager::load(workflow).unwrap();
     manager.validate_dispatch().unwrap();
     let (refresh_tx, refresh_rx) = tokio::sync::mpsc::channel(8);
-    let orchestrator = crate::orchestrator::Orchestrator::new(manager, refresh_rx);
+    let orchestrator = crate::orchestrator::Orchestrator::new(manager, refresh_rx).unwrap();
     let registry = orchestrator.meta_runtime_registry();
     let app = crate::http::router(
         orchestrator.shared_state(),

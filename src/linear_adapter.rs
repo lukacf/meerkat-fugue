@@ -59,10 +59,23 @@ pub fn record_internal_lane_for_workflow(
     identifier: &str,
     lane: &str,
 ) -> Result<()> {
-    let mut journal = HostSignalBinding::from_config(config)?.open()?;
-    let mut update = journal.begin()?;
-    update.observe_lane(identifier, lane);
-    update.commit()
+    HostSignalBinding::from_config(config)?.record_internal_lane(identifier, lane)
+}
+
+/// Host-owned projection records its observed result before reporting success.
+/// Operator board mutations use the ordinary adapter path so polling can notify
+/// the coordinator about the operator's intent.
+pub async fn move_issue_with_observation(
+    config: &ServiceConfig,
+    input: MoveIssueInput,
+) -> Result<MoveIssueOutput> {
+    let binding = HostSignalBinding::from_config(config)?;
+    binding.open()?;
+    let output = IssueAdapter::from_config(&config.tracker)?
+        .move_issue(input)
+        .await?;
+    binding.record_internal_lane(&output.issue.identifier.0, &output.issue.state.name)?;
+    Ok(output)
 }
 
 pub fn issue_lane_state_path_for_workflow(workflow_dir: &Path) -> std::path::PathBuf {

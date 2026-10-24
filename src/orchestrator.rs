@@ -1,3 +1,4 @@
+use crate::host_signal_journal::HostSignalBinding;
 use crate::kapellmeister::repo_kapellmeister_signal_message_with_lanes;
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
@@ -58,8 +59,7 @@ use crate::linear_adapter::{
     active_projection_phase_labels_for_template, classify_issue_lane, evaluate_issue_projection,
     issue_lane_state_path_for_workflow, lane_state_path_env_name,
     projected_terminal_lane_for_template_status, projection_lane_for_template_node,
-    reconcile_issue_lane_observation_state, record_internal_lane_for_workflow,
-    terminal_states_env_name,
+    reconcile_issue_lane_observation_state, terminal_states_env_name,
 };
 use crate::linear_tools::{LINEAR_ACTION_STATES_ENV, LINEAR_REVIEW_HANDOFF_STATES_ENV};
 use crate::meta_runtime::{
@@ -441,23 +441,17 @@ impl KapellmeisterHostToolExecutor for OrchestratorFinalPrGateStartExecutor {
             &self.config.independent_review.orchestrator_profile,
         );
         let repository = Some(request.pr.repo.clone());
-        let plan = match NativeMobLaunchPlan::new(
-            request.spawn_input,
-            template.clone(),
-            native_member_mcp_servers_for_issue(
-                &self.config.mob.mcp_servers,
-                &self.config.workflow_dir,
-                &template,
-                &self.issue,
-                repository.as_ref(),
-                &self.config.tracker.terminal_states,
-                &native_issue_review_handoff_states(&self.config, &self.issue),
-                &native_action_lanes(&self.config),
-            ),
-            native_member_direct_tool_servers(&self.config.tracker, &template),
-            self.config.tracker.project_slug.clone(),
-            repository,
-        ) {
+        let plan = match (|| {
+            NativeMobLaunchPlan::new(
+                request.spawn_input,
+                template.clone(),
+                bound_member_mcp_servers(&self.config, &template, &self.issue, repository.as_ref())
+                    .map_err(host_signal_launch_error)?,
+                native_member_direct_tool_servers(&self.config.tracker, &template),
+                self.config.tracker.project_slug.clone(),
+                repository,
+            )
+        })() {
             Ok(plan) => plan,
             Err(error) => {
                 return FugueToolResult::Err {
@@ -491,23 +485,17 @@ impl KapellmeisterHostToolExecutor for OrchestratorFinalPrGateStartExecutor {
         let mcp_tools = agent_visible_mcp_tool_names(&self.config.mob.mcp_servers);
         let template = independent_review_native_launch_template(&request, &mcp_tools);
         let repository = Some(request.pull_request.repo.clone());
-        let plan = match NativeMobLaunchPlan::new(
-            request.spawn_input,
-            template.clone(),
-            native_member_mcp_servers_for_issue(
-                &self.config.mob.mcp_servers,
-                &self.config.workflow_dir,
-                &template,
-                &self.issue,
-                repository.as_ref(),
-                &self.config.tracker.terminal_states,
-                &native_issue_review_handoff_states(&self.config, &self.issue),
-                &native_action_lanes(&self.config),
-            ),
-            native_member_direct_tool_servers(&self.config.tracker, &template),
-            self.config.tracker.project_slug.clone(),
-            repository,
-        ) {
+        let plan = match (|| {
+            NativeMobLaunchPlan::new(
+                request.spawn_input,
+                template.clone(),
+                bound_member_mcp_servers(&self.config, &template, &self.issue, repository.as_ref())
+                    .map_err(host_signal_launch_error)?,
+                native_member_direct_tool_servers(&self.config.tracker, &template),
+                self.config.tracker.project_slug.clone(),
+                repository,
+            )
+        })() {
             Ok(plan) => plan,
             Err(error) => {
                 return FugueToolResult::Err {
@@ -590,30 +578,18 @@ impl KapellmeisterHostToolExecutor for FinalPrGateProjectionExecutor {
                 metadata: ToolExecutionMetadata::default(),
             };
         }
-        match IssueAdapter::from_config(&self.config.tracker) {
-            Ok(adapter) => match adapter.move_issue(input).await {
-                Ok(output) => FugueToolResult::Ok {
-                    output: FugueToolOutput::LinearMoveIssue(output),
-                    metadata: ToolExecutionMetadata::default(),
-                },
-                Err(error) => FugueToolResult::Err {
-                    error: FugueToolError {
-                        operation: FugueToolOperation::LinearMoveIssue,
-                        code: FugueToolErrorCode::ExecutionFailed,
-                        message: error.to_string(),
-                        retry: RetryAdvice::DoNotRetry,
-                        idempotency_key: Some(idempotency_key),
-                    },
-                    metadata: ToolExecutionMetadata::default(),
-                },
+        match crate::linear_adapter::move_issue_with_observation(&self.config, input).await {
+            Ok(output) => FugueToolResult::Ok {
+                output: FugueToolOutput::LinearMoveIssue(output),
+                metadata: ToolExecutionMetadata::default(),
             },
             Err(error) => FugueToolResult::Err {
                 error: FugueToolError {
                     operation: FugueToolOperation::LinearMoveIssue,
-                    code: FugueToolErrorCode::BackendUnavailable,
+                    code: FugueToolErrorCode::ExecutionFailed,
                     message: error.to_string(),
-                    retry: RetryAdvice::SafeToRetry,
-                    idempotency_key: Some(input.idempotency_key),
+                    retry: RetryAdvice::DoNotRetry,
+                    idempotency_key: Some(idempotency_key),
                 },
                 metadata: ToolExecutionMetadata::default(),
             },
@@ -759,10 +735,12 @@ fn agent_visible_mcp_tool_names(
 }
 
 impl Orchestrator {
-    pub fn new(config: WorkflowConfigManager, refresh_rx: mpsc::Receiver<()>) -> Self {
+    pub fn new(config: WorkflowConfigManager, refresh_rx: mpsc::Receiver<()>) -> Result<Self> {
         let (internal_tx, internal_rx) = mpsc::channel(256);
         let effective = config.effective();
         let meerkat_config = effective.meerkat.clone();
+        let host_signal_binding = HostSignalBinding::from_config(effective)?;
+        let tracker_servers = host_signal_mcp_servers(effective)?;
         let fugue_host_api_url = fugue_host_api_url_from_config(effective);
         let fugue_host_api_auth = fugue_host_api_auth_from_config(effective);
         let meta_runtime_registry = MetaRuntimeRegistry::with_config(
@@ -771,7 +749,7 @@ impl Orchestrator {
             fugue_host_api_url.clone(),
             fugue_host_api_auth,
             native_repo_kapellmeister_mcp_servers(
-                &effective.mob.mcp_servers,
+                &tracker_servers,
                 &effective.workflow_dir,
                 repository_scope_from_config(effective).as_ref(),
                 effective.tracker.project_slug.as_deref(),
@@ -784,6 +762,7 @@ impl Orchestrator {
             ),
             effective.mob.templates.clone(),
         )
+        .with_host_signal_binding(host_signal_binding)
         .with_final_review_config(effective.final_review.clone())
         .with_independent_review_config(effective.independent_review.clone());
         let native_event_observer = NativeMobEventObserver::for_config(effective);
@@ -800,7 +779,7 @@ impl Orchestrator {
             last_error: None,
             recent_events: HashMap::new(),
         }));
-        Self {
+        Ok(Self {
             config,
             state,
             refresh_rx,
@@ -819,7 +798,7 @@ impl Orchestrator {
             #[cfg(test)]
             captured_native_signal_messages: None,
             linear_backoff_until: None,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -829,7 +808,7 @@ impl Orchestrator {
         refresh_rx: mpsc::Receiver<()>,
         native_execution_host: Arc<dyn NativeMobExecutionHost + Send + Sync>,
     ) -> Self {
-        let mut orchestrator = Self::new(config, refresh_rx);
+        let mut orchestrator = Self::new(config, refresh_rx).unwrap();
         orchestrator.native_execution_host = native_execution_host;
         orchestrator.native_worker_execution = false;
         // A fake worker host must not bootstrap a real coordinator as a side
@@ -3964,20 +3943,9 @@ impl Orchestrator {
         lane: &str,
         idempotency_suffix: &str,
     ) -> bool {
-        let adapter = match IssueAdapter::from_config(&self.config.effective().tracker) {
-            Ok(adapter) => adapter,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    issue_identifier = %identifier,
-                    target_lane = %lane,
-                    "native compact lane transition skipped because issue adapter is unavailable"
-                );
-                return false;
-            }
-        };
-        let result = adapter
-            .move_issue(MoveIssueInput {
+        let result = crate::linear_adapter::move_issue_with_observation(
+            self.config.effective(),
+            MoveIssueInput {
                 issue: issue_ref_for_identifier(identifier),
                 state: LinearStateRef::Name {
                     name: lane.to_string(),
@@ -3986,18 +3954,11 @@ impl Orchestrator {
                 idempotency_key: IdempotencyKey(format!(
                     "{idempotency_suffix}:{identifier}:{lane}"
                 )),
-            })
-            .await;
+            },
+        )
+        .await;
         match result {
-            Ok(output) => {
-                if native_lane_move_satisfied(&output) {
-                    self.record_internal_linear_lane(identifier, &output.issue.state.name)
-                        .await;
-                    true
-                } else {
-                    false
-                }
-            }
+            Ok(output) => native_lane_move_satisfied(&output),
             Err(err) => {
                 warn!(
                     error = %err,
@@ -4007,20 +3968,6 @@ impl Orchestrator {
                 );
                 false
             }
-        }
-    }
-
-    async fn record_internal_linear_lane(&self, identifier: &str, lane: &str) {
-        let result = record_internal_lane_for_workflow(self.config.effective(), identifier, lane);
-        if let Err(err) = result {
-            let mut state = self.state.write().await;
-            state.last_error = Some(err.to_string());
-            warn!(
-                error = %err,
-                issue_identifier = %identifier,
-                lane = %lane,
-                "failed to record internal Linear lane"
-            );
         }
     }
 
@@ -5212,30 +5159,32 @@ impl Orchestrator {
             }
         };
         let idempotency_key = native_execution_idempotency_key(&identifier, native_run_generation);
-        let plan = match NativeMobLaunchPlan::new(
-            SpawnOrResumeExecutionInput {
-                issue: issue_ref_for_identifier(&identifier),
-                workspace_key: workspace_key_for_identifier(&identifier),
-                template_id: selected.template_id.clone(),
-                worktree_path: Some(workspace_path.clone()),
-                instructions: Some(instructions),
-                idempotency_key,
-            },
-            selected.template.clone(),
-            native_member_mcp_servers_for_issue(
-                &self.config.effective().mob.mcp_servers,
-                &self.config.effective().workflow_dir,
-                selected.template,
-                &issue,
-                repository_scope_from_config(self.config.effective()).as_ref(),
-                &self.config.effective().tracker.terminal_states,
-                &native_issue_review_handoff_states(self.config.effective(), &issue),
-                &native_action_lanes(self.config.effective()),
-            ),
-            native_member_direct_tool_servers(&self.config.effective().tracker, selected.template),
-            self.config.effective().tracker.project_slug.clone(),
-            repository_scope_from_config(self.config.effective()),
-        ) {
+        let plan = match (|| {
+            NativeMobLaunchPlan::new(
+                SpawnOrResumeExecutionInput {
+                    issue: issue_ref_for_identifier(&identifier),
+                    workspace_key: workspace_key_for_identifier(&identifier),
+                    template_id: selected.template_id.clone(),
+                    worktree_path: Some(workspace_path.clone()),
+                    instructions: Some(instructions),
+                    idempotency_key,
+                },
+                selected.template.clone(),
+                bound_member_mcp_servers(
+                    self.config.effective(),
+                    selected.template,
+                    &issue,
+                    repository_scope_from_config(self.config.effective()).as_ref(),
+                )
+                .map_err(host_signal_launch_error)?,
+                native_member_direct_tool_servers(
+                    &self.config.effective().tracker,
+                    selected.template,
+                ),
+                self.config.effective().tracker.project_slug.clone(),
+                repository_scope_from_config(self.config.effective()),
+            )
+        })() {
             Ok(plan) => plan,
             Err(error) => {
                 self.block_native_issue_for_host_failure(
@@ -6778,6 +6727,50 @@ fn native_runtime_restore_keys(
             .then_with(|| left.2.cmp(&right.2))
     });
     candidates.into_iter().map(|(_, _, key)| key).collect()
+}
+
+fn host_signal_mcp_servers(
+    config: &ServiceConfig,
+) -> Result<BTreeMap<String, NativeMcpServerConfig>> {
+    let binding = HostSignalBinding::from_config(config)?.encode()?;
+    let mut servers = config.mob.mcp_servers.clone();
+    for (name, server) in &mut servers {
+        if is_native_linear_mcp_server(name, server) {
+            server.env.insert(
+                crate::host_signal_journal::HOST_SIGNAL_BINDING_ENV.to_owned(),
+                binding.clone(),
+            );
+        }
+    }
+    Ok(servers)
+}
+
+fn bound_member_mcp_servers(
+    config: &ServiceConfig,
+    template: &MaterializedMobTemplate,
+    issue: &Issue,
+    repository: Option<&GitHubRepoRef>,
+) -> Result<BTreeMap<String, NativeMcpServerConfig>> {
+    Ok(native_member_mcp_servers_for_issue(
+        &host_signal_mcp_servers(config)?,
+        &config.workflow_dir,
+        template,
+        issue,
+        repository,
+        &config.tracker.terminal_states,
+        &native_issue_review_handoff_states(config, issue),
+        &native_action_lanes(config),
+    ))
+}
+
+fn host_signal_launch_error(error: FugueError) -> FugueToolError {
+    FugueToolError {
+        operation: FugueToolOperation::MobSpawnOrResumeExecution,
+        code: FugueToolErrorCode::PreconditionFailed,
+        message: error.to_string(),
+        retry: RetryAdvice::DoNotRetry,
+        idempotency_key: None,
+    }
 }
 
 fn native_runtime_key_for_issue(config: &ServiceConfig, issue: &Issue) -> Option<String> {
@@ -10982,7 +10975,9 @@ mod tests {
             )
             .without_native_worker_execution()
         } else {
-            Orchestrator::new(manager, refresh_rx).without_native_worker_execution()
+            Orchestrator::new(manager, refresh_rx)
+                .unwrap()
+                .without_native_worker_execution()
         }
     }
 
@@ -10998,6 +10993,43 @@ mod tests {
             }),
         );
         definition
+    }
+
+    #[test]
+    fn tracker_modules_share_the_resolved_host_signal_binding() {
+        let mut config = native_control_plane_config();
+        config.meerkat.state_root = Some(PathBuf::from("/tmp/example-repository-runtime"));
+        config.mob.mcp_servers = BTreeMap::from([
+            (
+                "linear".to_owned(),
+                NativeMcpServerConfig {
+                    command: vec!["fugue-linear-mcp".to_owned()],
+                    url: None,
+                    env: BTreeMap::new(),
+                },
+            ),
+            (
+                "linear_projection".to_owned(),
+                NativeMcpServerConfig {
+                    command: vec!["fugue-linear-mcp".to_owned()],
+                    url: None,
+                    env: BTreeMap::new(),
+                },
+            ),
+        ]);
+        let expected = HostSignalBinding::from_config(&config).unwrap();
+        let servers = host_signal_mcp_servers(&config).unwrap();
+        for name in ["linear", "linear_projection"] {
+            let encoded = &servers[name].env[crate::host_signal_journal::HOST_SIGNAL_BINDING_ENV];
+            assert_eq!(HostSignalBinding::decode(encoded).unwrap(), expected);
+            assert!(!encoded.contains("token"));
+        }
+        assert!(
+            expected
+                .scope
+                .runtime_path
+                .starts_with("/tmp/example-repository-runtime")
+        );
     }
 
     fn native_control_plane_config() -> ServiceConfig {
@@ -15821,7 +15853,7 @@ worker:
             definition,
         )
         .unwrap();
-        let orchestrator = Orchestrator::new(manager, refresh_rx);
+        let orchestrator = Orchestrator::new(manager, refresh_rx).unwrap();
 
         orchestrator
             .schedule_retry(

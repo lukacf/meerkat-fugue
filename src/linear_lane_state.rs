@@ -462,12 +462,10 @@ pub fn comment_state_path_for_workflow(workflow_dir: &Path) -> PathBuf {
 }
 
 pub fn record_internal_lane_change_from_env(identifier: &str, lane: &str) -> Result<bool> {
-    let Some(path) = std::env::var_os(LINEAR_LANE_STATE_PATH_ENV).map(PathBuf::from) else {
+    let Some(binding) = crate::host_signal_journal::HostSignalBinding::from_environment()? else {
         return Ok(false);
     };
-    let mut state = LinearLaneState::read(&path)?;
-    state.observe_lane(identifier, lane);
-    state.write(&path)?;
+    binding.record_internal_lane(identifier, lane)?;
     Ok(true)
 }
 

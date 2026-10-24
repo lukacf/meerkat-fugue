@@ -22,7 +22,7 @@ const APPLICATION_ID: i64 = 0x46554753;
 const SCHEMA_VERSION: i64 = 1;
 
 mod binding;
-pub use binding::HostSignalBinding;
+pub use binding::{HOST_SIGNAL_BINDING_ENV, HostSignalBinding};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

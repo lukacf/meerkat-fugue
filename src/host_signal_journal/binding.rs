@@ -2,6 +2,8 @@ use super::*;
 use crate::config::ServiceConfig;
 use crate::kapellmeister::KapellmeisterShadowSignal;
 
+pub const HOST_SIGNAL_BINDING_ENV: &str = "FUGUE_HOST_SIGNAL_BINDING";
+
 /// Explicit repository and tracker routing supplied by the host. It contains
 /// no credentials and cannot redirect an existing journal to a different mob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,46 +14,52 @@ pub struct HostSignalBinding {
 }
 
 impl HostSignalBinding {
+    pub fn from_environment() -> Result<Option<Self>> {
+        match std::env::var(HOST_SIGNAL_BINDING_ENV) {
+            Ok(value) => Self::decode(&value).map(Some),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(failure("invalid host signal binding")),
+        }
+    }
+
+    pub fn decode(value: &str) -> Result<Self> {
+        let binding: Self =
+            serde_json::from_str(value).map_err(|_| failure("invalid host signal binding"))?;
+        binding.scope.validate()?;
+        if !binding.path.is_absolute() {
+            return Err(failure("journal binding requires an absolute path"));
+        }
+        Ok(binding)
+    }
+
+    pub fn encode(&self) -> Result<String> {
+        self.scope.validate()?;
+        encode(self)
+    }
+
+    pub fn validate_tracker(&self, config: &crate::config::TrackerConfig) -> Result<()> {
+        if self.scope.tracker != TrackerScope::from_config(config)? {
+            return Err(failure(
+                "tool tracker does not match the host signal binding",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn record_internal_lane(&self, identifier: &str, lane: &str) -> Result<()> {
+        let mut journal = self.open()?;
+        let mut update = journal.begin()?;
+        update.observe_lane(identifier, lane);
+        update.commit()
+    }
+
     pub fn from_config(config: &ServiceConfig) -> Result<Self> {
         let repository_path = std::path::absolute(&config.workflow_dir).map_err(failure)?;
         let runtime_path = std::path::absolute(crate::meta_runtime::meta_runtime_state_path(
             &config.meerkat,
         ))
         .map_err(failure)?;
-        let tracker = match config.tracker.kind.as_str() {
-            "jira" => {
-                let scope = crate::jira::routing_scope(&config.tracker)?;
-                TrackerScope::Jira {
-                    endpoint: scope.base.to_string(),
-                    project: scope.project,
-                    query: scope.query,
-                }
-            }
-            "linear" => {
-                let endpoint = reqwest::Url::parse(&config.tracker.endpoint)
-                    .map_err(|_| failure("invalid tracker endpoint"))?;
-                TrackerScope::Linear {
-                    endpoint: endpoint.to_string(),
-                    project: config
-                        .tracker
-                        .project_slug
-                        .clone()
-                        .ok_or(FugueError::MissingTrackerProjectSlug)?,
-                }
-            }
-            "fugue-ims" => TrackerScope::Internal {
-                database: std::path::absolute(crate::fugue_ims::fugue_ims_path(
-                    &config.tracker.endpoint,
-                )?)
-                .map_err(failure)?,
-                repository: config
-                    .tracker
-                    .project_slug
-                    .clone()
-                    .ok_or(FugueError::MissingTrackerProjectSlug)?,
-            },
-            kind => return Err(FugueError::UnsupportedTrackerKind(kind.to_string())),
-        };
+        let tracker = TrackerScope::from_config(&config.tracker)?;
         let scope = HostSignalScope {
             repository_path: repository_path.clone(),
             runtime_path,
@@ -92,6 +100,41 @@ impl SignalEnvelope {
         Ok(Self {
             content,
             mode: SignalHandlingMode::Steer,
+        })
+    }
+}
+
+impl TrackerScope {
+    pub fn from_config(config: &crate::config::TrackerConfig) -> Result<Self> {
+        Ok(match config.kind.as_str() {
+            "jira" => {
+                let scope = crate::jira::routing_scope(config)?;
+                TrackerScope::Jira {
+                    endpoint: scope.base.to_string(),
+                    project: scope.project,
+                    query: scope.query,
+                }
+            }
+            "linear" => {
+                let endpoint = reqwest::Url::parse(&config.endpoint)
+                    .map_err(|_| failure("invalid tracker endpoint"))?;
+                TrackerScope::Linear {
+                    endpoint: endpoint.to_string(),
+                    project: config
+                        .project_slug
+                        .clone()
+                        .ok_or(FugueError::MissingTrackerProjectSlug)?,
+                }
+            }
+            "fugue-ims" => TrackerScope::Internal {
+                database: std::path::absolute(crate::fugue_ims::fugue_ims_path(&config.endpoint)?)
+                    .map_err(failure)?,
+                repository: config
+                    .project_slug
+                    .clone()
+                    .ok_or(FugueError::MissingTrackerProjectSlug)?,
+            },
+            kind => return Err(FugueError::UnsupportedTrackerKind(kind.to_string())),
         })
     }
 }
