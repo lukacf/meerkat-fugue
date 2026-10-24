@@ -2094,6 +2094,7 @@ dependencies = [
  "indexmap",
  "jsonschema",
  "meerkat",
+ "meerkat-contracts",
  "meerkat-core",
  "meerkat-llm-core",
  "meerkat-meta",

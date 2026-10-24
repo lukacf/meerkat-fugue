@@ -80,6 +80,55 @@ impl HostSignalBinding {
         }
         HostSignalJournal::open(&self.path, &self.scope)
     }
+
+    /// Attempt one bounded snapshot of pending work in commit order. The sender
+    /// must use this exact scope, key, content and mode with native keyed
+    /// admission, and return its complete native receipt. No tracker read is
+    /// required, so callers can retry during tracker outages and startup.
+    ///
+    /// No database connection or transaction crosses the sender's await. A
+    /// failed, cancelled or unacknowledged send stays pending with its original
+    /// key. Native admission, not this journal, deduplicates uncertain retries.
+    /// Pending, stranded and refused receipts stop this snapshot and return
+    /// their native status intact; only an Admitted receipt is acknowledged.
+    pub async fn drain_pending<F, Fut>(
+        &self,
+        limit: std::num::NonZeroU32,
+        mut admit: F,
+    ) -> Result<DrainProgress>
+    where
+        F: FnMut(HostSignalScope, PendingSignal) -> Fut,
+        Fut: std::future::Future<Output = Result<meerkat_contracts::WireContinuationReceipt>>,
+    {
+        let pending = self.open()?.pending(limit.get())?;
+        let mut progress = DrainProgress::default();
+        for signal in pending {
+            let key = signal.key.clone();
+            let receipt = admit(self.scope.clone(), signal).await?;
+            if receipt.delivery_id.trim().is_empty() {
+                return Err(failure("native delivery receipt is empty"));
+            }
+            match &receipt.status {
+                meerkat_contracts::WireContinuationStatus::Admitted {
+                    session_id,
+                    input_id,
+                } => {
+                    if session_id.trim().is_empty() || input_id.trim().is_empty() {
+                        return Err(failure("native admission requires a session and input"));
+                    }
+                    self.open()?.acknowledge(&key, &receipt.delivery_id)?;
+                    progress.acknowledged += 1;
+                }
+                meerkat_contracts::WireContinuationStatus::Pending
+                | meerkat_contracts::WireContinuationStatus::Stranded
+                | meerkat_contracts::WireContinuationStatus::Refused { .. } => {
+                    progress.deferred = Some(DeferredSignal { key, receipt });
+                    break;
+                }
+            }
+        }
+        Ok(progress)
+    }
 }
 
 impl SignalEnvelope {

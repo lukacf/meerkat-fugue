@@ -21,6 +21,258 @@ fn message(text: &str) -> SignalEnvelope {
     }
 }
 
+fn binding(temp: &tempfile::TempDir) -> HostSignalBinding {
+    HostSignalBinding {
+        path: temp.path().join("signals.sqlite3"),
+        scope: scope(),
+    }
+}
+
+// Controlled sender results qualify journal mechanics only, not native delivery.
+fn admitted(id: &str) -> meerkat_contracts::WireContinuationReceipt {
+    meerkat_contracts::WireContinuationReceipt {
+        delivery_id: id.into(),
+        committed_at_ms: 1,
+        status: meerkat_contracts::WireContinuationStatus::Admitted {
+            session_id: "test-session".into(),
+            input_id: "test-input".into(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn native_receipts_without_admission_preserve_pending_work_and_their_status() {
+    use meerkat_contracts::{WireContinuationReceipt, WireContinuationStatus};
+    for status in [
+        WireContinuationStatus::Pending,
+        WireContinuationStatus::Stranded,
+        WireContinuationStatus::Refused {
+            reason: "authority refused".into(),
+        },
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let binding = binding(&temp);
+        let first = enqueue(&binding, "first");
+        let second = enqueue(&binding, "second");
+        let third = enqueue(&binding, "third");
+        let receipt = WireContinuationReceipt {
+            delivery_id: "committed-but-not-admitted".into(),
+            committed_at_ms: 1,
+            status,
+        };
+        let progress = binding
+            .drain_pending(std::num::NonZeroU32::new(10).unwrap(), |_, signal| {
+                let response = if signal.key == first.key {
+                    admitted("admitted-delivery")
+                } else {
+                    assert_eq!(signal.key, second.key, "do not overtake deferred delivery");
+                    receipt.clone()
+                };
+                std::future::ready(Ok(response))
+            })
+            .await
+            .unwrap();
+        assert_eq!(progress.acknowledged, 1);
+        assert_eq!(
+            progress.deferred,
+            Some(DeferredSignal {
+                key: second.key.clone(),
+                receipt
+            })
+        );
+        assert_eq!(
+            binding.open().unwrap().pending(10).unwrap(),
+            vec![second, third]
+        );
+    }
+}
+
+fn enqueue(binding: &HostSignalBinding, event: &str) -> PendingSignal {
+    let mut journal = binding.open().unwrap();
+    let mut update = journal.begin().unwrap();
+    let key = update.enqueue_once(event, || Ok(message(event))).unwrap();
+    update.commit().unwrap();
+    journal
+        .pending(100)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.key == key)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn drain_retries_the_exact_saved_request_after_admission_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let binding = binding(&temp);
+    let first = enqueue(&binding, "event-1");
+    let result = binding
+        .drain_pending(std::num::NonZeroU32::new(10).unwrap(), |scope, signal| {
+            assert_eq!(scope, binding.scope);
+            assert_eq!(signal, first);
+            std::future::ready(Err(failure("native admission unavailable")))
+        })
+        .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("native admission unavailable")
+    );
+    assert_eq!(
+        binding.open().unwrap().pending(10).unwrap(),
+        vec![first.clone()]
+    );
+    let reopened = HostSignalBinding::decode(&binding.encode().unwrap()).unwrap();
+    assert_eq!(
+        reopened
+            .drain_pending(std::num::NonZeroU32::new(10).unwrap(), |scope, signal| {
+                assert_eq!(scope, binding.scope);
+                assert_eq!(signal, first);
+                std::future::ready(Ok(admitted("native-delivery-1")))
+            })
+            .await
+            .unwrap(),
+        DrainProgress {
+            acknowledged: 1,
+            deferred: None
+        }
+    );
+    assert!(binding.open().unwrap().pending(10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cancelling_a_drain_keeps_unacknowledged_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let binding = binding(&temp);
+    let first = enqueue(&binding, "event-1");
+    let started = tokio::sync::Notify::new();
+    let drain = binding.drain_pending(std::num::NonZeroU32::new(10).unwrap(), |_, _| {
+        started.notify_one();
+        std::future::pending::<Result<meerkat_contracts::WireContinuationReceipt>>()
+    });
+    {
+        tokio::pin!(drain);
+        tokio::select! {
+            result = &mut drain => panic!("admission must still be pending: {result:?}"),
+            () = started.notified() => {}
+        }
+    }
+    assert_eq!(binding.open().unwrap().pending(10).unwrap(), vec![first]);
+}
+
+#[tokio::test]
+async fn drain_releases_database_locks_and_preserves_new_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let binding = binding(&temp);
+    let first = enqueue(&binding, "event-1");
+    let (entered, admission) = tokio::sync::oneshot::channel();
+    let (finish, release) = tokio::sync::oneshot::channel();
+    let sender_binding = binding.clone();
+    let first_copy = first.clone();
+    let drain = tokio::spawn(async move {
+        let mut entered = Some(entered);
+        let mut release = Some(release);
+        sender_binding
+            .drain_pending(std::num::NonZeroU32::new(1).unwrap(), |scope, signal| {
+                assert_eq!(scope, sender_binding.scope);
+                assert_eq!(signal, first_copy);
+                entered.take().unwrap().send(()).unwrap();
+                let release = release.take().unwrap();
+                async move {
+                    release.await.unwrap();
+                    Ok(admitted("native-delivery-1"))
+                }
+            })
+            .await
+    });
+    admission.await.unwrap();
+    let second = enqueue(&binding, "event-2");
+    finish.send(()).unwrap();
+    assert_eq!(
+        drain.await.unwrap().unwrap(),
+        DrainProgress {
+            acknowledged: 1,
+            deferred: None
+        }
+    );
+    assert_eq!(binding.open().unwrap().pending(10).unwrap(), vec![second]);
+}
+
+#[tokio::test]
+async fn drain_acknowledgment_failure_retries_the_original_admission_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let binding = binding(&temp);
+    let first = enqueue(&binding, "event-1");
+    let journal = binding.open().unwrap();
+    journal.connection.execute_batch(
+        "CREATE TRIGGER fail_ack BEFORE UPDATE ON deliveries BEGIN SELECT RAISE(ABORT, 'ack unavailable'); END;"
+    ).unwrap();
+    drop(journal);
+    let result = binding
+        .drain_pending(std::num::NonZeroU32::new(1).unwrap(), |_, signal| {
+            assert_eq!(signal, first);
+            std::future::ready(Ok(admitted("native-delivery-1")))
+        })
+        .await;
+    assert!(result.unwrap_err().to_string().contains("ack unavailable"));
+    let journal = binding.open().unwrap();
+    assert_eq!(journal.pending(10).unwrap(), vec![first.clone()]);
+    journal
+        .connection
+        .execute_batch("DROP TRIGGER fail_ack;")
+        .unwrap();
+    drop(journal);
+    assert_eq!(
+        binding
+            .drain_pending(std::num::NonZeroU32::new(1).unwrap(), |_, signal| {
+                assert_eq!(signal, first);
+                std::future::ready(Ok(admitted("native-delivery-1")))
+            })
+            .await
+            .unwrap(),
+        DrainProgress {
+            acknowledged: 1,
+            deferred: None
+        }
+    );
+    assert!(binding.open().unwrap().pending(10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn drain_refuses_empty_receipts_and_does_not_retarget_saved_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let binding = binding(&temp);
+    let first = enqueue(&binding, "event-1");
+    let result = binding
+        .drain_pending(std::num::NonZeroU32::new(1).unwrap(), |_, _| {
+            std::future::ready(Ok(admitted(" ")))
+        })
+        .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("native delivery receipt is empty")
+    );
+    let mut other = binding.clone();
+    other.scope.mob_id = "another-repository".into();
+    let result = other
+        .drain_pending(
+            std::num::NonZeroU32::new(1).unwrap(),
+            |_, _| -> std::future::Ready<Result<meerkat_contracts::WireContinuationReceipt>> {
+                panic!("a changed target must be refused before native admission");
+            },
+        )
+        .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("another repository, runtime or tracker scope")
+    );
+    assert_eq!(binding.open().unwrap().pending(10).unwrap(), vec![first]);
+}
+
 #[test]
 fn abandoned_transaction_saves_neither_observation_nor_notification() {
     let temp = tempfile::tempdir().unwrap();

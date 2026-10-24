@@ -121,6 +121,20 @@ pub struct PendingSignal {
     pub envelope: SignalEnvelope,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeferredSignal {
+    pub key: DeliveryKey,
+    pub receipt: meerkat_contracts::WireContinuationReceipt,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DrainProgress {
+    pub acknowledged: u32,
+    /// Preserve native Pending, Stranded and Refused outcomes for the caller.
+    /// None of these outcomes consumes the saved notification.
+    pub deferred: Option<DeferredSignal>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObservationRevision(i64);
 
