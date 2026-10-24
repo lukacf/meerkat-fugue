@@ -4070,6 +4070,15 @@ pub(crate) mod tests {
             )
             .expect("retain isolated runtime stderr");
         }
+        if name.starts_with("admitted_host_signal_")
+            && let Some(directory) = std::env::var_os("FUGUE_TEST_EVIDENCE_DIR")
+        {
+            let directory = PathBuf::from(directory);
+            std::fs::write(directory.join(format!("{name}.stdout.log")), &output.stdout)
+                .expect("retain host signal stdout");
+            std::fs::write(directory.join(format!("{name}.stderr.log")), &output.stderr)
+                .expect("retain host signal stderr");
+        }
         assert!(
             output.status.success(),
             "isolated {name} failed:\n{}\n{}",
@@ -5751,6 +5760,30 @@ pub(crate) mod tests {
         delivered.expect("host signal must reach the native coordinator session");
     }
 
+    struct RuntimeFailureEvidence(Option<tempfile::TempDir>);
+    impl Drop for RuntimeFailureEvidence {
+        fn drop(&mut self) {
+            // An external qualifier can reject a zero exit after inspecting
+            // its transcript. It owns cleanup when an evidence root is set.
+            if (std::thread::panicking() || std::env::var_os("FUGUE_TEST_EVIDENCE_DIR").is_some())
+                && let Some(directory) = self.0.take()
+            {
+                eprintln!(
+                    "Retained runtime state for qualification: {}",
+                    directory.keep().display()
+                );
+            }
+        }
+    }
+    fn host_signal_evidence(prefix: &str) -> RuntimeFailureEvidence {
+        let directory = match std::env::var_os("FUGUE_TEST_EVIDENCE_DIR") {
+            Some(parent) => tempfile::Builder::new().prefix(prefix).tempdir_in(parent),
+            None => tempfile::Builder::new().prefix(prefix).tempdir(),
+        }
+        .expect("host signal evidence directory");
+        RuntimeFailureEvidence(Some(directory))
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn admitted_host_signal_replays_after_restart_without_duplicate_input() {
         if !isolated_runtime_test(
@@ -5758,7 +5791,9 @@ pub(crate) mod tests {
         ) {
             return;
         }
-        let directory = tempfile::tempdir().unwrap();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let evidence = host_signal_evidence("host-signal-restart-");
+        let directory = evidence.0.as_ref().expect("host signal evidence owner");
         assert_native_host_signal_replay(directory.path(), false, false).await;
     }
 
@@ -5769,12 +5804,14 @@ pub(crate) mod tests {
         if !isolated_runtime_test(NAME) {
             return;
         }
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         const ROOT: &str = "FUGUE_SIGNAL_CRASH_ROOT";
         if let Some(root) = std::env::var_os(ROOT) {
             assert_native_host_signal_replay(Path::new(&root), true, false).await;
             panic!("child must exit before acknowledgement and runtime shutdown");
         }
-        let directory = tempfile::tempdir().unwrap();
+        let evidence = host_signal_evidence("host-signal-process-loss-");
+        let directory = evidence.0.as_ref().expect("host signal evidence owner");
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .env(ROOT, directory.path())
             .env("FUGUE_ISOLATED_RUNTIME_TEST", NAME)
@@ -5880,6 +5917,13 @@ pub(crate) mod tests {
                 std::process::exit(0);
             }
             registry.shutdown().await.unwrap();
+            // Keep the original admission-to-shutdown timing; only persist this
+            // diagnostic copy after the graceful shutdown under test.
+            std::fs::write(
+                root.join("native-admission.json"),
+                serde_json::to_vec_pretty(&accepted).unwrap(),
+            )
+            .unwrap();
             drop(registry);
             accepted
         };
@@ -5908,6 +5952,11 @@ pub(crate) mod tests {
             Some(&accepted),
             "restart must reuse the original native receipt and input"
         );
+        std::fs::write(
+            root.join("native-replay.json"),
+            serde_json::to_vec_pretty(&*replayed.lock().unwrap()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(progress.acknowledged, 1);
         assert!(binding.open().unwrap().pending(1).unwrap().is_empty());
         let runtime = registry.runtime().await.unwrap();
@@ -5915,24 +5964,30 @@ pub(crate) mod tests {
             WireContinuationStatus::Admitted { session_id, .. } => session_id,
             _ => unreachable!(),
         };
-        let history = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut last_history = None;
+        let history_result = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let history = runtime
                     .mob_runtime()
                     .read_session_history(&session_id, 0, None)
                     .await
                     .unwrap();
-                if serde_json::to_string(&history.messages)
-                    .unwrap()
-                    .contains(message)
-                {
+                let serialized = serde_json::to_string(&history.messages).unwrap();
+                let contains_input = serialized.contains(message);
+                last_history = Some(serialized);
+                if contains_input {
                     break history;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
-        .await
-        .expect("admitted input in canonical history");
+        .await;
+        std::fs::write(
+            root.join("canonical-history.json"),
+            last_history.as_deref().unwrap_or("null"),
+        )
+        .unwrap();
+        let history = history_result.expect("admitted input in canonical history");
         assert_eq!(
             history
                 .messages
@@ -5958,22 +6013,6 @@ pub(crate) mod tests {
             return;
         }
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-        struct RuntimeFailureEvidence(Option<tempfile::TempDir>);
-        impl Drop for RuntimeFailureEvidence {
-            fn drop(&mut self) {
-                // An external qualifier can reject a zero exit after inspecting
-                // its transcript. It owns cleanup when an evidence root is set.
-                if (std::thread::panicking()
-                    || std::env::var_os("FUGUE_TEST_EVIDENCE_DIR").is_some())
-                    && let Some(directory) = self.0.take()
-                {
-                    eprintln!(
-                        "Retained runtime state for qualification: {}",
-                        directory.keep().display()
-                    );
-                }
-            }
-        }
         let directory = match std::env::var_os("FUGUE_TEST_EVIDENCE_DIR") {
             Some(parent) => tempfile::Builder::new()
                 .prefix("runtime-")
