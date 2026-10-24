@@ -91,6 +91,15 @@ its answer through a persisted completion notice for the admitted job. This
 guards the fork integration contract; it does not prove a model's review quality
 or recovery after a host crash.
 
+The coordinator-notification regressions use the real native keyed admission
+API with a scripted model. They stop after native admission but before the host
+journal acknowledges the input, reopen the same runtime, and verify that retry
+returns the original receipt and produces exactly one native history input.
+Coverage includes graceful shutdown and a child process exiting without native
+shutdown. Separate tests check that saved work drains during tracker backoff and
+missing tracker authentication. These checks establish the local persistence
+contract; hosted restart and model behavior still need live acceptance.
+
 ### Browser coverage
 
 `npm run test:ui` starts disposable fixture servers. It covers repository setup,

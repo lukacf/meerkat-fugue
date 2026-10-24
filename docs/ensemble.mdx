@@ -134,11 +134,14 @@ not an operating-system sandbox.
 `init` connects all configured representatives. Use `--no-peers` to begin with
 isolated teams, or edit `peers` to describe a smaller network.
 
+The optional `model` overrides the recommendation in Fugue's pinned Meerkat
+catalog. Omit it to follow that recommendation, currently `gpt-6-astra`.
+
 ```yaml
 version: 1
 name: Product team
 state_root: .fugue/ensemble
-model: gpt-5.5
+model: gpt-6-astra
 max_sessions: 64
 repositories:
   api:

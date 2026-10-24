@@ -63,6 +63,11 @@ service definitions with the backup so rollback can restore a matching pair.
 Stop the service or use an explicitly supported consistent snapshot mechanism;
 a copy of live SQLite files alone is not a proven consistent backup.
 
+Include `.fugue/host-signals.sqlite3` beside each repository workflow. It stores
+observed changes and saved notifications to the repository coordinator. Preserve
+it with the matching workflow and native runtime state, including when moving
+or restoring the service. It can contain private issue and repository content.
+
 Managed repositories keep uploaded files under their own state directory's
 `files/tracker-files/<scope-hash>` folder. Explicit workflow installations use
 `.fugue/tracker-files/<scope-hash>` beside the workflow. The scope includes the
@@ -134,6 +139,51 @@ appears quiet, inspect the native status before treating it as stopped. At the
 configured stall boundary, a native status heartbeat can establish that a run is
 still pending, running or waiting for input. A UI observation timeout does not
 establish that the process terminated.
+
+## Recover saved notifications
+
+Fugue saves coordinator notifications before sending them to Meerkat. It retries
+pending notifications at startup and during the service loop, including while
+new tracker reads are backing off. This applies to saved work; changes that have
+not yet been observed still require a successful tracker or repository poll.
+
+An admission timeout can mean that Meerkat accepted the input but Fugue did not
+receive the result. The retry keeps the same delivery key, so native admission
+can return the original receipt instead of adding a second input. Fugue marks
+the saved notification acknowledged only when the native receipt is `Admitted`.
+That means Meerkat has queued an input for the coordinator. It does not prove
+that the coordinator has processed it, finished the work or merged a PR. Fugue
+retains the full admission receipt and checks the native input separately, so
+an in-flight turn does not block newer notifications. Check the conversation,
+Work Graph and delivery evidence for the task outcome.
+
+If a graceful stop abandons a queued notification before any execution, Fugue
+can submit a replacement after native state proves it never ran. The replacement
+key and proof are saved together, so another restart cannot create another copy.
+Notifications already consumed, associated with a run, canceled, or affected by
+held-tail repair are not automatically resubmitted.
+
+**Host notification needs attention** means Fugue cannot safely establish a
+retry. For example, the admitted native input may be missing or its runtime may
+have been destroyed. Its receipt stays saved, and later notifications can still
+arrive. Preserve the workflow's `.fugue/host-signals.sqlite3`, the matching native
+runtime state and the service log for diagnosis. A missing input is not proof
+that its earlier work had no effect. Do not clear the journal or repeat the
+tracker action to manufacture progress.
+
+If logs report **host notification remains saved for retry**, inspect the
+associated runtime or storage error and restore that dependency. Leave the
+journal intact and allow the service to retry. A failure to save a notification
+is a different error: preserve the logs and verify the affected tracker action
+before repeating it, because an external mutation may already have succeeded.
+
+The journal belongs to one repository workflow, native runtime, coordinator and
+tracker scope. Editing the tracker site, project or Jira query must not redirect
+old pending work to another queue. A live routing-change error requires a managed
+restart with the intended configuration; an existing journal scope mismatch
+also requires restoring its matching configuration and state or using a separate
+repository workspace. Restart alone cannot make another queue's journal valid.
+Do not delete or edit the journal to bypass a scope or format error.
 
 ## Validate delivery
 

@@ -214,7 +214,7 @@ fn mdx_documentation_set_covers_operator_and_native_execution_topics() {
     assert!(configuration.contains("omitted top-level `backend` resolves to `native-execution`"));
     assert!(configuration.contains("mcp:linear"));
     assert!(configuration.contains("native-execution"));
-    assert!(native_mobs.contains("Linear projection model"));
+    assert!(native_mobs.contains("Tracker projection model"));
     assert!(native_mobs.contains("inputSchema"));
     assert!(native_mobs.contains("Projected Lane Ownership"));
     assert!(native_mobs.contains("report lifecycle facts to the issue lead"));
