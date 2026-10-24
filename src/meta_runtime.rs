@@ -1,3 +1,4 @@
+use crate::host_signal_journal::HostSignalBinding;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -29,37 +30,41 @@ use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::agent::{
-    execute_github_fugue_tool, external_tools_for_tracker, is_github_fugue_tool_name,
+    execute_github_fugue_tool_with_host, external_tools_for_tracker, is_github_fugue_tool_name,
 };
 use crate::config::{
-    DEFAULT_AGENT_MODEL, FinalReviewReviewerConfig, IndependentReviewConfig,
-    MaterializedMobTemplate, MeerkatConfig, MetaConsoleBasicAuthConfig, NativeAgentProfile,
-    NativeMcpServerConfig, NativeMobFlow, TrackerConfig, is_native_linear_mcp_server,
+    FinalReviewReviewerConfig, IndependentReviewConfig, MaterializedMobTemplate, MeerkatConfig,
+    MetaConsoleBasicAuthConfig, NativeAgentProfile, NativeMcpServerConfig, NativeMobFlow,
+    TrackerConfig, default_agent_model, is_native_linear_mcp_server,
 };
 use crate::deploy_gate::DeployStartRequest;
-use crate::domain::normalize_state;
 use crate::final_pr_gate::FinalPrGateStartRequest;
 use crate::independent_review::{
     IndependentReviewCompletionRequest, IndependentReviewStartRequest,
     independent_review_completion_input_schema,
 };
 use crate::linear_tools::{
-    LINEAR_ACTION_STATES_ENV, LINEAR_REVIEW_HANDOFF_STATES_ENV,
-    execute_linear_fugue_tool_with_review_handoff_states, is_linear_fugue_tool_name,
+    LINEAR_ACTION_STATES_ENV, LINEAR_REVIEW_HANDOFF_STATES_ENV, execute_linear_fugue_tool_bound,
+    is_linear_fugue_tool_name,
 };
 use crate::mob_tools::{NativeMobExecutionHost, NativeMobLaunchPlan, ObserveStructuralEventsInput};
 use crate::tools::{
     CancelExecutionInput, Cursor, FugueToolErrorCode, FugueToolOperation, FugueToolOutput,
     FugueToolResult, GitHubOwner, GitHubRepoName, GitHubRepoRef, InspectRunInput, LinearIssueRef,
-    LinearStateRef, ListRunsInput, ListRunsOutput, MobEventKind, MobEventSnapshot, MobRunId,
-    MobRunSnapshot, MobRunStatus, MoveIssueInput, RetryAdvice, SpawnOrResumeExecutionInput,
-    SpawnOrResumeExecutionOutput, ToolExecutionMetadata,
+    ListRunsInput, ListRunsOutput, MobEventKind, MobEventSnapshot, MobRunId, MobRunSnapshot,
+    MobRunStatus, RetryAdvice, SpawnOrResumeExecutionInput, SpawnOrResumeExecutionOutput,
+    ToolExecutionMetadata,
 };
-use crate::workgraph_gate::{WORKGRAPH_BLOCKED_STATES_ENV, WorkGraphTerminalGate};
+use crate::workgraph_gate::{
+    WORKGRAPH_BLOCKED_STATES_ENV, WorkGraphTerminalGate,
+    guard_public_lane_move as guard_direct_public_lane_move,
+};
 
-const RUNTIME_KEY: &str = "fugue";
+#[cfg(test)]
+use crate::tools::{LinearStateRef, MoveIssueInput};
+
 const MOB_ID: &str = crate::native_mob_contract::FUGUE_MOB_ID;
-const KAPELLMEISTER: &str = "kapellmeister";
+pub(crate) const KAPELLMEISTER: &str = "kapellmeister";
 const ISSUE_LEAD: &str = "issue_lead";
 const FUGUE_CONTEXT_KEY: &str = "fugue";
 const FUGUE_CONTEXT_WORKTREE_PATH_KEY: &str = "worktree_path";
@@ -70,18 +75,14 @@ const DEFAULT_NATIVE_MAX_ORPHANED_TURNS: u32 = 128;
 const TURN_LIMIT_PHASE: &str = "turn_limit_reached";
 const MEMBER_TERMINAL_FAILURE_PHASE: &str = "member_terminal_failure";
 
-#[derive(Debug, Clone)]
-pub struct FugueHostSignalAccepted {
-    pub interaction_id: String,
-    pub identity: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FugueMobJob {
     run: MobRunSnapshot,
     member_identities: Vec<String>,
     notified_member_failure_cursors: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_failure: Option<crate::tools::NativeLaunchFailure>,
 }
 
 impl FugueMobJob {
@@ -90,12 +91,13 @@ impl FugueMobJob {
             run,
             member_identities,
             notified_member_failure_cursors: BTreeSet::new(),
+            launch_failure: None,
         }
     }
 }
 
 #[derive(Debug, Default)]
-struct FugueConsoleVisibilityPolicy;
+pub(crate) struct FugueConsoleVisibilityPolicy;
 
 impl ConsoleVisibilityPolicy for FugueConsoleVisibilityPolicy {
     fn include_implicit_delegate_members(&self) -> bool {
@@ -135,17 +137,61 @@ fn is_raw_comms_admission_prompt(prompt: &str) -> bool {
         || lower.starts_with("peer response from ")
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct RepositorySpecialist {
+    pub identity: String,
+    pub label: String,
+    pub focus: String,
+    pub paths: Vec<PathBuf>,
+}
+
+fn resolve_review_specialists(
+    reviewers: &meerkat_mob::FlowRoleTargets,
+    specialists: &[RepositorySpecialist],
+    issue_participants: &BTreeSet<String>,
+) -> Result<meerkat_mob::FlowRoleTargets, crate::review_requests::ReviewRequestError> {
+    let mut bindings = Vec::new();
+    for (role, identities) in reviewers.bound_roles() {
+        let mut resolved = Vec::new();
+        for identity in identities {
+            let specialist = specialists
+                .iter()
+                .find(|specialist| {
+                    specialist.identity == identity.as_str()
+                        || meerkat_meta::member_comms_id::roster_member_id_for_identity(
+                            &specialist.identity,
+                        ) == *identity
+                })
+                .ok_or(crate::review_requests::ReviewRequestError::IneligibleReviewer)?;
+            let native =
+                meerkat_meta::member_comms_id::roster_member_id_for_identity(&specialist.identity);
+            if issue_participants.contains(native.as_str())
+                || issue_participants.contains(&specialist.identity)
+            {
+                return Err(crate::review_requests::ReviewRequestError::IneligibleReviewer);
+            }
+            resolved.push(native);
+        }
+        bindings.push((role.clone(), resolved));
+    }
+    meerkat_mob::FlowRoleTargets::new(bindings)
+        .map_err(|_| crate::review_requests::ReviewRequestError::IneligibleReviewer)
+}
+
 #[derive(Clone)]
 pub struct MetaRuntimeRegistry {
     meerkat: MeerkatConfig,
     repo_mcp_servers: BTreeMap<String, NativeMcpServerConfig>,
     tracker: TrackerConfig,
+    host_signal_binding: Option<HostSignalBinding>,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
     templates: BTreeMap<String, MaterializedMobTemplate>,
-    final_review_reviewers: Vec<FinalReviewReviewerConfig>,
+    final_review: crate::config::FinalReviewConfig,
     independent_review: IndependentReviewConfig,
     runtime: Arc<tokio::sync::Mutex<Option<Arc<UnifiedRuntime>>>>,
+    specialists: Arc<OnceLock<Vec<RepositorySpecialist>>>,
+    console: Arc<OnceLock<Arc<crate::console::ConsoleHub>>>,
     meta_task_runtime: Arc<Mutex<Option<tokio::runtime::Runtime>>>,
     event_drain_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     kapellmeister_bootstrap: Arc<tokio::sync::Mutex<()>>,
@@ -156,6 +202,258 @@ pub struct MetaRuntimeRegistry {
 }
 
 impl MetaRuntimeRegistry {
+    fn review_requests(&self) -> crate::review_requests::ReviewRequestStore {
+        crate::review_requests::ReviewRequestStore::new(
+            self.state_path().join("review-requests.sqlite3"),
+        )
+    }
+
+    pub(crate) async fn with_current_review<T: Send + 'static>(
+        &self,
+        intent: crate::native_review::ReviewIntent,
+        action: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, crate::review_requests::ReviewRequestError> {
+        let store = self.review_requests();
+        tokio::task::spawn_blocking(move || store.with_current(&intent, action))
+            .await
+            .map_err(|_| crate::review_requests::ReviewRequestError::Unavailable)?
+    }
+
+    pub(crate) fn verify_review_independence(
+        &self,
+        intent: &crate::native_review::ReviewIntent,
+    ) -> Result<(), crate::review_requests::ReviewRequestError> {
+        use crate::review_requests::ReviewRequestError;
+        self.restore_jobs()
+            .map_err(|_| ReviewRequestError::Unavailable)?;
+        let participants: BTreeSet<_> = self
+            .jobs
+            .lock()
+            .map_err(|_| ReviewRequestError::Unavailable)?
+            .values()
+            .filter(|job| match &job.run.issue {
+                Some(LinearIssueRef::Id { id }) => id == &intent.candidate.issue_id,
+                Some(LinearIssueRef::Identifier { identifier }) => {
+                    identifier.0 == intent.candidate.issue_identifier
+                }
+                None => false,
+            })
+            .flat_map(|job| job.member_identities.iter().cloned())
+            .collect();
+        let specialists = self
+            .specialists
+            .get()
+            .ok_or(ReviewRequestError::Unavailable)?;
+        let resolved = resolve_review_specialists(&intent.reviewers, specialists, &participants)?;
+        if resolved != intent.reviewers {
+            return Err(ReviewRequestError::IneligibleReviewer);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn read_current_native_review(
+        &self,
+        candidate: &crate::native_review::ReviewCandidate,
+    ) -> Result<crate::native_review::VerifiedReview, crate::native_review::ReviewProofError> {
+        let store = self.review_requests();
+        let lookup = candidate.clone();
+        let intent = tokio::task::spawn_blocking(move || store.current(&lookup))
+            .await
+            .map_err(|_| crate::native_review::ReviewProofError::Unavailable)?
+            .map_err(|_| crate::native_review::ReviewProofError::Unavailable)?
+            .ok_or(crate::native_review::ReviewProofError::Superseded)?;
+        let reference =
+            crate::native_review::reference_for(&self.meerkat.mob_id().as_ref().into(), &intent)?;
+        self.read_native_review(candidate, &reference).await
+    }
+
+    pub(crate) async fn admit_native_review(
+        &self,
+        mut draft: crate::review_requests::ReviewRequestDraft,
+    ) -> Result<
+        (
+            crate::native_review::ReviewIntent,
+            crate::native_review::ReviewReference,
+        ),
+        crate::review_requests::ReviewRequestError,
+    > {
+        use crate::review_requests::ReviewRequestError;
+        if !self.reviews_enabled() || self.stopping.load(Ordering::SeqCst) {
+            return Err(ReviewRequestError::Unavailable);
+        }
+        self.restore_jobs()
+            .map_err(|_| ReviewRequestError::Unavailable)?;
+        let participants: BTreeSet<String> = self
+            .jobs
+            .lock()
+            .map_err(|_| ReviewRequestError::Unavailable)?
+            .values()
+            .filter(|job| match &job.run.issue {
+                Some(LinearIssueRef::Id { id }) => id == &draft.candidate.issue_id,
+                Some(LinearIssueRef::Identifier { identifier }) => {
+                    identifier.0 == draft.candidate.issue_identifier
+                }
+                None => false,
+            })
+            .flat_map(|job| job.member_identities.iter().cloned())
+            .collect();
+        let specialists = self
+            .specialists
+            .get()
+            .ok_or(ReviewRequestError::Unavailable)?;
+        draft.reviewers = resolve_review_specialists(&draft.reviewers, specialists, &participants)?;
+        let runtime = self
+            .runtime()
+            .await
+            .map_err(|_| ReviewRequestError::Unavailable)?;
+        let handle = runtime.mob_handle();
+        for (role, identities) in draft.reviewers.bound_roles() {
+            for identity in identities {
+                let member = handle
+                    .get_member(identity)
+                    .await
+                    .map_err(|_| ReviewRequestError::Unavailable)?
+                    .ok_or(ReviewRequestError::IneligibleReviewer)?;
+                if &member.role != role {
+                    return Err(ReviewRequestError::IneligibleReviewer);
+                }
+            }
+        }
+        let store = self.review_requests();
+        let required = self.configured_review_count(&draft.reviewers)?;
+        // Commit the current-request decision before any native admission.
+        let intent = tokio::task::spawn_blocking(move || store.reserve(draft, required))
+            .await
+            .map_err(|_| ReviewRequestError::Unavailable)??;
+        let reference = crate::native_review::admit(&handle, &intent, required).await?;
+        let store = self.review_requests();
+        tokio::task::spawn_blocking(move || {
+            store.require_current(&intent)?;
+            Ok((intent, reference))
+        })
+        .await
+        .map_err(|_| ReviewRequestError::Unavailable)?
+    }
+
+    pub(crate) async fn read_native_review(
+        &self,
+        candidate: &crate::native_review::ReviewCandidate,
+        reference: &crate::native_review::ReviewReference,
+    ) -> Result<crate::native_review::VerifiedReview, crate::native_review::ReviewProofError> {
+        let store = self.review_requests();
+        let candidate_for_request = candidate.clone();
+        let current = tokio::task::spawn_blocking(move || store.current(&candidate_for_request))
+            .await
+            .map_err(|_| crate::native_review::ReviewProofError::Unavailable)?
+            .map_err(|_| crate::native_review::ReviewProofError::Unavailable)?
+            .ok_or(crate::native_review::ReviewProofError::Superseded)?;
+        if &current.candidate != candidate {
+            return Err(crate::native_review::ReviewProofError::Superseded);
+        }
+        let runtime = self
+            .runtime()
+            .await
+            .map_err(|_| crate::native_review::ReviewProofError::Unavailable)?;
+        let expected =
+            crate::native_review::reference_for(&runtime.mob_handle().definition().id, &current)?;
+        if expected.runs.len() != reference.runs.len()
+            || expected.runs.iter().collect::<BTreeSet<_>>()
+                != reference.runs.iter().collect::<BTreeSet<_>>()
+        {
+            return Err(crate::native_review::ReviewProofError::Superseded);
+        }
+        let proof = crate::native_review::read(
+            &runtime.mob_handle(),
+            candidate,
+            self.configured_review_count(&current.reviewers)?,
+            reference,
+        )
+        .await?;
+        let store = self.review_requests();
+        tokio::task::spawn_blocking(move || {
+            if proof.intent() != &current {
+                return Err(crate::native_review::ReviewProofError::Superseded);
+            }
+            store
+                .with_current(&current, || proof)
+                .map_err(|_| crate::native_review::ReviewProofError::Superseded)
+        })
+        .await
+        .map_err(|_| crate::native_review::ReviewProofError::Unavailable)?
+    }
+
+    pub(crate) fn connections(&self) -> Option<&Arc<crate::setup::connections::Connections>> {
+        self.meerkat.runtime_connections.as_ref()
+    }
+    pub(crate) fn auth_binding(&self) -> Option<meerkat_core::AuthBindingRef> {
+        self.meerkat.auth_binding.clone()
+    }
+    pub(crate) fn configure_model(&self, config: &mut meerkat::Config) -> anyhow::Result<()> {
+        if let Some(connections) = self.connections() {
+            connections.apply_model_config(config, &self.state_path())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn repository_binding(&self) -> Option<&crate::config::RepositoryRuntimeBinding> {
+        self.meerkat.repository_runtime.as_ref()
+    }
+
+    pub(crate) fn repository_definition(&self) -> Result<MobDefinition, String> {
+        self.mob_definition()
+    }
+
+    pub(crate) fn repository_session_hook(&self) -> Result<Arc<dyn SessionHook>, String> {
+        Ok(Arc::new(FugueDirectToolSessionHook {
+            connections: self.meerkat.runtime_connections.clone(),
+            mob_id: self.meerkat.mob_id().into_owned(),
+            agent_profiles: self
+                .templates
+                .values()
+                .flat_map(|template| template.members.iter())
+                .map(|member| (member.profile.clone(), member.agent.clone()))
+                .collect(),
+            default_auth_binding: self.meerkat.auth_binding.clone(),
+            review_orchestrator_profile: self.independent_review.orchestrator_profile.clone(),
+            independent_review_enabled: self.reviews_enabled(),
+            tracker: self.tracker.clone(),
+            host_signal_binding: self.host_signal_binding.clone(),
+            host_api_url: self.host_api_url.clone(),
+            host_api_auth: self.host_api_auth.clone(),
+            github_repo: github_repo_from_mcp_servers(&self.repo_mcp_servers)?,
+            review_handoff_states: review_handoff_states_from_mcp_servers(&self.repo_mcp_servers),
+            action_states: action_states_from_mcp_servers(&self.repo_mcp_servers),
+            workgraph_gate: WorkGraphTerminalGate::new(
+                self.state_path().join("workgraph.sqlite3"),
+                self.tracker.terminal_states.clone(),
+                workgraph_blocked_states_from_mcp_servers(&self.repo_mcp_servers),
+            )
+            .for_mob(self.meerkat.mob_id().into_owned()),
+        }))
+    }
+
+    /// Borrow the repository's native owner. Never construct a second queue mob.
+    pub(crate) async fn attach_repository_runtime(
+        &self,
+        runtime: Arc<UnifiedRuntime>,
+        specialists: Vec<RepositorySpecialist>,
+    ) -> Result<(), String> {
+        let binding = self
+            .repository_binding()
+            .ok_or("queue has no repository binding")?;
+        if runtime.mob_handle().mob_id().as_str() != binding.mob_id() {
+            return Err("repository runtime does not match the queue binding".into());
+        }
+        let mut current = self.runtime.lock().await;
+        if current.is_some() {
+            return Err("repository runtime is already attached".into());
+        }
+        self.specialists
+            .set(specialists)
+            .map_err(|_| "repository specialists are already attached")?;
+        *current = Some(runtime);
+        Ok(())
+    }
     pub fn new(meerkat: MeerkatConfig) -> Self {
         Self::with_templates(meerkat, BTreeMap::new(), BTreeMap::new())
     }
@@ -187,12 +485,15 @@ impl MetaRuntimeRegistry {
             meerkat,
             repo_mcp_servers,
             tracker,
+            host_signal_binding: None,
             host_api_url,
             host_api_auth,
             templates,
-            final_review_reviewers: Vec::new(),
+            final_review: crate::config::FinalReviewConfig::default(),
             independent_review: IndependentReviewConfig::default(),
             runtime: Arc::new(tokio::sync::Mutex::new(None)),
+            specialists: Arc::new(OnceLock::new()),
+            console: Arc::new(OnceLock::new()),
             meta_task_runtime: Arc::new(Mutex::new(None)),
             event_drain_task: Arc::new(Mutex::new(None)),
             kapellmeister_bootstrap: Arc::new(tokio::sync::Mutex::new(())),
@@ -201,6 +502,11 @@ impl MetaRuntimeRegistry {
             stopping: Arc::new(AtomicBool::new(false)),
             launch_tasks: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub fn with_host_signal_binding(mut self, binding: HostSignalBinding) -> Self {
+        self.host_signal_binding = Some(binding);
+        self
     }
 
     pub fn with_repo_mcp_servers(
@@ -214,8 +520,35 @@ impl MetaRuntimeRegistry {
         mut self,
         reviewers: Vec<FinalReviewReviewerConfig>,
     ) -> Self {
-        self.final_review_reviewers = reviewers;
+        self.final_review.enabled = !reviewers.is_empty();
+        self.final_review.reviewers = reviewers;
         self
+    }
+
+    pub fn with_final_review_config(mut self, config: crate::config::FinalReviewConfig) -> Self {
+        self.final_review = config;
+        self
+    }
+
+    fn reviews_enabled(&self) -> bool {
+        self.independent_review.enabled || self.final_review.enabled
+    }
+
+    fn review_runtime_config(&self) -> IndependentReviewConfig {
+        let mut config = self.independent_review.clone();
+        config.enabled = self.reviews_enabled();
+        config
+    }
+
+    fn configured_review_count(
+        &self,
+        reviewers: &meerkat_mob::FlowRoleTargets,
+    ) -> Result<usize, crate::native_review::ReviewProofError> {
+        crate::native_review::configured_review_count(
+            &self.independent_review,
+            &self.final_review,
+            reviewers,
+        )
     }
 
     pub fn with_independent_review_config(mut self, config: IndependentReviewConfig) -> Self {
@@ -226,42 +559,213 @@ impl MetaRuntimeRegistry {
     pub async fn bootstrap_repo_kapellmeister(&self) -> Result<(), String> {
         let _bootstrap_guard = self.kapellmeister_bootstrap.lock().await;
         let runtime = self.runtime().await?;
+        self.ensure_repo_kapellmeister_member(&runtime).await?;
+        self.wire_repository_members(&runtime).await
+    }
+
+    async fn ensure_repo_kapellmeister_member(
+        &self,
+        runtime: &UnifiedRuntime,
+    ) -> Result<(), String> {
         ensure_member(
-            &runtime,
+            runtime,
             KAPELLMEISTER,
             KAPELLMEISTER,
             Some("You are the repo-scoped Fugue Kapellmeister. Startup rule: do not inspect Linear, call tools, send peer messages, start issue mobs, mutate lifecycle lanes, or infer work from this initial autonomous wake. Reply briefly that you are idle and waiting for explicit Fugue host signals, issue-lead messages, or operator messages. When a Fugue host signal arrives, treat that signal payload as the task context and then coordinate through the provided tools one call at a time."),
-            BTreeMap::from([("role".to_string(), KAPELLMEISTER.to_string())]),
+            BTreeMap::from([
+                ("role".to_string(), KAPELLMEISTER.to_string()),
+                ("display_name".to_string(), "Queue coordinator".to_string()),
+            ]),
             None,
             None,
             self.meerkat.auth_binding.as_ref(),
         )
-        .await?;
+        .await
+    }
+
+    pub(crate) async fn wire_repository_members(
+        &self,
+        runtime: &UnifiedRuntime,
+    ) -> Result<(), String> {
+        let Some(binding) = self.repository_binding() else {
+            return Ok(());
+        };
+        let authority = runtime
+            .identity_runtime()
+            .ok_or("repository identity runtime is missing")?;
+        let identities = self
+            .specialists
+            .get()
+            .into_iter()
+            .flatten()
+            .map(|specialist| specialist.identity.clone())
+            .chain(std::iter::once(format!(
+                "{}:representative",
+                binding.repository
+            )));
+        for identity in identities {
+            let identity = meerkat_meta::identity_first::AgentIdentity::parse(&identity)
+                .map_err(|error| error.to_string())?;
+            let status = authority
+                .status(&identity)
+                .await
+                .map_err(|error| error.to_string())?;
+            if status.agent_runtime_id.is_none() {
+                return Err(format!("specialist {identity} is unavailable"));
+            }
+        }
+        // One repository is one communication group. Reconcile the native
+        // roster on bootstrap as well as admission so existing installations
+        // gain missing links without replacing members or their sessions.
+        let members = runtime.mob_handle().list_members().await;
+        for (index, member) in members.iter().enumerate() {
+            for peer in &members[index + 1..] {
+                wire_pair(
+                    runtime,
+                    member.agent_identity.as_str(),
+                    peer.agent_identity.as_str(),
+                )
+                .await?;
+            }
+        }
         Ok(())
     }
 
-    pub async fn deliver_repo_kapellmeister_signal_batch(
+    fn repository_collaboration_prompt(&self, prompt: String) -> String {
+        if self.repository_binding().is_none() {
+            return prompt;
+        }
+        use std::fmt::Write;
+        let mut directory = String::new();
+        for specialist in self.specialists.get().into_iter().flatten() {
+            let _ = writeln!(
+                directory,
+                "- {}: {}. {}. Paths: {:?}",
+                specialist.identity, specialist.label, specialist.focus, specialist.paths
+            );
+        }
+        format!(
+            "{prompt}\n\nRepository specialist directory:\n{directory}\nYou share this repository mob with its persistent domain specialists and representative. Use native peers to discover them. Consult the relevant domain specialist before planning or implementing a change, and include its response as evidence in your handoff. Consult an independent specialist for review where its charter applies. These specialists retain repository knowledge between tickets. After changing their domain, send the affected specialists a change summary, changed paths, tests, and commit SHA. Share the ticket worktree path and commit SHA; specialists can use repository_read_revision to inspect that commit without changing the checkout. Include an uncommitted diff directly when no commit exists yet; do not ask them to mutate the main checkout. WorkGraph is the same shared ledger for this whole repository. If consultation fails, report the blocker rather than silently substituting a generic role."
+        )
+    }
+
+    pub async fn deliver_repo_kapellmeister_signal(
         &self,
-        content: String,
-    ) -> Result<FugueHostSignalAccepted, String> {
-        self.bootstrap_repo_kapellmeister().await?;
+        scope: &crate::host_signal_journal::HostSignalScope,
+        signal: &crate::host_signal_journal::PendingSignal,
+    ) -> Result<meerkat_contracts::WireContinuationReceipt, String> {
+        self.validate_host_signal_scope(scope)?;
         let runtime = self.runtime().await?;
+        {
+            let _bootstrap_guard = self.kapellmeister_bootstrap.lock().await;
+            self.ensure_repo_kapellmeister_member(&runtime).await?;
+        }
+        let handle = runtime.mob_handle();
+        if handle.mob_id().as_str() != scope.mob_id {
+            return Err("host signal mob does not match the active native owner".into());
+        }
+        let mode = match signal.envelope.mode {
+            crate::host_signal_journal::SignalHandlingMode::Steer => HandlingMode::Steer,
+        };
+        // This is the public native admission door also used by Meta's keyed
+        // identity sender. Use the original spawn identity for this Core member.
+        // Native continuation service owns admission, replay and lifecycle.
         runtime
-            .mob_handle()
-            .member(&AgentIdentity::from(KAPELLMEISTER))
+            .mob_runtime()
+            .agent_mob_mcp_state()
+            .ok_or("native member continuation service is unavailable")?
+            .mob_member_send_keyed(
+                handle.mob_id(),
+                AgentIdentity::from(scope.member.as_str()),
+                signal.envelope.content.clone().into(),
+                mode,
+                &signal.key.0,
+            )
             .await
-            .map_err(|err| format!("resolve Kapellmeister member: {err}"))?
-            .send(content, HandlingMode::Steer)
-            .await
-            .map_err(|err| format!("deliver Kapellmeister host signal: {err}"))?;
-        let interaction_id = format!(
-            "fugue-host-signal-repo-kapellmeister-{}",
-            Utc::now().timestamp_millis()
-        );
-        Ok(FugueHostSignalAccepted {
-            interaction_id,
-            identity: format!("{RUNTIME_KEY}/{KAPELLMEISTER}"),
-        })
+            .map_err(|error| format!("admit coordinator host signal: {error}"))
+    }
+
+    fn validate_host_signal_scope(
+        &self,
+        scope: &crate::host_signal_journal::HostSignalScope,
+    ) -> Result<(), String> {
+        let binding = self
+            .host_signal_binding
+            .as_ref()
+            .ok_or("host signal routing is not configured")?;
+        if scope != &binding.scope
+            || scope.member != KAPELLMEISTER
+            || scope.mob_id != self.meerkat.mob_id()
+            || scope.runtime_path
+                != std::path::absolute(self.state_path()).map_err(|error| error.to_string())?
+        {
+            return Err("host signal scope does not match the coordinator runtime".into());
+        }
+        Ok(())
+    }
+
+    pub async fn observe_repo_kapellmeister_input(
+        &self,
+        scope: &crate::host_signal_journal::HostSignalScope,
+        receipt: &meerkat_contracts::WireContinuationReceipt,
+    ) -> Result<crate::host_signal_journal::NativeInputObservation, String> {
+        use crate::host_signal_journal::{InputUnavailable, NativeInputObservation};
+        use meerkat_contracts::WireContinuationStatus;
+        use meerkat_runtime::{RuntimeDriverError, RuntimeState, SessionServiceRuntimeExt};
+        self.validate_host_signal_scope(scope)?;
+        let WireContinuationStatus::Admitted {
+            session_id,
+            input_id,
+        } = &receipt.status
+        else {
+            return Err("input observation requires native admission".into());
+        };
+        let session =
+            meerkat_core::SessionId::parse(session_id).map_err(|error| error.to_string())?;
+        let input = uuid::Uuid::parse_str(input_id)
+            .map(meerkat_core::lifecycle::InputId)
+            .map_err(|error| error.to_string())?;
+        let runtime = self.runtime().await?;
+        if runtime.mob_handle().mob_id().as_str() != scope.mob_id {
+            return Err("host signal mob does not match the active native owner".into());
+        }
+        let Some(service) = runtime.mob_runtime().session_service() else {
+            return Ok(NativeInputObservation::Unresolvable(
+                InputUnavailable::MissingSessionService,
+            ));
+        };
+        let Some(machine) = service
+            .acquire_runtime_adapter(None)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(NativeInputObservation::Unresolvable(
+                InputUnavailable::MissingRuntimeAdapter,
+            ));
+        };
+        match machine.input_state(&session, &input).await {
+            Ok(Some(state)) => Ok(NativeInputObservation::Present(Box::new(state))),
+            Ok(None) => Ok(NativeInputObservation::Unresolvable(
+                InputUnavailable::MissingInput,
+            )),
+            Err(RuntimeDriverError::NotFound { .. }) => Ok(NativeInputObservation::Unresolvable(
+                InputUnavailable::MissingRuntime,
+            )),
+            Err(
+                RuntimeDriverError::Destroyed
+                | RuntimeDriverError::NotReady {
+                    state: RuntimeState::Destroyed,
+                },
+            ) => Ok(NativeInputObservation::Unresolvable(
+                InputUnavailable::DestroyedRuntime,
+            )),
+            Err(error) => Err(format!("observe native coordinator input: {error}")),
+        }
+    }
+
+    pub fn use_console(&self, console: Arc<crate::console::ConsoleHub>) -> Result<(), String> {
+        self.console
+            .set(console)
+            .map_err(|_| "console is already attached".into())
     }
 
     pub async fn reference_console_router<S>(
@@ -271,6 +775,17 @@ impl MetaRuntimeRegistry {
     where
         S: Clone + Send + Sync + 'static,
     {
+        if let Some(console) = self.console.get() {
+            if self.repository_binding().is_none() {
+                use sha2::{Digest, Sha256};
+                let key = format!(
+                    "queue-{:x}",
+                    Sha256::digest(self.state_path().as_os_str().as_encoded_bytes())
+                );
+                console.register(key, self.runtime().await?);
+            }
+            return Ok(console.router(decision_state).with_state::<S>(()));
+        }
         let runtime = self.runtime().await?;
         Ok(runtime
             .build_reference_app_router_with_console_visibility_policy(
@@ -289,6 +804,9 @@ impl MetaRuntimeRegistry {
             return Ok(runtime.clone());
         }
 
+        if self.repository_binding().is_some() {
+            return Err("Repository formation has not attached its shared mob yet".into());
+        }
         let definition = self.mob_definition()?;
         let state_path = self.state_path();
         let (runtime, meta_task_runtime) = build_unified_runtime(
@@ -301,9 +819,10 @@ impl MetaRuntimeRegistry {
                 .collect(),
             self.meerkat.auth_binding.clone(),
             self.meerkat.max_sessions,
-            self.independent_review.orchestrator_profile.clone(),
+            self.review_runtime_config(),
             self.repo_mcp_servers.clone(),
             self.tracker.clone(),
+            self.host_signal_binding.clone(),
             self.host_api_url.clone(),
             self.host_api_auth.clone(),
         )?;
@@ -341,6 +860,10 @@ impl MetaRuntimeRegistry {
         let Some(runtime) = guard.take() else {
             return Ok(());
         };
+        if self.repository_binding().is_some() {
+            // Ensemble owns shutdown. The queue only relinquishes its lease.
+            return Ok(());
+        }
         let report = runtime.shutdown().await;
         let drain_task = self
             .event_drain_task
@@ -358,7 +881,12 @@ impl MetaRuntimeRegistry {
     }
 
     fn mob_definition(&self) -> Result<MobDefinition, String> {
-        let mut definition = MobDefinition::explicit(MOB_ID);
+        let model = self
+            .meerkat
+            .model
+            .as_deref()
+            .unwrap_or(default_agent_model());
+        let mut definition = MobDefinition::explicit(self.meerkat.mob_id().as_ref());
         definition.limits = Some(LimitsSpec {
             max_orphaned_turns: Some(DEFAULT_NATIVE_MAX_ORPHANED_TURNS),
             ..LimitsSpec::default()
@@ -368,6 +896,7 @@ impl MetaRuntimeRegistry {
             ProfileBinding::Inline(Box::new(control_profile(
                 "Repo-level Fugue coordinator",
                 &self.repo_mcp_servers,
+                model,
             ))),
         );
         let issue_lead_profile = match self
@@ -377,7 +906,11 @@ impl MetaRuntimeRegistry {
             .find(|member| is_issue_lead_member(member))
         {
             Some(member) => agent_profile(&member.agent, &self.repo_mcp_servers)?,
-            None => control_profile("Issue-level Fugue coordinator", &self.repo_mcp_servers),
+            None => control_profile(
+                "Issue-level Fugue coordinator",
+                &self.repo_mcp_servers,
+                model,
+            ),
         };
         definition.profiles.insert(
             ProfileName::from(ISSUE_LEAD),
@@ -404,18 +937,7 @@ impl MetaRuntimeRegistry {
                 }
             }
         }
-        for reviewer in &self.final_review_reviewers {
-            definition
-                .profiles
-                .entry(ProfileName::from(reviewer.profile.as_str()))
-                .or_insert_with(|| {
-                    ProfileBinding::Inline(Box::new(final_reviewer_profile(
-                        &reviewer.id,
-                        &self.repo_mcp_servers,
-                    )))
-                });
-        }
-        if self.independent_review.enabled {
+        if self.reviews_enabled() {
             definition
                 .profiles
                 .entry(ProfileName::from(
@@ -424,6 +946,7 @@ impl MetaRuntimeRegistry {
                 .or_insert_with(|| {
                     ProfileBinding::Inline(Box::new(independent_review_orchestrator_profile(
                         &self.repo_mcp_servers,
+                        model,
                     )))
                 });
         }
@@ -502,6 +1025,9 @@ impl MetaRuntimeRegistry {
 }
 
 pub fn meta_runtime_state_path(meerkat: &MeerkatConfig) -> PathBuf {
+    if let Some(binding) = &meerkat.repository_runtime {
+        return binding.state_path.clone();
+    }
     meerkat
         .state_root
         .clone()
@@ -515,10 +1041,14 @@ pub struct MetaRuntimeNativeMobExecutionHost {
 }
 
 struct FugueDirectToolSessionHook {
+    connections: Option<Arc<crate::setup::connections::Connections>>,
+    mob_id: String,
     agent_profiles: BTreeMap<String, NativeAgentProfile>,
     default_auth_binding: Option<meerkat_core::AuthBindingRef>,
     review_orchestrator_profile: String,
+    independent_review_enabled: bool,
     tracker: TrackerConfig,
+    host_signal_binding: Option<HostSignalBinding>,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
     github_repo: Option<GitHubRepoRef>,
@@ -530,11 +1060,12 @@ struct FugueDirectToolSessionHook {
 #[async_trait]
 impl SessionHook for FugueDirectToolSessionHook {
     async fn before_create(&self, req: &mut CreateSessionRequest) -> Result<(), SessionError> {
-        let authority = HostToolAuthority::for_binding(
+        let authority = HostToolAuthority::for_mob_binding(
             req.build
                 .as_ref()
                 .and_then(|build| build.mob_member_binding.as_ref()),
             &self.review_orchestrator_profile,
+            &self.mob_id,
         );
         let workspace_root = fugue_worktree_path_from_request(req);
         let profile = req
@@ -580,6 +1111,12 @@ impl SessionHook for FugueDirectToolSessionHook {
             build.auth_binding = self.default_auth_binding.clone();
         }
         build.keep_alive = true;
+        if let Some(connections) = &self.connections {
+            build
+                .shell_env
+                .get_or_insert_with(Default::default)
+                .extend(connections.github_environment());
+        }
         let direct_tools = direct_tool_dispatcher(
             &self.tracker,
             self.host_api_url.clone(),
@@ -590,6 +1127,9 @@ impl SessionHook for FugueDirectToolSessionHook {
             self.review_handoff_states.clone(),
             self.action_states.clone(),
             self.workgraph_gate.clone(),
+            self.independent_review_enabled,
+            self.connections.clone(),
+            self.host_signal_binding.clone(),
         );
         let existing_tools = build.external_tools.take();
         let fugue_tools = match workspace_root {
@@ -604,6 +1144,7 @@ impl SessionHook for FugueDirectToolSessionHook {
                     direct_tools,
                     builtins,
                     shell,
+                    self.connections.as_deref(),
                 )?
             }
             None => direct_tools,
@@ -673,9 +1214,16 @@ fn workspace_bounded_tool_dispatcher(
     external: Arc<dyn AgentToolDispatcher>,
     builtins: bool,
     shell: bool,
+    connections: Option<&crate::setup::connections::Connections>,
 ) -> Result<Arc<dyn AgentToolDispatcher>, SessionError> {
     let workspace_root = workspace_root.to_path_buf();
-    let shell_config = shell.then(|| ShellConfig::with_project_root(workspace_root.clone()));
+    let shell_config = shell.then(|| {
+        let mut config = ShellConfig::with_project_root(workspace_root.clone());
+        if let Some(connections) = connections {
+            config.env_vars.extend(connections.github_environment());
+        }
+        config
+    });
     let mut policy = ToolPolicyLayer::new().with_mode(if builtins {
         meerkat_tools::ToolMode::AllowAll
     } else {
@@ -718,8 +1266,17 @@ enum HostToolAuthority {
 }
 
 impl HostToolAuthority {
+    #[cfg(test)]
     fn for_binding(binding: Option<&meerkat_core::MobMemberBinding>, review_profile: &str) -> Self {
-        let Some(binding) = binding.filter(|binding| binding.mob_id == MOB_ID) else {
+        Self::for_mob_binding(binding, review_profile, MOB_ID)
+    }
+
+    fn for_mob_binding(
+        binding: Option<&meerkat_core::MobMemberBinding>,
+        review_profile: &str,
+        mob_id: &str,
+    ) -> Self {
+        let Some(binding) = binding.filter(|binding| binding.mob_id == mob_id) else {
             return Self::Worker;
         };
         match (binding.role.as_str(), binding.member.as_str()) {
@@ -746,7 +1303,11 @@ impl HostToolAuthority {
 
     fn allows_host_tool(self, name: &str) -> bool {
         match name {
-            "fugue_complete_independent_review" => matches!(self, Self::ReviewOrchestrator),
+            "fugue_admit_independent_review"
+            | "fugue_complete_independent_review"
+            | "fugue_complete_final_pr_gate" => {
+                matches!(self, Self::ReviewOrchestrator)
+            }
             "fugue_start_issue_mob"
             | "fugue_start_final_pr_gate"
             | "fugue_start_independent_review"
@@ -757,7 +1318,9 @@ impl HostToolAuthority {
 }
 
 struct FugueDirectToolDispatcher {
+    github: crate::github_tools::GitHubToolHost,
     tracker: TrackerConfig,
+    host_signal_binding: Option<HostSignalBinding>,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
     allow_issue_mutation: bool,
@@ -811,10 +1374,20 @@ impl AgentToolDispatcher for FugueDirectToolDispatcher {
                 )
                 .into());
             }
-            if call.name == "linear_move_issue"
-                && let Ok(input) =
-                    serde_json::from_value::<crate::tools::MoveIssueInput>(arguments.clone())
-            {
+            let lane_move = crate::workgraph_gate::lane_move_for_tool(
+                call.name.parse::<FugueToolOperation>().map_err(|error| {
+                    meerkat_core::error::ToolError::InvalidArguments {
+                        name: call.name.to_owned(),
+                        reason: error.to_string(),
+                    }
+                })?,
+                &arguments,
+            )
+            .map_err(|error| meerkat_core::error::ToolError::InvalidArguments {
+                name: call.name.to_string(),
+                reason: error.to_string(),
+            })?;
+            if let Some(input) = lane_move {
                 if let Err(message) = guard_direct_public_lane_move(
                     &self.tracker,
                     &self.review_handoff_states,
@@ -832,7 +1405,11 @@ impl AgentToolDispatcher for FugueDirectToolDispatcher {
                     )
                     .into());
                 }
-                if let Err(message) = self.workgraph_gate.guard_terminal_move(&input).await {
+                if let Err(message) = self
+                    .workgraph_gate
+                    .guard_terminal_move(&self.tracker, &input)
+                    .await
+                {
                     return Ok(ToolResult::new(
                         call.id.to_string(),
                         json!({
@@ -845,18 +1422,20 @@ impl AgentToolDispatcher for FugueDirectToolDispatcher {
                     .into());
                 }
             }
-            let (is_error, content) = execute_linear_fugue_tool_with_review_handoff_states(
+            let (is_error, content) = execute_linear_fugue_tool_bound(
                 &self.tracker,
                 call.name,
                 &arguments,
                 &self.review_handoff_states,
+                self.host_signal_binding.as_ref(),
             )
             .await;
             return Ok(ToolResult::new(call.id.to_string(), content, is_error).into());
         }
         if is_github_fugue_tool_name(call.name) {
             let arguments = apply_direct_github_repo_scope(arguments, self.github_repo.as_ref());
-            let (is_error, content, _signals) = execute_github_fugue_tool(call.name, &arguments);
+            let (is_error, content, _signals) =
+                execute_github_fugue_tool_with_host(call.name, &arguments, &self.github);
             return Ok(ToolResult::new(call.id.to_string(), content, is_error).into());
         }
         if call.name == "fugue_start_issue_mob" {
@@ -886,11 +1465,29 @@ impl AgentToolDispatcher for FugueDirectToolDispatcher {
             .await;
             return Ok(ToolResult::new(call.id.to_string(), content, is_error).into());
         }
-        if call.name == "fugue_complete_independent_review" {
-            let (is_error, content) = call_fugue_complete_independent_review(
+        if call.name == "fugue_admit_independent_review" {
+            let (is_error, content) = call_fugue_admit_independent_review(
                 self.host_api_url.as_deref(),
                 self.host_api_auth.as_ref(),
                 &arguments,
+            )
+            .await;
+            return Ok(ToolResult::new(call.id.to_string(), content, is_error).into());
+        }
+        if matches!(
+            call.name,
+            "fugue_complete_independent_review" | "fugue_complete_final_pr_gate"
+        ) {
+            let endpoint = if call.name == "fugue_complete_final_pr_gate" {
+                "complete-final-pr-gate"
+            } else {
+                "complete-independent-review"
+            };
+            let (is_error, content) = call_fugue_complete_native_review(
+                self.host_api_url.as_deref(),
+                self.host_api_auth.as_ref(),
+                &arguments,
+                endpoint,
             )
             .await;
             return Ok(ToolResult::new(call.id.to_string(), content, is_error).into());
@@ -924,6 +1521,9 @@ fn direct_tool_dispatcher(
     review_handoff_states: Vec<String>,
     action_states: Vec<String>,
     workgraph_gate: WorkGraphTerminalGate,
+    independent_review_enabled: bool,
+    connections: Option<Arc<crate::setup::connections::Connections>>,
+    host_signal_binding: Option<HostSignalBinding>,
 ) -> Arc<dyn AgentToolDispatcher> {
     let allow_issue_mutation = authority.can_move_issue();
     let tracker = tracker.clone();
@@ -962,20 +1562,37 @@ fn direct_tool_dispatcher(
         }),
     )));
     tools.push(Arc::new(ToolDef::new(
+        "fugue_admit_independent_review",
+        "Request native review by selected existing repository specialists. The host resolves the candidate, reserves the current request and admits native flows. Replay an uncertain response with exactly the same key and assignment; replacing a request requires its current ID in supersedes.",
+        crate::independent_review::independent_review_admission_input_schema(),
+    )));
+    tools.push(Arc::new(ToolDef::new(
         "fugue_complete_independent_review",
-        "Submit typed independent reviewer verdicts to Fugue so the host can aggregate them, persist the Workpad/comment/WorkGraph evidence, and move to the configured review outcome lane. Use only from the review orchestrator after collecting exactly three reviewer verdicts. Every verdict.schema_version must be exactly \"fugue.review.v1\". Include workgraph_scope copied exactly from the reviewer obligation items so red-review blockers are created in the same WorkGraph realm and namespace.",
+        "Submit native review flow references after the selected specialists finish. Fugue reads durable producer results and verifies the current repository, tracker issue and PR head before recording review evidence. Do not submit verdicts or timeout claims. WorkGraph scope must be this repository native realm and default namespace.",
+        independent_review_completion_input_schema(),
+    )));
+    tools.push(Arc::new(ToolDef::new(
+        "fugue_complete_final_pr_gate",
+        "Finish the configured final review using native run references from the selected existing specialists. The host verifies required profiles, current intent, immutable PR head, CI and WorkGraph before its guarded merge, then projects the actual success/rework/blocked outcome. Caller verdicts are not accepted.",
         independent_review_completion_input_schema(),
     )));
     tools.push(Arc::new(ToolDef::new(
         "fugue_run_deploy",
-        "Run the configured guarded merge-only or merge-and-OTA action from a typed DeployStartRequest: verify policy and merge the exact PR head, then perform OTA only when configured. Use only as repo Kapellmeister authority after explicit action-lane/operator intent.",
-        json!({
-            "type": "object",
-            "description": "Typed DeployStartRequest payload with issue, PR snapshot, recorded head, CI status, WorkGraph blocker count, and idempotency key.",
-            "additionalProperties": true
-        }),
+        "Run the configured guarded merge-only or merge-and-OTA action. Use only as repository authority after explicit action-lane/operator intent. Replay lost responses unchanged. For a failed or uncertain deployment, report the attempt ID and wait for operator inspection and authorization before supplying retry_deployment with a new key.",
+        crate::deploy_gate::deploy_start_input_schema(),
     )));
     tools.retain(|tool| {
+        if !independent_review_enabled
+            && matches!(
+                tool.name.as_str(),
+                "fugue_start_independent_review"
+                    | "fugue_admit_independent_review"
+                    | "fugue_complete_independent_review"
+                    | "fugue_complete_final_pr_gate"
+            )
+        {
+            return false;
+        }
         // Merges must traverse the typed deploy gate, even for the coordinator.
         if tool.name == "github_merge_pr" {
             return false;
@@ -998,8 +1615,19 @@ fn direct_tool_dispatcher(
             }
         })
     });
+    // These tools are in-process host callbacks. Stable source identity lets
+    // native delegation preserve the parent's witnessed tool ceiling. Without
+    // it, Meerkat correctly refuses to inherit this catalog into a child.
+    for tool in &mut tools {
+        Arc::make_mut(tool).provenance = Some(meerkat_core::ToolProvenance::new(
+            meerkat_core::ToolSourceKind::Callback,
+            "fugue-direct-tools",
+        ));
+    }
     Arc::new(FugueDirectToolDispatcher {
+        github: crate::github_tools::GitHubToolHost::with_connections(connections),
         tracker,
+        host_signal_binding,
         host_api_url,
         host_api_auth,
         allow_issue_mutation,
@@ -1046,128 +1674,10 @@ fn fugue_tool_defs(config: &TrackerConfig, allow_issue_mutation: bool) -> Vec<Ar
 }
 
 fn linear_tool_mutates_issue_lane(name: &str) -> bool {
-    matches!(name, "linear_move_issue" | "linear_delete_issue")
-}
-
-fn guard_direct_public_lane_move(
-    tracker: &TrackerConfig,
-    review_handoff_states: &[String],
-    action_states: &[String],
-    input: &MoveIssueInput,
-) -> Result<(), String> {
-    let target = match &input.state {
-        LinearStateRef::Name { name } => name.trim(),
-        LinearStateRef::Id { .. } => {
-            return Err(
-                "linear_move_issue requires a named Fugue public lane, not an opaque Linear state id"
-                    .to_string(),
-            );
-        }
-    };
-    if target.is_empty() {
-        return Err("linear_move_issue target lane must not be empty".to_string());
-    }
-    if tracker.kind != "jira"
-        && let Some(replacement) = legacy_public_lane_replacement(target)
-    {
-        return Err(format!(
-            "{target:?} is a legacy Fugue/Linear phase lane and must not be written by agents; use {replacement:?} and record phase/detail as labels, WorkGraph, Workpad, or Meta evidence"
-        ));
-    }
-    if direct_public_lane_is_action(action_states, target) {
-        return Err(format!(
-            "{target:?} is a Fugue action lane. Action lanes are operator or host-observed control inputs only; agents must not move issues there with linear_move_issue. Keep ordinary running work on the active projection lane, record PR/review/deploy intent as evidence, or use Blocked/terminal lanes when those facts are true."
-        ));
-    }
-    if direct_public_lane_allowed(tracker, review_handoff_states, target) {
-        return Ok(());
-    }
-    Err(format!(
-        "{target:?} is not a configured Fugue public lane for this queue. Allowed lanes: {}",
-        PublicLaneList::new(tracker, review_handoff_states, action_states)
-    ))
-}
-
-fn direct_public_lane_is_action(action_states: &[String], target: &str) -> bool {
-    let normalized = normalize_state(target);
-    action_states
-        .iter()
-        .any(|candidate| normalize_state(candidate) == normalized)
-}
-
-fn direct_public_lane_allowed(
-    tracker: &TrackerConfig,
-    review_handoff_states: &[String],
-    target: &str,
-) -> bool {
-    let normalized = normalize_state(target);
-    tracker
-        .intake_states
-        .iter()
-        .chain(tracker.in_flight_states.iter())
-        .chain(tracker.active_states.iter())
-        .chain(tracker.terminal_states.iter())
-        .chain(review_handoff_states.iter())
-        .any(|candidate| normalize_state(candidate) == normalized)
-}
-
-fn legacy_public_lane_replacement(target: &str) -> Option<&'static str> {
-    match normalize_state(target).as_str() {
-        "planning" | "implementing" | "reviewing" | "in progress" => Some("Active"),
-        "do review" | "in review" | "ready for review" | "human review" => Some("Review"),
-        "rework" => Some("Active"),
-        "merging" => Some("Deploy"),
-        _ => None,
-    }
-}
-
-struct PublicLaneList<'a> {
-    tracker: &'a TrackerConfig,
-    review_handoff_states: &'a [String],
-    action_states: &'a [String],
-}
-
-impl<'a> PublicLaneList<'a> {
-    fn new(
-        tracker: &'a TrackerConfig,
-        review_handoff_states: &'a [String],
-        action_states: &'a [String],
-    ) -> Self {
-        Self {
-            tracker,
-            review_handoff_states,
-            action_states,
-        }
-    }
-}
-
-impl std::fmt::Display for PublicLaneList<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut first = true;
-        let mut seen = BTreeSet::new();
-        for lane in self
-            .tracker
-            .intake_states
-            .iter()
-            .chain(self.tracker.in_flight_states.iter())
-            .chain(self.tracker.active_states.iter())
-            .chain(self.tracker.terminal_states.iter())
-            .chain(self.review_handoff_states.iter())
-        {
-            if direct_public_lane_is_action(self.action_states, lane) {
-                continue;
-            }
-            if !seen.insert(normalize_state(lane)) {
-                continue;
-            }
-            if !first {
-                f.write_str(", ")?;
-            }
-            first = false;
-            f.write_str(lane)?;
-        }
-        Ok(())
-    }
+    matches!(
+        name,
+        "linear_move_issue" | "linear_claim_issue" | "linear_delete_issue"
+    )
 }
 
 fn tool_def_from_value(value: Value) -> Option<ToolDef> {
@@ -1200,6 +1710,7 @@ fn default_tracker_config() -> TrackerConfig {
         intake_states: env_list("FUGUE_LINEAR_INTAKE_STATES"),
         in_flight_states: env_list("FUGUE_LINEAR_IN_FLIGHT_STATES"),
         active_states: env_list("FUGUE_LINEAR_ACTIVE_STATES"),
+        attachment_root: None,
         max_attachment_files: env_u64("FUGUE_LINEAR_MAX_ATTACHMENT_FILES")
             .and_then(|value| usize::try_from(value).ok())
             .unwrap_or(20),
@@ -1259,9 +1770,10 @@ fn build_unified_runtime(
     agent_profiles: BTreeMap<String, NativeAgentProfile>,
     default_auth_binding: Option<meerkat_core::AuthBindingRef>,
     max_sessions: usize,
-    review_orchestrator_profile: String,
+    independent_review: IndependentReviewConfig,
     servers: BTreeMap<String, NativeMcpServerConfig>,
     tracker: TrackerConfig,
+    host_signal_binding: Option<HostSignalBinding>,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
 ) -> Result<(UnifiedRuntime, Option<tokio::runtime::Runtime>), String> {
@@ -1298,10 +1810,14 @@ fn build_unified_runtime(
             .persistent_state(state_path)
             .require_incremental_session_persistence(true)
             .session_hook(Arc::new(FugueDirectToolSessionHook {
+                connections: None,
+                mob_id: MOB_ID.to_owned(),
                 agent_profiles,
                 default_auth_binding,
-                review_orchestrator_profile,
+                review_orchestrator_profile: independent_review.orchestrator_profile,
+                independent_review_enabled: independent_review.enabled,
                 tracker,
+                host_signal_binding,
                 host_api_url,
                 host_api_auth,
                 github_repo,
@@ -1312,7 +1828,7 @@ fn build_unified_runtime(
             .timeout(Duration::from_secs(30))
             .max_sessions(max_sessions);
         #[cfg(test)]
-        let builder = builder.default_llm_client(Arc::new(meerkat_llm_core::TestClient::default()));
+        let builder = builder.default_llm_client(tests::runtime_test_llm_client());
         builder
             .build()
             .await
@@ -1702,10 +2218,37 @@ async fn call_fugue_start_independent_review(
     }
 }
 
-async fn call_fugue_complete_independent_review(
+async fn call_fugue_admit_independent_review(
     host_api_url: Option<&str>,
     host_api_auth: Option<&MetaConsoleBasicAuthConfig>,
     arguments: &Value,
+) -> (bool, String) {
+    let request = match serde_json::from_value::<
+        crate::independent_review::IndependentReviewAdmissionRequest,
+    >(arguments.clone())
+    {
+        Ok(request) => request,
+        Err(_) => {
+            return (
+                true,
+                json!({"error":"invalid_review_assignment"}).to_string(),
+            );
+        }
+    };
+    call_fugue_review_request(
+        host_api_url,
+        host_api_auth,
+        "admit-independent-review",
+        &request,
+    )
+    .await
+}
+
+async fn call_fugue_complete_native_review(
+    host_api_url: Option<&str>,
+    host_api_auth: Option<&MetaConsoleBasicAuthConfig>,
+    arguments: &Value,
+    endpoint: &str,
 ) -> (bool, String) {
     let request =
         match serde_json::from_value::<IndependentReviewCompletionRequest>(arguments.clone()) {
@@ -1721,18 +2264,27 @@ async fn call_fugue_complete_independent_review(
                 );
             }
         };
+    call_fugue_review_request(host_api_url, host_api_auth, endpoint, &request).await
+}
+
+async fn call_fugue_review_request<T: Serialize>(
+    host_api_url: Option<&str>,
+    host_api_auth: Option<&MetaConsoleBasicAuthConfig>,
+    endpoint: &str,
+    request: &T,
+) -> (bool, String) {
     let Some(host_api_url) = host_api_url.filter(|url| !url.trim().is_empty()) else {
         return (
             true,
             json!({
                 "error": "fugue_host_unconfigured",
-                "message": "fugue_complete_independent_review requires server.port or an explicit Fugue host API URL"
+                "message": "Review operations require server.port or an explicit Fugue host API URL"
             })
             .to_string(),
         );
     };
     let url = format!(
-        "{}/api/v1/kapellmeister/complete-independent-review",
+        "{}/api/v1/kapellmeister/{endpoint}",
         host_api_url.trim_end_matches('/')
     );
     let client = match fugue_host_api_client() {
@@ -1782,7 +2334,12 @@ async fn call_fugue_complete_independent_review(
         Ok(response) => {
             let status = response.status();
             match response.text().await {
-                Ok(text) if status.is_success() => (false, text),
+                Ok(text)
+                    if status.is_success()
+                        && crate::independent_review::completion_acknowledged(&text) =>
+                {
+                    (false, text)
+                }
                 Ok(text) => (
                     true,
                     json!({
@@ -2036,6 +2593,7 @@ impl NativeMobExecutionHost for MetaRuntimeNativeMobExecutionHost {
                 Some(job) => ok(FugueToolOutput::MobInspectRun(
                     crate::tools::InspectRunOutput {
                         run: job.run.clone(),
+                        launch_failure: job.launch_failure.clone(),
                     },
                 )),
                 None => err(
@@ -2121,7 +2679,7 @@ impl NativeMobExecutionHost for MetaRuntimeNativeMobExecutionHost {
                                 error = %message,
                                 "Meta runtime issue launch failed"
                             );
-                            if let Err(error) = host.set_run_status(&run_id, MobRunStatus::Failed) {
+                            if let Err(error) = host.set_launch_failure(&run_id, message.clone()) {
                                 warn!(%error, "persist failed Fugue launch");
                             }
                         }
@@ -2152,7 +2710,7 @@ impl NativeMobExecutionHost for MetaRuntimeNativeMobExecutionHost {
                         block_on(self.complete_spawn_or_resume_plan_async(plan, run_id.clone()))
                             .and_then(|result| result)
                     {
-                        if let Err(error) = self.set_run_status(&run_id, MobRunStatus::Failed) {
+                        if let Err(error) = self.set_launch_failure(&run_id, message.clone()) {
                             return err(FugueToolOperation::MobSpawnOrResumeExecution, &error);
                         }
                         return err(FugueToolOperation::MobSpawnOrResumeExecution, &message);
@@ -2354,12 +2912,15 @@ impl MetaRuntimeNativeMobExecutionHost {
             &issue_lead,
             None,
             member_labels(&issue, ISSUE_LEAD),
-            Some(issue_lead_prompt_for_tracker(
-                &issue,
-                plan.input.instructions.as_deref(),
-                &self.registry.tracker,
-                plan.template.linear_projection.as_ref(),
-            )),
+            Some(
+                self.registry
+                    .repository_collaboration_prompt(issue_lead_prompt_for_tracker(
+                        &issue,
+                        plan.input.instructions.as_deref(),
+                        &self.registry.tracker,
+                        plan.template.linear_projection.as_ref(),
+                    )),
+            ),
             plan.input.worktree_path.as_deref(),
             plan.template
                 .members
@@ -2370,6 +2931,7 @@ impl MetaRuntimeNativeMobExecutionHost {
         )
         .await?;
         wire_pair(&runtime, KAPELLMEISTER, &issue_lead).await?;
+        self.registry.wire_repository_members(&runtime).await?;
 
         for member in plan
             .template
@@ -2385,15 +2947,18 @@ impl MetaRuntimeNativeMobExecutionHost {
                 &identity,
                 initial_message.as_deref(),
                 member_labels(&issue, &member.name),
-                Some(worker_prompt_with_lane(
-                    &issue,
-                    &member.name,
-                    plan.input.instructions.as_deref(),
-                    running_lane(
-                        &self.registry.tracker,
-                        plan.template.linear_projection.as_ref(),
-                    ),
-                )),
+                Some(
+                    self.registry
+                        .repository_collaboration_prompt(worker_prompt_with_lane(
+                            &issue,
+                            &member.name,
+                            plan.input.instructions.as_deref(),
+                            running_lane(
+                                &self.registry.tracker,
+                                plan.template.linear_projection.as_ref(),
+                            ),
+                        )),
+                ),
                 plan.input.worktree_path.as_deref(),
                 member
                     .agent
@@ -2403,6 +2968,7 @@ impl MetaRuntimeNativeMobExecutionHost {
             )
             .await?;
             wire_pair(&runtime, &issue_lead, &identity).await?;
+            self.registry.wire_repository_members(&runtime).await?;
         }
         wire_template_members(&runtime, &issue, &plan.template).await?;
         self.set_run_status(&run_id, MobRunStatus::Running)?;
@@ -2431,7 +2997,20 @@ impl MetaRuntimeNativeMobExecutionHost {
         Ok(())
     }
 
+    fn set_launch_failure(&self, run_id: &MobRunId, message: String) -> Result<(), String> {
+        self.update_run_status(run_id, MobRunStatus::Failed, Some(message))
+    }
+
     fn set_run_status(&self, run_id: &MobRunId, status: MobRunStatus) -> Result<(), String> {
+        self.update_run_status(run_id, status, None)
+    }
+
+    fn update_run_status(
+        &self,
+        run_id: &MobRunId,
+        status: MobRunStatus,
+        launch_error: Option<String>,
+    ) -> Result<(), String> {
         let mut jobs = self
             .registry
             .jobs
@@ -2443,6 +3022,10 @@ impl MetaRuntimeNativeMobExecutionHost {
         };
         job.run.status = status;
         job.run.updated_at = Utc::now();
+        job.launch_failure = launch_error.map(|message| crate::tools::NativeLaunchFailure {
+            occurred_at: job.run.updated_at,
+            message,
+        });
         if matches!(
             status,
             MobRunStatus::Succeeded | MobRunStatus::Failed | MobRunStatus::Cancelled
@@ -2479,7 +3062,7 @@ impl MetaRuntimeNativeMobExecutionHost {
         let envelopes = tokio::time::timeout(
             META_EVENT_QUERY_TIMEOUT,
             runtime.query_mob_events(&EventQuery {
-                mob_id: Some(MOB_ID.to_string()),
+                mob_id: Some(self.registry.meerkat.mob_id().into_owned()),
                 after_seq,
                 limit: Some(usize::from(input.limit)),
                 ..EventQuery::default()
@@ -2857,15 +3440,19 @@ fn meta_runtime_run_status_is_active(status: MobRunStatus) -> bool {
 fn control_profile(
     description: &str,
     mcp_servers: &BTreeMap<String, NativeMcpServerConfig>,
+    model: &str,
 ) -> Profile {
     Profile {
+        // Persisted mob membership supplies restart continuity; do not opt
+        // into a second durable-worker discovery contract for these profiles.
+        durable: false,
         model_fallback: None,
         provider: None,
         self_hosted_server_id: None,
         image_generation_provider: None,
         auto_compact_threshold: None,
         resume_overrides: Vec::new(),
-        model: DEFAULT_AGENT_MODEL.to_string(),
+        model: model.to_string(),
         skills: Vec::new(),
         tools: ToolConfig {
             builtins: false,
@@ -2890,6 +3477,7 @@ fn agent_profile(
     mcp_servers: &BTreeMap<String, NativeMcpServerConfig>,
 ) -> Result<Profile, String> {
     Ok(Profile {
+        durable: false,
         model_fallback: None,
         provider: agent
             .provider
@@ -2906,7 +3494,7 @@ fn agent_profile(
         model: agent
             .model
             .clone()
-            .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string()),
+            .unwrap_or_else(|| default_agent_model().to_string()),
         skills: agent.skills.clone(),
         tools: ToolConfig {
             builtins: agent
@@ -2972,48 +3560,19 @@ fn agent_mcp_servers(
     visible
 }
 
-fn final_reviewer_profile(
-    reviewer_id: &str,
-    mcp_servers: &BTreeMap<String, NativeMcpServerConfig>,
-) -> Profile {
-    Profile {
-        model_fallback: None,
-        provider: None,
-        self_hosted_server_id: None,
-        image_generation_provider: None,
-        auto_compact_threshold: None,
-        resume_overrides: Vec::new(),
-        model: DEFAULT_AGENT_MODEL.to_string(),
-        skills: Vec::new(),
-        tools: ToolConfig {
-            builtins: true,
-            shell: true,
-            comms: true,
-            workgraph: true,
-            mcp_servers: agent_mcp_server_configs(mcp_servers),
-            ..ToolConfig::default()
-        },
-        peer_description: format!("Repo-level final PR reviewer {reviewer_id}"),
-        external_addressable: true,
-        backend: None,
-        runtime_mode: MobRuntimeMode::AutonomousHost,
-        max_inline_peer_notifications: None,
-        output_schema: None,
-        provider_params: None,
-    }
-}
-
 fn independent_review_orchestrator_profile(
     mcp_servers: &BTreeMap<String, NativeMcpServerConfig>,
+    model: &str,
 ) -> Profile {
     Profile {
+        durable: false,
         model_fallback: None,
         provider: None,
         self_hosted_server_id: None,
         image_generation_provider: None,
         auto_compact_threshold: None,
         resume_overrides: Vec::new(),
-        model: DEFAULT_AGENT_MODEL.to_string(),
+        model: model.to_string(),
         skills: Vec::new(),
         tools: ToolConfig {
             builtins: true,
@@ -3220,9 +3779,17 @@ fn issue_key(issue: &LinearIssueRef) -> String {
 }
 
 fn member_labels(issue: &str, role: &str) -> BTreeMap<String, String> {
+    let label = match role {
+        ISSUE_LEAD => "Issue lead",
+        "planner" => "Planner",
+        "coder" => "Coder",
+        "reviewer" => "Reviewer",
+        other => other,
+    };
     BTreeMap::from([
         ("issue".to_string(), issue.to_string()),
         ("role".to_string(), role.to_string()),
+        ("display_name".to_string(), format!("{issue} / {label}")),
     ])
 }
 
@@ -3246,8 +3813,11 @@ fn issue_lead_prompt_for_tracker(
         return issue_lead_prompt(issue, instructions);
     }
     let active = running_lane(tracker, projection);
+    let handoff = projection
+        .map(|projection| projection.terminal_lanes.succeeded.as_str())
+        .unwrap_or("the configured development handoff lane");
     format!(
-        "You are the Fugue issue lead for {issue}. Coordinate visible worker peers through Meta comms. You own issue-level Jira lane projection: inspect the issue, update the Workpad, and use linear_move_issue with the configured Jira status names. Kapellmeister owns repo-level startup/resume/retire coordination. Once intake is accepted, project the issue to {active}. Record internal planner/coder/reviewer/remediation phases in labels, WorkGraph, Workpad, and Meta evidence. Follow the template's configured node and terminal projections; never invent tracker statuses or enter operator action lanes from inside the issue mob. Terminal success means accepted development work; merge is a separate action. Red review, failed checks, or actionable operator findings must create or update WorkGraph blockers and keep or return the issue to {active} for focused replanning. Use labels `fugue`, `issue:{issue}`, and `blocking`. Deleted comments do not clear obligations without explicit newer acceptance. Use the default WorkGraph scope: omit realm_id and namespace unless following an exact returned item reference; never invent a realm or namespace from the issue identifier. Planner/coder may claim, update, and add evidence, but only reviewer-role agents may close completed review obligations. Before terminal success, query WorkGraph yourself and verify every blocking `issue:{issue}` item is terminal. Execute actual transition calls before reporting lane movement complete.\n\n{}",
+        "You are the Fugue issue lead for {issue}. Coordinate visible worker peers through Meta comms. You own issue-level Jira lane projection: inspect the issue, update the Workpad, and use linear_move_issue with the configured Jira status names. Kapellmeister owns repo-level startup/resume/retire coordination. Once intake is accepted, project the issue to {active}. Record internal planner/coder/reviewer/remediation phases in labels, WorkGraph, Workpad, and Meta evidence. Follow the template's configured node and terminal projections; never invent tracker statuses or enter operator action lanes from inside the issue mob. Successful development projects to {handoff} after review and WorkGraph obligations are satisfied. A configured review holding lane may be entered for this handoff; it is distinct from operator action lanes. Do not substitute the tracker completion lane for this projection. Merging requires a separate explicit action and verified merge completion follows its configured success projection. Red review, failed checks, or actionable operator findings must create or update WorkGraph blockers and keep or return the issue to {active} for focused replanning. Use labels `fugue`, `issue:{issue}`, and `blocking`. Deleted comments do not clear obligations without explicit newer acceptance. Use the default WorkGraph scope: omit realm_id and namespace unless following an exact returned item reference; never invent a realm or namespace from the issue identifier. Planner/coder may claim, update, and add evidence, but only reviewer-role agents may close completed review obligations. Before terminal success, query WorkGraph yourself and verify every blocking `issue:{issue}` item is terminal. Execute actual transition calls before reporting lane movement complete.\n\n{}",
         instructions.unwrap_or_default()
     )
 }
@@ -3272,7 +3842,7 @@ fn worker_prompt_with_lane(
 ) -> String {
     let role_contract = match member {
         "reviewer" => format!(
-            "Reviewer contract for {issue}: query WorkGraph items labeled `fugue`, `issue:{issue}`, and `blocking` before deciding green/red. Use the default WorkGraph scope: omit realm_id and namespace unless an exact item reference gives you a scope; never invent a realm or namespace from the issue identifier. For every review pass, use a fresh neutral review helper through the mob/delegate tooling when available; give it strict neutral instructions to inspect the diff against base with shell/GitHub tools and query WorkGraph itself. Do not hand it a precomputed diff, curated findings, or a WorkGraph dump. If review is green, close only the completed WorkGraph obligations with workgraph_close after verifying evidence; if red, create or update blocking WorkGraph items and ask the issue lead to keep or project the issue to {active} for focused replanning/remediation with phase evidence."
+            "Reviewer contract for {issue}: query WorkGraph items labeled `fugue`, `issue:{issue}`, and `blocking` before deciding green/red. Use the default WorkGraph scope: omit realm_id and namespace unless an exact item reference gives you a scope; never invent a realm or namespace from the issue identifier. For every review pass, use a fresh neutral review helper through native fork_off with message_count: 0. The empty transcript avoids inheriting earlier conclusions while the native fork preserves your issue workspace and WorkGraph scope. Plain delegate inherits tool visibility but does not preserve this issue workspace. Give the child strict neutral instructions to verify its working directory first, independently inspect the diff against base with shell/GitHub tools, and query WorkGraph itself; it must not delegate further, change code, close obligations, or move tracker lanes. Do not hand it a precomputed diff, curated findings, or a WorkGraph dump. Await its native result, record the evidence, and retire it. A workspace refusal blocks review; never work around it. If review is green, close only the completed WorkGraph obligations with workgraph_close after verifying evidence; if red, create or update blocking WorkGraph items and ask the issue lead to keep or project the issue to {active} for focused replanning/remediation with phase evidence."
         ),
         "planner" => format!(
             "Planner contract for {issue}: inspect WorkGraph items labeled `fugue`, `issue:{issue}`, and `blocking`, turn open obligations into concrete Workpad plan items, and add WorkGraph evidence as planning clarifies scope. Use the default WorkGraph scope: omit realm_id and namespace unless an exact item reference gives you a scope; never invent a realm or namespace from the issue identifier. Do not close WorkGraph review obligations."
@@ -3308,7 +3878,7 @@ fn member_initial_message_for_plan(plan: &NativeMobLaunchPlan, member: &str) -> 
         return None;
     }
     Some(format!(
-        "Start your required repo-level final PR review now.\n\nIssue: {}\nReviewer: {}\nWorkspace: {}\nTemplate: {}\n\nEmit a typed FinalReviewVerdict to the issue lead when complete. Do not merge.\n\n{}",
+        "Start repo-level final review coordination now.\n\nIssue: {}\nCoordinator: {}\nWorkspace: {}\nTemplate: {}\n\nSelect existing specialists, admit native review, then call fugue_complete_final_pr_gate with native run references. Do not merge directly.\n\n{}",
         issue_key(&plan.input.issue),
         member,
         plan.input
@@ -3360,8 +3930,64 @@ fn block_on<T>(future: impl Future<Output = T>) -> Result<T, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn review_selection_resolves_durable_aliases_and_excludes_issue_participants() {
+        let specialist = RepositorySpecialist {
+            identity: "repo:domain".into(),
+            label: "Domain".into(),
+            focus: "Domain review".into(),
+            paths: vec![],
+        };
+        let canonical =
+            meerkat_meta::member_comms_id::roster_member_id_for_identity(&specialist.identity);
+        let public =
+            meerkat_mob::FlowRoleTargets::new([("domain", [specialist.identity.clone().into()])])
+                .unwrap();
+        let native = meerkat_mob::FlowRoleTargets::new([("domain", [canonical.clone()])]).unwrap();
+        for input in [&public, &native] {
+            assert_eq!(
+                resolve_review_specialists(
+                    input,
+                    std::slice::from_ref(&specialist),
+                    &BTreeSet::new()
+                )
+                .unwrap(),
+                native
+            );
+            for participant in [&specialist.identity, &canonical.to_string()] {
+                assert!(
+                    resolve_review_specialists(
+                        input,
+                        std::slice::from_ref(&specialist),
+                        &BTreeSet::from([participant.clone()])
+                    )
+                    .is_err()
+                );
+            }
+        }
+        let duplicates = meerkat_mob::FlowRoleTargets::new([(
+            "domain",
+            [canonical, specialist.identity.clone().into()],
+        )])
+        .unwrap();
+        assert!(
+            resolve_review_specialists(
+                &duplicates,
+                std::slice::from_ref(&specialist),
+                &BTreeSet::new()
+            )
+            .is_err()
+        );
+        assert!(resolve_review_specialists(&public, &[], &BTreeSet::new()).is_err());
+        let runtime_alias =
+            meerkat_mob::FlowRoleTargets::new([("domain", ["rt:repo:domain:0".into()])]).unwrap();
+        assert!(
+            resolve_review_specialists(&runtime_alias, &[specialist], &BTreeSet::new()).is_err()
+        );
+    }
 
     use crate::config::{MaterializedMobMember, MobExecutionBackend};
     use crate::tools::{IdempotencyKey, LinearIssueIdentifier, WorkspaceKey};
@@ -3495,6 +4121,30 @@ mod tests {
             .args(["--exact", "--nocapture"])
             .output()
             .expect("isolated runtime test process");
+        if name == "runtime_members_emit_canonical_structural_events"
+            && let Some(directory) = std::env::var_os("FUGUE_TEST_EVIDENCE_DIR")
+        {
+            let directory = PathBuf::from(directory);
+            std::fs::write(
+                directory.join("structural-events.stdout.log"),
+                &output.stdout,
+            )
+            .expect("retain isolated runtime stdout");
+            std::fs::write(
+                directory.join("structural-events.stderr.log"),
+                &output.stderr,
+            )
+            .expect("retain isolated runtime stderr");
+        }
+        if name.starts_with("admitted_host_signal_")
+            && let Some(directory) = std::env::var_os("FUGUE_TEST_EVIDENCE_DIR")
+        {
+            let directory = PathBuf::from(directory);
+            std::fs::write(directory.join(format!("{name}.stdout.log")), &output.stdout)
+                .expect("retain host signal stdout");
+            std::fs::write(directory.join(format!("{name}.stderr.log")), &output.stderr)
+                .expect("retain host signal stderr");
+        }
         assert!(
             output.status.success(),
             "isolated {name} failed:\n{}\n{}",
@@ -3504,7 +4154,7 @@ mod tests {
         false
     }
 
-    fn test_meerkat_config(state_root: PathBuf) -> MeerkatConfig {
+    pub(crate) fn test_meerkat_config(state_root: PathBuf) -> MeerkatConfig {
         let realm_suffix = state_root
             .parent()
             .and_then(|path| path.file_name())
@@ -3513,6 +4163,8 @@ mod tests {
         let context_root = state_root.join("context");
         let user_config_root = state_root.join("user-config");
         MeerkatConfig {
+            runtime_connections: None,
+            repository_runtime: None,
             command: "rkat-rpc".to_string(),
             realm: Some(format!("fugue-test-{realm_suffix}")),
             instance: None,
@@ -3521,7 +4173,7 @@ mod tests {
             context_root: Some(context_root),
             user_config_root: Some(user_config_root),
             auth_binding: None,
-            model: Some(DEFAULT_AGENT_MODEL.to_string()),
+            model: Some(default_agent_model().to_string()),
             provider: None,
             max_tokens: None,
             system_prompt: None,
@@ -3562,6 +4214,7 @@ mod tests {
             intake_states: vec!["Todo".to_string()],
             in_flight_states: vec!["Planning".to_string(), "Implementing".to_string()],
             active_states: vec!["Todo".to_string(), "Planning".to_string()],
+            attachment_root: None,
             max_attachment_files: 20,
             max_attachment_bytes: 25 * 1024 * 1024,
             max_attachment_total_bytes: 100 * 1024 * 1024,
@@ -3661,7 +4314,42 @@ mod tests {
             Vec::new(),
             Vec::new(),
             WorkGraphTerminalGate::new("/unused/workgraph.sqlite3", Vec::new(), Vec::new()),
+            true,
+            None,
+            None,
         )
+    }
+
+    #[tokio::test]
+    async fn disabled_independent_review_is_absent_from_host_tool_catalog() {
+        let tools = direct_tool_dispatcher(
+            &tracker_with_key(),
+            None,
+            None,
+            HostToolAuthority::Coordinator,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            WorkGraphTerminalGate::new("/unused/workgraph.sqlite3", Vec::new(), Vec::new()),
+            false,
+            None,
+            None,
+        );
+        assert!(!tools.tools().iter().any(|tool| {
+            matches!(
+                tool.name.as_str(),
+                "fugue_start_independent_review"
+                    | "fugue_complete_independent_review"
+                    | "fugue_complete_final_pr_gate"
+            )
+        }));
+        assert!(
+            tools
+                .tools()
+                .iter()
+                .any(|tool| tool.name == "fugue_run_deploy")
+        );
     }
 
     #[tokio::test]
@@ -3725,7 +4413,19 @@ mod tests {
             reviewer
                 .tools()
                 .iter()
+                .any(|tool| tool.name == "fugue_admit_independent_review")
+        );
+        assert!(
+            reviewer
+                .tools()
+                .iter()
                 .any(|tool| tool.name == "fugue_complete_independent_review")
+        );
+        assert!(
+            reviewer
+                .tools()
+                .iter()
+                .any(|tool| tool.name == "fugue_complete_final_pr_gate")
         );
         assert!(
             !reviewer
@@ -3759,6 +4459,23 @@ mod tests {
         assert!(!lead.contains("Queue is the intake lane"));
         assert!(!reviewer.contains("project the issue to Active"));
         assert!(lead.contains("omit realm_id and namespace"));
+        assert!(!lead.contains("Terminal success means accepted development work"));
+        let projection = crate::config::MaterializedLinearProjection {
+            id: "development".into(),
+            node_lanes: BTreeMap::new(),
+            node_phase_labels: BTreeMap::new(),
+            aggregate: crate::config::NativeLinearProjectionAggregate {
+                precedence: vec!["Working".into()],
+                fallback: Some("Working".into()),
+            },
+            terminal_lanes: crate::config::NativeLinearProjectionTerminals {
+                succeeded: "Awaiting approval".into(),
+                failed: "Working".into(),
+                cancelled: "Closed".into(),
+            },
+        };
+        let lead = issue_lead_prompt_for_tracker("TEST-1", None, &tracker, Some(&projection));
+        assert!(lead.contains("Successful development projects to Awaiting approval"));
     }
 
     #[test]
@@ -3767,6 +4484,9 @@ mod tests {
 
         assert!(prompt.contains("project the issue to Active"));
         assert!(prompt.contains("focused replanning/remediation with phase evidence"));
+        assert!(prompt.contains("fork_off with message_count: 0"));
+        assert!(prompt.contains("verify its working directory first"));
+        assert!(prompt.contains("it must not delegate further"));
     }
 
     #[test]
@@ -3784,17 +4504,17 @@ mod tests {
     }
 
     #[test]
-    fn final_gate_reviewers_receive_bootstrap_assignment() {
+    fn final_gate_coordinator_receives_native_review_assignment() {
         let mut plan = launch_plan();
         plan.input.template_id = crate::tools::MobTemplateId("final-pr-gate-191".to_string());
         plan.input.instructions =
-            Some("Review exact head SHA `abc123` and emit FinalReviewVerdict.".to_string());
+            Some("Review exact head SHA `abc123` using existing specialists.".to_string());
 
-        let message = member_initial_message_for_plan(&plan, "tests")
-            .expect("final gate reviewer assignment");
+        let message = member_initial_message_for_plan(&plan, "review_orchestrator")
+            .expect("final gate coordinator assignment");
 
-        assert!(message.contains("Reviewer: tests"));
-        assert!(message.contains("FinalReviewVerdict"));
+        assert!(message.contains("Coordinator: review_orchestrator"));
+        assert!(message.contains("fugue_complete_final_pr_gate"));
         assert!(message.contains("Do not merge"));
         assert!(message.contains("abc123"));
     }
@@ -3818,6 +4538,167 @@ mod tests {
             !tool_names.iter().any(|name| name == "linear_move_issue"),
             "worker sessions can inspect/update evidence but must not own lane mutation"
         );
+        assert!(
+            !tool_names.iter().any(|name| name == "linear_claim_issue"),
+            "claim can assign a terminal state and requires the same lifecycle authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_checks_obligations_before_jira_assignment_or_transition() {
+        use crate::jira::tests::{issue, mock_jira, reply, tracker};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workgraph.sqlite3");
+        let realm = meerkat_core::mob_realm_id("claim-test").unwrap();
+        let graph = meerkat::WorkGraphService::with_scope(
+            Arc::new(meerkat::SqliteWorkGraphStore::open(&path).unwrap()),
+            realm.as_str(),
+            meerkat::WorkNamespace::default(),
+        );
+        graph
+            .create(meerkat::CreateWorkItemRequest {
+                realm_id: None,
+                namespace: None,
+                title: "Unresolved review".into(),
+                description: None,
+                priority: meerkat::WorkPriority::High,
+                completion_policy: meerkat::WorkCompletionPolicy::SelfAttest,
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                labels: ["fugue", "blocking", "issue:TEST-1"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: Some(meerkat::WorkStatus::Open),
+            })
+            .await
+            .unwrap();
+        for (use_mcp, tool_name) in [
+            (false, "linear_claim_issue"),
+            (true, "linear_claim_issue"),
+            (true, "linear.claim_issue"),
+            (true, "linear_move_issue"),
+            (true, "linear.move_issue"),
+        ] {
+            let is_claim = tool_name.parse::<FugueToolOperation>().unwrap()
+                == FugueToolOperation::LinearClaimIssue;
+            let state_field = if is_claim { "target_state" } else { "state" };
+            for issue_ref in [
+                json!({"kind":"identifier", "identifier":"TEST-1"}),
+                json!({"kind":"id", "id":"10001"}),
+            ] {
+                let lookup_path = if issue_ref["kind"] == "id" {
+                    "/rest/api/3/issue/10001"
+                } else {
+                    "/rest/api/3/issue/TEST-1"
+                };
+                let mock = mock_jira(vec![
+                    reply("GET", lookup_path, issue("In Progress")),
+                    reply(
+                        "GET",
+                        "/rest/api/3/issue/TEST-1/comment",
+                        json!({
+                            "comments": [], "total": 0, "startAt": 0, "maxResults": 100
+                        }),
+                    ),
+                ])
+                .await;
+                let tracker = tracker(&mock.endpoint);
+                let gate = WorkGraphTerminalGate::new(&path, vec!["Done".into()], Vec::new())
+                    .for_mob("claim-test");
+                let mcp = crate::mcp_server::LinearMcpHandler::projection_for_test(
+                    tracker.clone(),
+                    Some(gate.clone()),
+                );
+                let dispatcher = direct_tool_dispatcher(
+                    &tracker,
+                    None,
+                    None,
+                    HostToolAuthority::IssueLead,
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    gate.clone(),
+                    false,
+                    None,
+                    None,
+                );
+                let mut input = json!({
+                    "issue": issue_ref, "assignee": {"kind":"id", "id":"operator"},
+                    "target_state": {"kind":"name", "name":"Done"},
+                    "idempotency_key":"claim-test"
+                });
+                for (state, expected) in [
+                    (
+                        json!({"kind":"name", "name":"Done"}),
+                        "unresolved_workgraph_obligations",
+                    ),
+                    (json!({"kind":"id", "id":"3"}), "noncanonical_public_lane"),
+                ] {
+                    input[state_field] = state;
+                    if use_mcp {
+                        let (failed, response) = mcp.execute(tool_name, input.clone()).await;
+                        assert!(failed);
+                        assert!(response.contains(expected), "{response}");
+                    } else {
+                        let args = serde_json::value::to_raw_value(&input).unwrap();
+                        let outcome = dispatcher
+                            .dispatch(ToolCallView {
+                                id: "claim",
+                                name: "linear_claim_issue",
+                                args: &args,
+                            })
+                            .await
+                            .unwrap();
+                        assert!(outcome.result.is_error);
+                        assert!(
+                            serde_json::to_string(&outcome.result.content)
+                                .unwrap()
+                                .contains(expected)
+                        );
+                    }
+                }
+                assert!(mock.responses.lock().unwrap().is_empty());
+                assert_eq!(
+                    mock.requests.lock().unwrap().len(),
+                    2,
+                    "only inspection may reach Jira"
+                );
+                if !is_claim {
+                    continue;
+                }
+                // An assignment without a lane change remains usable even with an open obligation.
+                mock.responses.lock().unwrap().extend([
+                    reply("GET", lookup_path, issue("In Progress")),
+                    reply("PUT", "/rest/api/3/issue/TEST-1/assignee", json!({})),
+                    reply("GET", lookup_path, issue("In Progress")),
+                ]);
+                input["target_state"] = Value::Null;
+                if use_mcp {
+                    let (failed, response) = mcp.execute(tool_name, input.clone()).await;
+                    assert!(!failed, "{response}");
+                } else {
+                    let args = serde_json::value::to_raw_value(&input).unwrap();
+                    let outcome = dispatcher
+                        .dispatch(ToolCallView {
+                            id: "assign",
+                            name: "linear_claim_issue",
+                            args: &args,
+                        })
+                        .await
+                        .unwrap();
+                    assert!(!outcome.result.is_error, "{:?}", outcome.result.content);
+                }
+                assert!(mock.responses.lock().unwrap().is_empty());
+                assert_eq!(mock.requests.lock().unwrap().len(), 5);
+            }
+        }
     }
 
     #[test]
@@ -3977,10 +4858,14 @@ mod tests {
         let worktree = temp.path().join("worktree");
         std::fs::create_dir_all(&worktree).expect("create worktree");
         let hook = FugueDirectToolSessionHook {
+            connections: None,
+            mob_id: MOB_ID.to_owned(),
             agent_profiles: BTreeMap::new(),
             default_auth_binding: None,
             review_orchestrator_profile: IndependentReviewConfig::default().orchestrator_profile,
+            independent_review_enabled: false,
             tracker: tracker_with_key(),
+            host_signal_binding: None,
             host_api_url: None,
             host_api_auth: None,
             github_repo: None,
@@ -3993,7 +4878,7 @@ mod tests {
             ),
         };
         let mut req = CreateSessionRequest {
-            model: DEFAULT_AGENT_MODEL.to_string(),
+            model: default_agent_model().to_string(),
             prompt: meerkat_core::types::ContentInput::Text(
                 "You are coder for Fugue issue LUC-900.".to_string(),
             ),
@@ -4042,6 +4927,25 @@ mod tests {
         assert!(tool_names.iter().any(|name| name == "shell"));
         assert!(tool_names.iter().any(|name| name == "apply_patch"));
         assert!(tool_names.iter().any(|name| name == "linear_inspect_issue"));
+        let tools = dispatcher.tools();
+        let filter = meerkat_core::tool_scope::ToolFilter::Allow(
+            tools
+                .iter()
+                .filter(|tool| {
+                    is_linear_fugue_tool_name(&tool.name) || is_github_fugue_tool_name(&tool.name)
+                })
+                .map(|tool| tool.name.clone())
+                .collect(),
+        );
+        let definitions = tools
+            .iter()
+            .map(|tool| tool.as_ref().clone())
+            .collect::<Vec<_>>();
+        let witnesses =
+            meerkat_core::tool_scope::filter_witnesses_for_tool_defs(&definitions, &filter);
+        meerkat_core::tool_scope::validate_witnessed_filter_authority(&filter, &witnesses)
+            .expect("native helper inheritance retains Fugue tool provenance");
+
         assert!(
             !tool_names.iter().any(|name| name == "linear_move_issue"),
             "worker sessions still must not get lane mutation tools"
@@ -4082,10 +4986,14 @@ mod tests {
     async fn session_hook_preserves_existing_external_tools() {
         let temp = tempfile::tempdir().expect("tempdir");
         let hook = FugueDirectToolSessionHook {
+            connections: None,
+            mob_id: MOB_ID.to_owned(),
             agent_profiles: BTreeMap::new(),
             default_auth_binding: None,
             review_orchestrator_profile: IndependentReviewConfig::default().orchestrator_profile,
+            independent_review_enabled: false,
             tracker: tracker_with_key(),
+            host_signal_binding: None,
             host_api_url: None,
             host_api_auth: None,
             github_repo: None,
@@ -4098,7 +5006,7 @@ mod tests {
             ),
         };
         let mut req = CreateSessionRequest {
-            model: DEFAULT_AGENT_MODEL.to_string(),
+            model: default_agent_model().to_string(),
             prompt: meerkat_core::types::ContentInput::Text(
                 "You are coder for Fugue issue LUC-900.".to_string(),
             ),
@@ -4150,7 +5058,7 @@ mod tests {
     #[test]
     fn quoted_coordinator_text_does_not_grant_mutation_authority() {
         let mut req = CreateSessionRequest {
-            model: DEFAULT_AGENT_MODEL.to_string(),
+            model: default_agent_model().to_string(),
             prompt: meerkat_core::types::ContentInput::Text(
                 "You have been spawned as 'FUG-607/issue_lead' (role: issue_lead) in mob 'fugue'."
                     .to_string(),
@@ -4263,6 +5171,76 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn embedded_tracker_dispatch_records_the_repository_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let definition = crate::config::WorkflowDefinition {
+            config: json!({"tracker": {
+                "kind": "fugue-ims", "endpoint": temp.path().join("issues.sqlite3"),
+                "project_slug": "example/app", "active_states": ["Queued", "Active"],
+                "terminal_states": ["Done"]
+            }})
+            .as_object()
+            .unwrap()
+            .clone(),
+            prompt_template: String::new(),
+        };
+        let config = crate::config::ServiceConfig::from_definition(
+            temp.path().join("fugue.yaml"),
+            &definition,
+        )
+        .unwrap();
+        let store = crate::fugue_ims::FugueImsStore::from_config(&config.tracker).unwrap();
+        store
+            .create_issue(crate::fugue_ims::CreateFugueIssue {
+                key: crate::ims::ImsIssueKey("APP-1".into()),
+                repo: "example/app".into(),
+                title: "Embedded journal dispatch".into(),
+                description: None,
+                stage: crate::ims::ImsStageName("Queued".into()),
+                labels: Vec::new(),
+            })
+            .unwrap();
+        let binding = HostSignalBinding::from_config(&config).unwrap();
+        binding.record_internal_lane("APP-1", "Queued").unwrap();
+        let before = binding.open().unwrap().revision().unwrap();
+        let dispatcher = direct_tool_dispatcher(
+            &config.tracker,
+            None,
+            None,
+            HostToolAuthority::IssueLead,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            WorkGraphTerminalGate::for_service(&config),
+            false,
+            None,
+            Some(binding.clone()),
+        );
+        let args = serde_json::value::to_raw_value(&json!({
+            "issue": {"kind": "identifier", "identifier": "APP-1"},
+            "state": {"kind": "name", "name": "Active"}, "idempotency_key": "embedded-move"
+        }))
+        .unwrap();
+        let outcome = dispatcher
+            .dispatch(ToolCallView {
+                id: "move",
+                name: "linear_move_issue",
+                args: &args,
+            })
+            .await
+            .unwrap();
+        assert!(!outcome.result.is_error, "{:?}", outcome.result.content);
+        let mut journal = binding.open().unwrap();
+        assert_ne!(journal.revision().unwrap(), before);
+        assert!(journal.pending(10).unwrap().is_empty());
+        assert_eq!(
+            journal.begin().unwrap().observe_lane("APP-1", "Active"),
+            crate::linear_lane_state::LinearLaneObservation::Unchanged
+        );
+    }
+
     #[test]
     fn direct_linear_tools_inherit_review_handoff_states_from_module_scope() {
         let servers = BTreeMap::from([(
@@ -4371,7 +5349,7 @@ mod tests {
             ("github".to_string(), mcp_server(&["fugue-github-mcp"], &[])),
             ("docs".to_string(), mcp_server(&["docs-mcp"], &[])),
         ]);
-        let control = control_profile("repo coordinator", &mcp_servers);
+        let control = control_profile("repo coordinator", &mcp_servers, default_agent_model());
         let worker = agent_profile(
             &native_agent_profile(&[
                 "mob",
@@ -4436,7 +5414,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_reviewer_profiles_expose_playwright_mcp_when_configured() {
+    fn review_coordinator_exposes_playwright_mcp_when_configured() {
         let mcp_servers = BTreeMap::from([
             ("linear".to_string(), mcp_server(&["fugue-linear-mcp"], &[])),
             ("github".to_string(), mcp_server(&["fugue-github-mcp"], &[])),
@@ -4450,11 +5428,11 @@ mod tests {
             ),
         ]);
 
-        let final_reviewer = final_reviewer_profile("tests", &mcp_servers);
-        let independent_orchestrator = independent_review_orchestrator_profile(&mcp_servers);
+        let independent_orchestrator =
+            independent_review_orchestrator_profile(&mcp_servers, default_agent_model());
 
         assert_eq!(
-            final_reviewer
+            independent_orchestrator
                 .tools
                 .mcp_servers
                 .iter()
@@ -4462,14 +5440,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["playwright"]
         );
-        assert_eq!(
-            final_reviewer.tools.mcp_servers,
-            independent_orchestrator.tools.mcp_servers
-        );
     }
 
     #[test]
-    fn mob_definition_registers_final_reviewer_profiles() {
+    fn final_only_review_registers_coordinator_without_manufacturing_specialists() {
         let mcp_servers = BTreeMap::from([
             ("linear".to_string(), mcp_server(&["fugue-linear-mcp"], &[])),
             ("github".to_string(), mcp_server(&["fugue-github-mcp"], &[])),
@@ -4485,10 +5459,17 @@ mod tests {
             required: true,
         }]);
         let definition = registry.mob_definition().expect("valid definition");
+        assert!(
+            !definition
+                .profiles
+                .contains_key(&ProfileName::from("final_architecture_reviewer"))
+        );
         let binding = definition
             .profiles
-            .get(&ProfileName::from("final_architecture_reviewer"))
-            .expect("final reviewer profile");
+            .get(&ProfileName::from(
+                IndependentReviewConfig::default().orchestrator_profile,
+            ))
+            .expect("shared review coordinator");
         let ProfileBinding::Inline(profile) = binding else {
             panic!("final reviewer profile must be inline")
         };
@@ -4497,6 +5478,39 @@ mod tests {
         assert!(profile.tools.workgraph);
         assert!(profile.tools.mcp_servers.is_empty());
         assert_eq!(profile.runtime_mode, MobRuntimeMode::AutonomousHost);
+    }
+
+    #[test]
+    fn coordinator_and_review_profiles_honor_the_workspace_model() {
+        for model in [None, Some("gpt-5.5"), Some("custom-model")] {
+            let mut config = test_meerkat_config(PathBuf::from("/tmp/fugue-state"));
+            config.model = model.map(str::to_owned);
+            let registry =
+                MetaRuntimeRegistry::with_templates(config, BTreeMap::new(), BTreeMap::new())
+                    .with_final_review_reviewers(vec![FinalReviewReviewerConfig {
+                        id: "tests".into(),
+                        profile: "final_tests".into(),
+                        required: true,
+                    }])
+                    .with_independent_review_config(IndependentReviewConfig {
+                        enabled: true,
+                        orchestrator_profile: "review_orchestrator".into(),
+                        ..Default::default()
+                    });
+            let definition = registry.mob_definition().expect("valid definition");
+            for name in [KAPELLMEISTER, ISSUE_LEAD, "review_orchestrator"] {
+                let ProfileBinding::Inline(profile) =
+                    &definition.profiles[&ProfileName::from(name)]
+                else {
+                    panic!("generated profile must be inline")
+                };
+                assert_eq!(
+                    profile.model,
+                    model.unwrap_or_else(default_agent_model),
+                    "{name}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4733,12 +5747,672 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn repo_host_signal_reaches_native_coordinator_history() {
+        if !isolated_runtime_test("repo_host_signal_reaches_native_coordinator_history") {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = MetaRuntimeRegistry::with_templates(
+            test_meerkat_config(temp.path().join("state")),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        registry
+            .bootstrap_repo_kapellmeister()
+            .await
+            .expect("initial coordinator");
+        // A failed peer-wiring pass must not prevent subsequent diagnostics.
+        let original_meerkat = registry.meerkat.clone();
+        registry.meerkat.repository_runtime = Some(crate::config::RepositoryRuntimeBinding {
+            repository: crate::ensemble::config::RepoId::try_from("unavailable-peer".to_owned())
+                .expect("repo id"),
+            state_path: temp.path().join("state"),
+        });
+        assert!(registry.bootstrap_repo_kapellmeister().await.is_err());
+        registry.meerkat = original_meerkat;
+        let message = "Fugue host signal fixture: worker completed fixture-123";
+        let scope = crate::host_signal_journal::HostSignalScope {
+            repository_path: temp.path().to_owned(),
+            runtime_path: std::path::absolute(registry.state_path()).unwrap(),
+            mob_id: registry.meerkat.mob_id().into_owned(),
+            member: KAPELLMEISTER.to_owned(),
+            tracker: crate::host_signal_journal::TrackerScope::Linear {
+                endpoint: "https://api.linear.app/graphql".to_owned(),
+                project: "fixture".to_owned(),
+            },
+        };
+        registry.host_signal_binding = Some(HostSignalBinding {
+            path: temp.path().join("signals.sqlite3"),
+            scope: scope.clone(),
+        });
+        let signal = crate::host_signal_journal::PendingSignal {
+            key: crate::host_signal_journal::DeliveryKey("fugue-history-fixture".to_owned()),
+            envelope: crate::host_signal_journal::SignalEnvelope {
+                content: message.to_owned(),
+                mode: crate::host_signal_journal::SignalHandlingMode::Steer,
+            },
+        };
+        let accepted = registry
+            .deliver_repo_kapellmeister_signal(&scope, &signal)
+            .await
+            .expect("native signal acceptance");
+        assert!(!accepted.delivery_id.is_empty());
+        let runtime = registry.runtime().await.expect("runtime");
+        let member = runtime
+            .mob_handle()
+            .get_member(&AgentIdentity::from(KAPELLMEISTER))
+            .await
+            .expect("member query")
+            .expect("coordinator");
+        let session = member.bridge_session_id().expect("coordinator session");
+        let delivered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let history = runtime
+                    .mob_runtime()
+                    .read_session_history(&session.to_string(), 0, None)
+                    .await
+                    .expect("canonical coordinator history");
+                if serde_json::to_string(&history.messages)
+                    .expect("serialize messages")
+                    .contains(message)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        registry.shutdown().await.expect("shutdown");
+        delivered.expect("host signal must reach the native coordinator session");
+    }
+
+    static HOST_SIGNAL_BLOCKING_CLIENT: OnceLock<Arc<HostSignalBlockingClient>> = OnceLock::new();
+
+    pub(super) fn runtime_test_llm_client() -> Arc<dyn meerkat_llm_core::LlmClient> {
+        match HOST_SIGNAL_BLOCKING_CLIENT.get() {
+            Some(client) => Arc::clone(client) as Arc<dyn meerkat_llm_core::LlmClient>,
+            None => Arc::new(meerkat_llm_core::TestClient::default()),
+        }
+    }
+
+    #[derive(Default)]
+    struct HostSignalBlockingClient {
+        block: AtomicBool,
+        entered: tokio::sync::Notify,
+        normal: meerkat_llm_core::TestClient,
+    }
+
+    #[async_trait]
+    impl meerkat_llm_core::LlmClient for HostSignalBlockingClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_llm_core::LlmError> {
+            self.normal.project_replay_messages(messages)
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a meerkat_llm_core::LlmRequest,
+        ) -> meerkat_llm_core::LlmStream<'a> {
+            if self.block.load(Ordering::SeqCst) {
+                self.entered.notify_one();
+                Box::pin(futures::stream::pending())
+            } else {
+                self.normal.stream(request)
+            }
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Other
+        }
+
+        async fn health_check(&self) -> Result<(), meerkat_llm_core::LlmError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admitted_host_signal_queued_at_stop_remains_recoverable() {
+        const NAME: &str = "admitted_host_signal_queued_at_stop_remains_recoverable";
+        if !isolated_runtime_test(NAME) {
+            return;
+        }
+        assert_queued_host_signal_recovery(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admitted_host_signal_acknowledged_at_stop_remains_recoverable() {
+        const NAME: &str = "admitted_host_signal_acknowledged_at_stop_remains_recoverable";
+        if !isolated_runtime_test(NAME) {
+            return;
+        }
+        assert_queued_host_signal_recovery(true).await;
+    }
+
+    async fn assert_queued_host_signal_recovery(acknowledge_before_stop: bool) {
+        use crate::host_signal_journal::{
+            HostSignalScope, SignalEnvelope, SignalHandlingMode, TrackerScope,
+        };
+        use meerkat_contracts::WireContinuationStatus;
+        use meerkat_runtime::{
+            InputAbandonReason, InputLifecycleState, InputTerminalOutcome, SessionServiceRuntimeExt,
+        };
+        let evidence = host_signal_evidence("host-signal-queued-stop-");
+        let root = evidence.0.as_ref().unwrap().path();
+        let client = Arc::new(HostSignalBlockingClient::default());
+        client.block.store(true, Ordering::SeqCst);
+        assert!(HOST_SIGNAL_BLOCKING_CLIENT.set(Arc::clone(&client)).is_ok());
+        let config = test_meerkat_config(root.join("state"));
+        let scope = HostSignalScope {
+            repository_path: root.to_owned(),
+            runtime_path: meta_runtime_state_path(&config),
+            mob_id: config.mob_id().into_owned(),
+            member: KAPELLMEISTER.to_owned(),
+            tracker: TrackerScope::Internal {
+                database: root.join("issues.sqlite3"),
+                repository: "fixture".into(),
+            },
+        };
+        let binding = HostSignalBinding {
+            path: root.join("signals.sqlite3"),
+            scope: scope.clone(),
+        };
+        let registry =
+            MetaRuntimeRegistry::with_templates(config.clone(), BTreeMap::new(), BTreeMap::new())
+                .with_host_signal_binding(binding.clone());
+        registry.bootstrap_repo_kapellmeister().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), client.entered.notified())
+            .await
+            .expect("bootstrap provider request must be in flight");
+        let mut journal = binding.open().unwrap();
+        let mut update = journal.begin().unwrap();
+        update
+            .enqueue_once("queued-stop-fixture", || {
+                Ok(SignalEnvelope {
+                    content: "notification queued during a provider request".into(),
+                    mode: SignalHandlingMode::Steer,
+                })
+            })
+            .unwrap();
+        update.commit().unwrap();
+        drop(journal);
+        let saved = binding.open().unwrap().pending(1).unwrap().remove(0);
+        let admitted = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let receipt = registry
+                    .deliver_repo_kapellmeister_signal(&scope, &saved)
+                    .await
+                    .unwrap();
+                match receipt.status {
+                    WireContinuationStatus::Admitted { .. } => break receipt,
+                    WireContinuationStatus::Pending => {
+                        tokio::time::sleep(Duration::from_millis(20)).await
+                    }
+                    _ => panic!("unexpected terminal native admission: {receipt:?}"),
+                }
+            }
+        })
+        .await
+        .expect("native admission while the bootstrap provider request is held");
+        let (session_id, input_id) = match &admitted.status {
+            WireContinuationStatus::Admitted {
+                session_id,
+                input_id,
+            } => (
+                meerkat_core::SessionId::parse(session_id).unwrap(),
+                meerkat_core::lifecycle::InputId(uuid::Uuid::parse_str(input_id).unwrap()),
+            ),
+            other => panic!("expected native admission: {other:?}"),
+        };
+        let runtime = registry.runtime().await.unwrap();
+        let machine = runtime
+            .mob_runtime()
+            .session_service()
+            .unwrap()
+            .acquire_runtime_adapter(None)
+            .unwrap()
+            .unwrap();
+        let queued = machine
+            .input_state(&session_id, &input_id)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(
+            root.join("native-queued-input.json"),
+            serde_json::to_vec_pretty(&queued).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(queued.seed.phase, InputLifecycleState::Queued);
+        assert_eq!(queued.seed.last_run_id, None);
+        assert_eq!(queued.seed.attempt_count, 0);
+        if acknowledge_before_stop {
+            binding
+                .open()
+                .unwrap()
+                .acknowledge(&saved.key, &admitted)
+                .unwrap();
+        }
+        registry.shutdown().await.unwrap();
+        let stopped = machine
+            .input_state(&session_id, &input_id)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(
+            root.join("native-stopped-input.json"),
+            serde_json::to_vec_pretty(&stopped).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("native-admission.json"),
+            serde_json::to_vec_pretty(&admitted).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stopped.seed.phase, InputLifecycleState::Abandoned);
+        assert_eq!(
+            stopped.seed.terminal_outcome,
+            Some(InputTerminalOutcome::Abandoned {
+                reason: InputAbandonReason::Stopped,
+            })
+        );
+        assert_eq!(stopped.seed.last_run_id, None);
+        assert_eq!(stopped.seed.attempt_count, 0);
+        assert_eq!(stopped.state.stop_requeue, None);
+        drop(machine);
+        drop(runtime);
+        drop(registry);
+        client.block.store(false, Ordering::SeqCst);
+        let registry =
+            MetaRuntimeRegistry::with_templates(config, BTreeMap::new(), BTreeMap::new())
+                .with_host_signal_binding(binding.clone());
+        assert_eq!(
+            registry
+                .deliver_repo_kapellmeister_signal(&scope, &saved)
+                .await
+                .unwrap(),
+            admitted,
+            "native keyed replay still returns the original receipt after restart"
+        );
+        let result = binding
+            .drain_pending(std::num::NonZeroU32::MIN, |scope, signal| {
+                let registry = &registry;
+                let admitted = admitted.clone();
+                async move {
+                    let replay = registry
+                        .deliver_repo_kapellmeister_signal(&scope, &signal)
+                        .await
+                        .map_err(crate::error::FugueError::Workspace)?;
+                    assert_eq!(replay, admitted);
+                    Ok(replay)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            result.acknowledged,
+            u32::from(!acknowledge_before_stop),
+            "native admission remains distinct from consumption"
+        );
+        let runtime = registry.runtime().await.unwrap();
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let history = runtime
+                    .mob_runtime()
+                    .read_session_history(&session_id.to_string(), 0, None)
+                    .await
+                    .unwrap();
+                if serde_json::to_string(&history.messages)
+                    .unwrap()
+                    .contains(&saved.envelope.content)
+                {
+                    assert_eq!(
+                        history
+                            .messages
+                            .iter()
+                            .filter(|entry| serde_json::to_string(entry)
+                                .unwrap()
+                                .contains(&saved.envelope.content))
+                            .count(),
+                        1
+                    );
+                    if binding.open().unwrap().pending(1).unwrap().is_empty()
+                        && binding
+                            .open()
+                            .unwrap()
+                            .admitted_for_reconciliation(1)
+                            .unwrap()
+                            .is_empty()
+                    {
+                        return;
+                    }
+                }
+                reconcile_host_signal_fixture(&binding, &registry).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        registry.shutdown().await.unwrap();
+        recovered.expect(
+            "a queued notification must survive graceful stop and reach canonical history once",
+        );
+        let journal = rusqlite::Connection::open(&binding.path).unwrap();
+        assert_eq!(
+            journal
+                .query_row("SELECT count(*) FROM replacements", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            1,
+            "exactly one proven stopped input gets a successor key"
+        );
+        let final_receipt: String = journal
+            .query_row("SELECT admitted_receipt FROM deliveries", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        std::fs::write(root.join("native-recovered-admission.json"), &final_receipt).unwrap();
+        let final_receipt: meerkat_contracts::WireContinuationReceipt =
+            serde_json::from_str(&final_receipt).unwrap();
+        assert_ne!(final_receipt.delivery_id, admitted.delivery_id);
+    }
+
+    async fn reconcile_host_signal_fixture(
+        binding: &HostSignalBinding,
+        registry: &MetaRuntimeRegistry,
+    ) {
+        let progress = binding
+            .reconcile_admitted(std::num::NonZeroU32::MIN, |scope, receipt| async move {
+                registry
+                    .observe_repo_kapellmeister_input(&scope, &receipt)
+                    .await
+                    .map_err(crate::error::FugueError::Workspace)
+            })
+            .await
+            .unwrap();
+        assert!(
+            progress.attention.is_empty(),
+            "unexpected native terminal: {:?}",
+            progress.attention
+        );
+        assert!(
+            progress.unresolvable.is_empty(),
+            "unresolvable native input: {:?}",
+            progress.unresolvable
+        );
+        binding
+            .drain_pending(std::num::NonZeroU32::MIN, |scope, signal| async move {
+                registry
+                    .deliver_repo_kapellmeister_signal(&scope, &signal)
+                    .await
+                    .map_err(crate::error::FugueError::Workspace)
+            })
+            .await
+            .unwrap();
+    }
+
+    struct RuntimeFailureEvidence(Option<tempfile::TempDir>);
+    impl Drop for RuntimeFailureEvidence {
+        fn drop(&mut self) {
+            // An external qualifier can reject a zero exit after inspecting
+            // its transcript. It owns cleanup when an evidence root is set.
+            if (std::thread::panicking() || std::env::var_os("FUGUE_TEST_EVIDENCE_DIR").is_some())
+                && let Some(directory) = self.0.take()
+            {
+                eprintln!(
+                    "Retained runtime state for qualification: {}",
+                    directory.keep().display()
+                );
+            }
+        }
+    }
+    fn host_signal_evidence(prefix: &str) -> RuntimeFailureEvidence {
+        let directory = match std::env::var_os("FUGUE_TEST_EVIDENCE_DIR") {
+            Some(parent) => tempfile::Builder::new().prefix(prefix).tempdir_in(parent),
+            None => tempfile::Builder::new().prefix(prefix).tempdir(),
+        }
+        .expect("host signal evidence directory");
+        RuntimeFailureEvidence(Some(directory))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admitted_host_signal_replays_after_restart_without_duplicate_input() {
+        if !isolated_runtime_test(
+            "admitted_host_signal_replays_after_restart_without_duplicate_input",
+        ) {
+            return;
+        }
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let evidence = host_signal_evidence("host-signal-restart-");
+        let directory = evidence.0.as_ref().expect("host signal evidence owner");
+        assert_native_host_signal_replay(directory.path(), false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admitted_host_signal_replays_after_process_loss_without_duplicate_input() {
+        const NAME: &str =
+            "admitted_host_signal_replays_after_process_loss_without_duplicate_input";
+        if !isolated_runtime_test(NAME) {
+            return;
+        }
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        const ROOT: &str = "FUGUE_SIGNAL_CRASH_ROOT";
+        if let Some(root) = std::env::var_os(ROOT) {
+            assert_native_host_signal_replay(Path::new(&root), true, false).await;
+            panic!("child must exit before acknowledgement and runtime shutdown");
+        }
+        let evidence = host_signal_evidence("host-signal-process-loss-");
+        let directory = evidence.0.as_ref().expect("host signal evidence owner");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(ROOT, directory.path())
+            .env("FUGUE_ISOLATED_RUNTIME_TEST", NAME)
+            .arg(format!("meta_runtime::tests::{NAME}"))
+            .args(["--exact", "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_native_host_signal_replay(directory.path(), false, true).await;
+    }
+
+    async fn assert_native_host_signal_replay(
+        root: &Path,
+        exit_before_ack: bool,
+        restore_after_exit: bool,
+    ) {
+        use crate::host_signal_journal::{
+            HostSignalScope, SignalEnvelope, SignalHandlingMode, TrackerScope,
+        };
+        use meerkat_contracts::WireContinuationStatus;
+        let config = test_meerkat_config(root.join("state"));
+        let scope = HostSignalScope {
+            repository_path: root.to_owned(),
+            runtime_path: meta_runtime_state_path(&config),
+            mob_id: config.mob_id().into_owned(),
+            member: KAPELLMEISTER.to_owned(),
+            tracker: TrackerScope::Linear {
+                endpoint: "https://api.linear.app/graphql".to_owned(),
+                project: "fixture".to_owned(),
+            },
+        };
+        let binding = HostSignalBinding {
+            path: root.join("signals.sqlite3"),
+            scope: scope.clone(),
+        };
+        let message = "host notification survives native admission before journal acknowledgement";
+        {
+            let mut journal = binding.open().unwrap();
+            let mut update = journal.begin().unwrap();
+            update
+                .enqueue_once("fixture-completion", || {
+                    Ok(SignalEnvelope {
+                        content: message.to_owned(),
+                        mode: SignalHandlingMode::Steer,
+                    })
+                })
+                .unwrap();
+            update.commit().unwrap();
+        }
+        let accepted: meerkat_contracts::WireContinuationReceipt = if restore_after_exit {
+            serde_json::from_slice(&std::fs::read(root.join("native-admission.json")).unwrap())
+                .unwrap()
+        } else {
+            let registry = MetaRuntimeRegistry::with_templates(
+                config.clone(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .with_host_signal_binding(binding.clone());
+            let saved = binding.open().unwrap().pending(1).unwrap().remove(0);
+            let accepted = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let receipt = registry
+                        .deliver_repo_kapellmeister_signal(&scope, &saved)
+                        .await
+                        .unwrap();
+                    match receipt.status {
+                        WireContinuationStatus::Admitted { .. } => break receipt,
+                        WireContinuationStatus::Pending => {
+                            tokio::time::sleep(Duration::from_millis(20)).await
+                        }
+                        _ => panic!("unexpected terminal admission: {receipt:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("native admission");
+            // Native has admitted the input, but the host has not committed its ack.
+            assert_eq!(
+                binding.open().unwrap().pending(1).unwrap(),
+                vec![saved.clone()]
+            );
+            let mut conflict = saved.clone();
+            conflict.envelope.content.push_str(" changed");
+            assert!(
+                registry
+                    .deliver_repo_kapellmeister_signal(&scope, &conflict)
+                    .await
+                    .is_err(),
+                "the same key cannot commit changed content"
+            );
+            if exit_before_ack {
+                let path = root.join("native-admission.json");
+                let file = std::fs::File::create(path).unwrap();
+                serde_json::to_writer(&file, &accepted).unwrap();
+                file.sync_all().unwrap();
+                std::fs::File::open(root).unwrap().sync_all().unwrap();
+                std::process::exit(0);
+            }
+            registry.shutdown().await.unwrap();
+            // Keep the original admission-to-shutdown timing; only persist this
+            // diagnostic copy after the graceful shutdown under test.
+            std::fs::write(
+                root.join("native-admission.json"),
+                serde_json::to_vec_pretty(&accepted).unwrap(),
+            )
+            .unwrap();
+            drop(registry);
+            accepted
+        };
+        let saved = binding.open().unwrap().pending(1).unwrap().remove(0);
+        let registry =
+            MetaRuntimeRegistry::with_templates(config, BTreeMap::new(), BTreeMap::new())
+                .with_host_signal_binding(binding.clone());
+        let replayed = Arc::new(Mutex::new(None));
+        let progress = binding
+            .drain_pending(std::num::NonZeroU32::MIN, |scope, signal| {
+                let registry = &registry;
+                let replayed = Arc::clone(&replayed);
+                async move {
+                    let receipt = registry
+                        .deliver_repo_kapellmeister_signal(&scope, &signal)
+                        .await
+                        .map_err(crate::error::FugueError::Workspace)?;
+                    *replayed.lock().unwrap() = Some(receipt.clone());
+                    Ok(receipt)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            replayed.lock().unwrap().as_ref(),
+            Some(&accepted),
+            "restart must reuse the original native receipt and input"
+        );
+        std::fs::write(
+            root.join("native-replay.json"),
+            serde_json::to_vec_pretty(&*replayed.lock().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(progress.acknowledged, 1);
+        assert!(binding.open().unwrap().pending(1).unwrap().is_empty());
+        let runtime = registry.runtime().await.unwrap();
+        let session_id = match accepted.status {
+            WireContinuationStatus::Admitted { session_id, .. } => session_id,
+            _ => unreachable!(),
+        };
+        let mut last_history = None;
+        let history_result = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                reconcile_host_signal_fixture(&binding, &registry).await;
+                let history = runtime
+                    .mob_runtime()
+                    .read_session_history(&session_id, 0, None)
+                    .await
+                    .unwrap();
+                let serialized = serde_json::to_string(&history.messages).unwrap();
+                let contains_input = serialized.contains(message);
+                last_history = Some(serialized);
+                if contains_input {
+                    break history;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        std::fs::write(
+            root.join("canonical-history.json"),
+            last_history.as_deref().unwrap_or("null"),
+        )
+        .unwrap();
+        let history = history_result.expect("admitted input in canonical history");
+        assert_eq!(
+            history
+                .messages
+                .iter()
+                .filter(|entry| serde_json::to_string(entry).unwrap().contains(message))
+                .count(),
+            1
+        );
+        let mut wrong_scope = scope;
+        wrong_scope.mob_id = "other-repository".into();
+        assert!(
+            registry
+                .deliver_repo_kapellmeister_signal(&wrong_scope, &saved)
+                .await
+                .is_err()
+        );
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn runtime_members_emit_canonical_structural_events() {
         if !isolated_runtime_test("runtime_members_emit_canonical_structural_events") {
             return;
         }
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-        let temp = tempfile::tempdir().expect("tempdir");
+        let directory = match std::env::var_os("FUGUE_TEST_EVIDENCE_DIR") {
+            Some(parent) => tempfile::Builder::new()
+                .prefix("runtime-")
+                .tempdir_in(parent),
+            None => tempfile::tempdir(),
+        }
+        .expect("runtime evidence directory");
+        let evidence = RuntimeFailureEvidence(Some(directory));
+        let temp = evidence.0.as_ref().expect("runtime evidence owner");
         let registry = MetaRuntimeRegistry::with_templates(
             test_meerkat_config(temp.path().join("state")),
             BTreeMap::new(),
@@ -4921,6 +6595,130 @@ mod tests {
     }
 
     #[test]
+    fn launch_failure_restart_listing_reads_past_first_page_and_keeps_terminal_evidence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = MetaRuntimeRegistry::new(test_meerkat_config(temp.path().join("state")));
+        let plan = launch_plan();
+        let jobs = (0..205)
+            .map(|index| {
+                let run_id = MobRunId(format!("run-{index:03}"));
+                let mut run = meta_runtime_run_snapshot_from_plan(&run_id, &plan, Utc::now());
+                run.status = if index == 204 {
+                    MobRunStatus::Succeeded
+                } else {
+                    MobRunStatus::Failed
+                };
+                (
+                    run_id.0,
+                    FugueMobJob::new(run, member_identities_for_plan(&plan)),
+                )
+            })
+            .collect();
+        registry.persist_jobs(&jobs).expect("persist pages");
+        let host = MetaRuntimeNativeMobExecutionHost::from_registry(registry);
+        let runs = crate::orchestrator::list_native_runs_for_restart(&host).expect("all pages");
+        assert_eq!(runs.len(), 205);
+        assert_eq!(runs.last().expect("last page").run_id.0, "run-204");
+        assert_eq!(
+            runs.last().expect("terminal evidence").status,
+            MobRunStatus::Succeeded
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_failure_from_async_admission_is_inspectable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = test_meerkat_config(temp.path().join("state"));
+        config.repository_runtime = Some(crate::config::RepositoryRuntimeBinding {
+            repository: crate::ensemble::config::RepoId::try_from("not-attached".to_owned())
+                .expect("repo id"),
+            state_path: temp.path().join("state"),
+        });
+        let registry = MetaRuntimeRegistry::new(config);
+        let host = MetaRuntimeNativeMobExecutionHost::from_registry(registry.clone());
+        let plan = launch_plan();
+        let run_id = MobRunId(plan.input.idempotency_key.0.clone());
+        assert!(matches!(
+            host.spawn_or_resume_plan(plan),
+            FugueToolResult::Ok { .. }
+        ));
+        let failure = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let FugueToolResult::Ok {
+                    output: FugueToolOutput::MobInspectRun(output),
+                    ..
+                } = host.status(InspectRunInput {
+                    run_id: run_id.clone(),
+                }) && let Some(failure) = output.launch_failure
+                {
+                    assert_eq!(output.run.status, MobRunStatus::Failed);
+                    break failure;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("async failure should be published");
+        assert_eq!(
+            failure.message,
+            "Repository formation has not attached its shared mob yet"
+        );
+        assert!(
+            registry.runtime.lock().await.is_none(),
+            "no replacement runtime"
+        );
+    }
+
+    #[test]
+    fn launch_failure_write_error_preserves_last_durable_status() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = test_meerkat_config(temp.path().join("state"));
+        let (host, run_id) = persisted_failure_test_host(config.clone());
+        let db = rusqlite::Connection::open(host.registry.state_path().join("fugue-runs.sqlite3"))
+            .expect("store");
+        db.execute_batch("CREATE TRIGGER reject_update BEFORE DELETE ON fugue_runs BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").expect("inject failure");
+        assert!(
+            host.set_launch_failure(&run_id, "wiring failed".to_owned())
+                .is_err()
+        );
+        let job = host.registry.jobs.lock().expect("jobs")[&run_id.0].clone();
+        assert_eq!(job.run.status, MobRunStatus::Running);
+        assert!(job.launch_failure.is_none());
+        let restarted = MetaRuntimeRegistry::new(config);
+        restarted.restore_jobs().expect("restore");
+        assert!(
+            restarted.jobs.lock().expect("jobs")[&run_id.0]
+                .launch_failure
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn launch_failure_survives_restart_with_its_original_detail() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = test_meerkat_config(temp.path().join("state"));
+        let (host, run_id) = persisted_failure_test_host(config.clone());
+        let detail = "wire planner -> specialist: wire requires comms runtime";
+        host.set_launch_failure(&run_id, detail.to_owned())
+            .expect("persist failure");
+        let restarted =
+            MetaRuntimeNativeMobExecutionHost::from_registry(MetaRuntimeRegistry::new(config));
+        let FugueToolResult::Ok {
+            output: FugueToolOutput::MobInspectRun(output),
+            ..
+        } = restarted.status(InspectRunInput { run_id })
+        else {
+            panic!("inspect restored run")
+        };
+        assert_eq!(output.run.status, MobRunStatus::Failed);
+        let failure = output
+            .launch_failure
+            .expect("admission error must remain inspectable");
+        assert_eq!(failure.message, detail);
+        assert_eq!(output.run.completed_at, Some(failure.occurred_at));
+    }
+
+    #[test]
     fn member_failure_notification_is_durable_before_return_and_deduplicated_after_restart() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config = test_meerkat_config(temp.path().join("state"));
@@ -5017,6 +6815,7 @@ mod tests {
             Arc::new(StaticToolDispatcher::with_tool("linear_inspect_issue")),
             false,
             false,
+            None,
         )
         .expect("dispatcher");
         let names = tools.tools();

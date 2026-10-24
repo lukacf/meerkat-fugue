@@ -1,21 +1,19 @@
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+#[cfg(test)]
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
-use tokio::process::Command;
-use tokio::time;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::config::OtaUpdateConfig;
 use crate::error::{FugueError, Result};
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OtaUpdateStatus {
     Succeeded,
@@ -23,7 +21,7 @@ pub enum OtaUpdateStatus {
     Disabled,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OtaUpdateStep {
     pub name: String,
     pub command: String,
@@ -32,8 +30,10 @@ pub struct OtaUpdateStep {
     pub stderr_excerpt: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OtaUpdateReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_attempt: Option<String>,
     pub status: OtaUpdateStatus,
     pub branch: String,
     pub remote: String,
@@ -48,9 +48,24 @@ pub struct OtaUpdateReport {
 }
 
 pub async fn run_ota_update(config: &OtaUpdateConfig) -> Result<OtaUpdateReport> {
+    run_ota_update_target(config, None).await
+}
+
+pub(crate) async fn run_ota_update_for_revision(
+    config: &OtaUpdateConfig,
+    expected: &crate::tools::GitSha,
+) -> Result<OtaUpdateReport> {
+    run_ota_update_target(config, Some(expected)).await
+}
+
+async fn run_ota_update_target(
+    config: &OtaUpdateConfig,
+    expected: Option<&crate::tools::GitSha>,
+) -> Result<OtaUpdateReport> {
     let started_at = Utc::now();
     if !config.enabled {
         return Ok(OtaUpdateReport {
+            deployment_attempt: None,
             status: OtaUpdateStatus::Disabled,
             branch: config.branch.clone(),
             remote: config.remote.clone(),
@@ -67,10 +82,13 @@ pub async fn run_ota_update(config: &OtaUpdateConfig) -> Result<OtaUpdateReport>
 
     let repo_path = canonical_repo_path(&config.repo_path)?;
     ensure_git_repo(&repo_path)?;
-    let lock_path = config
-        .lock_path
-        .clone()
-        .unwrap_or_else(|| repo_path.join(".fugue-ota-update.lock"));
+    let lock_path = config.lock_path.clone().unwrap_or_else(|| {
+        let identity = Sha256::digest(repo_path.as_os_str().as_encoded_bytes());
+        repo_path
+            .parent()
+            .unwrap_or(&repo_path)
+            .join(format!(".fugue-ota-{identity:x}.lock"))
+    });
     let lock = match OtaUpdateLock::acquire(&lock_path) {
         Ok(lock) => lock,
         Err(OtaUpdateLockError::Busy) => {
@@ -82,7 +100,7 @@ pub async fn run_ota_update(config: &OtaUpdateConfig) -> Result<OtaUpdateReport>
                 Vec::new(),
                 OtaUpdateStatus::Failed,
                 &format!(
-                    "another OTA update is already running; lock file exists at {}",
+                    "another OTA update is already running; process lease is held at {}",
                     lock_path.display()
                 ),
                 None,
@@ -97,7 +115,7 @@ pub async fn run_ota_update(config: &OtaUpdateConfig) -> Result<OtaUpdateReport>
         }
     };
 
-    let result = run_ota_update_locked(config, &repo_path, started_at).await;
+    let result = run_ota_update_locked(config, &repo_path, started_at, expected).await;
     drop(lock);
     result
 }
@@ -106,6 +124,7 @@ async fn run_ota_update_locked(
     config: &OtaUpdateConfig,
     repo_path: &Path,
     started_at: DateTime<Utc>,
+    expected: Option<&crate::tools::GitSha>,
 ) -> Result<OtaUpdateReport> {
     let mut steps = Vec::new();
     let timeout = Duration::from_millis(config.timeout_ms);
@@ -239,6 +258,20 @@ async fn run_ota_update_locked(
             fetched_sha,
         ));
     };
+
+    if expected.is_some_and(|expected| expected.0 != target_sha) {
+        return Ok(report(
+            config,
+            repo_path,
+            None,
+            started_at,
+            steps,
+            OtaUpdateStatus::Failed,
+            "the fetched branch no longer matches the expected merge revision; no build or deployment was started",
+            previous_sha,
+            fetched_sha,
+        ));
+    }
 
     let staging = staging_path_for(repo_path);
     staging_path = Some(staging.clone());
@@ -401,6 +434,7 @@ fn report(
     fetched_sha: Option<String>,
 ) -> OtaUpdateReport {
     OtaUpdateReport {
+        deployment_attempt: None,
         status,
         branch: config.branch.clone(),
         remote: config.remote.clone(),
@@ -437,16 +471,10 @@ async fn command_output(
 ) -> Result<String> {
     let command_display = display_command(program, args);
     let mut child = Command::new(program);
-    child
-        .args(args)
-        .current_dir(cwd)
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    child.args(args).current_dir(cwd);
     for (key, value) in envs {
         child.env(key, value);
     }
-    configure_child_process_group(&mut child);
     run_child(child, command_display, timeout, steps, name).await
 }
 
@@ -459,58 +487,32 @@ async fn shell_output(
     name: &str,
 ) -> Result<String> {
     let mut child = Command::new("sh");
-    child
-        .arg("-lc")
-        .arg(command)
-        .current_dir(cwd)
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    child.arg("-lc").arg(command).current_dir(cwd);
     for (key, value) in envs {
         child.env(key, value);
     }
-    configure_child_process_group(&mut child);
     run_child(child, command.to_string(), timeout, steps, name).await
 }
 
-#[cfg(unix)]
-fn configure_child_process_group(child: &mut Command) {
-    child.as_std_mut().process_group(0);
-}
-
-#[cfg(not(unix))]
-fn configure_child_process_group(_child: &mut Command) {}
-
 async fn run_child(
-    mut child: Command,
+    child: Command,
     command_display: String,
     timeout: Duration,
     steps: &mut Vec<OtaUpdateStep>,
     name: &str,
 ) -> Result<String> {
-    let child = child
-        .spawn()
-        .map_err(|err| FugueError::HookFailed(format!("ota_update {name}: spawn failed: {err}")))?;
-    let mut cleanup = ChildCleanup::new(child.id());
-    let output = match time::timeout(timeout, child.wait_with_output()).await {
-        Ok(result) => {
-            cleanup.disarm();
-            result.map_err(|err| {
-                FugueError::HookFailed(format!("ota_update {name}: wait failed: {err}"))
-            })?
-        }
-        Err(_) => {
+    let output = match crate::process::run_async(child, timeout).await {
+        Ok(output) => output,
+        Err(error) => {
             steps.push(OtaUpdateStep {
                 name: name.to_string(),
                 command: command_display,
                 exit_code: None,
                 stdout_excerpt: String::new(),
-                stderr_excerpt: format!("timed out after {} ms", timeout.as_millis()),
+                stderr_excerpt: error.to_string(),
             });
-            cleanup.kill_now();
             return Err(FugueError::HookFailed(format!(
-                "ota_update {name}: timed out after {} ms",
-                timeout.as_millis()
+                "ota_update {name}: {error}"
             )));
         }
     };
@@ -531,47 +533,6 @@ async fn run_child(
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
-
-struct ChildCleanup {
-    pid: Option<u32>,
-}
-
-impl ChildCleanup {
-    fn new(pid: Option<u32>) -> Self {
-        Self { pid }
-    }
-
-    fn disarm(&mut self) {
-        self.pid = None;
-    }
-
-    fn kill_now(&mut self) {
-        kill_child_tree(self.pid);
-        self.pid = None;
-    }
-}
-
-impl Drop for ChildCleanup {
-    fn drop(&mut self) {
-        kill_child_tree(self.pid);
-    }
-}
-
-#[cfg(unix)]
-fn kill_child_tree(pid: Option<u32>) {
-    let Some(pid) = pid else {
-        return;
-    };
-    let pgid = format!("-{pid}");
-    let _ = std::process::Command::new("kill")
-        .args(["-TERM", "--", &pgid])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(not(unix))]
-fn kill_child_tree(_pid: Option<u32>) {}
 
 async fn cleanup_staging(
     repo_path: &Path,
@@ -694,7 +655,7 @@ fn staging_path_for(repo_path: &Path) -> PathBuf {
 }
 
 struct OtaUpdateLock {
-    path: PathBuf,
+    _lease: crate::file_lease::FileLease,
 }
 
 impl OtaUpdateLock {
@@ -702,17 +663,22 @@ impl OtaUpdateLock {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(OtaUpdateLockError::Io)?;
         }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|err| {
-                if err.kind() == ErrorKind::AlreadyExists {
-                    OtaUpdateLockError::Busy
-                } else {
-                    OtaUpdateLockError::Io(err)
-                }
-            })?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path).map_err(OtaUpdateLockError::Io)?;
+        let lease = crate::file_lease::FileLease::acquire(
+            file.try_clone().map_err(OtaUpdateLockError::Io)?,
+        )
+        .map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => OtaUpdateLockError::Busy,
+            std::fs::TryLockError::Error(error) => OtaUpdateLockError::Io(error),
+        })?;
+        file.set_len(0).map_err(OtaUpdateLockError::Io)?;
         writeln!(
             file,
             "pid={} acquired_at={}",
@@ -720,15 +686,7 @@ impl OtaUpdateLock {
             Utc::now()
         )
         .map_err(OtaUpdateLockError::Io)?;
-        Ok(Self {
-            path: path.to_path_buf(),
-        })
-    }
-}
-
-impl Drop for OtaUpdateLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        Ok(Self { _lease: lease })
     }
 }
 
@@ -849,6 +807,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revision_mismatch_stops_before_build_or_deploy() {
+        let fixture = ota_fixture();
+        let config = base_config(&fixture);
+        let old = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&fixture.live)
+            .output()
+            .unwrap();
+        assert!(old.status.success());
+        let expected = crate::tools::GitSha(String::from_utf8(old.stdout).unwrap().trim().into());
+        let report = run_ota_update_for_revision(&config, &expected)
+            .await
+            .unwrap();
+        assert_eq!(report.status, OtaUpdateStatus::Failed);
+        assert!(report.message.contains("expected merge revision"));
+        assert!(!report.steps.iter().any(|step| matches!(
+            step.name.as_str(),
+            "build" | "deploy" | "create_staging_worktree"
+        )));
+        assert!(!fixture.deployed.exists());
+        assert_eq!(
+            fs::read_to_string(fixture.live.join("version.txt")).unwrap(),
+            "one"
+        );
+        assert!(OtaUpdateLock::acquire(&fixture.lock_path).is_ok());
+    }
+
+    #[tokio::test]
     async fn ota_update_builds_staging_and_runs_deploy_command() {
         let fixture = ota_fixture();
         let config = base_config(&fixture);
@@ -880,9 +866,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn issue_deployment_replays_durable_receipt_without_running_the_command_again() {
+        let fixture = ota_fixture();
+        let mut ota = base_config(&fixture);
+        ota.deploy_command = format!(
+            "printf 'deployed\\n' >> {}",
+            shell_quote(&fixture.deployed.display().to_string())
+        );
+        let mut config = crate::config::ServiceConfig::from_definition(fixture._temp.path().join("fugue.yaml"),
+            &crate::config::WorkflowDefinition {
+                config: serde_json::json!({"tracker":{"kind":"fugue-ims", "endpoint":fixture._temp.path().join("issues.sqlite3"),"project_slug":"example/app"}}).as_object().unwrap().clone(), prompt_template:"test".into(),
+            }).unwrap();
+        config.ota_update = Some(ota);
+        config.meerkat.state_root = Some(fixture._temp.path().join("state"));
+        crate::fugue_ims::create_issue_for_config(
+            &config.tracker,
+            crate::fugue_ims::CreateFugueIssue {
+                key: crate::ims::ImsIssueKey("TEST-1".into()),
+                repo: "example/app".into(),
+                title: "Deploy receipt fixture".into(),
+                description: None,
+                stage: crate::ims::ImsStageName("Deploy".into()),
+                labels: Vec::new(),
+            },
+        )
+        .unwrap();
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(fixture._temp.path().join("seed"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let merged = crate::tools::GitSha(String::from_utf8(output.stdout).unwrap().trim().into());
+        let mut request: crate::deploy_gate::DeployStartRequest = serde_json::from_value(serde_json::json!({
+            "issue":{"kind":"identifier","identifier":"TEST-1"},
+            "pull_request":{"repo":{"owner":"example","name":"app"}, "number":1, "title":"Deploy", "url":"https://github.com/example/app/pull/1", "state":"merged", "draft":false,"head_branch":"feature","base_branch":"main","head_sha":"a".repeat(40)},
+            "recorded_head_sha":"a".repeat(40), "ci_status":"success", "unresolved_workgraph_blockers":0,"idempotency_key":"deploy-1"
+        })).unwrap();
+        let first = crate::deployment_receipts::run(&config, &request, &merged)
+            .await
+            .unwrap()
+            .outcome
+            .unwrap();
+        assert_eq!(first.status, OtaUpdateStatus::Succeeded);
+        assert_eq!(first.fetched_sha.as_deref(), Some(merged.0.as_str()));
+        for key in ["deploy-1", "different-key"] {
+            request.idempotency_key.0 = key.into();
+            let repeated = crate::deployment_receipts::run(&config, &request, &merged)
+                .await
+                .unwrap()
+                .outcome
+                .unwrap();
+            assert_eq!(repeated, first);
+        }
+        assert_eq!(fs::read_to_string(&fixture.deployed).unwrap(), "deployed\n");
+        request.idempotency_key.0 = "operator-retry".into();
+        request.retry_deployment = Some(crate::DeploymentRetry {
+            attempt_id: first.deployment_attempt.clone().unwrap(),
+            reason: "Operator inspected the service and explicitly requested another deployment"
+                .into(),
+        });
+        let retried = crate::deployment_receipts::run(&config, &request, &merged)
+            .await
+            .unwrap()
+            .outcome
+            .unwrap();
+        assert_ne!(retried.deployment_attempt, first.deployment_attempt);
+        assert_eq!(
+            crate::deployment_receipts::run(&config, &request, &merged)
+                .await
+                .unwrap()
+                .outcome
+                .unwrap(),
+            retried
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.deployed).unwrap(),
+            "deployed\ndeployed\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.live.join("version.txt")).unwrap(),
+            "one"
+        );
+    }
+
+    #[tokio::test]
+    async fn ota_update_lock_recovery_handles_stale_files_and_default_clean_checkout() {
+        for use_default in [false, true] {
+            let fixture = ota_fixture();
+            let mut config = base_config(&fixture);
+            if use_default {
+                config.lock_path = None;
+            } else {
+                fs::write(&fixture.lock_path, "pid=old-process").unwrap();
+            }
+            let result = run_ota_update(&config).await.unwrap();
+            assert_eq!(
+                result.status,
+                OtaUpdateStatus::Succeeded,
+                "{}",
+                result.message
+            );
+            assert_eq!(fs::read_to_string(&fixture.deployed).unwrap(), "two");
+        }
+    }
+
+    #[tokio::test]
     async fn ota_update_rejects_concurrent_lock() {
         let fixture = ota_fixture();
-        fs::write(&fixture.lock_path, "busy").unwrap();
+        let _owner = OtaUpdateLock::acquire(&fixture.lock_path)
+            .unwrap_or_else(|_| panic!("acquire fixture lease"));
         let config = base_config(&fixture);
 
         let report = run_ota_update(&config).await.unwrap();
@@ -973,6 +1066,55 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("timed out waiting for pid file {}", path.display());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ota_timeout_and_cancellation_stop_term_resistant_late_effects() {
+        for cancel in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let ready = temp.path().join("ready.pid");
+            let effect = temp.path().join("late-effect");
+            let command = format!(
+                "sh -c 'trap \"\" TERM; echo $$ > \"$1\"; sleep 1; echo leaked > \"$2\"' helper {} {} & wait",
+                shell_quote(&ready.display().to_string()),
+                shell_quote(&effect.display().to_string())
+            );
+            let cwd = temp.path().to_owned();
+            let task = tokio::spawn(async move {
+                shell_output(
+                    &cwd,
+                    &command,
+                    if cancel {
+                        Duration::from_secs(30)
+                    } else {
+                        Duration::from_millis(300)
+                    },
+                    &[],
+                    &mut Vec::new(),
+                    "resistant_child",
+                )
+                .await
+            });
+            wait_for_pid_file(&ready).await;
+            if cancel {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(
+                    task.await
+                        .unwrap()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("timed out")
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            assert!(
+                !effect.exists(),
+                "cleanup must finish before operation ownership is released (cancel={cancel})"
+            );
+        }
     }
 
     #[cfg(unix)]

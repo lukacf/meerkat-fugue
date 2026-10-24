@@ -8,6 +8,20 @@ use crate::tools::{
 
 pub const INDEPENDENT_REVIEW_SCHEMA_VERSION: &str = "fugue.review.v1";
 
+/// HTTP success alone does not establish that the host accepted a completion.
+/// This decodes only the acknowledgement, not the host's review evidence.
+pub(crate) fn completion_acknowledged(body: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Response {
+        result: Acceptance,
+    }
+    #[derive(Deserialize)]
+    struct Acceptance {
+        accepted: bool,
+    }
+    serde_json::from_str::<Response>(body).is_ok_and(|response| response.result.accepted)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndependentReviewVerdict {
@@ -30,6 +44,42 @@ pub struct IndependentReviewStartRequest {
     pub orchestrator_profile: String,
 }
 
+/// The caller selects members, not a review request identity or verdict. The
+/// host resolves the candidate and atomically creates the current request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndependentReviewAdmissionRequest {
+    pub issue: LinearIssueRef,
+    pub repo: crate::tools::GitHubRepoRef,
+    pub pull_request: crate::tools::GitHubPullRequestNumber,
+    pub head_sha: GitSha,
+    pub reviewers: meerkat_mob::FlowRoleTargets,
+    pub task: String,
+    pub idempotency_key: IdempotencyKey,
+    #[serde(default)]
+    pub supersedes: Option<String>,
+}
+
+pub fn independent_review_admission_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "issue": {"type":"object", "description":"Configured tracker issue reference: kind id with id, or kind identifier with identifier."},
+            "repo": {"type":"object", "properties":{"host":{"type":"string"}, "owner":{"type":"string"}, "name":{"type":"string"}}, "required":["owner","name"], "additionalProperties":false},
+            "pull_request": {"type":"integer", "minimum":1},
+            "head_sha": {"type":"string", "description":"Expected immutable PR head; host rechecks it."},
+            "reviewers": {"type":"object", "minProperties":1,
+                "description":"Map existing native profile names to selected existing specialist identities. Use the repository specialist directory and native roster. Never create replacement reviewers.",
+                "additionalProperties":{"type":"array", "minItems":1, "uniqueItems":true, "items":{"type":"string", "minLength":1}}},
+            "task": {"type":"string", "minLength":1},
+            "idempotency_key": {"type":"string", "minLength":1, "description":"Reuse the same key and unchanged assignment after an uncertain response."},
+            "supersedes": {"type":["string","null"], "description":"Current request ID to replace explicitly. Omit only when no request exists."}
+        },
+        "required":["issue","repo","pull_request","head_sha","reviewers","task","idempotency_key"],
+        "additionalProperties":false
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndependentReviewCompletionRequest {
@@ -37,11 +87,23 @@ pub struct IndependentReviewCompletionRequest {
     pub pull_request: GitHubPullRequestSnapshot,
     pub head_sha: GitSha,
     pub workgraph_scope: IndependentReviewWorkGraphScope,
-    #[serde(default)]
-    pub verdicts: Vec<IndependentReviewVerdict>,
-    #[serde(default)]
-    pub timed_out: bool,
+    pub native_review: crate::native_review::ReviewReference,
     pub idempotency_key: IdempotencyKey,
+}
+
+impl IndependentReviewCompletionRequest {
+    pub fn validate(&self) -> Result<(), IndependentReviewVerdictError> {
+        self.workgraph_scope.validate()?;
+        if self.head_sha.0.trim().is_empty() || self.pull_request.head_sha != self.head_sha {
+            return Err(IndependentReviewVerdictError::MismatchedHead);
+        }
+        if self.native_review.runs.is_empty() {
+            return Err(IndependentReviewVerdictError::MissingField(
+                "native_review.runs",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +114,22 @@ pub struct IndependentReviewWorkGraphScope {
 }
 
 impl IndependentReviewWorkGraphScope {
+    pub fn validate_for_mob(&self, mob_id: &str) -> Result<(), IndependentReviewVerdictError> {
+        self.validate()?;
+        let realm = meerkat_core::mob_realm_id(mob_id)
+            .map_err(|error| IndependentReviewVerdictError::InvalidScope(error.to_string()))?;
+        if self.realm_id != realm.as_str()
+            || self.namespace != meerkat::WorkNamespace::default().as_str()
+        {
+            return Err(IndependentReviewVerdictError::InvalidScope(
+                "review obligations must belong to the repository's native mob realm and default namespace".into(),
+            ));
+        }
+        meerkat::WorkNamespace::new(self.namespace.clone())
+            .map_err(|error| IndependentReviewVerdictError::InvalidScope(error.to_string()))?;
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), IndependentReviewVerdictError> {
         if self.realm_id.trim().is_empty() {
             return Err(IndependentReviewVerdictError::MissingField(
@@ -157,11 +235,14 @@ pub enum IndependentReviewVerdictError {
     MissingField(&'static str),
     GreenWithFindings,
     RedWithoutFindings,
+    MismatchedHead,
+    InvalidScope(String),
 }
 
 impl std::fmt::Display for IndependentReviewVerdictError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidScope(message) => write!(formatter, "invalid WorkGraph scope: {message}"),
             Self::UnsupportedSchema { schema_version } => write!(
                 formatter,
                 "unsupported schema_version {schema_version:?}; expected {INDEPENDENT_REVIEW_SCHEMA_VERSION:?}"
@@ -171,6 +252,8 @@ impl std::fmt::Display for IndependentReviewVerdictError {
                 formatter.write_str("green verdict must not include findings")
             }
             Self::RedWithoutFindings => formatter.write_str("red verdict must include findings"),
+            Self::MismatchedHead => formatter
+                .write_str("PR snapshot and every verdict must match the reviewed head SHA"),
         }
     }
 }
@@ -180,115 +263,27 @@ impl std::error::Error for IndependentReviewVerdictError {}
 pub fn independent_review_completion_input_schema() -> Value {
     json!({
         "type": "object",
-        "description": format!(
-            "Typed IndependentReviewCompletionRequest. Every verdict.schema_version must be exactly {:?}.",
-            INDEPENDENT_REVIEW_SCHEMA_VERSION
-        ),
+        "description": "Complete independent review using native flow references. The host reads producer results from durable native records and rechecks the current repository, issue and PR head. Do not submit verdicts or timeout claims.",
         "properties": {
-            "issue": {
-                "type": "object",
-                "description": "Linear issue reference, for example {\"kind\":\"identifier\",\"identifier\":\"LUC-631\"}."
-            },
-            "pull_request": {
-                "type": "object",
-                "description": "GitHubPullRequestSnapshot for the reviewed PR."
-            },
-            "head_sha": {
-                "type": "string",
-                "description": "Exact reviewed PR head SHA."
-            },
+            "issue": {"type": "object", "description": "The repository's tracker issue reference."},
+            "pull_request": {"type": "object", "description": "PR selector and expected snapshot; the host fetches current forge state."},
+            "head_sha": {"type": "string", "description": "Exact reviewed PR head SHA."},
             "workgraph_scope": {
                 "type": "object",
-                "description": "The exact WorkGraph scope used by the independent review mob. Copy realm_id and namespace from the reviewer obligation items you created; Fugue will create red-review blockers in this same scope.",
-                "properties": {
-                    "realm_id": {
-                        "type": "string",
-                        "minLength": 1
-                    },
-                    "namespace": {
-                        "type": "string",
-                        "minLength": 1
-                    }
+                "description": "The repository's native mob realm and default WorkGraph namespace.",
+                "properties": {"realm_id": {"type": "string", "minLength": 1}, "namespace": {"type": "string", "minLength": 1}},
+                "required": ["realm_id", "namespace"], "additionalProperties": false
+            },
+            "native_review": {
+                "type": "object", "properties": {
+                    "runs": {"type": "array", "minItems": 1, "maxItems": 255, "uniqueItems": true,
+                        "items": {"type": "string", "format": "uuid"}}
                 },
-                "required": ["realm_id", "namespace"],
-                "additionalProperties": false
+                "required": ["runs"], "additionalProperties": false
             },
-            "timed_out": {
-                "type": "boolean",
-                "default": false
-            },
-            "idempotency_key": {
-                "type": "string"
-            },
-            "verdicts": {
-                "type": "array",
-                "minItems": 3,
-                "maxItems": 3,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "schema_version": {
-                            "type": "string",
-                            "const": INDEPENDENT_REVIEW_SCHEMA_VERSION
-                        },
-                        "reviewer_id": {"type": "string"},
-                        "focus": {"type": "string"},
-                        "verdict": {
-                            "type": "string",
-                            "enum": ["green", "red", "blocked"]
-                        },
-                        "summary": {"type": "string"},
-                        "findings": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "severity": {
-                                        "type": "string",
-                                        "enum": ["blocker", "major", "minor", "note"]
-                                    },
-                                    "title": {"type": "string"},
-                                    "detail": {"type": "string"},
-                                    "file": {"type": "string"},
-                                    "line": {"type": "integer", "minimum": 1}
-                                },
-                                "required": ["severity", "title", "detail"],
-                                "additionalProperties": false
-                            }
-                        },
-                        "evidence": {
-                            "type": "object",
-                            "properties": {
-                                "base": {"type": "string"},
-                                "head_sha": {"type": "string"},
-                                "commands": {"type": "array", "items": {"type": "string"}},
-                                "checked_paths": {"type": "array", "items": {"type": "string"}}
-                            },
-                            "required": ["base", "head_sha"],
-                            "additionalProperties": false
-                        }
-                    },
-                    "required": [
-                        "schema_version",
-                        "reviewer_id",
-                        "focus",
-                        "verdict",
-                        "summary",
-                        "evidence"
-                    ],
-                    "additionalProperties": false
-                }
-            }
+            "idempotency_key": {"type": "string"}
         },
-        "required": [
-            "issue",
-            "pull_request",
-            "head_sha",
-            "workgraph_scope",
-            "verdicts",
-            "timed_out",
-            "idempotency_key"
-        ],
+        "required": ["issue", "pull_request", "head_sha", "workgraph_scope", "native_review", "idempotency_key"],
         "additionalProperties": false
     })
 }
@@ -331,6 +326,24 @@ pub fn aggregate_independent_review(
     input: IndependentReviewAggregationInput,
 ) -> IndependentReviewAggregationPlan {
     let required = usize::from(input.config.reviewer_count);
+    if let Some(reason) = input.verdicts.iter().find_map(|verdict| {
+        verdict
+            .validate()
+            .err()
+            .map(|error| error.to_string())
+            .or_else(|| {
+                (verdict.evidence.head_sha != input.head_sha)
+                    .then(|| IndependentReviewVerdictError::MismatchedHead.to_string())
+            })
+    }) {
+        return IndependentReviewAggregationPlan {
+            decision: IndependentReviewDecision::Blocked,
+            target_lane: Some(input.config.blocked_lane),
+            consolidated_comment: None,
+            workgraph_items: Vec::new(),
+            reasons: vec![reason],
+        };
+    }
     let distinct_reviewer_ids = distinct_reviewer_ids(&input.verdicts);
     if distinct_reviewer_ids.len() < input.verdicts.len() {
         return IndependentReviewAggregationPlan {
@@ -566,20 +579,16 @@ mod tests {
     }
 
     #[test]
-    fn independent_review_completion_schema_exposes_exact_verdict_schema() {
+    fn independent_review_completion_schema_accepts_references_not_verdicts() {
         let schema = independent_review_completion_input_schema();
-
-        assert_eq!(
-            schema
-                .pointer("/properties/verdicts/items/properties/schema_version/const")
-                .and_then(Value::as_str),
-            Some(INDEPENDENT_REVIEW_SCHEMA_VERSION)
-        );
+        assert!(schema.pointer("/properties/verdicts").is_none());
+        assert!(schema.pointer("/properties/timed_out").is_none());
+        assert_eq!(schema["additionalProperties"], false);
         assert!(
             schema
-                .pointer("/description")
-                .and_then(Value::as_str)
-                .is_some_and(|description| description.contains(INDEPENDENT_REVIEW_SCHEMA_VERSION))
+                .pointer("/required")
+                .and_then(Value::as_array)
+                .is_some_and(|required| required.iter().any(|value| value == "native_review"))
         );
         assert_eq!(
             schema
@@ -592,6 +601,22 @@ mod tests {
                 .pointer("/required")
                 .and_then(Value::as_array)
                 .is_some_and(|required| required.iter().any(|value| value == "workgraph_scope"))
+        );
+    }
+
+    #[test]
+    fn completion_schema_accepts_four_distinct_profile_runs() {
+        let schema = independent_review_completion_input_schema();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let input = json!({
+            "issue": {"kind":"id", "id":"10001"}, "pull_request": {},
+            "head_sha":"a".repeat(40), "idempotency_key":"four-profiles",
+            "workgraph_scope":{"realm_id":"repository", "namespace":"default"},
+            "native_review":{"runs":(1..=4).map(uuid::Uuid::from_u128).collect::<Vec<_>>()}
+        });
+        assert!(
+            validator.is_valid(&input),
+            "four configured profiles need four native run references"
         );
     }
 
@@ -615,6 +640,19 @@ mod tests {
 
         assert_eq!(plan.decision, IndependentReviewDecision::Success);
         assert_eq!(plan.target_lane.as_deref(), Some("Ready for review"));
+    }
+
+    #[test]
+    fn independent_review_cannot_approve_a_different_commit() {
+        let mut second = green_verdict();
+        second.reviewer_id = "product".into();
+        second.evidence.head_sha = GitSha("previous-head".into());
+        let mut third = green_verdict();
+        third.reviewer_id = "ops".into();
+        let plan =
+            aggregate_independent_review(aggregation_input(vec![green_verdict(), second, third]));
+        assert_eq!(plan.decision, IndependentReviewDecision::Blocked);
+        assert!(plan.reasons.iter().any(|reason| reason.contains("head")));
     }
 
     #[test]

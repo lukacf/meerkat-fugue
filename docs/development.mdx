@@ -1,13 +1,59 @@
-# Development guide
+---
+title: "Development and testing"
+description: "Run the right local checks, test upgrade failures, and distinguish fixture coverage from hosted acceptance."
+---
 
-This guide covers local validation, coding rules, documentation changes, and the
-ignored real E2E suite.
+# Development and testing
 
-## Safe validation
+Use the smallest relevant test while fixing a bug, then run the checks for the
+surfaces you changed. Keep the regression focused on the failed behavior.
+Do not rerun an unchanged release build to obtain a second copy of its result.
 
-Run before opening a PR:
+## Local setup
 
-```bash
+The checkout pins Rust in `rust-toolchain.toml`. Browser tests use Node.js 22,
+the locked npm dependencies and Playwright Chromium. Release and installer
+tests use Python 3 on Linux or macOS, plus `lsof` for the release safeguards.
+Publication scans and their delivery regressions also require ripgrep (`rg`).
+Install it before running those checks, for example `brew install ripgrep` on
+macOS or `sudo apt-get install ripgrep` on Ubuntu. Both CI jobs install it
+explicitly; a missing search tool is a failed scan, not a clean result.
+The process-group harness also requires Python's `os.waitid` and `os.WNOWAIT`;
+it reports skips when those are unavailable. Check the test summaries: a zero
+command exit with skipped cases does not qualify those checks. Use a compatible
+Python on your PATH and rerun the skipped suite before reporting it as passed.
+
+```sh
+npm ci
+npx playwright install chromium
+```
+
+On a Linux CI host, use `npx playwright install --with-deps chromium` to also
+install browser system dependencies. No repository, tracker or model credentials
+are needed for the default checks. Keep local state and credentials outside the
+checkout.
+
+## Choose the checks
+
+| Change | Checks |
+| --- | --- |
+| Rust logic, configuration or native runtime integration | Focused Rust regression, then the Rust checks below. |
+| Home, Board, repository setup or navigation | `npm run test:ui`, then inspect the changed screen in a real Fugue instance. |
+| Release tooling or bundle installation | `npm run test:delivery`. Add a failure-injection regression if rollback or validation changed. |
+| Documentation | Verify commands against their implementations, check local links and inspect the rendered Markdown/MDX. |
+| Runtime versions or shipped binaries | Locked build, complete release manifest, matching executable identities, restart checks and fresh hosted acceptance. |
+
+The browser and delivery commands are the same entry points used by
+[CI](../.github/workflows/ci.yml). To run one regression while iterating:
+
+```sh
+python3 -m unittest discover -s scripts/distribution -p 'test_install.py' -v
+npx playwright test tests/welcome.spec.mjs --project=chromium
+```
+
+### Rust checks
+
+```sh
 cargo fmt --check
 cargo check --all-targets --locked
 cargo test --all-targets --locked
@@ -15,76 +61,319 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo run --locked -- --help
 ```
 
-These checks do not create live Linear, GitHub, or Meta resources.
+The normal suite uses temporary local state and fixtures. The destructive live
+test remains ignored. When working alongside another Rust build, give your
+checkout a separate `CARGO_TARGET_DIR`; do not delete another build's target or
+lock files to resolve contention.
 
-## Real E2E suite
+### Native qualification evidence
 
-`tests/real_e2e.rs` is ignored by default because it creates live Linear and
-GitHub resources and runs real Meerkat sessions. Do not run it casually.
+CI separately repeats the native handoff checks five times and the retirement
+check twenty times with four trials in parallel. Every phase writes its log and
+a JSON record from startup. The `native-retirement-evidence` artifact retains
+successful diagnostics, failures and unfinished trials, plus the test
+executable's SHA-256. A zero exit code cannot hide a transcript conflict or an
+empty test selection.
 
-Run it only in an operator-approved disposable environment:
+The artifact also includes the full suite's retirement-test database and child
+process logs under `fugue-full-suite`. Setting `FUGUE_TEST_EVIDENCE_DIR` transfers
+cleanup responsibility to the caller: the test retains its database even on a
+normal exit. The repeat harness removes only its own successful trial's database
+after checking the transcript. Rejected or unfinished trials keep their state.
 
-```bash
-set -a
-source ~/.zshrc
-set +a
+Listings, handoff rounds and retirement trials have individual time limits.
+Timeout or cancellation stops the owned process group, escalating to a kill if
+termination does not finish. The CI step leaves extra time for cleanup and
+artifact upload. A forcibly killed runner can leave `running` records; these
+are incomplete evidence and must never count as qualification.
 
-MEERKAT_FUGUE_REAL_E2E=1 \
-MEERKAT_FUGUE_E2E_POLICY_MODE=native_only \
-MEERKAT_FUGUE_E2E_KEEP_RESOURCES=1 \
-cargo test --test real_e2e -- --ignored --nocapture
+`npm run test:delivery` includes real subprocess regressions for streamed logs,
+outer cancellation, descendant cleanup and termination escalation. These use
+local fixtures and do not establish native runtime recovery or hosted access.
+
+The Rust suite also exercises a ticket reviewer's native `fork_off` from inside
+its running turn, after a completed tool round. It uses the configured reviewer
+profile and actual native runtime with a scripted model: the child receives an
+empty inherited transcript, reads a file from the issue worktree, and returns
+its answer through a persisted completion notice for the admitted job. This
+guards the fork integration contract; it does not prove a model's review quality
+or recovery after a host crash.
+
+The coordinator-notification regressions use the real native keyed admission
+API with a scripted model. They stop after native admission but before the host
+journal acknowledges the input, reopen the same runtime, and verify that retry
+returns the original receipt and produces exactly one native history input.
+Coverage includes graceful shutdown and a child process exiting without native
+shutdown. Separate tests check that saved work drains during tracker backoff and
+missing tracker authentication. These checks establish the local persistence
+contract; hosted restart and model behavior still need live acceptance.
+
+### Browser coverage
+
+`npm run test:ui` starts disposable fixture servers. It covers repository setup,
+search, issue detail, queue selection, navigation and the welcome guide. The
+tests exercise responsive layouts, keyboard behavior and reload state without
+changing a real repository or tracker. Playwright retains traces on failure in
+`test-results/`.
+
+A fixture pass does not establish native streaming, authentication, repository
+cloning or model access. For a console change, also check the real runtime's
+conversation ordering and sends, live updates, team selection, topology, Memory
+and Work Graph. Reload the page and verify that the same state remains visible.
+
+### Installer coverage
+
+`npm run test:delivery` tests release safeguards and installation into temporary
+directories. Test bundles contain small executable fixtures that report build
+identity; they do not start Fugue or contact a cloud service.
+
+Installation tests cover successful install/retry/upgrade, complete checksums,
+archive path and file validation, executable identity, rkat version, concurrent
+install refusal, candidate timeout and failed activation. Failure assertions
+check that both `current` and `previous` remain correct and that a subsequent
+retry succeeds. Keep the existing installation and state as the test's observable
+contract; a mocked successful return alone is not rollback evidence.
+
+## Live acceptance
+
+Use a fresh issue and an explicitly authorized disposable repository/tracker
+scope. Keep a private record of the exact binary and dependency revisions,
+resources created, issue, PR, checks, merge, restart outcome and cleanup. Never
+commit credentials, private hostnames or organization-specific evidence here.
+
+For the browser journey, start from repository onboarding and verify mapping
+creates specialists. Follow a small issue through planning, code, testing,
+independent review and the configured merge action. Confirm the actual merged
+PR and terminal tracker state. A zero exit from the merge command is insufficient:
+verify that GitHub reports the expected head as merged and returns its merge
+commit. Retrying an already merged PR must confirm that evidence without issuing
+another merge command. Repository-scoped MCP calls must reject a different
+repository, and tool aliases must obey the same merge permission.
+
+CI evidence must belong to the exact PR head. The native monitor and final-review
+path read every GraphQL check page, checking the PR head and latest commit on
+each page. Include both check runs and legacy commit statuses in tests. A
+cancelled check alongside a passing check must remain cancelled; an unfinished
+run with a previous success conclusion must remain pending. Missing fields,
+partial GraphQL errors and broken pagination must fail the read, rather than
+activate the configured exception for repositories without CI. GitHub's
+[check result types](https://github.com/cli/cli/blob/trunk/api/queries_pr.go)
+define the two response shapes.
+
+Test login, streaming and restart through the intended hosted gateway. Laptop
+connectivity and local fixtures do not establish that the deployment can reach
+GHE or Jira.
+
+### Tracker-specific acceptance
+
+Run the journey with the tracker intended for the deployment. For Jira, verify
+the configured project's issue creation, assignment, status transitions,
+Workpad comments and final terminal state. Include issue keys and immutable IDs
+in access-boundary checks, and ensure a stale update cannot overwrite a newer
+operator change.
+
+For the built-in tracker, verify issue creation and the full Board workflow,
+then restart and confirm issues and comments persist. Configure a second
+repository using the same database and verify that its board, lookups, comments
+and mutations remain isolated. A passing journey on one tracker does not
+qualify another backend.
+
+Keep Linear's supported path covered and repair known defects even when another
+tracker is the deployment's primary acceptance target. Prioritization determines
+the order of qualification; it does not waive failures.
+
+### Current review request
+
+Review selection belongs to repository authority. Fugue records only the current
+request intent in `review-requests.sqlite3`, alongside the other repository state.
+Native runs retain ownership of dispatch, lifecycle and reviewer verdicts. Include
+the request database in complete state backups.
+
+The review orchestrator selects existing specialists outside the issue's execution
+team and calls `fugue_admit_independent_review`. Admission reserves a server-issued
+request ID before calling native flows. An unchanged idempotency key reuses that
+request after a lost response or restart. Different assignments under the same key
+conflict. Replacing a request requires a new key and the current ID in `supersedes`.
+A retry of an older request must never make it current again.
+
+Verify both native run identity and immutable activation parameters. Copying an
+assignment into an unrelated run must not establish review evidence. Completion
+must use every selected profile's run from the current request, with native
+producer-bound results for the exact issue, repository and PR head. Failed,
+canceled or recovery-canceled runs cannot be replayed into approval; replacement
+needs a new explicit request.
+
+Exercise concurrent first requests, simultaneous retries, explicit replacement,
+stale completion, reviewer alias normalization and a restart between admission
+and response. Final merge must still recheck current review authority, PR head,
+CI and WorkGraph obligations at the irreversible operation.
+
+### Final review uses the same native protocol
+
+The final gate starts one coordinator in the repository mob. It selects existing
+specialists, admits the current review request and submits native run references
+to `fugue_complete_final_pr_gate`. This works with `final_review` enabled even
+when the independent Review action is disabled. The host reads durable native
+results; transient completion events and caller-supplied verdicts cannot approve
+this gate.
+
+Review admission and both merge procedures share the repository allowlist and
+base branch currently stored under `deploy`. Set them even for a review-only
+installation; starting an enabled review procedure with no allowlist is refused.
+The Deploy action itself may remain disabled:
+
+```yaml
+deploy:
+  enabled: false
+  allowed_repositories:
+    - owner: example
+      name: app
+  base_branch: main
+  allow_no_ci_checks: false
 ```
 
-Useful controls include:
+The final gate uses its own merge strategy and CI-required setting. Its explicit
+no-checks exception is `deploy.allow_no_ci_checks`. Repository setup generates
+an enabled independent Review action and the same scoped policy for Jira,
+built-in tickets and Linear.
 
-- `MEERKAT_FUGUE_E2E_LINEAR_TEAM_KEY`
-- `MEERKAT_FUGUE_E2E_GITHUB_OWNER`
-- `MEERKAT_FUGUE_E2E_ISSUE_COUNT`
-- `MEERKAT_FUGUE_E2E_POLICY_MODE`
-- `MEERKAT_FUGUE_E2E_MERGING_STATE`
-- `MEERKAT_FUGUE_E2E_IN_REVIEW_STATE`
-- `MEERKAT_FUGUE_E2E_CREATE_MISSING_LINEAR_STATES`
-- `MEERKAT_FUGUE_E2E_KEEP_RESOURCES`
+Jira can map **Awaiting review** to one existing holding status without needing
+another workflow status. When `linear.lanes.review_ready` equals the enabled
+independent-review lane and no separate `do_review` lane exists, the repository
+coordinator may hand completed work to that status. First-seen and recovered
+observations report pending review to Kapellmeister, which inspects the PR and
+current native review before starting or resuming specialist work. The status
+never grants approval, and a completed current review must not be restarted just
+because a ticket is still awaiting the operator's merge decision. A distinct
+Review action remains protected from direct agent lane mutations.
 
-## Code style
+`final_review.reviewers[].profile` selects an existing native specialist profile
+from the repository roster. Every required entry needs a distinct eligible member;
+two required entries for one profile need two members of that profile. At least
+three distinct specialists must participate. Optional profiles may be omitted,
+and additional eligible specialists may be selected. Missing required coverage
+blocks the gate instead of creating generic replacement reviewers.
 
-Follow `AGENTS.md`:
+Keep the configured manual or automatic trigger and success, rework and blocked
+lanes. Final completion checks profile coverage again and binds its merge to the
+exact completed request. A changed current request, failed CI or active WorkGraph
+blocker cannot project merge success. Confirmed merge evidence is written to the
+Workpad before the terminal tracker update; retrying after an interrupted update
+reads the existing merge without issuing a second merge command.
 
-- prefer typed structs and enums over carrying `serde_json::Value` through the
-  system;
-- return `Result` instead of swallowing mechanism errors;
-- avoid `unwrap()` and `expect()` in library code;
-- prefer allocation-conscious iterators and display helpers;
-- use `slab` for stable keys that survive collection mutation;
-- keep domain models separate from billing and usage metadata;
-- use `IndexMap` when iteration order matters.
+### Merge authority
 
-## Documentation changes
+The configured deploy and final-review paths use the same merge gate. It resolves
+the canonical tracker issue, reads the current native review and checks that all
+selected reviewers approved the exact candidate, including its base branch.
+Changing the head or base invalidates that request, and a producer verdict must
+name the same base. The adapter checks the latest observed base again before
+merge and verifies it in the returned merge evidence. GitHub's merge command
+provides an atomic head check; it does not provide an atomic base-branch check.
+The gate holds the current-request lock while refreshing the PR, checking all
+CI pages, rechecking reviewer eligibility
+and checking native WorkGraph obligations before calling GitHub. Review completion
+holds the same lock while publishing its results, so replacement admission cannot
+race that publication.
 
-Documentation should be operator-actionable:
+The bare GitHub adapter cannot authorize a merge. Standalone `fugue-github-mcp`
+does not advertise `github_merge_pr`, including when a legacy merge permission
+flag is set. Use the configured repository host action, which has access to the
+tracker, native runtime and merge policy.
 
-- state whether commands are safe or destructive;
-- name required credentials and external resources;
-- include rollback or handoff guidance for live operations;
-- keep examples aligned with `fugue.example.yaml`, backend onboarding docs, and CLI help;
-- preserve the native Meta execution model.
+Tests must cover a successful native review-to-merge call as well as failed CI,
+superseded review, missing WorkGraph storage and unresolved native obligations.
+An already merged retry still verifies current authority and actual forge evidence,
+but must not issue a second merge command. A historical Workpad receipt cannot
+skip these checks or authorize a changed request under a reused key.
 
-When changing config fields, update:
+The native review integration test retries the complete merge-only transaction
+after shutting down and reopening the repository runtime and tracker. A persisted
+WorkGraph blocker refuses the retry while preserving the confirmed deployment
+section byte for byte. After explicit native resolution, the same request reads
+the existing merge, restores the success projection, and issues neither another
+merge command nor another review. Forge responses and model output are scripted;
+the native review, WorkGraph and tracker state are real local stores. Hosted
+acceptance must repeat the journey against the intended services.
 
-- `fugue.example.yaml`;
-- `docs/configuration.mdx` and `docs/configuration.md` if the Markdown contract
-  is still referenced by tests;
-- backend/onboarding docs when generated queue shape changes;
-- relevant operator/development docs;
-- tests that assert parsing/default behavior.
+### Deployment recovery
 
-## Branch and PR hygiene
+Issue-driven OTA execution records its attempt in `deployment-receipts.sqlite3`
+before starting commands. The receipt binds the tracker context and immutable
+issue ID, repository, PR head, merge commit and configured procedure. An unchanged
+request replays its recorded result after a lost response or restart. Changing
+only the request key does not rerun a completed or uncertain deployment.
 
-Keep changes focused on the Linear issue. For documentation-only work, prefer a
-single commit that updates MDX docs, README links, and any doc reference tests.
-Run the safe validation set before requesting review.
+An intentional retry needs a new key and `retry_deployment` with the current
+attempt's ID and an explanation of the operator's inspection and authorization.
+The retry uses fresh merge checks and must compare against the current attempt.
+Older requests cannot restore a superseded attempt. Native verdicts remain the
+review authority; these receipts record only external deployment effects.
 
-## Related docs
+The deployment lease remains held through tracker projection. Exercise both a
+lost response after completion and interruption before a result was recorded.
+Verify that simultaneous calls cannot execute or project competing attempts.
+Also test an actual command with observable effects, completed-result replay,
+explicit retry, a changed procedure, corrupt storage and private file permissions.
 
-- [Configuration](./configuration.mdx)
-- [Operations](./operations.mdx)
+OTA must compare the fetched branch revision with the verified merge commit
+before creating a worktree or running build, health-check or deploy commands.
+Moving the branch ahead must refuse execution. The update lock uses a process
+lease: a stale diagnostic file does not own the lock, and the default lock file
+must not make a clean checkout dirty. These local checks do not replace hosted
+installation, recovery and service-health acceptance.
+
+### Opt-in Linear/GitHub harness
+
+`tests/real_e2e.rs` is a separate automated harness. It creates an external Linear
+project and GitHub repository, spends model tokens, opens PRs and merges them
+from the test. It does not verify the UI-only onboarding journey or Jira.
+
+Provide `LINEAR_API_KEY` securely in the process environment, authenticate `gh`
+for the intended account and configure native model access. Set the destination
+explicitly instead of relying on the harness's historical defaults:
+
+```sh
+MEERKAT_FUGUE_REAL_E2E=1 \
+MEERKAT_FUGUE_E2E_LINEAR_TEAM_KEY=YOUR_TEST_TEAM \
+MEERKAT_FUGUE_E2E_GITHUB_OWNER=your-test-account \
+MEERKAT_FUGUE_E2E_POLICY_MODE=native_only \
+MEERKAT_FUGUE_E2E_CREATE_MISSING_LINEAR_STATES=0 \
+MEERKAT_FUGUE_E2E_KEEP_RESOURCES=0 \
+cargo test --locked --test real_e2e -- --ignored --nocapture
+```
+
+Use an existing dedicated test team with the required lanes, or explicitly
+authorize creating missing states there. The harness can delete its project
+and repository during cleanup; team workflow states are shared and must be
+reviewed separately. `KEEP_RESOURCES=1` retains resources for investigation and
+requires later manual cleanup. Check cleanup errors even when the main test
+also failed. Do not source an entire interactive shell startup file to load one
+credential.
+
+Other controls include `MEERKAT_FUGUE_E2E_ISSUE_COUNT`,
+`MEERKAT_FUGUE_E2E_PRIVATE_REPO`, `MEERKAT_FUGUE_E2E_REPO_PREFIX` and
+`MEERKAT_FUGUE_E2E_RKAT_COMMAND`. See
+[the harness](../tests/real_e2e.rs) for lane and timeout overrides.
+
+## Review and documentation
+
+### Documentation changes
+
+Follow [AGENTS.md](../AGENTS.md): use typed boundaries, explicit errors and native
+runtime authority. Review the behavior at its boundary, including failure,
+retry, cancellation and restart. Keep test outputs tied to the source revision
+that produced them; distinguish skipped, failed and unexecuted checks.
+
+Update affected examples and the [configuration reference](./configuration.mdx)
+when changing configuration. Keep one maintained guide for each task and link to
+it from older entry points. Documentation should identify the required access,
+the expected result and how to recover if a step fails.
+
+For optimization, first record a reproducible workload and its timing or
+allocation profile. Compare the same workload before and after the change while
+preserving correctness checks. A smaller function or fewer lines alone does not
+demonstrate a performance improvement.
+
+See [operations](./operations.mdx) for complete state backup and recovery, and
+[release bundles](../scripts/distribution/README.md) for installation behavior.

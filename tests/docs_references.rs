@@ -3,46 +3,47 @@ fn readme_links_to_current_operator_docs() {
     let readme = include_str!("../README.md");
     let operator_guide = include_str!("../docs/operator-guide.md");
 
-    let operations_link = "[Operations](docs/operations.mdx)";
-    let current_operator_heading = "## Rollback";
+    let operations_link = "[Operations and recovery](docs/operations.mdx)";
+    let operations = include_str!("../docs/operations.mdx");
     let removed_stage6_heading = "Stage 6 native-default deployment smoke and rollback";
 
     assert!(readme.contains(operations_link));
-    assert!(operator_guide.contains(current_operator_heading));
+    assert!(operator_guide.contains("operations.mdx"));
+    assert!(operations.contains("## Upgrade and roll back"));
     assert!(!readme.contains(removed_stage6_heading));
 }
 
 #[test]
-fn operator_docs_capture_post_quarantine_mcp_workpad_contract() {
+fn operator_docs_link_to_canonical_tool_and_workpad_contracts() {
     let operator_guide = include_str!("../docs/operator-guide.md");
+    let native_mobs = include_str!("../docs/native-mobs.mdx");
+    let troubleshooting = include_str!("../docs/troubleshooting.mdx");
 
-    assert!(operator_guide.contains("Post-quarantine MCP Workpad contract"));
-    assert!(operator_guide.contains("inputSchema"));
-    assert!(operator_guide.contains("mcp:linear"));
-    assert!(operator_guide.contains("mcp:github"));
-    assert!(operator_guide.contains("planner/coder/reviewer"));
-    assert!(operator_guide.contains("do not call `linear_move_issue`"));
-    assert!(operator_guide.contains("observes Meta flow/member state"));
-    assert!(operator_guide.contains("typed Kapellmeister `move` decision"));
-    assert!(operator_guide.contains("text:\"ok\""));
-    assert!(operator_guide.contains("reviewer records a gate outcome"));
-    assert!(operator_guide.contains("PR/no-PR evidence"));
-    assert!(operator_guide.contains("rkat-rpc ... --tcp"));
-    assert!(operator_guide.contains("mob/flow_run"));
-    assert!(operator_guide.contains("Transport closed"));
-    assert!(operator_guide.contains("missing_tracker_project_slug"));
-    assert!(operator_guide.contains("retry loops"));
-    assert!(operator_guide.contains("stale active rows"));
-    assert!(operator_guide.contains("Unexpected response type"));
+    assert!(operator_guide.contains("native-mobs.mdx"));
+    assert!(operator_guide.contains("troubleshooting.mdx"));
+    for contract in [
+        "inputSchema",
+        "mcp:linear",
+        "mcp:github",
+        "planner/coder/reviewer",
+        "linear_move_issue",
+        "text:\"ok\"",
+    ] {
+        assert!(
+            native_mobs.contains(contract),
+            "native contract should retain {contract}"
+        );
+    }
+    assert!(native_mobs.contains("green reviewer gate"));
+    assert!(troubleshooting.contains("Unexpected response type"));
 }
 
 #[test]
 fn ota_deployment_docs_and_script_install_complete_fugue_binary_set() {
-    let readme = include_str!("../README.md");
+    let bundle_guide = include_str!("../scripts/distribution/README.md");
     let configuration_md = include_str!("../docs/configuration.md");
     let configuration_mdx = include_str!("../docs/configuration.mdx");
     let operations = include_str!("../docs/operations.mdx");
-    let operator_guide = include_str!("../docs/operator-guide.md");
     let example = include_str!("../fugue.example.yaml");
     let ota_script = include_str!("../scripts/gcp-systemd/ota-update.sh");
 
@@ -55,11 +56,10 @@ fn ota_deployment_docs_and_script_install_complete_fugue_binary_set() {
     ];
 
     for (name, doc) in [
-        ("README.md", readme),
+        ("scripts/distribution/README.md", bundle_guide),
         ("docs/configuration.md", configuration_md),
         ("docs/configuration.mdx", configuration_mdx),
         ("docs/operations.mdx", operations),
-        ("docs/operator-guide.md", operator_guide),
         ("fugue.example.yaml", example),
         ("scripts/gcp-systemd/ota-update.sh", ota_script),
     ] {
@@ -68,9 +68,8 @@ fn ota_deployment_docs_and_script_install_complete_fugue_binary_set() {
         }
     }
 
-    assert!(readme.contains("atomically replacing the five binaries"));
-    assert!(operations.contains("Install or restart all five binaries atomically"));
-    assert!(operator_guide.contains("Install or restart all five binaries atomically"));
+    assert!(operations.contains("Install the full\n   bundle atomically"));
+    assert!(operations.contains("matching state snapshot"));
 }
 
 #[test]
@@ -79,7 +78,8 @@ fn operator_docs_capture_workpad_handoff_recovery_safeguards() {
     let native_mobs = include_str!("../docs/native-mobs.mdx");
     let operations = include_str!("../docs/operations.mdx");
 
-    for doc in [operator_guide, native_mobs, operations] {
+    assert!(operator_guide.contains("native-mobs.mdx"));
+    for doc in [native_mobs, operations] {
         assert!(doc.contains("## LUC-123 Workpad"));
         assert!(doc.contains("evidence-rich") || doc.contains("richer handoff evidence"));
         assert!(doc.contains("Meta `Cancelled`"));
@@ -88,9 +88,8 @@ fn operator_docs_capture_workpad_handoff_recovery_safeguards() {
         assert!(doc.contains("PR, check, merge"));
     }
 
-    assert!(operator_guide.contains("Never replace durable PR or"));
     assert!(native_mobs.contains("must not overwrite PR, check, or merge evidence"));
-    assert!(operations.contains("Do not move the Linear issue to a canceled lane"));
+    assert!(operations.contains("does not by itself prove the human"));
 }
 
 #[test]
@@ -99,15 +98,15 @@ fn docs_capture_pr_handoff_idempotency_smoke_guardrails() {
     let native_mobs = include_str!("../docs/native-mobs.mdx");
     let operations = include_str!("../docs/operations.mdx");
 
-    assert!(operator_guide.contains("exactly one issue-specific Workpad"));
-    assert!(operator_guide.contains("generic Fugue Workpad"));
+    assert!(operator_guide.contains("native-mobs.mdx"));
+    assert!(native_mobs.contains("generic Fugue Workpad"));
     assert!(native_mobs.contains("exactly one Workpad for that issue"));
     assert!(native_mobs.contains("branch-scoped CI evidence"));
     assert!(native_mobs.contains("stale SHA-only check"));
     assert!(operations.contains("Exactly one PR exists for the issue branch"));
-    assert!(operations.contains("CI/check evidence is branch-scoped"));
+    assert!(operations.contains("branch-scoped"));
     assert!(operations.contains("merge SHA"));
-    assert!(operations.contains("`Done` handoff"));
+    assert!(operations.contains("terminal tracker projection"));
 }
 
 #[test]
@@ -195,6 +194,7 @@ fn mdx_documentation_set_covers_operator_and_native_execution_topics() {
     for doc in [
         "overview.mdx",
         "getting-started.mdx",
+        "daily-work.mdx",
         "configuration.mdx",
         "native-mobs.mdx",
         "operations.mdx",
@@ -207,19 +207,20 @@ fn mdx_documentation_set_covers_operator_and_native_execution_topics() {
         assert!(navigation.contains(doc), "navigation should link to {doc}");
     }
 
-    assert!(overview.contains("When to use Fugue"));
-    assert!(getting_started.contains("cargo fmt --check"));
-    assert!(getting_started.contains("--port 0"));
+    assert!(overview.contains("## Setup creates the team"));
+    assert!(getting_started.contains("cargo install --locked --path ."));
+    assert!(getting_started.contains("meerkat-fugue serve --port 8788"));
+    assert!(getting_started.contains("Check account access"));
     assert!(configuration.contains("omitted top-level `backend` resolves to `native-execution`"));
     assert!(configuration.contains("mcp:linear"));
     assert!(configuration.contains("native-execution"));
-    assert!(native_mobs.contains("Linear projection model"));
+    assert!(native_mobs.contains("Tracker projection model"));
     assert!(native_mobs.contains("inputSchema"));
     assert!(native_mobs.contains("Projected Lane Ownership"));
     assert!(native_mobs.contains("report lifecycle facts to the issue lead"));
     assert!(native_mobs.contains("linear_move_issue"));
-    assert!(operations.contains("Common incidents"));
-    assert!(operations.contains("Real E2E warning"));
+    assert!(operations.contains("## Recover from an incident"));
+    assert!(operations.contains("## Live acceptance and cleanup"));
     assert!(status_api.contains("/api/v1/state"));
     assert!(status_api.contains("/console"));
     assert!(status_api.contains("Fugue does not implement its own console RPC facade"));

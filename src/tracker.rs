@@ -7,14 +7,64 @@ use futures::StreamExt;
 use reqwest::header::{
     AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION,
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
 use crate::config::TrackerConfig;
 use crate::domain::{BlockerRef, Issue, IssueAttachment};
-use crate::error::{FugueError, Result};
+use crate::error::{FugueError, LinearGraphqlFailure, Result};
 
 const LINEAR_ISSUE_STATES_PAGE_SIZE: usize = 50;
+
+#[derive(Deserialize)]
+struct GraphqlProviderError {
+    message: Option<String>,
+    extensions: Option<GraphqlErrorExtensions>,
+}
+
+#[derive(Deserialize)]
+struct GraphqlErrorExtensions {
+    code: Option<String>,
+}
+
+impl GraphqlProviderError {
+    fn kind(&self) -> LinearGraphqlFailure {
+        use LinearGraphqlFailure as Kind;
+        let code = self
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.code.as_deref());
+        match code {
+            Some("RATELIMITED") => return Kind::RateLimited,
+            Some("UNAUTHENTICATED" | "AUTHENTICATION_ERROR") => return Kind::Authentication,
+            Some("FORBIDDEN") => return Kind::Permission,
+            Some("ENTITY_NOT_FOUND") => return Kind::NotFound,
+            Some("CONFLICT") => return Kind::Conflict,
+            _ => {}
+        }
+        // Preserve compatibility with message-only provider errors while
+        // discarding the text immediately after classification.
+        let message = self
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if message.contains("unauthorized") || message.contains("authentication") {
+            Kind::Authentication
+        } else if message.contains("permission") || message.contains("forbidden") {
+            Kind::Permission
+        } else if message.contains("not found") {
+            Kind::NotFound
+        } else if message.contains("rate limit") || message.contains("too many requests") {
+            Kind::RateLimited
+        } else if message.contains("conflict") {
+            Kind::Conflict
+        } else {
+            Kind::Other
+        }
+    }
+}
 
 #[async_trait]
 pub trait IssueTracker: Send + Sync {
@@ -32,6 +82,7 @@ pub struct LinearClient {
     client: reqwest::Client,
     download_client: reqwest::Client,
     attachment_limits: AttachmentDownloadLimits,
+    attachment_root: Option<PathBuf>,
 }
 
 pub struct LinearDownloadedFile {
@@ -140,6 +191,10 @@ struct LinearIssueCreateContext {
 }
 
 impl LinearClient {
+    pub(crate) fn project_slug(&self) -> &str {
+        &self.project_slug
+    }
+
     pub fn from_config(config: &TrackerConfig) -> Result<Self> {
         let api_key = config
             .api_key
@@ -147,8 +202,11 @@ impl LinearClient {
             .ok_or(FugueError::MissingTrackerApiKey)?;
         let project_slug = config
             .project_slug
-            .clone()
-            .ok_or(FugueError::MissingTrackerProjectSlug)?;
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or(FugueError::MissingTrackerProjectSlug)?
+            .to_owned();
         let mut headers = HeaderMap::new();
         let auth = HeaderValue::from_str(&api_key).map_err(|err| {
             FugueError::InvalidConfig(format!("tracker.api_key cannot be used as a header: {err}"))
@@ -173,6 +231,7 @@ impl LinearClient {
             client,
             download_client,
             attachment_limits: AttachmentDownloadLimits::from_config(config),
+            attachment_root: config.attachment_root.clone(),
         })
     }
 
@@ -182,6 +241,10 @@ impl LinearClient {
 
     pub fn states_query() -> &'static str {
         ISSUE_STATES_QUERY
+    }
+
+    pub(crate) fn attachment_root(&self) -> Option<&Path> {
+        self.attachment_root.as_deref()
     }
 
     pub fn attachment_download_limits(&self) -> AttachmentDownloadLimits {
@@ -256,44 +319,36 @@ impl LinearClient {
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
 
-        let tmp_path = path.with_extension(format!(
-            "{}.part",
-            path.extension()
-                .and_then(|extension| extension.to_str())
-                .unwrap_or("download")
-        ));
-        let mut file = tokio::fs::File::create(&tmp_path)
-            .await
-            .map_err(|err| FugueError::Workspace(err.to_string()))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| FugueError::Workspace("attachment path has no parent".into()))?;
+        let pending = tempfile::Builder::new()
+            .prefix(".fugue-download-")
+            .tempfile_in(parent)
+            .map_err(|error| FugueError::Workspace(error.to_string()))?;
+        let mut file = tokio::fs::File::from_std(
+            pending
+                .reopen()
+                .map_err(|error| FugueError::Workspace(error.to_string()))?,
+        );
         let mut byte_len = 0u64;
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(err) => {
-                    let _ = tokio::fs::remove_file(&tmp_path).await;
-                    return Err(FugueError::LinearUnknownPayload(err.to_string()));
-                }
-            };
+            let chunk =
+                chunk.map_err(|error| FugueError::LinearUnknownPayload(error.to_string()))?;
             byte_len = byte_len.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-            if let Err(err) = budget.check_streamed_len(url, byte_len) {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                return Err(err);
-            }
-            if let Err(err) = file.write_all(&chunk).await {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                return Err(FugueError::Workspace(err.to_string()));
-            }
+            budget.check_streamed_len(url, byte_len)?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| FugueError::Workspace(error.to_string()))?;
         }
-        if let Err(err) = file.flush().await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(FugueError::Workspace(err.to_string()));
-        }
+        file.sync_all()
+            .await
+            .map_err(|error| FugueError::Workspace(error.to_string()))?;
         drop(file);
-        if let Err(err) = tokio::fs::rename(&tmp_path, path).await {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(FugueError::Workspace(err.to_string()));
-        }
+        pending
+            .persist(path)
+            .map_err(|error| FugueError::Workspace(error.to_string()))?;
         budget.record_success(byte_len);
         Ok(LinearDownloadedFile {
             content_type,
@@ -568,7 +623,7 @@ impl IssueTracker for LinearClient {
             return Ok(Vec::new());
         }
         let mut issues = Vec::new();
-        for variables in issue_state_query_variables(issue_ids) {
+        for variables in issue_state_query_variables(&self.project_slug, issue_ids) {
             let response = self.graphql(ISSUE_STATES_QUERY, variables).await?;
             let connection = response
                 .get("data")
@@ -597,8 +652,16 @@ impl IssueTracker for LinearClient {
         let body: Value = serde_json::from_str(&text)
             .map_err(|err| FugueError::LinearUnknownPayload(err.to_string()))?;
         if let Some(errors) = body.get("errors") {
-            let _ = errors;
-            return Err(FugueError::LinearGraphqlErrors(body.to_string()));
+            let errors: Vec<GraphqlProviderError> = serde_json::from_value(errors.clone())
+                .map_err(|_| {
+                    FugueError::LinearUnknownPayload("invalid GraphQL error envelope".to_owned())
+                })?;
+            let kind = errors
+                .iter()
+                .map(GraphqlProviderError::kind)
+                .find(|kind| *kind != LinearGraphqlFailure::Other)
+                .unwrap_or(LinearGraphqlFailure::Other);
+            return Err(FugueError::LinearGraphqlErrors(kind));
         }
         if !status.is_success() {
             return Err(FugueError::LinearApiStatus(status.to_string()));
@@ -621,7 +684,6 @@ pub async fn execute_linear_graphql_tool(
     };
     match client.graphql(&parsed.query, parsed.variables).await {
         Ok(value) => (false, value.to_string()),
-        Err(FugueError::LinearGraphqlErrors(body)) => (true, body),
         Err(err) => (true, json!({"error": err.to_string()}).to_string()),
     }
 }
@@ -664,10 +726,10 @@ fn parse_linear_graphql_arguments(
     })
 }
 
-fn issue_state_query_variables(issue_ids: &[String]) -> Vec<Value> {
+fn issue_state_query_variables(project_slug: &str, issue_ids: &[String]) -> Vec<Value> {
     issue_ids
         .chunks(LINEAR_ISSUE_STATES_PAGE_SIZE)
-        .map(|ids| json!({ "ids": ids, "first": ids.len() }))
+        .map(|ids| json!({ "ids": ids, "first": ids.len(), "projectSlug": project_slug }))
         .collect()
 }
 
@@ -1112,8 +1174,8 @@ query FugueOpenProjectIssues($projectSlug: String!, $stateTypes: [String!], $fir
 "#;
 
 const ISSUE_STATES_QUERY: &str = r#"
-query FugueIssueStates($ids: [ID!]!, $first: Int!) {
-  issues(filter: { id: { in: $ids } }, first: $first) {
+query FugueIssueStates($projectSlug: String!, $ids: [ID!]!, $first: Int!) {
+  issues(filter: { project: { slugId: { eq: $projectSlug } }, id: { in: $ids } }, first: $first) {
     nodes {
       id
       identifier
@@ -1161,6 +1223,7 @@ mod tests {
             intake_states: vec![],
             in_flight_states: vec![],
             active_states: vec![],
+            attachment_root: None,
             max_attachment_files,
             max_attachment_bytes,
             max_attachment_total_bytes,
@@ -1643,11 +1706,12 @@ mod tests {
             .map(|index| format!("issue-{index}"))
             .collect::<Vec<_>>();
 
-        let batches = issue_state_query_variables(&issue_ids);
+        let batches = issue_state_query_variables("project", &issue_ids);
 
         assert_eq!(batches.len(), 3);
         let mut collected = Vec::new();
         for batch in &batches {
+            assert_eq!(batch["projectSlug"], "project");
             let ids = batch
                 .get("ids")
                 .and_then(Value::as_array)

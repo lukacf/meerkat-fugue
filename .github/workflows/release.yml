@@ -1,0 +1,87 @@
+name: Release bundle
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  qualification:
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/ci.yml
+
+  bundle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify installer failure and upgrade behavior
+        run: python3 -m unittest discover -s scripts/distribution -p 'test_*.py' -v
+      - name: Build all cooperating binaries from the locked source
+        run: cargo build --release --bins --locked
+      - name: Package with pinned rkat and file checksums
+        run: python3 scripts/distribution/package.py --bin-dir target/release --target x86_64-unknown-linux-gnu --output /tmp/fugue-dist
+      - name: Exercise the exact package on a fresh installation path
+        run: |
+          archive=$(find /tmp/fugue-dist -name '*.tar.gz')
+          checksum=$(cut -d ' ' -f 1 "$archive.sha256")
+          python3 scripts/distribution/install.py --archive "$archive" --sha256 "$checksum" --prefix /tmp/fugue-installed
+          /tmp/fugue-installed/bin/meerkat-fugue build-info
+          /tmp/fugue-installed/bin/rkat --version
+      - name: Include the matching bootstrap installer
+        run: |
+          cp scripts/distribution/install.py /tmp/fugue-dist/install.py
+          cd /tmp/fugue-dist
+          sha256sum install.py > install.py.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fugue-linux-x64
+          path: /tmp/fugue-dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [bundle, qualification]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fugue-linux-x64
+          path: release
+      - name: Publish the verified tag bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cd release
+          sha256sum --check ./*.sha256
+          python3 - <<'PYVERIFY'
+          import glob, json, os, tarfile
+          archives = glob.glob('*.tar.gz')
+          assert len(archives) == 1, 'Expected one platform bundle'
+          with tarfile.open(archives[0]) as archive:
+              manifest = json.load(archive.extractfile('manifest.json'))
+          assert os.environ['RELEASE_TAG'] == 'v' + manifest['fugue']['version'], 'Tag and bundle version differ'
+          assert os.environ['GITHUB_SHA'] == manifest['fugue']['commit'], 'Tag and bundle source differ'
+          PYVERIFY
+          gh release create "$RELEASE_TAG" ./* --verify-tag \
+            --title "Fugue $RELEASE_TAG" \
+            --notes "Linux x64 bundle for Ubuntu 24.04, with all five Fugue executables, pinned rkat, licenses, verified installer, and checksums. Follow scripts/distribution/README.md for installation and the authenticated operator boundary."

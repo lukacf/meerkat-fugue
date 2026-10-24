@@ -12,9 +12,22 @@ use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::config::TrackerConfig;
-use crate::domain::{BlockerRef, Issue, IssueAttachment};
+use crate::domain::{BlockerRef, CreatedIssueReceipt, Issue, IssueAttachment};
 use crate::error::{FugueError, Result};
 use crate::tools::*;
+
+/// Bytes received from a validated browser multipart request. This is deliberately
+/// not deserializable: tool/JSON callers cannot use it to read host-local paths.
+pub(crate) struct JiraUploadFile {
+    pub name: String,
+    pub content_type: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+pub(crate) struct JiraUploadReceipt {
+    pub attachments: Vec<LinearCommentAttachmentInput>,
+    pub complete: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -33,6 +46,9 @@ pub struct JiraConfig {
     pub transition_fields_file: Option<String>,
     /// Jira issue-link type names whose inward side blocks this issue.
     pub blocking_link_types: Vec<String>,
+    /// Exact Jira priority names mapped to dispatch ranks (lower runs first).
+    /// Jira IDs are opaque; unmapped names have no numeric priority.
+    pub priority_ranks: BTreeMap<String, std::num::NonZeroU32>,
 }
 
 impl Default for JiraConfig {
@@ -46,6 +62,7 @@ impl Default for JiraConfig {
             create_fields_file: None,
             transition_fields_file: None,
             blocking_link_types: vec!["Blocks".to_string()],
+            priority_ranks: BTreeMap::new(),
         }
     }
 }
@@ -104,7 +121,7 @@ fn request_error(error: reqwest::Error) -> FugueError {
     FugueError::JiraRequest(error.without_url().to_string())
 }
 
-fn env_value(value: &str) -> Option<String> {
+pub(crate) fn env_value(value: &str) -> Option<String> {
     match value.strip_prefix('$') {
         Some(name) => std::env::var(name).ok(),
         None => Some(value.to_string()),
@@ -146,41 +163,68 @@ impl std::fmt::Display for JqlValues<'_> {
     }
 }
 
+pub(crate) struct JiraRoutingScope {
+    pub base: Url,
+    pub project: String,
+    pub query: Option<String>,
+}
+
+/// Resolve exactly the same routing coordinates for the client and durable
+/// notification scope without requiring credentials or contacting the server.
+pub(crate) fn routing_scope(tracker: &TrackerConfig) -> Result<JiraRoutingScope> {
+    let endpoint = env_value(&tracker.endpoint)
+        .ok_or_else(|| invalid("Jira requires tracker.endpoint or JIRA_BASE_URL"))?;
+    let mut base =
+        Url::parse(&endpoint).map_err(|_| invalid("tracker.endpoint must be a Jira site URL"))?;
+    if !matches!(base.scheme(), "http" | "https")
+        || base.host_str().is_none()
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.query().is_some()
+        || base.fragment().is_some()
+    {
+        return Err(invalid(
+            "Jira site URL must be HTTP(S) without credentials, query, or fragment",
+        ));
+    }
+    base.set_path(&format!("{}/", base.path().trim_end_matches('/')));
+    let project = tracker
+        .project_slug
+        .as_deref()
+        .and_then(env_value)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(FugueError::MissingTrackerProjectSlug)?;
+    let query = tracker
+        .jira
+        .as_ref()
+        .and_then(|config| config.jql.as_deref())
+        .map(|jql| {
+            env_value(jql).ok_or_else(|| {
+                invalid("tracker.jira.jql references a missing or empty environment variable")
+            })
+        })
+        .transpose()?;
+    Ok(JiraRoutingScope {
+        base,
+        project,
+        query,
+    })
+}
+
 impl JiraClient {
     pub fn from_config(tracker: &TrackerConfig) -> Result<Self> {
-        let endpoint = env_value(&tracker.endpoint)
-            .ok_or_else(|| invalid("Jira requires tracker.endpoint or JIRA_BASE_URL"))?;
-        let mut base = Url::parse(&endpoint)
-            .map_err(|_| invalid("tracker.endpoint must be a Jira site URL"))?;
-        if !matches!(base.scheme(), "http" | "https")
-            || base.host_str().is_none()
-            || !base.username().is_empty()
-            || base.password().is_some()
-            || base.query().is_some()
-            || base.fragment().is_some()
-        {
-            return Err(invalid(
-                "Jira site URL must be HTTP(S) without credentials, query, or fragment",
-            ));
-        }
-        base.set_path(&format!("{}/", base.path().trim_end_matches('/')));
-        let project = tracker
-            .project_slug
-            .as_deref()
-            .and_then(env_value)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(FugueError::MissingTrackerProjectSlug)?;
+        let JiraRoutingScope {
+            base,
+            project,
+            query,
+        } = routing_scope(tracker)?;
         let token = tracker
             .api_key
             .as_deref()
             .and_then(env_value)
             .ok_or(FugueError::MissingTrackerApiKey)?;
         let mut config = tracker.jira.clone().unwrap_or_default();
-        if let Some(jql) = &config.jql {
-            config.jql = Some(env_value(jql).ok_or_else(|| {
-                invalid("tracker.jira.jql references a missing or empty environment variable")
-            })?);
-        }
+        config.jql = query;
         if let Some(issue_type) = &config.issue_type {
             config.issue_type = Some(env_value(issue_type).ok_or_else(|| {
                 invalid(
@@ -427,7 +471,13 @@ impl JiraClient {
             identifier: issue.key,
             title: issue.fields.summary,
             description: issue.fields.description.map(|body| body.markdown()),
-            priority: issue.fields.priority.map(|priority| priority.id),
+            priority: issue.fields.priority.and_then(|priority| {
+                self.config
+                    .priority_ranks
+                    .get(&priority.name)
+                    .copied()
+                    .map(|rank| i64::from(rank.get()))
+            }),
             state: issue.fields.status.name,
             branch_name: None,
             labels: issue.fields.labels,
@@ -532,6 +582,15 @@ impl JiraClient {
             .collect())
     }
 
+    pub(crate) async fn resolve_issue_identifier(
+        &self,
+        issue: &LinearIssueRef,
+    ) -> Result<LinearIssueIdentifier> {
+        self.fetch_issue(issue)
+            .await
+            .map(|issue| LinearIssueIdentifier(issue.key))
+    }
+
     pub async fn inspect_issue(&self, input: InspectIssueInput) -> Result<InspectIssueOutput> {
         let issue = self.fetch_issue(&input.issue).await?;
         let comments = self.comments_for_key(&issue.key).await?;
@@ -627,6 +686,80 @@ impl JiraClient {
             comment_id: LinearCommentId(comment.id),
             created: true,
             updated: false,
+        })
+    }
+
+    /// Uses Jira's native multipart attachment contract, not links to host files:
+    /// <https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-attachments/#api-rest-api-3-issue-issueidorkey-attachments-post>
+    pub(crate) async fn upload_browser_files(
+        &self,
+        issue: &LinearIssueRef,
+        files: Vec<JiraUploadFile>,
+    ) -> Result<JiraUploadReceipt> {
+        let issue = self.fetch_issue(issue).await?;
+        let expected = files.len();
+        let mut form = reqwest::multipart::Form::new();
+        for file in files {
+            let mut part = reqwest::multipart::Part::bytes(file.bytes).file_name(file.name);
+            if let Some(content_type) = file.content_type {
+                part = part.mime_str(&content_type).map_err(request_error)?;
+            }
+            form = form.part("file", part);
+        }
+        let response = self
+            .client
+            .post(self.url(&["issue", &issue.key, "attachments"])?)
+            .header("X-Atlassian-Token", "no-check")
+            .multipart(form)
+            .send()
+            .await;
+        // A lost response or server failure cannot prove that Jira rejected the
+        // upload. The caller must retain the issue and ask for reconciliation.
+        let uncertain = || JiraUploadReceipt {
+            attachments: Vec::new(),
+            complete: false,
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(_) => return Ok(uncertain()),
+        };
+        if response.status().is_client_error() {
+            return Err(FugueError::JiraApiStatus {
+                status: response.status().as_u16(),
+            });
+        }
+        if !response.status().is_success() {
+            return Ok(uncertain());
+        }
+        let uploaded: Vec<JiraUploadedFile> = match response.json().await {
+            Ok(uploaded) => uploaded,
+            Err(_) => return Ok(uncertain()),
+        };
+        let mut seen = BTreeSet::new();
+        let mut attachments = Vec::with_capacity(uploaded.len());
+        for file in uploaded {
+            let Ok(url) = Url::parse(&file.content) else {
+                continue;
+            };
+            if file.filename.is_empty()
+                || url.origin() != self.base.origin()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || !seen.insert(url.to_string())
+            {
+                continue;
+            }
+            attachments.push(LinearCommentAttachmentInput {
+                title: Some(file.filename),
+                url: url.to_string(),
+                path: None,
+                content_type: file.mime_type,
+                byte_len: file.size,
+            });
+        }
+        Ok(JiraUploadReceipt {
+            complete: attachments.len() == expected,
+            attachments,
         })
     }
 
@@ -739,10 +872,6 @@ impl JiraClient {
                 "Jira accepted the transition but the requested status was not observed",
             ));
         }
-        crate::linear_lane_state::record_internal_lane_change_from_env(
-            &issue.key,
-            &updated.fields.status.name,
-        )?;
         Ok(MoveIssueOutput {
             issue: self.snapshot(&updated),
             changed: true,
@@ -824,25 +953,39 @@ impl JiraClient {
                 },
             },
         };
-        let created: JiraId = self
+        let created: JiraCreatedIssue = self
             .send(Method::POST, &["issue"], Some(&payload))
             .await?
             .json()
             .await
             .map_err(request_error)?;
-        let reference = LinearIssueRef::Id {
-            id: LinearIssueId(created.id),
+        let receipt = CreatedIssueReceipt {
+            url: created.key.as_deref().map(|key| self.browse_url(key)),
+            identifier: created.key.unwrap_or_else(|| created.id.clone()),
+            id: created.id,
         };
-        self.move_issue(MoveIssueInput {
-            issue: reference.clone(),
-            state: LinearStateRef::Name {
-                name: lane.to_string(),
-            },
-            expected_updated_at: None,
-            idempotency_key: IdempotencyKey("jira-create-initial-status".to_string()),
+        let reference = LinearIssueRef::Id {
+            id: LinearIssueId(receipt.id.clone()),
+        };
+        // Creation has committed upstream. Every subsequent failure must retain
+        // that acknowledgement so the caller recovers this issue, not a new one.
+        let follow_up = async {
+            self.move_issue(MoveIssueInput {
+                issue: reference.clone(),
+                state: LinearStateRef::Name {
+                    name: lane.to_string(),
+                },
+                expected_updated_at: None,
+                idempotency_key: IdempotencyKey("jira-create-initial-status".to_string()),
+            })
+            .await?;
+            Ok(self.normalize(self.fetch_issue(&reference).await?))
+        }
+        .await;
+        follow_up.map_err(|source| FugueError::IssueCreatedNeedsAttention {
+            created: receipt,
+            source: Box::new(source),
         })
-        .await?;
-        Ok(self.normalize(self.fetch_issue(&reference).await?))
     }
 
     pub async fn materialize_issue_attachments(
@@ -1007,12 +1150,21 @@ pub async fn execute_tool(
     operation: FugueToolOperation,
     arguments: &serde_json::Value,
 ) -> (bool, String) {
+    let result = execute_tool_result(config, operation, arguments).await;
+    crate::linear_tools::tool_result_to_callback(result)
+}
+
+pub(crate) async fn execute_tool_result(
+    config: &TrackerConfig,
+    operation: FugueToolOperation,
+    arguments: &serde_json::Value,
+) -> FugueToolResult {
     let result = execute_typed_tool(config, operation, arguments).await;
     let key = arguments
         .get("idempotency_key")
         .and_then(serde_json::Value::as_str)
         .map(|value| IdempotencyKey(value.to_string()));
-    let result = match result {
+    match result {
         Ok(output) => FugueToolResult::Ok {
             output,
             metadata: ToolExecutionMetadata::default(),
@@ -1062,11 +1214,6 @@ pub async fn execute_tool(
                 metadata: ToolExecutionMetadata::default(),
             }
         }
-    };
-    let is_error = matches!(result, FugueToolResult::Err { .. });
-    match serde_json::to_string(&result) {
-        Ok(content) => (is_error, content),
-        Err(error) => (true, error.to_string()),
     }
 }
 
@@ -1316,20 +1463,19 @@ struct JiraFields {
     attachment: Vec<JiraAttachment>,
 }
 
+#[derive(Deserialize)]
+struct JiraCreatedIssue {
+    id: String,
+    // Retain an acknowledged ID even if a compatible server omits its key.
+    key: Option<String>,
+}
 #[derive(Serialize, Deserialize)]
 struct JiraId {
     id: String,
 }
 #[derive(Deserialize)]
 struct JiraPriority {
-    #[serde(deserialize_with = "deserialize_priority")]
-    id: i64,
-}
-fn deserialize_priority<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<i64, D::Error> {
-    let id = String::deserialize(deserializer)?;
-    id.parse().map_err(serde::de::Error::custom)
+    name: String,
 }
 #[derive(Deserialize)]
 struct JiraProject {
@@ -1429,6 +1575,15 @@ struct JiraAttachment {
     id: String,
     filename: String,
     content: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JiraUploadedFile {
+    filename: String,
+    content: String,
+    size: u64,
+    mime_type: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1607,4 +1762,4 @@ impl std::fmt::Display for AdfNode {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -47,8 +47,8 @@ meerkat:
   turn_timeout_ms: 3600000
   read_timeout_ms: 5000
   stall_timeout_ms: 300000
-  # model defaults to "gpt-5.5" when omitted; set explicitly to override.
-  # model: gpt-5.5
+  # model defaults to "gpt-6-astra" when omitted; set explicitly to override.
+  # model: gpt-6-astra
 
 server:
   port: 0

@@ -5,7 +5,6 @@ use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::agent::{execute_github_fugue_tool, external_tools_for_tracker};
 use crate::config::TrackerConfig;
 use crate::independent_review::independent_review_completion_input_schema;
-use crate::linear_tools::execute_linear_fugue_tool;
 use crate::tools::{
     BranchName, FugueToolOperation, GitHubOwner, GitHubPullRequestNumber, GitHubPullRequestRef,
     GitHubRepoName, GitHubRepoRef, GitRef, LinearIssueId, LinearIssueIdentifier, LinearIssueRef,
@@ -19,106 +18,208 @@ pub async fn run_linear_mcp_server(config: TrackerConfig) -> anyhow::Result<()> 
     }
     let authority = LinearMcpAuthority::from_env();
     let tools = linear_tools(&config, authority);
-    let scope = LinearMcpScope::from_env();
-    let memory = Arc::new(Mutex::new(LinearMcpCallMemory::default()));
-    let server_name = if config.kind == "jira" {
+    let handler = LinearMcpHandler {
+        gate: WorkGraphTerminalGate::from_env(&config),
+        config,
+        authority,
+        scope: LinearMcpScope::from_env(),
+        memory: Arc::new(Mutex::new(LinearMcpCallMemory::default())),
+        review_handoff_states: env_list(crate::linear_tools::LINEAR_REVIEW_HANDOFF_STATES_ENV),
+        action_states: env_list(crate::linear_tools::LINEAR_ACTION_STATES_ENV),
+    };
+    let server_name = if handler.config.kind == "jira" {
         "fugue-jira-mcp"
     } else {
         "fugue-linear-mcp"
     };
     run_stdio_mcp(server_name, tools, move |name, arguments| {
-        let config = config.clone();
+        let handler = handler.clone();
+        async move { handler.execute(&name, arguments).await }
+    })
+    .await
+}
+
+/// The same admission path serves stdio requests and integration tests.
+#[derive(Clone)]
+pub(crate) struct LinearMcpHandler {
+    config: TrackerConfig,
+    scope: LinearMcpScope,
+    authority: LinearMcpAuthority,
+    memory: Arc<Mutex<LinearMcpCallMemory>>,
+    gate: Option<WorkGraphTerminalGate>,
+    review_handoff_states: Vec<String>,
+    action_states: Vec<String>,
+}
+
+impl LinearMcpHandler {
+    pub(crate) async fn execute(&self, name: &str, arguments: Value) -> (bool, String) {
+        let Some(operation) = linear_fugue_operation(name) else {
+            return (
+                true,
+                json!({"error": format!("unsupported Linear MCP tool {name}")}).to_string(),
+            );
+        };
+        // Scope, policy, memory and execution must agree on the operation for
+        // every accepted spelling. Never dispatch the unnormalized input name.
+        let name = operation.provider_callback_name();
+        if !linear_mcp_authority_allows(self.authority, operation) {
+            return (true, json!({"error": format!(
+                "Linear MCP tool {name} requires projection authority; issue-mob members may write Workpad evidence, while issue leads own per-issue lifecycle state changes"
+            )}).to_string());
+        }
+        let arguments = match apply_linear_mcp_scope(&self.config, &self.scope, name, arguments) {
+            Ok(arguments) => arguments,
+            Err(error) => return (true, json!({"error": error}).to_string()),
+        };
+        let arguments = apply_linear_mcp_memory(&self.memory, name, arguments);
+        remember_linear_mcp_issue_argument(&self.memory, &arguments);
+        let lane_move = match crate::workgraph_gate::lane_move_for_tool(operation, &arguments) {
+            Ok(input) => input,
+            Err(error) => return (true, json!({"error": error.to_string()}).to_string()),
+        };
+        if let Some(input) = lane_move {
+            if let Err(message) = crate::workgraph_gate::guard_public_lane_move(
+                &self.config,
+                &self.review_handoff_states,
+                &self.action_states,
+                &input,
+            ) {
+                return (
+                    true,
+                    json!({"error": "noncanonical_public_lane", "message": message}).to_string(),
+                );
+            }
+            let Some(gate) = &self.gate else {
+                return (true, json!({
+                    "error": "workgraph_gate_unconfigured",
+                    "message": "Issue state changes require the Fugue host's WorkGraph configuration. Start this MCP server through Fugue or configure FUGUE_WORKGRAPH_STATE_PATH and FUGUE_WORKGRAPH_MOB_ID."
+                }).to_string());
+            };
+            if let Err(message) = gate.guard_terminal_move(&self.config, &input).await {
+                return (
+                    true,
+                    json!({"error": "unresolved_workgraph_obligations", "message": message})
+                        .to_string(),
+                );
+            }
+        }
+        crate::linear_tools::execute_linear_fugue_tool_with_review_handoff_states(
+            &self.config,
+            name,
+            &arguments,
+            &self.review_handoff_states,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn projection_for_test(
+        config: TrackerConfig,
+        gate: Option<WorkGraphTerminalGate>,
+    ) -> Self {
+        Self {
+            config,
+            gate,
+            scope: LinearMcpScope::default(),
+            authority: LinearMcpAuthority::Projection,
+            memory: Arc::new(Mutex::new(LinearMcpCallMemory::default())),
+            review_handoff_states: Vec::new(),
+            action_states: Vec::new(),
+        }
+    }
+}
+
+fn env_list(key: &str) -> Vec<String> {
+    env_string(key)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub async fn run_github_mcp_server() -> anyhow::Result<()> {
+    let scope = GitHubMcpScope::from_env()?;
+    if scope.allow_merge {
+        tracing::warn!(
+            "Standalone GitHub merge is unavailable; use the configured Fugue host merge action"
+        );
+    }
+    let tools = github_tools(false);
+    let memory = Arc::new(Mutex::new(GitHubMcpCallMemory::default()));
+    run_stdio_mcp("fugue-github-mcp", tools, move |name, arguments| {
         let scope = scope.clone();
-        let authority = authority;
         let memory = Arc::clone(&memory);
         async move {
-            if let Some(operation) = linear_fugue_operation(&name) {
-                if !linear_mcp_authority_allows(authority, operation) {
-                    return (
-                        true,
-                        json!({
-                            "error": format!(
-                                "Linear MCP tool {name} requires projection authority; issue-mob members may write Workpad evidence, while issue leads own per-issue lifecycle state changes"
-                            )
-                        })
-                        .to_string(),
-                    );
-                }
-                let arguments = match apply_linear_mcp_scope(&config, &scope, &name, arguments) {
-                    Ok(arguments) => arguments,
-                    Err(error) => {
-                        return (true, json!({"error": error}).to_string());
-                    }
-                };
-                let arguments = apply_linear_mcp_memory(&memory, &name, arguments);
-                remember_linear_mcp_issue_argument(&memory, &arguments);
-                if operation == FugueToolOperation::LinearMoveIssue
-                    && let Ok(input) =
-                        serde_json::from_value::<crate::tools::MoveIssueInput>(arguments.clone())
-                    && let Some(gate) = WorkGraphTerminalGate::from_env(&config)
-                    && let Err(message) = gate.guard_terminal_move(&input).await
-                {
-                    return (
-                        true,
-                        json!({
-                            "error": "unresolved_workgraph_obligations",
-                            "message": message
-                        })
-                        .to_string(),
-                    );
-                }
-                execute_linear_fugue_tool(&config, &name, &arguments).await
-            } else {
-                (
-                    true,
-                    json!({"error": format!("unsupported Linear MCP tool {name}")}).to_string(),
-                )
+            let (name, arguments) = match prepare_github_mcp_call(&scope, &memory, &name, arguments)
+            {
+                Ok(prepared) => prepared,
+                Err(reason) => return (true, json!({"error":reason}).to_string()),
+            };
+            if let Some(response) = github_mcp_scope_boundary_response(&scope, name, &arguments) {
+                return (false, response.to_string());
             }
+            let (is_error, content, _) = execute_github_fugue_tool(name, &arguments);
+            if !is_error {
+                remember_github_mcp_call(&memory, name, &content);
+            }
+            (is_error, content)
         }
     })
     .await
 }
 
-pub async fn run_github_mcp_server() -> anyhow::Result<()> {
-    let scope = GitHubMcpScope::from_env()?;
-    let tools = github_tools(scope.allow_merge);
-    let memory = Arc::new(Mutex::new(GitHubMcpCallMemory::default()));
-    run_stdio_mcp(
-        "fugue-github-mcp",
-        tools,
-        move |name, arguments| {
-            let scope = scope.clone();
-            let memory = Arc::clone(&memory);
-            async move {
-                if name == FugueToolOperation::GitHubMergePr.provider_callback_name()
-                    && !scope.allow_merge
-                {
-                    return (
-                        true,
-                        json!({
-                            "error": "github_merge_pr is disabled for this Fugue GitHub MCP server; configure FUGUE_GITHUB_ALLOW_MERGE=true only for an explicit repo-level merge authority"
-                        })
-                        .to_string(),
-                    );
-                }
-                let arguments = apply_github_mcp_memory(
-                    &memory,
-                    &name,
-                    apply_github_mcp_scope(&scope, &name, arguments),
-                );
-                if let Some(response) = github_mcp_scope_boundary_response(&scope, &name, &arguments)
-                {
-                    return (false, response.to_string());
-                }
-                let (is_error, content, _) = execute_github_fugue_tool(&name, &arguments);
-                if !is_error {
-                    remember_github_mcp_call(&memory, &name, &content);
-                }
-                (is_error, content)
-            }
-        },
-    )
-    .await
+// Permission, scope and execution must interpret tool aliases identically.
+fn canonical_github_tool_name(name: &str) -> &str {
+    match name.parse::<FugueToolOperation>() {
+        Ok(
+            operation @ (FugueToolOperation::GitHubInspectRepo
+            | FugueToolOperation::GitHubInspectPr
+            | FugueToolOperation::GitHubCreatePr
+            | FugueToolOperation::GitHubCheckCi
+            | FugueToolOperation::GitHubMergePr
+            | FugueToolOperation::GitHubLinkIssue),
+        ) => operation.provider_callback_name(),
+        _ => name,
+    }
+}
+
+fn prepare_github_mcp_call<'a>(
+    scope: &GitHubMcpScope,
+    memory: &Arc<Mutex<GitHubMcpCallMemory>>,
+    name: &'a str,
+    arguments: Value,
+) -> Result<(&'a str, Value), &'static str> {
+    let name = canonical_github_tool_name(name);
+    if name == FugueToolOperation::GitHubMergePr.provider_callback_name() && !scope.allow_merge {
+        return Err(
+            "github_merge_pr is disabled for this Fugue GitHub MCP server; only an explicit repository merge authority may enable it",
+        );
+    }
+    let arguments =
+        apply_github_mcp_memory(memory, name, apply_github_mcp_scope(scope, name, arguments));
+    if crate::agent::is_github_fugue_tool_name(name)
+        && let Some(expected) = &scope.repo
+    {
+        let requested: GitHubRepoRef = arguments
+            .get("repo")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .ok_or("a valid repository reference is required")?;
+        if requested.hostname() != expected.hostname()
+            || !requested.owner.0.eq_ignore_ascii_case(&expected.owner.0)
+            || !requested.name.0.eq_ignore_ascii_case(&expected.name.0)
+        {
+            return Err(
+                "requested repository differs from this GitHub MCP server's repository scope",
+            );
+        }
+    }
+    Ok((name, arguments))
 }
 
 pub async fn run_host_mcp_server() -> anyhow::Result<()> {
@@ -157,18 +258,24 @@ pub async fn run_host_mcp_server() -> anyhow::Result<()> {
             }
         }),
         json!({
+            "name": "fugue_admit_independent_review",
+            "description": "Reserve the current review request and admit native flows for selected existing repository specialists. Retry with the same key and assignment; explicit replacement requires supersedes.",
+            "input_schema": crate::independent_review::independent_review_admission_input_schema()
+        }),
+        json!({
             "name": "fugue_complete_independent_review",
-            "description": "Submit typed independent reviewer verdicts to Fugue so the host can aggregate them, persist evidence, and move to the configured review outcome lane. Every verdict.schema_version must be exactly \"fugue.review.v1\". Include workgraph_scope copied exactly from the reviewer obligation items so red-review blockers are created in the same WorkGraph realm and namespace.",
+            "description": "Submit native review flow references. Fugue reads the actual producer results, verifies the current candidate, records evidence and projects the configured outcome lane. Caller-supplied verdicts or timeout claims are not accepted.",
+            "input_schema": independent_review_completion_input_schema()
+        }),
+        json!({
+            "name": "fugue_complete_final_pr_gate",
+            "description": "Complete configured final review with verified native specialist run references. The host checks current review, head, CI and WorkGraph before guarded merge and tracker projection.",
             "input_schema": independent_review_completion_input_schema()
         }),
         json!({
             "name": "fugue_run_deploy",
-            "description": "Run the guarded Fugue deploy lane action from a typed DeployStartRequest.",
-            "input_schema": {
-                "type": "object",
-                "description": "Typed DeployStartRequest payload with issue, PR snapshot, recorded head, CI status, WorkGraph blocker count, and idempotency key.",
-                "additionalProperties": true
-            }
+            "description": "Run the guarded Fugue deploy action. Replay lost responses unchanged. For a failed or uncertain deployment, wait for operator inspection and authorization before supplying retry_deployment with a new key.",
+            "input_schema": crate::deploy_gate::deploy_start_input_schema()
         }),
     ];
     let endpoint =
@@ -208,12 +315,31 @@ pub async fn run_host_mcp_server() -> anyhow::Result<()> {
                     )
                     .await
                 }
+                "fugue_admit_independent_review" => {
+                    execute_host_admit_independent_review(
+                        &endpoint,
+                        username.as_deref(),
+                        password.as_deref(),
+                        arguments,
+                    )
+                    .await
+                }
                 "fugue_complete_independent_review" => {
                     execute_host_complete_independent_review(
                         &endpoint,
                         username.as_deref(),
                         password.as_deref(),
                         arguments,
+                    )
+                    .await
+                }
+                "fugue_complete_final_pr_gate" => {
+                    execute_host_complete_native_review(
+                        &endpoint,
+                        username.as_deref(),
+                        password.as_deref(),
+                        arguments,
+                        "complete-final-pr-gate",
                     )
                     .await
                 }
@@ -384,18 +510,99 @@ async fn execute_host_start_independent_review(
     }
 }
 
+async fn execute_host_admit_independent_review(
+    endpoint: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    arguments: Value,
+) -> (bool, String) {
+    let request = match serde_json::from_value::<
+        crate::independent_review::IndependentReviewAdmissionRequest,
+    >(arguments)
+    {
+        Ok(request) => request,
+        Err(_) => {
+            return (
+                true,
+                json!({"error":"invalid_review_assignment"}).to_string(),
+            );
+        }
+    };
+    execute_host_review_request(
+        endpoint,
+        username,
+        password,
+        "admit-independent-review",
+        &request,
+    )
+    .await
+}
+
 async fn execute_host_complete_independent_review(
     endpoint: &str,
     username: Option<&str>,
     password: Option<&str>,
     arguments: Value,
 ) -> (bool, String) {
+    execute_host_complete_native_review(
+        endpoint,
+        username,
+        password,
+        arguments,
+        "complete-independent-review",
+    )
+    .await
+}
+
+async fn execute_host_complete_native_review(
+    endpoint: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    arguments: Value,
+    path: &str,
+) -> (bool, String) {
+    let request_body = match serde_json::from_value::<
+        crate::independent_review::IndependentReviewCompletionRequest,
+    >(arguments)
+    {
+        Ok(request) => request,
+        Err(_) => {
+            return (
+                true,
+                json!({"error":"invalid_independent_review_reference"}).to_string(),
+            );
+        }
+    };
+    if let Err(error) = request_body.validate() {
+        return (
+            true,
+            json!({"error":"invalid_independent_review_reference", "message":error.to_string()})
+                .to_string(),
+        );
+    }
+    execute_host_review_request(endpoint, username, password, path, &request_body).await
+}
+
+async fn execute_host_review_request<T: serde::Serialize>(
+    endpoint: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    path: &str,
+    request_body: &T,
+) -> (bool, String) {
     let url = format!(
-        "{}/api/v1/kapellmeister/complete-independent-review",
+        "{}/api/v1/kapellmeister/{path}",
         endpoint.trim_end_matches('/')
     );
-    let client = reqwest::Client::new();
-    let mut request = client.post(url).json(&arguments);
+    let client = match reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return (true, json!({"error":"host_client_unavailable"}).to_string()),
+    };
+    let mut request = client.post(url).json(&request_body);
     if let (Some(username), Some(password)) = (username, password) {
         request = request.basic_auth(username, Some(password));
     }
@@ -404,6 +611,8 @@ async fn execute_host_complete_independent_review(
             let status = response.status();
             match response.text().await {
                 Ok(body) => {
+                    let is_error = !status.is_success()
+                        || !crate::independent_review::completion_acknowledged(&body);
                     let content = if body.trim().is_empty() {
                         json!({
                             "error": "Fugue host returned an empty response body",
@@ -413,17 +622,17 @@ async fn execute_host_complete_independent_review(
                     } else {
                         body
                     };
-                    (false, content)
+                    (is_error, content)
                 }
                 Err(error) => (
-                    false,
+                    true,
                     json!({"error": format!("failed to read Fugue host response: {error}")})
                         .to_string(),
                 ),
             }
         }
         Err(error) => (
-            false,
+            true,
             json!({"error": format!("failed to call Fugue host: {error}")}).to_string(),
         ),
     }
@@ -578,8 +787,8 @@ fn apply_linear_mcp_scope(
     if operation == FugueToolOperation::LinearMoveIssue && config.kind != "jira" {
         object.remove("expected_updated_at");
     }
-    normalize_linear_state_argument(config, operation, &mut object, "state")?;
-    normalize_linear_state_argument(config, operation, &mut object, "target_state")?;
+    normalize_linear_state_argument(&mut object, "state");
+    normalize_linear_state_argument(&mut object, "target_state");
     insert_default_linear_idempotency_key(operation, &mut object);
     Ok(Value::Object(object))
 }
@@ -745,6 +954,7 @@ fn apply_github_mcp_scope(scope: &GitHubMcpScope, name: &str, arguments: Value) 
         | FugueToolOperation::GitHubInspectPr
         | FugueToolOperation::GitHubCreatePr
         | FugueToolOperation::GitHubCheckCi
+        | FugueToolOperation::GitHubLinkIssue
         | FugueToolOperation::GitHubMergePr => {
             insert_default(&mut object, "repo", scope.repo.as_ref());
             if let Some(host) = scope.repo.as_ref().and_then(|repo| repo.host.as_ref())
@@ -891,29 +1101,15 @@ fn insert_default<T: serde::Serialize>(
     }
 }
 
-fn normalize_linear_state_argument(
-    config: &TrackerConfig,
-    operation: FugueToolOperation,
-    object: &mut Map<String, Value>,
-    key: &str,
-) -> std::result::Result<(), String> {
-    let Some(value) = object.get(key) else {
-        return Ok(());
-    };
-    let Some(name) = linear_state_name(value) else {
-        return Ok(());
+// Normalize wire shorthand only. Lane policy belongs to guard_public_lane_move,
+// shared by direct dispatch and MCP, including configured review handoff lanes.
+fn normalize_linear_state_argument(object: &mut Map<String, Value>, key: &str) {
+    let Some(name) = object.get(key).and_then(linear_state_name) else {
+        return;
     };
     let name = name.trim();
     if name.is_empty() {
-        return Ok(());
-    }
-    let configured_lanes = configured_linear_lanes(config);
-    if !configured_lanes.is_empty() && !configured_linear_lanes_contain(&configured_lanes, name) {
-        return Err(format!(
-            "{} rejected unconfigured Linear state name {name:?} for {key}; allowed lanes are: {}",
-            operation.provider_callback_name(),
-            configured_lanes.join(", ")
-        ));
+        return;
     }
     object.insert(
         key.to_string(),
@@ -921,7 +1117,6 @@ fn normalize_linear_state_argument(
             name: name.to_string(),
         }),
     );
-    Ok(())
 }
 
 fn linear_state_name(value: &Value) -> Option<&str> {
@@ -938,36 +1133,6 @@ fn linear_state_name(value: &Value) -> Option<&str> {
         }
         _ => None,
     }
-}
-
-fn configured_linear_lanes_contain(lanes: &[String], name: &str) -> bool {
-    let normalized = crate::domain::normalize_state(name);
-    lanes
-        .iter()
-        .any(|candidate| crate::domain::normalize_state(candidate) == normalized)
-}
-
-fn configured_linear_lanes(config: &TrackerConfig) -> Vec<String> {
-    let mut lanes: Vec<String> = Vec::new();
-    for lane in config
-        .intake_states
-        .iter()
-        .chain(config.in_flight_states.iter())
-        .chain(config.active_states.iter())
-        .chain(config.terminal_states.iter())
-    {
-        if lane.trim().is_empty() {
-            continue;
-        }
-        let normalized = crate::domain::normalize_state(lane);
-        if !lanes
-            .iter()
-            .any(|candidate| crate::domain::normalize_state(candidate.as_str()) == normalized)
-        {
-            lanes.push(lane.clone());
-        }
-    }
-    lanes
 }
 
 fn linear_issue_ref_from_env() -> Option<LinearIssueRef> {
@@ -1102,6 +1267,7 @@ fn github_tools(allow_merge: bool) -> Vec<Value> {
         intake_states: Vec::new(),
         in_flight_states: Vec::new(),
         active_states: Vec::new(),
+        attachment_root: None,
         max_attachment_files: 20,
         max_attachment_bytes: 25 * 1024 * 1024,
         max_attachment_total_bytes: 100 * 1024 * 1024,
@@ -1237,6 +1403,211 @@ fn protocol_tool_descriptor(tool: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn review_admission_mcp_preserves_assignment_and_rejects_forged_authority() {
+        use axum::{Json, Router, routing::post};
+        let request = json!({
+            "issue":{"kind":"identifier", "identifier":"TEST-1"},
+            "repo":{"owner":"example", "name":"app"},
+            "pull_request":1, "head_sha":"a".repeat(40),
+            "reviewers":{"domain":["repo:a", "repo:b", "repo:c"]},
+            "task":"Review the candidate", "idempotency_key":"request-1", "supersedes":null
+        });
+        let expected = request.clone();
+        let router = Router::new().route(
+            "/api/v1/kapellmeister/admit-independent-review",
+            post(move |Json(body): Json<Value>| {
+                assert_eq!(body, expected);
+                async {
+                    Json(json!({"result":{"accepted":false, "current_request":"existing-request"}}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (error, response) =
+            execute_host_admit_independent_review(&endpoint, None, None, request.clone()).await;
+        assert!(error);
+        assert!(response.contains("existing-request"));
+        for field in ["round", "verdicts", "accepted"] {
+            let mut forged = request.clone();
+            forged[field] = json!(true);
+            let (error, response) =
+                execute_host_admit_independent_review(&endpoint, None, None, forged).await;
+            assert!(error);
+            assert_eq!(response, r#"{"error":"invalid_review_assignment"}"#);
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn native_review_mcp_rejects_forged_inputs_and_unacknowledged_responses() {
+        use axum::{Router, http::StatusCode, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let request = json!({
+            "issue":{"kind":"identifier", "identifier":"TEST-1"},
+            "pull_request":{
+                "repo":{"owner":"example", "name":"app"}, "number":1,
+                "title":"Candidate", "url":"https://github.com/example/app/pull/1",
+                "state":"open", "draft":false, "head_branch":"feature", "base_branch":"main", "head_sha":"a".repeat(40)
+            },
+            "head_sha":"a".repeat(40),
+            "workgraph_scope":{"realm_id":"repository-mob", "namespace":"default"},
+            "native_review":{"runs":[meerkat_mob::RunId::new()]},
+            "idempotency_key":"review-round-1"
+        });
+        for (status, body, expected_error) in [
+            (
+                StatusCode::ACCEPTED,
+                r#"{"result":{"accepted":true}}"#,
+                false,
+            ),
+            (StatusCode::OK, r#"{"result":{"accepted":false}}"#, true),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"result":{"accepted":false}}"#,
+                true,
+            ),
+            (
+                StatusCode::BAD_GATEWAY,
+                r#"{"error":"upstream unavailable"}"#,
+                true,
+            ),
+            (StatusCode::OK, "{}", true),
+            (StatusCode::OK, "", true),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let route = post(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async move { (status, body) }
+            });
+            let router = Router::new()
+                .route(
+                    "/api/v1/kapellmeister/complete-independent-review",
+                    route.clone(),
+                )
+                .route("/api/v1/kapellmeister/complete-final-pr-gate", route);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            for key in ["verdicts", "timed_out"] {
+                let mut forged = request.clone();
+                forged[key] = json!(true);
+                for path in ["complete-independent-review", "complete-final-pr-gate"] {
+                    let (error, _) = execute_host_complete_native_review(
+                        &endpoint,
+                        None,
+                        None,
+                        forged.clone(),
+                        path,
+                    )
+                    .await;
+                    assert!(error, "{path}: {key}");
+                }
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "forged evidence must not be forwarded"
+            );
+            let (error, response) =
+                execute_host_complete_independent_review(&endpoint, None, None, request.clone())
+                    .await;
+            assert_eq!(error, expected_error, "{status}: {response}");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let (error, response) = execute_host_complete_native_review(
+                &endpoint,
+                None,
+                None,
+                request.clone(),
+                "complete-final-pr-gate",
+            )
+            .await;
+            assert_eq!(error, expected_error, "final gate {status}: {response}");
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_applies_role_public_lane_and_required_gate_policy_to_all_spellings() {
+        for (name, state_field) in [
+            ("linear_move_issue", "state"),
+            ("linear.move_issue", "state"),
+            ("linear_claim_issue", "target_state"),
+            ("linear.claim_issue", "target_state"),
+        ] {
+            let mut config = compact_tracker_config();
+            config.active_states = vec!["Active".into(), "Deploy".into()];
+            let mut handler = LinearMcpHandler::projection_for_test(config, None);
+            handler.action_states = vec!["Deploy".into()];
+            let mut input = json!({"issue":"TEST-1"});
+            for (state, expected) in [
+                (
+                    json!({"kind":"name","name":"Deploy"}),
+                    "noncanonical_public_lane",
+                ),
+                (
+                    json!({"kind":"name","name":"Unknown"}),
+                    "noncanonical_public_lane",
+                ),
+                (
+                    json!({"kind":"id","id":"opaque-state"}),
+                    "noncanonical_public_lane",
+                ),
+                (
+                    json!({"kind":"name","name":"Active"}),
+                    "workgraph_gate_unconfigured",
+                ),
+            ] {
+                input[state_field] = state;
+                let (failed, response) = handler.execute(name, input.clone()).await;
+                assert!(failed, "{name}: {response}");
+                assert!(response.contains(expected), "{name}: {response}");
+            }
+            handler.authority = LinearMcpAuthority::Workpad;
+            let (failed, response) = handler.execute(name, input).await;
+            assert!(failed);
+            assert!(
+                response.contains("requires projection authority"),
+                "{response}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_admission_accepts_the_same_custom_handoff_lane_as_direct_dispatch() {
+        let config = compact_tracker_config();
+        let mut handler = LinearMcpHandler::projection_for_test(config.clone(), None);
+        handler.review_handoff_states = vec!["Awaiting domain review".into()];
+        let input = json!({"issue":"TEST-1", "state":"Awaiting domain review"});
+        let direct_input: crate::tools::MoveIssueInput = serde_json::from_value(json!({
+            "issue":{"kind":"identifier","identifier":"TEST-1"},
+            "state":{"kind":"name","name":"Awaiting domain review"}, "idempotency_key":"fixture"
+        }))
+        .unwrap();
+        assert!(
+            crate::workgraph_gate::guard_public_lane_move(
+                &config,
+                &handler.review_handoff_states,
+                &[],
+                &direct_input
+            )
+            .is_ok()
+        );
+        let (failed, response) = handler.execute("linear.move_issue", input).await;
+        assert!(failed);
+        assert!(
+            response.contains("workgraph_gate_unconfigured"),
+            "the public lane should pass admission before the required WorkGraph check: {response}"
+        );
+    }
+
     #[test]
     fn enterprise_scope_supplies_missing_host_and_preserves_explicit_host() {
         let scope = GitHubMcpScope {
@@ -1296,6 +1667,7 @@ mod tests {
                 "Implementing".to_string(),
                 "Reviewing".to_string(),
             ],
+            attachment_root: None,
             max_attachment_files: 20,
             max_attachment_bytes: 25 * 1024 * 1024,
             max_attachment_total_bytes: 100 * 1024 * 1024,
@@ -1485,40 +1857,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn linear_mcp_scope_rejects_unconfigured_state_name_shorthand() {
-        let scope = LinearMcpScope {
-            issue: Some(LinearIssueRef::Identifier {
-                identifier: LinearIssueIdentifier("LUC-376".to_string()),
-            }),
-        };
-        let config = compact_tracker_config();
-
-        let err = apply_linear_mcp_scope(
-            &config,
-            &scope,
-            "linear_claim_issue",
-            json!({
-                "target_state": "In Progress",
-                "idempotency_key": "claim-unconfigured-lane"
-            }),
-        )
-        .expect_err("unconfigured lanes must not be accepted unless configured");
-        assert!(err.contains("unconfigured Linear state name"));
-        assert!(err.contains("Implementing"));
-        assert!(!err.contains("In Review"));
-
-        let err = apply_linear_mcp_scope(
-            &config,
-            &scope,
-            "linear_move_issue",
-            json!({
-                "state": { "kind": "name", "name": "Human Review" },
-                "idempotency_key": "move-unconfigured-lane"
-            }),
-        )
-        .expect_err("typed unconfigured lane names must not bypass the guard");
-        assert!(err.contains("Human Review"));
+    #[tokio::test]
+    async fn linear_mcp_admission_rejects_unconfigured_state_names_after_normalization() {
+        let handler = LinearMcpHandler::projection_for_test(compact_tracker_config(), None);
+        for (operation, arguments) in [
+            (
+                "linear_claim_issue",
+                json!({"issue":"TEST-1", "target_state":"In Progress"}),
+            ),
+            (
+                "linear_move_issue",
+                json!({"issue":"TEST-1", "state":{"kind":"name", "name":"Human Review"}}),
+            ),
+        ] {
+            let (failed, response) = handler.execute(operation, arguments).await;
+            assert!(failed);
+            assert!(response.contains("noncanonical_public_lane"), "{response}");
+        }
     }
 
     #[test]
@@ -1537,6 +1892,7 @@ mod tests {
             intake_states: Vec::new(),
             in_flight_states: Vec::new(),
             active_states: Vec::new(),
+            attachment_root: None,
             max_attachment_files: 20,
             max_attachment_bytes: 25 * 1024 * 1024,
             max_attachment_total_bytes: 100 * 1024 * 1024,
@@ -1625,6 +1981,54 @@ mod tests {
                 .and_then(Value::as_str),
             Some("luka/luc-362-docs")
         );
+    }
+
+    #[test]
+    fn github_mcp_aliases_cannot_bypass_merge_permission_or_repository_scope() {
+        let mut scope = GitHubMcpScope {
+            repo: Some(serde_json::from_value(json!({"owner":"example", "name":"app"})).unwrap()),
+            head_branch: None,
+            pull_request: None,
+            allow_merge: false,
+        };
+        let memory = Arc::new(Mutex::new(GitHubMcpCallMemory::default()));
+        for operation in [
+            FugueToolOperation::GitHubInspectRepo,
+            FugueToolOperation::GitHubInspectPr,
+            FugueToolOperation::GitHubCreatePr,
+            FugueToolOperation::GitHubCheckCi,
+            FugueToolOperation::GitHubMergePr,
+            FugueToolOperation::GitHubLinkIssue,
+        ] {
+            let canonical = operation.provider_callback_name();
+            let dotted = canonical.replacen("github_", "github.", 1);
+            for alias in [canonical, dotted.as_str()] {
+                if operation == FugueToolOperation::GitHubMergePr {
+                    assert!(prepare_github_mcp_call(&scope, &memory, alias, json!({})).is_err());
+                }
+                scope.allow_merge = true;
+                assert!(
+                    prepare_github_mcp_call(
+                        &scope,
+                        &memory,
+                        alias,
+                        json!({
+                            "repo":{"host":"other.example.test", "owner":"other", "name":"private"}
+                        })
+                    )
+                    .is_err()
+                );
+                let (name, arguments) =
+                    prepare_github_mcp_call(&scope, &memory, alias, json!({})).unwrap();
+                assert_eq!(name, canonical);
+                assert_eq!(
+                    arguments.get("repo"),
+                    Some(&serde_json::to_value(&scope.repo).unwrap())
+                );
+                scope.allow_merge = false;
+            }
+        }
+        assert_eq!(canonical_github_tool_name("unknown.tool"), "unknown.tool");
     }
 
     #[test]
@@ -1760,6 +2164,7 @@ mod tests {
             intake_states: Vec::new(),
             in_flight_states: Vec::new(),
             active_states: Vec::new(),
+            attachment_root: None,
             max_attachment_files: 20,
             max_attachment_bytes: 25 * 1024 * 1024,
             max_attachment_total_bytes: 100 * 1024 * 1024,
@@ -1865,6 +2270,7 @@ mod tests {
             intake_states: Vec::new(),
             in_flight_states: vec!["Planning".to_string()],
             active_states: Vec::new(),
+            attachment_root: None,
             max_attachment_files: 20,
             max_attachment_bytes: 25 * 1024 * 1024,
             max_attachment_total_bytes: 100 * 1024 * 1024,
@@ -1911,6 +2317,7 @@ mod tests {
             intake_states: Vec::new(),
             in_flight_states: Vec::new(),
             active_states: Vec::new(),
+            attachment_root: None,
             max_attachment_files: 20,
             max_attachment_bytes: 25 * 1024 * 1024,
             max_attachment_total_bytes: 100 * 1024 * 1024,
@@ -1943,6 +2350,7 @@ mod tests {
             intake_states: Vec::new(),
             in_flight_states: Vec::new(),
             active_states: Vec::new(),
+            attachment_root: None,
             max_attachment_files: 20,
             max_attachment_bytes: 25 * 1024 * 1024,
             max_attachment_total_bytes: 100 * 1024 * 1024,
@@ -1987,6 +2395,7 @@ mod tests {
             intake_states: Vec::new(),
             in_flight_states: Vec::new(),
             active_states: Vec::new(),
+            attachment_root: None,
             max_attachment_files: 20,
             max_attachment_bytes: 25 * 1024 * 1024,
             max_attachment_total_bytes: 100 * 1024 * 1024,

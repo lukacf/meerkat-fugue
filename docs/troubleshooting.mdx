@@ -1,34 +1,152 @@
+---
+title: "Troubleshooting"
+description: "Diagnose setup, access, queue and native runtime problems without losing evidence."
+---
+
 # Troubleshooting
 
-Use this guide when Fugue is not dispatching work, a native run stalls, or
-handoff evidence is inconsistent.
+Start with the affected repository. Its tracker, access settings and team are
+independent of other repositories on the same Fugue host. Keep the error and
+issue reference before retrying an operation.
+
+## Start with the affected layer
+
+| Symptom | First check |
+| --- | --- |
+| Add repository fails before configuration opens | Service logs and the saved private draft. Fix startup before adding a duplicate. |
+| Setup cannot clone or read the project | Connectivity and saved credentials on the execution host. |
+| Setup cannot load saved settings, or preparation stays disabled | The page's error and unsaved connection fields. See [setup recovery](#setup-will-not-prepare-or-start). |
+| Jira status transition fails | Actual available transitions, required fields and configured project scope. |
+| An issue attachment cannot be opened or uploaded | Selected repository, current tracker credentials and whether the issue belongs to that configured project. |
+| Browser asks you to sign in again | Host gateway session, separate from repository and model credentials. |
+| Agents cannot call the model | Native rkat binding under the service user's persistent HOME. |
+| Git reports `Author identity unknown` | Repository settings, then **Commit author**. Save and prepare the configuration before retrying. |
+| Memory or Work Graph is unavailable | Selected native runtime, its capabilities and the installed Meta bundle version. |
+| Board or console stops updating | Connection state and service health; preserve the last error before retrying. |
+
+For managed workspaces, open **Repository settings** to stop and reconfigure that
+repository after finishing active work. Use the host's private deployment guide
+for gateway, DNS and network problems. A working connection on a laptop does not
+prove access from the host.
+
+If Fugue reports that native cleanup is incomplete, restart the whole Fugue host
+before resuming repositories. Retained native owners cannot safely be reopened
+in the same process. Keep the private state and service logs for diagnosis;
+repeated preparation or deleting state is not a recovery procedure.
+
+Attachment access checks issue membership with the tracker before reading or
+writing files. A tracker outage or permission failure can therefore prevent
+opening a locally stored attachment. Restore tracker access and retry the
+existing issue. For older explicit workflow file locations, see
+[preserving state](./operations.mdx#preserve-the-right-state).
+
+## Setup will not prepare or start
+
+Wait for saved configuration to load before editing connections or workflow
+settings. Save repository access, tracker access and model access before
+preparing the workspace. If loading saved settings fails, restore access and
+reload setup; the forms remain disabled until the existing configuration loads.
+An error loading settings does not mean the repository needs to be added again.
+
+If you edit a connection while its save is pending, the page may say **Earlier
+values saved. You have newer unsaved changes.** Review those newer values and
+save that connection again. Preparation remains disabled while connection
+changes are unsaved. Keep the page open until they are saved.
+
+Changing the tracker can change its default lane mapping. Review the workflow
+after a successful tracker switch, then check the workspace again. For Jira,
+use the project's actual statuses. Do not create statuses in a shared Jira
+workflow just to match Fugue's built-in defaults.
 
 ## No issues are picked up
 
-Check:
+First distinguish an issue missing from the Board from a visible issue that has
+not started.
 
-1. `linear.project_slug` matches the target project.
-2. The issue is in `linear.lanes.ready` for fresh native dispatch.
-3. Required labels match `linear.labels` and `selection.by_label` rules.
-4. The issue is not blocked, terminal, already running, claimed by another run,
-   or waiting for retry backoff.
-5. The status API `last_errors` does not show Linear authentication or GraphQL
-   errors.
+| Tracker | If the issue is missing |
+| --- | --- |
+| Jira | Open the existing issue in Jira. Check its project, status and the repository's JQL filter. A label filter needs matching **Labels for new issues** for Board-created tickets; other required filter fields must also match. |
+| Fugue tickets | Open the repository where you created the ticket. Built-in queues are separate for each repository and do not synchronize to an external tracker. |
+| Linear | Check the saved account's access to the selected project and team, and that the issue's status belongs to the configured workflow. |
 
-After fixing configuration or lanes, call `POST /api/v1/refresh`.
+Clear any Board search or lane filter, then choose **Refresh** to reload that
+repository's board. If creation returned an issue key or an uncertain result,
+check the existing issue before creating another one. See
+[ticket recovery](./daily-work.mdx#work-from-the-board).
+
+For a visible issue that has not started:
+
+1. Check **Repositories** for a running, prepared team. A configured connection
+   alone does not start agents.
+2. Use the configured intake lane. Built-in tickets start from **Queue**;
+   **Backlog** holds drafts. Jira uses the status mapped during setup.
+3. Check blockers, a current run or claim, and retry backoff. An issue already
+   running or awaiting retry should not start a second attempt.
+4. Read the reported tracker, model or runtime error. Correct that cause, then
+   allow the next poll to run. Refreshing the Board reloads its display; it does
+   not bypass admission rules or retry backoff.
+
+For advanced YAML workflows, verify `tracker.project_slug`, the configured intake
+states and `tracker.jira.jql` where applicable. Historical `linear.*` names also
+appear in the shared configuration. `selection.by_label` chooses a mob template,
+falling back to `selection.default_template`; it is not a required-label filter.
+See [configuration](./configuration.mdx) for the exact contract. Administrators
+can request an immediate poll through the
+[repository-scoped refresh API](./status-api.mdx#refreshing-immediately).
+
+Linear errors show a safe failure category instead of the raw provider response,
+which can include partial issue data. Check the account and project for access
+failures, follow retry advice for rate limits, and refresh state before retrying
+a conflict.
+
+## Coordinator notifications are waiting
+
+Check the service log for the error accompanying **host notification remains
+saved for retry**. Restore native runtime or disk access, then allow the running
+service to retry. Saved notifications also resume at startup. A tracker outage
+prevents observing new changes but does not prevent retrying work already saved.
+
+If the message is **host notification needs attention**, the input was admitted
+but its native state does not permit a safe automatic retry. The message names
+the missing input/runtime or the terminal outcome. Keep the saved receipt and
+matching runtime state; ask the host operator to diagnose that delivery before
+repeating the tracker action. Other notifications continue independently.
+
+An ordinary graceful stop is handled automatically when native state proves a
+queued notification never ran. Fugue does not automatically resend a consumed,
+canceled, previously attempted or held-tail-repaired input.
+
+If the log says **host signal routing changed**, restart through the service's
+normal managed procedure after checking the intended repository configuration.
+If it says **journal belongs to another repository, runtime or tracker scope**,
+preserve the journal and restore its matching configuration/state. Do not reuse
+that journal for a different project or Jira filter. A corrupt or unrecognized
+journal must also be preserved for diagnosis, rather than replaced with an empty
+file.
+
+An acknowledged native input is not proof that the coordinator completed its
+work. Inspect its conversation and Work Graph before retrying an operator
+action. See [saved notification recovery](./operations.mdx#recover-saved-notifications)
+for the admission and backup contract.
 
 ## Hook fails before worker launch
 
 Hook failures are usually repository, credentials, or host setup problems.
+Have the host operator inspect the failing command before running it again;
+hooks can have external side effects.
 
 1. Open the issue workspace under `workspace.root`.
-2. Re-run the failing script manually from that directory.
-3. Fix clone URLs, credentials, branch names, or shell assumptions.
-4. Retry with the status refresh endpoint or wait for the next poll.
+2. Check the command's error, clone URL, credentials, branch and required tools.
+3. Fix the cause and establish whether any part of the command already ran.
+4. Retry only the intended operation. Use the scoped refresh API or wait for the
+   next poll once the hook is safe to run again.
 
 ## Native run appears stalled
 
-Inspect the issue row in `GET /api/v1/{issue_identifier}`:
+Open the issue's workpad and its team's conversations under **Agents**. A quiet
+Board alone does not establish that native execution has stopped. For detailed
+diagnostics, inspect `GET /api/v1/{issue_identifier}`, with the repository prefix
+in managed mode as described in the [status API](./status-api.mdx):
 
 - If recent events include `native_mob_status_heartbeat`, Meta still reports
   the run as pending, running, or waiting for input.
@@ -45,7 +163,7 @@ Do not force completion. Compare:
 - Workpad run id;
 - workspace branch and head SHA;
 - PR number and head SHA;
-- Linear PR mentions;
+- PR links in the configured tracker;
 - GitHub PR state and checks.
 
 Leave the issue in the reviewer node's projected lane, record the finding in
@@ -62,24 +180,62 @@ the reviewer node's projected lane until status evidence is coherent.
 
 Symptoms can include empty tool catalogs, `Unexpected response type`, missing
 Workpad updates, or member tooling notes about attempted lifecycle lane
-mutations. Planner/coder/reviewer members should report lifecycle facts to the
-issue lead; the issue lead owns per-issue `linear_move_issue` movement while
-Fugue observes Linear for external lane drift.
+mutations. The historical `linear_*` tool names also serve Jira and built-in
+tickets; their names do not mean a Linear account is required.
+
+Planner/coder/reviewer members should report lifecycle facts to the issue lead;
+the issue lead owns per-issue `linear_move_issue` movement while Fugue observes
+the configured tracker for external lane drift. `linear_claim_issue` also requires
+lead or coordinator authority because it can change the lane. If a claim with
+`target_state` is refused for unresolved WorkGraph obligations, resolve the
+findings through review; changing the assignment is not a way to complete them.
+
+For `workgraph_gate_unconfigured`, start the MCP server through Fugue so it
+receives the repository's WorkGraph database path and mob identity. Do not
+remove the guard to make state changes work. For `noncanonical_public_lane`,
+use a configured status name; action lanes such as Deploy are operator inputs.
 
 Check that:
 
 - `mcp_servers` defines the named server;
-- agent profiles use `mcp:linear` and `mcp:github` where needed;
+- agent profiles declare the configured tracker server (`mcp:jira` or
+  `mcp:linear`) and `mcp:github` where needed;
 - MCP `tools/list` returns `inputSchema` descriptors;
 - the Meta console shows the expected native members and their issue launch context.
 
 ## Need to stop native execution quickly
 
-Pause the systemd service, inspect `/api/v1/state`, and reconcile or park active
-native runs through Kapellmeister/Linear projection. Do not switch production
-queues to another execution backend as a lifecycle workaround.
+For planned reconfiguration, finish active work, open **Repository settings**,
+then choose **Stop runtime and reopen setup**. Wait for setup to reopen before
+preparing or starting that repository again.
+
+If continued execution could mutate the wrong work, the host operator should
+stop the Fugue service using the deployment guide. This stops all repositories
+in that process. Capture status first only if doing so does not delay an urgent
+stop; the status API cannot answer while the service is down.
+
+Preserve the private state and logs, then follow
+[incident recovery](./operations.mdx#recover-from-an-incident). Reconcile runtime,
+tracker and PR evidence before resuming. Do not delete state, start a second
+service against the same queue, or switch execution backends as a workaround.
 
 ## Related docs
 
 - [Operations](./operations.mdx)
-- [Status Api](./status-api.mdx)
+- [Status API](./status-api.mdx)
+
+
+## Team startup failed
+
+Open the issue from Home's attention section to inspect the failure and its
+team. This means Fugue could not finish admitting the team. Some members may
+already exist, so do not add another copy of the issue to force a restart.
+
+Fugue retains the diagnostic in `native_recovery.launch_failure` on the
+issue status API and sends a failure observation to the repository coordinator.
+An unavailable specialist does not prevent that observation from reaching an
+available coordinator. The coordinator decides whether to resume, pause or
+request help; the host does not move the tracker lane or replace native sessions.
+If the coordinator itself is unavailable, check service logs and native runtime
+health before retrying. This behavior applies to Jira, the built-in tracker and
+Linear.

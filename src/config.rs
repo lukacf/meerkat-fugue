@@ -7,6 +7,7 @@ use std::time::SystemTime;
 use minijinja::{Environment, UndefinedBehavior, context};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::domain::{Issue, normalize_state, sanitize_workspace_key};
 use crate::error::{FugueError, Result};
@@ -19,7 +20,7 @@ use crate::tools::{
 };
 
 /// Default model used by the meerkat agent when a workflow does not specify one.
-pub const DEFAULT_AGENT_MODEL: &str = "gpt-5.5";
+pub use meerkat_models::global_default_model as default_agent_model;
 pub const DEFAULT_KAPELLMEISTER_SHADOW_PROMPT: &str = "You are Kapellmeister running in Meerkat Fugue shadow mode. Observe repository-scoped orchestration signals, preserve durable cursors, and produce recommendations only. The Rust orchestrator remains authoritative; do not mutate Linear, GitHub, the workspace, or production state.";
 const DEFAULT_PLAYWRIGHT_MCP_SERVER_ID: &str = "playwright";
 const DEFAULT_PLAYWRIGHT_MCP_COMMAND: [&str; 4] =
@@ -56,6 +57,9 @@ pub struct ServiceConfig {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TrackerConfig {
+    /// Host-owned storage scope; never shared through process CWD or environment.
+    #[serde(skip)]
+    pub attachment_root: Option<PathBuf>,
     pub kind: String,
     pub endpoint: String,
     #[serde(skip_serializing)]
@@ -326,6 +330,8 @@ pub struct DeployLaneConfig {
     pub base_branch: String,
     pub merge_method: MergeMethod,
     pub require_ci_success: bool,
+    /// Permit an explicitly empty host check set, while retaining all other CI gates.
+    pub allow_no_ci_checks: bool,
     pub require_fresh_head: bool,
     pub require_no_blocking_workgraph: bool,
     pub require_ota_update: bool,
@@ -346,6 +352,7 @@ impl Default for DeployLaneConfig {
             base_branch: "main".to_string(),
             merge_method: MergeMethod::Squash,
             require_ci_success: true,
+            allow_no_ci_checks: false,
             require_fresh_head: true,
             require_no_blocking_workgraph: true,
             require_ota_update: true,
@@ -532,8 +539,26 @@ pub enum SkillRef {
     },
 }
 
+/// The repository mob owns both durable domain specialists and ticket members.
+/// Legacy queue-only workflows have no repository binding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryRuntimeBinding {
+    pub repository: crate::ensemble::config::RepoId,
+    pub state_path: PathBuf,
+}
+
+impl RepositoryRuntimeBinding {
+    pub fn mob_id(&self) -> String {
+        format!("ensemble-{}", self.repository)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MeerkatConfig {
+    #[serde(skip)]
+    pub runtime_connections: Option<std::sync::Arc<crate::setup::connections::Connections>>,
+    pub repository_runtime: Option<RepositoryRuntimeBinding>,
     pub command: String,
     pub realm: Option<String>,
     pub instance: Option<String>,
@@ -573,6 +598,13 @@ pub struct MeerkatConfig {
 }
 
 impl MeerkatConfig {
+    pub fn mob_id(&self) -> std::borrow::Cow<'_, str> {
+        match &self.repository_runtime {
+            Some(binding) => std::borrow::Cow::Owned(binding.mob_id()),
+            None => std::borrow::Cow::Borrowed(crate::native_mob_contract::FUGUE_MOB_ID),
+        }
+    }
+
     pub fn command_line(&self) -> String {
         let mut command = self.command.clone();
         append_flag(&mut command, "--realm", self.realm.as_deref());
@@ -921,7 +953,7 @@ pub struct OtaUpdateConfig {
     pub trigger_token_env: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeFugueConfig {
     #[serde(default)]
@@ -968,7 +1000,7 @@ pub struct NativeFugueConfig {
     pub ota_update: Option<NativeOtaUpdateConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeLinearConfig {
     #[serde(default)]
@@ -1038,7 +1070,7 @@ pub struct NativeMcpServerConfig {
     pub env: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeMobTemplate {
     #[serde(default)]
@@ -1052,7 +1084,7 @@ pub struct NativeMobTemplate {
     pub max_review_cycles: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeMobExecutionSection {
     #[serde(default)]
@@ -1061,7 +1093,7 @@ pub struct NativeMobExecutionSection {
     pub native: Option<NativeMobRuntimeConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum NativeMobMember {
     Profile(String),
@@ -1084,7 +1116,7 @@ impl NativeMobMember {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeWorkerConfig {
     #[serde(default)]
@@ -1139,9 +1171,11 @@ pub struct NativeRuntimeAgentConfig {
     pub max_concurrent_agents_by_state: Option<BTreeMap<String, usize>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeMeerkatConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_runtime: Option<RepositoryRuntimeBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1247,7 +1281,7 @@ pub struct NativeServerConfig {
     pub meta_console: Option<NativeMetaConsoleServerConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeMetaConsoleServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1309,6 +1343,7 @@ pub struct WorkflowConfigManager {
     definition: WorkflowDefinition,
     effective: ServiceConfig,
     last_reload_error: Option<String>,
+    connections: Option<std::sync::Arc<crate::setup::connections::Connections>>,
 }
 
 impl WorkflowConfigManager {
@@ -1324,6 +1359,7 @@ impl WorkflowConfigManager {
             definition,
             effective,
             last_reload_error: None,
+            connections: None,
         })
     }
 
@@ -1340,6 +1376,33 @@ impl WorkflowConfigManager {
             definition,
             effective,
             last_reload_error: None,
+            connections: None,
+        })
+    }
+
+    pub fn load_scoped(
+        path: PathBuf,
+        connections: std::sync::Arc<crate::setup::connections::Connections>,
+    ) -> Result<Self> {
+        let (mut definition, modified) = load_workflow_file(&path)?;
+        resolve_connection_variables(&mut definition.config, &connections);
+        let mut effective = ServiceConfig::from_definition(path.clone(), &definition)?;
+        effective.meerkat.runtime_connections = Some(connections.clone());
+        if let Some(binding) = connections
+            .model_binding(&crate::meta_runtime::meta_runtime_state_path(
+                &effective.meerkat,
+            ))
+            .map_err(|error| FugueError::InvalidConfig(error.to_string()))?
+        {
+            effective.meerkat.auth_binding = Some(binding);
+        }
+        Ok(Self {
+            workflow_path: path,
+            last_modified: modified,
+            definition,
+            effective,
+            last_reload_error: None,
+            connections: Some(connections),
         })
     }
 
@@ -1367,9 +1430,22 @@ impl WorkflowConfigManager {
             return false;
         }
 
-        match load_workflow_file(&self.workflow_path).and_then(|(definition, modified)| {
-            let effective =
+        match load_workflow_file(&self.workflow_path).and_then(|(mut definition, modified)| {
+            if let Some(connections) = &self.connections {
+                resolve_connection_variables(&mut definition.config, connections);
+            }
+            let mut effective =
                 ServiceConfig::from_definition(self.workflow_path.clone(), &definition)?;
+            effective.meerkat.runtime_connections = self.connections.clone();
+            if let Some(connections) = &self.connections
+                && let Some(binding) = connections
+                    .model_binding(&crate::meta_runtime::meta_runtime_state_path(
+                        &effective.meerkat,
+                    ))
+                    .map_err(|error| FugueError::InvalidConfig(error.to_string()))?
+            {
+                effective.meerkat.auth_binding = Some(binding);
+            }
             Ok((definition, modified, effective))
         }) {
             Ok((definition, modified, effective)) => {
@@ -1391,12 +1467,49 @@ impl WorkflowConfigManager {
     }
 }
 
+fn resolve_connection_variables(
+    config: &mut Map<String, Value>,
+    connections: &crate::setup::connections::Connections,
+) {
+    fn visit(value: &mut Value, env: &BTreeMap<&str, String>) {
+        match value {
+            Value::String(text) => {
+                if let Some(variable) = text.strip_prefix('$') {
+                    if let Some(value) = env.get(variable) {
+                        *text = value.clone();
+                    } else if crate::setup::connections::SERVICE_CREDENTIAL_ENV.contains(&variable)
+                    {
+                        text.clear();
+                    }
+                }
+            }
+            Value::Array(values) => values.iter_mut().for_each(|value| visit(value, env)),
+            Value::Object(values) => values.values_mut().for_each(|value| visit(value, env)),
+            _ => {}
+        }
+    }
+    let env = connections.environment();
+    for value in config.values_mut() {
+        visit(value, &env);
+    }
+}
+
 impl ServiceConfig {
     /// A tracker with one shared unstarted status has no separate parked lane.
     /// Explicit intake scope takes precedence so that status remains runnable.
     pub fn is_parked_state(&self, state: &str) -> bool {
         normalize_state(state) == normalize_state(&self.linear.lanes.parked)
             && !self.tracker.is_intake_state(state)
+    }
+
+    /// Workflows with few statuses can use one holding status for review.
+    /// The status requests attention; only native review evidence grants approval.
+    pub(crate) fn independent_review_handoff_lane(&self) -> Option<&str> {
+        let lane = self.linear.lanes.review_ready.as_deref()?;
+        (self.independent_review.enabled
+            && self.linear.lanes.do_review.is_none()
+            && normalize_state(lane) == normalize_state(&self.independent_review.lane))
+        .then_some(lane)
     }
 
     pub fn from_definition(path: PathBuf, definition: &WorkflowDefinition) -> Result<Self> {
@@ -1418,7 +1531,13 @@ impl ServiceConfig {
             section_object(&definition.config, "meerkat")?,
             &workflow_dir,
         )?;
-        let mob = MobExecutionConfig::from_raw(section_object(&definition.config, "mob")?)?;
+        let mut mob = MobExecutionConfig::from_raw(section_object(&definition.config, "mob")?)?;
+        for server in mob.mcp_servers.values_mut() {
+            server.env.insert(
+                crate::workgraph_gate::WORKGRAPH_MOB_ID_ENV.into(),
+                meerkat.mob_id().into_owned(),
+            );
+        }
         let mut worker_policy =
             WorkerPolicyConfig::from_raw(section_object(&definition.config, "worker_policy")?)?;
         if worker_policy.native_launch_context_template.is_none() {
@@ -1441,7 +1560,7 @@ impl ServiceConfig {
             section_object(&definition.config, "ota_update")?,
             &workflow_dir,
         )?;
-        let config = Self {
+        let mut config = Self {
             workflow_path: path,
             workflow_dir,
             prompt_template: definition.prompt_template.clone(),
@@ -1461,8 +1580,62 @@ impl ServiceConfig {
             server,
             ota_update,
         };
+        config.tracker.attachment_root = Some(config.attachment_storage_root());
         config.validate_static()?;
         Ok(config)
+    }
+
+    pub(crate) fn attachment_storage_root(&self) -> PathBuf {
+        self.meerkat
+            .repository_runtime
+            .as_ref()
+            .map(|binding| {
+                binding
+                    .state_path
+                    .join("files")
+                    .join("tracker-files")
+                    .join(self.tracker_context_id())
+            })
+            .unwrap_or_else(|| {
+                // Explicit workflows may share a directory or database. Keep
+                // their files scoped even when tracker keys overlap.
+                self.workflow_dir
+                    .join(".fugue")
+                    .join("tracker-files")
+                    .join(self.tracker_context_id())
+            })
+    }
+
+    /// Stable tracker identity, excluding credentials and display settings.
+    pub(crate) fn tracker_context_id(&self) -> String {
+        // Jira also accepts environment references for its site and project.
+        // Scope the effective values so changing a deployment's environment
+        // cannot reuse another tracker's browser receipts or local files.
+        let jira_endpoint = (self.tracker.kind == "jira")
+            .then(|| crate::jira::env_value(&self.tracker.endpoint))
+            .flatten();
+        let jira_project = (self.tracker.kind == "jira")
+            .then(|| {
+                self.tracker
+                    .project_slug
+                    .as_deref()
+                    .and_then(crate::jira::env_value)
+            })
+            .flatten();
+        let mut identity = Sha256::new();
+        for component in [
+            self.tracker.kind.as_str(),
+            jira_endpoint.as_deref().unwrap_or(&self.tracker.endpoint),
+            jira_project
+                .as_deref()
+                .or(self.tracker.project_slug.as_deref())
+                .unwrap_or_default()
+                .trim(),
+        ] {
+            identity.update((component.len() as u64).to_le_bytes());
+            identity.update(component.as_bytes());
+        }
+        format!("{:x}", identity.finalize())
     }
 
     fn validate_static(&self) -> Result<()> {
@@ -1514,7 +1687,23 @@ impl ServiceConfig {
                 self.tracker.kind.clone(),
             ));
         }
+        if (self.independent_review.enabled || self.final_review.enabled)
+            && self.deploy.allowed_repositories.is_empty()
+        {
+            return Err(FugueError::InvalidConfig(
+                "Review requires deploy.allowed_repositories to scope the candidate; deploy.enabled may remain false. Set deploy.base_branch to the branch being reviewed."
+                    .into(),
+            ));
+        }
         if self.tracker.kind == "fugue-ims" {
+            if self
+                .tracker
+                .project_slug
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(FugueError::MissingTrackerProjectSlug);
+            }
             if self.tracker.endpoint.trim().is_empty() {
                 return Err(FugueError::InvalidConfig(
                     "tracker.endpoint must point at a fugue-ims sqlite database".to_string(),
@@ -1721,10 +1910,11 @@ impl TrackerConfig {
                 .map(|value| serde_json::from_value(value.clone()))
                 .transpose()
                 .map_err(|err| FugueError::InvalidConfig(format!("tracker.jira: {err}")))?,
-            project_slug: opt_string(raw, "project_slug")?,
+            project_slug: opt_string(raw, "project_slug")?.map(|scope| scope.trim().to_owned()),
             intake_states,
             in_flight_states,
             active_states,
+            attachment_root: None,
             max_attachment_files: opt_usize(raw, "max_attachment_files")?.unwrap_or(20),
             max_attachment_bytes: opt_u64(raw, "max_attachment_bytes")?.unwrap_or(25 * 1024 * 1024),
             max_attachment_total_bytes: opt_u64(raw, "max_attachment_total_bytes")?
@@ -1823,6 +2013,15 @@ impl DeployLaneConfig {
         if self.enabled && self.allowed_repositories.is_empty() {
             return Err(FugueError::InvalidConfig(
                 "deploy.enabled requires at least one allowed repository".to_string(),
+            ));
+        }
+        if self
+            .success_lane
+            .trim()
+            .eq_ignore_ascii_case(self.blocked_lane.trim())
+        {
+            return Err(FugueError::InvalidConfig(
+                "deploy.success_lane and deploy.blocked_lane must differ".into(),
             ));
         }
         for repo in &self.allowed_repositories {
@@ -2082,7 +2281,22 @@ impl MeerkatConfig {
             FugueError::InvalidConfig("meerkat.max_sessions exceeds platform capacity".to_string())
         })?;
         Ok(Self {
+            runtime_connections: None,
             command,
+            repository_runtime: raw
+                .and_then(|raw| raw.get("repository_runtime"))
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    let mut binding: RepositoryRuntimeBinding =
+                        serde_json::from_value(value.clone()).map_err(|error| {
+                            FugueError::InvalidConfig(format!(
+                                "meerkat.repository_runtime: {error}"
+                            ))
+                        })?;
+                    binding.state_path = absolute_clean_path(workflow_dir, &binding.state_path);
+                    Ok::<_, FugueError>(binding)
+                })
+                .transpose()?,
             realm: opt_string(raw, "realm")?.and_then(|v| resolve_env_string(&v)),
             instance: opt_string(raw, "instance")?.and_then(|v| resolve_env_string(&v)),
             realm_backend,
@@ -2090,7 +2304,7 @@ impl MeerkatConfig {
             context_root: path_field(raw, "context_root", workflow_dir)?,
             user_config_root: path_field(raw, "user_config_root", workflow_dir)?,
             auth_binding,
-            model: opt_string(raw, "model")?.or_else(|| Some(DEFAULT_AGENT_MODEL.to_string())),
+            model: opt_string(raw, "model")?.or_else(|| Some(default_agent_model().to_string())),
             provider: opt_string(raw, "provider")?,
             max_tokens: opt_u64(raw, "max_tokens")?,
             system_prompt: opt_string(raw, "system_prompt")?,
@@ -4182,8 +4396,8 @@ mod tests {
         assert!(!config.mob.native.shadow);
         assert_eq!(
             config.meerkat.model.as_deref(),
-            Some(DEFAULT_AGENT_MODEL),
-            "meerkat.model should default to {DEFAULT_AGENT_MODEL} when unspecified"
+            Some(default_agent_model()),
+            "meerkat.model should use the Meerkat catalog default when unspecified"
         );
         assert_eq!(config.tracker.active_states, vec!["Todo", "Active"]);
     }
@@ -4299,6 +4513,22 @@ mod tests {
     }
 
     #[test]
+    fn deploy_success_cannot_share_the_blocked_lane() {
+        let config = DeployLaneConfig {
+            success_lane: "Closed".into(),
+            blocked_lane: " closed ".into(),
+            ..Default::default()
+        };
+        assert!(
+            config
+                .validate_static()
+                .unwrap_err()
+                .to_string()
+                .contains("deploy.success_lane and deploy.blocked_lane must differ")
+        );
+    }
+
+    #[test]
     fn deploy_lane_config_requires_repository_when_enabled() {
         let definition = WorkflowDefinition {
             config: json!({
@@ -4373,6 +4603,51 @@ mod tests {
             .to_string();
 
         assert!(err.contains("independent_review.enabled requires reviewer_count = 3"));
+    }
+
+    #[test]
+    fn review_only_dispatch_requires_explicit_repository_scope_but_not_deployment() {
+        let native = parse_native_workflow(
+            Path::new("/tmp/fugue.yaml"),
+            include_str!("../fugue.jira.example.yaml"),
+        )
+        .unwrap();
+        for review in ["independent_review", "final_review"] {
+            let mut raw = json!({
+                "tracker":{"kind":"fugue-ims", "project_slug":"example/app", "endpoint":"/tmp/review-policy.sqlite"},
+                "deploy":{"enabled":false}
+            });
+            raw["mob"] = native.config["mob"].clone();
+            raw[review] = if review == "independent_review" {
+                json!({"enabled":true})
+            } else {
+                json!({"enabled":true,"reviewers":[{"id":"domain","profile":"domain","required":true}]})
+            };
+            let definition = WorkflowDefinition {
+                config: raw.as_object().unwrap().clone(),
+                prompt_template: "test".into(),
+            };
+            let config =
+                ServiceConfig::from_definition(PathBuf::from("/tmp/fugue.yaml"), &definition)
+                    .unwrap();
+            assert!(
+                config
+                    .validate_dispatch()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("deploy.allowed_repositories")
+            );
+            raw["deploy"]["allowed_repositories"] = json!([{"owner":"example","name":"app"}]);
+            let definition = WorkflowDefinition {
+                config: raw.as_object().unwrap().clone(),
+                prompt_template: "test".into(),
+            };
+            let config =
+                ServiceConfig::from_definition(PathBuf::from("/tmp/fugue.yaml"), &definition)
+                    .unwrap();
+            assert!(!config.deploy.enabled);
+            config.validate_dispatch().unwrap();
+        }
     }
 
     #[test]

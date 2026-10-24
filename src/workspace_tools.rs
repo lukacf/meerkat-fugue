@@ -20,6 +20,12 @@ pub struct WorkspaceToolHost {
 }
 
 impl WorkspaceToolHost {
+    pub(crate) fn for_service(config: &crate::config::ServiceConfig) -> Self {
+        Self {
+            manager: WorkspaceManager::for_service(config),
+        }
+    }
+
     pub fn new(workspace: &WorkspaceConfig, hooks: &HooksConfig) -> Self {
         Self {
             manager: WorkspaceManager::new(workspace, hooks),

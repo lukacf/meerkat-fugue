@@ -9,6 +9,11 @@
 > Any older names discussed here are legacy compatibility inputs that must be
 > repaired or reported into the canonical model.
 
+> The spawning and caller-supplied verdict design below is also historical.
+> Current review admission selects existing specialists in the repository mob
+> and verifies native results against the current request. See the
+> [current review contract](../development.mdx#current-review-request).
+
 ## Summary
 
 Add two repo-level control lanes to Fugue without turning the host into a second orchestrator:

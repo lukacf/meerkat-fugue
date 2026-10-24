@@ -198,36 +198,34 @@ fn final_pr_gate_native_launch_template(
     request: &FinalPrGateStartRequest,
     mcp_tools: &[String],
 ) -> MaterializedMobTemplate {
-    let members = request
-        .reviewers
-        .iter()
-        .map(|reviewer| crate::config::MaterializedMobMember {
-            name: reviewer.id.clone(),
-            profile: reviewer.profile.clone(),
-            agent: crate::config::NativeAgentProfile {
-                model: None,
-                provider: None,
-                auth_binding: None,
-                max_tokens: None,
-                system_prompt: None,
-                output_schema: None,
-                structured_output_retries: None,
-                provider_params: None,
-                tools: review_agent_tools(["mob", "shell", "comms"], mcp_tools),
-                skills: Vec::new(),
-                additional_instructions: Some(vec![
-                    "You are a repo-level final PR reviewer. Emit typed final-review verdicts only. Do not merge.".to_string(),
-                ]),
-            },
-        })
-        .collect::<Vec<_>>();
-    MaterializedMobTemplate {
-        backend: MobExecutionBackend::NativeExecution,
-        members,
-        flow: None,
-        linear_projection: None,
-        max_review_cycles: None,
+    final_pr_gate_native_launch_template_with_profile(
+        request,
+        mcp_tools,
+        &crate::config::IndependentReviewConfig::default().orchestrator_profile,
+    )
+}
+
+pub(crate) fn final_pr_gate_native_launch_template_with_profile(
+    request: &FinalPrGateStartRequest,
+    mcp_tools: &[String],
+    orchestrator_profile: &str,
+) -> MaterializedMobTemplate {
+    let mut template = independent_review_native_launch_template(
+        &IndependentReviewStartRequest {
+            issue: request.issue.clone(),
+            pull_request: request.pr.clone(),
+            spawn_input: request.spawn_input.clone(),
+            orchestrator_profile: orchestrator_profile.to_owned(),
+        },
+        mcp_tools,
+    );
+    for member in &mut template.members {
+        member.agent.additional_instructions = Some(vec![format!(
+            "You coordinate the repository's final PR review for PR #{} ({}), exact head {}. Select at least three distinct independent EXISTING repository specialists, excluding everyone who implemented this issue. Configured profile selectors: {:?}. Each required entry needs a distinct specialist of that existing native profile; multiple entries for the same profile need multiple distinct members. Inspect the specialist directory and native roster; never create replacement reviewers or profiles. If the existing specialists cannot cover the required profiles, report the missing coverage to Kapellmeister as blocked. Record the chosen focus areas and rationale in the task. Create review-execution obligations in the repository native realm and default WorkGraph namespace, labelled fugue, issue:<canonical issue identifier>, and blocking. Call fugue_admit_independent_review with the canonical issue, repository, PR number, immutable head_sha, selected profile-to-identity reviewers, task and a stable request key. Retry uncertain admission with identical arguments; a replacement requires the current request ID in supersedes and a new key. Do not run review flows yourself. Native flows collect each selected specialist's typed review. Inspect their native run references until terminal; close completed execution obligations and keep unresolved findings blocking. Call fugue_complete_final_pr_gate with the native_review references and exact workgraph_scope after every selected run completes. Do not submit copied verdicts or claim a failed/canceled run passed. That configured host action owns fresh review, CI, WorkGraph and merge checks, records the actual merge result, and projects success/rework/blocked lanes. If native execution cannot finish, report the terminal blocker to Kapellmeister instead of waiting indefinitely. Never call the independent-review completion action for this final-gate assignment.",
+            request.pr.number.0, request.pr.url, request.pr.head_sha.0, request.reviewers
+        )]);
     }
+    template
 }
 
 pub fn independent_review_native_launch_template(
@@ -249,7 +247,7 @@ pub fn independent_review_native_launch_template(
             tools: review_agent_tools(["mob", "shell", "comms", "workgraph"], mcp_tools),
             skills: Vec::new(),
             additional_instructions: Some(vec![format!(
-                "You are the Fugue independent review orchestrator for PR #{} ({}). Inspect the issue, Workpad, PR metadata, touched modules, and WorkGraph obligations yourself. Choose exactly three independent reviewer roles/focus areas, record the choices and rationale, then create reviewer obligation items in one WorkGraph scope and keep the returned realm_id and namespace. Spawn those reviewers using Meta native mob/delegate tooling. Do not pre-chew the diff for reviewers; instruct each reviewer to inspect the diff against base using shell/GitHub tools and emit a typed verdict whose schema_version is exactly {:?}. When you have all three verdicts or hit the bounded timeout, call fugue_complete_independent_review with an IndependentReviewCompletionRequest; include workgraph_scope copied exactly from the reviewer obligation items so Fugue records any red-review blockers in the same realm/namespace. Fugue then records the Workpad summary, review comment, WorkGraph blockers, and configured lane move exactly once. Do not use any alternate schema string, and do not call completion without workgraph_scope.",
+                "You are the Fugue independent review orchestrator for PR #{} ({}). Inspect the issue, PR metadata, touched modules and WorkGraph obligations. Choose the configured number of independent existing repository specialists from the specialist directory, verify their identities and profiles in the native roster, and exclude anyone who implemented this change. Record their focus areas and your selection rationale in the task. Create reviewer obligations in this repository's native realm and default WorkGraph namespace, labelled fugue, issue:<issue identifier>, and blocking; retain that exact workgraph_scope. Call fugue_admit_independent_review with the issue, repository, PR number, immutable head_sha, profile-to-identity reviewers map, task and a stable idempotency_key. Do not spawn reviewers or run review flows directly. The host reserves the current request before native admission. On an uncertain response retry the identical request and key. To replace a failed, canceled, superseded or outdated assignment, inspect the current request and supply its ID in supersedes with a new key. Native flows dispatch the immutable assignment and record typed verdicts using schema {:?}. Inspect the returned native run references until all selected reviewers finish. Complete the review-execution obligations only after their corresponding native runs complete, preserving unresolved findings as blockers. Then call fugue_complete_independent_review with those native_review references and the exact workgraph_scope. Do not submit copied verdicts, peer prose or timeout claims as completion. If native execution fails, is canceled or cannot finish, report the blocker to Kapellmeister and keep merge blocked. Fugue projects verified native results to the configured tracker.",
                 request.pull_request.number.0,
                 request.pull_request.url,
                 crate::independent_review::INDEPENDENT_REVIEW_SCHEMA_VERSION
@@ -343,6 +341,22 @@ pub async fn execute_guarded_kapellmeister_decision_with_native_tools(
 
 struct GuardedAuthority<'a> {
     authority: &'a KapellmeisterToolAuthority,
+}
+
+pub(crate) fn ensure_guarded_operations(
+    authority: &KapellmeisterToolAuthority,
+    context: &KapellmeisterDecisionContext,
+    operations: &[FugueToolOperation],
+) -> Result<()> {
+    let guard = GuardedAuthority::evaluate(authority, context).ok_or_else(|| {
+        FugueError::InvalidConfig(
+            "Final review requires matching guarded repository authority".into(),
+        )
+    })?;
+    for operation in operations {
+        guard.ensure_permitted(*operation)?;
+    }
+    Ok(())
 }
 
 impl<'a> GuardedAuthority<'a> {

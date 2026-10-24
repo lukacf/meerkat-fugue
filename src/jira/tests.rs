@@ -47,14 +47,21 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-struct MockResponse {
+pub(crate) struct MockResponse {
     method: &'static str,
     path: &'static str,
     status: StatusCode,
     body: Value,
 }
 
-fn reply(method: &'static str, path: &'static str, body: Value) -> MockResponse {
+impl MockResponse {
+    pub(crate) fn with_status(mut self, status: StatusCode) -> Self {
+        self.status = status;
+        self
+    }
+}
+
+pub(crate) fn reply(method: &'static str, path: &'static str, body: Value) -> MockResponse {
     MockResponse {
         method,
         path,
@@ -63,10 +70,10 @@ fn reply(method: &'static str, path: &'static str, body: Value) -> MockResponse 
     }
 }
 
-struct MockJira {
-    endpoint: String,
-    requests: Arc<Mutex<Vec<(String, Value)>>>,
-    responses: Arc<Mutex<VecDeque<MockResponse>>>,
+pub(crate) struct MockJira {
+    pub(crate) endpoint: String,
+    pub(crate) requests: Arc<Mutex<Vec<(String, Value)>>>,
+    pub(crate) responses: Arc<Mutex<VecDeque<MockResponse>>>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for MockJira {
@@ -75,7 +82,7 @@ impl Drop for MockJira {
     }
 }
 
-async fn mock_jira(responses: Vec<MockResponse>) -> MockJira {
+pub(crate) async fn mock_jira(responses: Vec<MockResponse>) -> MockJira {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -97,11 +104,36 @@ async fn mock_jira(responses: Vec<MockResponse>) -> MockJira {
             assert_eq!(parts.method.as_str(), response.method);
             assert_eq!(parts.uri.path(), response.path);
             assert!(parts.headers.contains_key("authorization"));
-            let body = to_bytes(body, 1024 * 1024).await.expect("request body");
-            let body = if body.is_empty() {
-                Value::Null
+            let body = if parts
+                .headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("multipart/form-data"))
+            {
+                use axum::extract::FromRequest;
+                assert_eq!(parts.headers["x-atlassian-token"], "no-check");
+                let request = Request::from_parts(parts.clone(), body);
+                let mut multipart = axum::extract::Multipart::from_request(request, &())
+                    .await
+                    .unwrap();
+                let mut files = Vec::new();
+                while let Some(field) = multipart.next_field().await.unwrap() {
+                    assert_eq!(field.name(), Some("file"));
+                    let name = field.file_name().unwrap().to_owned();
+                    let content_type = field.content_type().map(str::to_owned);
+                    let bytes = field.bytes().await.unwrap();
+                    files.push(
+                        json!({"name":name,"content_type":content_type,"bytes":bytes.to_vec()}),
+                    );
+                }
+                json!({"files":files})
             } else {
-                serde_json::from_slice(&body).expect("JSON")
+                let body = to_bytes(body, 1024 * 1024).await.expect("request body");
+                if body.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&body).expect("JSON")
+                }
             };
             observed
                 .lock()
@@ -114,6 +146,7 @@ async fn mock_jira(responses: Vec<MockResponse>) -> MockJira {
                 .expect("response")
         }
     }));
+    let app = app.layer(axum::extract::DefaultBodyLimit::max(101 * 1024 * 1024));
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve");
     });
@@ -125,7 +158,7 @@ async fn mock_jira(responses: Vec<MockResponse>) -> MockJira {
     }
 }
 
-fn tracker(endpoint: &str) -> TrackerConfig {
+pub(crate) fn tracker(endpoint: &str) -> TrackerConfig {
     TrackerConfig {
         kind: "jira".to_string(),
         endpoint: endpoint.to_string(),
@@ -139,14 +172,50 @@ fn tracker(endpoint: &str) -> TrackerConfig {
         in_flight_states: vec!["In Progress".to_string()],
         active_states: vec!["To Do".to_string(), "In Progress".to_string()],
         terminal_states: vec!["Done".to_string()],
+        attachment_root: None,
         max_attachment_files: 2,
         max_attachment_bytes: 1024,
         max_attachment_total_bytes: 2048,
     }
 }
 
-fn issue(status: &str) -> Value {
+pub(crate) fn issue(status: &str) -> Value {
     json!({"id":"10001","key":"TEST-1","fields":{"summary":"Integration fixture","description":null,"project":{"id":"10","key":"TEST"},"updated":"2026-01-01T00:00:00.000+0000","status":{"id":if status == "Done" { "3" } else { "2" },"name":status,"statusCategory":{"key":if status == "Done" { "done" } else { "indeterminate" }}}}})
+}
+
+#[test]
+fn opaque_jira_priority_ids_are_not_numeric_ranks() {
+    let mut config = tracker("https://jira.example.com");
+    let client = JiraClient::from_config(&config).unwrap();
+    let mut value = issue("In Progress");
+    value["fields"]["priority"] = json!({"id":"10002", "name":"Normal"});
+    assert_eq!(
+        client
+            .normalize(serde_json::from_value(value.clone()).unwrap())
+            .priority,
+        None
+    );
+    config
+        .jira
+        .as_mut()
+        .unwrap()
+        .priority_ranks
+        .insert("Normal".into(), std::num::NonZeroU32::new(3).unwrap());
+    let client = JiraClient::from_config(&config).unwrap();
+    assert_eq!(
+        client
+            .normalize(serde_json::from_value(value.clone()).unwrap())
+            .priority,
+        Some(3)
+    );
+    value["fields"]["priority"]["id"] = json!("opaque-priority-id");
+    assert_eq!(
+        client
+            .normalize(serde_json::from_value(value).unwrap())
+            .priority,
+        Some(3)
+    );
+    assert!(serde_json::from_value::<JiraConfig>(json!({"priority_ranks":{"Normal":0}})).is_err());
 }
 fn reference() -> LinearIssueRef {
     LinearIssueRef::Identifier {
@@ -587,4 +656,85 @@ async fn creation_passes_required_custom_fields_without_changing_project() {
         json!({"id":"7"})
     );
     assert_eq!(requests[0].1["fields"]["labels"], json!(["fugue"]));
+}
+
+#[tokio::test]
+async fn creation_receipt_survives_initial_status_and_refresh_failures() {
+    for failure in ["initial_read", "transition", "refresh", "missing_key"] {
+        let failed_read = MockResponse {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            ..reply(
+                "GET",
+                "/rest/api/3/issue/10001",
+                json!({"errorMessages":["temporarily unavailable"]}),
+            )
+        };
+        let mut responses = vec![reply(
+            "POST",
+            "/rest/api/3/issue",
+            if failure == "missing_key" {
+                json!({"id":"10001"})
+            } else {
+                json!({"id":"10001", "key":"TEST-1"})
+            },
+        )];
+        match failure {
+            "initial_read" | "missing_key" => responses.push(failed_read),
+            "transition" => {
+                responses.push(reply(
+                    "GET",
+                    "/rest/api/3/issue/10001",
+                    issue("In Progress"),
+                ));
+                responses.push(reply(
+                    "GET",
+                    "/rest/api/3/issue/TEST-1/transitions",
+                    json!({"transitions":[]}),
+                ));
+            }
+            _ => {
+                responses.push(reply("GET", "/rest/api/3/issue/10001", issue("To Do")));
+                responses.push(failed_read);
+            }
+        }
+        let mock = mock_jira(responses).await;
+        let error = JiraClient::from_config(&tracker(&mock.endpoint))
+            .expect("client")
+            .create_issue("Only one issue", Some("Creation recovery fixture"), "To Do")
+            .await
+            .expect_err("follow-up operation fails");
+        let FugueError::IssueCreatedNeedsAttention { created, source } = error else {
+            panic!("{failure} lost the creation receipt: {error}");
+        };
+        assert_eq!(created.id, "10001");
+        if failure == "missing_key" {
+            assert_eq!(created.identifier, "10001");
+            assert_eq!(created.url, None);
+        } else {
+            assert_eq!(created.identifier, "TEST-1");
+            assert_eq!(
+                created.url,
+                Some(format!("{}/browse/TEST-1", mock.endpoint))
+            );
+        }
+        if failure != "transition" {
+            assert!(matches!(*source, FugueError::JiraApiStatus { status: 503 }));
+        } else {
+            assert!(
+                source
+                    .to_string()
+                    .contains("no currently available transition")
+            );
+        }
+        assert_eq!(
+            mock.requests
+                .lock()
+                .expect("requests")
+                .iter()
+                .filter(|(uri, _)| uri == "/rest/api/3/issue")
+                .count(),
+            1
+        );
+        assert!(mock.responses.lock().expect("responses").is_empty());
+    }
 }

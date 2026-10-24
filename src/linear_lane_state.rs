@@ -16,7 +16,7 @@ use crate::tools::{LinearCommentId, LinearIssueIdentifier, LinearIssueRef, Linea
 pub const LINEAR_LANE_STATE_PATH_ENV: &str = "FUGUE_LINEAR_LANE_STATE_PATH";
 pub const LINEAR_COMMENT_STATE_FILE: &str = "linear-comments.json";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinearLaneState {
     #[serde(default)]
@@ -97,6 +97,14 @@ pub type LinearLaneClassification = ImsStageClassification;
 pub fn classify_linear_lane(config: &ServiceConfig, lane: &str) -> LinearLaneClassification {
     if config.is_parked_state(lane) {
         return LinearLaneClassification::Parked;
+    }
+    if config
+        .independent_review_handoff_lane()
+        .is_some_and(|handoff| same_lane(lane, handoff))
+    {
+        // Report pending review after restart as well as on a transition.
+        // Kapellmeister inspects native review state before admitting work.
+        return LinearLaneClassification::ControlActive;
     }
     if config
         .linear
@@ -319,7 +327,7 @@ pub struct LinearCommentSnapshot {
     pub body_markdown: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinearCommentState {
     #[serde(default)]
@@ -454,12 +462,10 @@ pub fn comment_state_path_for_workflow(workflow_dir: &Path) -> PathBuf {
 }
 
 pub fn record_internal_lane_change_from_env(identifier: &str, lane: &str) -> Result<bool> {
-    let Some(path) = std::env::var_os(LINEAR_LANE_STATE_PATH_ENV).map(PathBuf::from) else {
+    let Some(binding) = crate::host_signal_journal::HostSignalBinding::from_environment()? else {
         return Ok(false);
     };
-    let mut state = LinearLaneState::read(&path)?;
-    state.observe_lane(identifier, lane);
-    state.write(&path)?;
+    binding.record_internal_lane(identifier, lane)?;
     Ok(true)
 }
 

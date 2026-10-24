@@ -9,6 +9,12 @@
 > evidence names should be interpreted as legacy compatibility inputs repaired
 > or reported into the canonical model.
 
+> The old HTTP verdict-submission and Workpad-only deploy retry examples below
+> are historical evidence, not qualification of current review or merge
+> authorization. Current acceptance must follow the
+> [native review request contract](../development.mdx#current-review-request)
+> and the hosted delivery checks in that guide.
+
 ## Requirement Traceability Matrix
 
 | ID | Requirement | Phase | Runtime Caller | Test/Evidence | Status |

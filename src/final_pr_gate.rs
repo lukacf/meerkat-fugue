@@ -4,7 +4,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::{FinalReviewConfig, FinalReviewMergeStrategy, FinalReviewMode};
@@ -281,38 +281,15 @@ pub fn final_reviewer_mob_definition(
     pr: &GitHubPullRequestSnapshot,
     trigger_mode: FinalReviewMode,
 ) -> Value {
-    let mut profiles = Map::new();
-    let mut members = Vec::new();
-    for spec in final_reviewer_member_specs(config) {
-        profiles.entry(spec.profile.clone()).or_insert_with(|| {
-            json!({
-                "peer_description": format!("Repo-level final PR reviewer {} for PR #{}", spec.id, pr.number.0),
-                "tools": {
-                    "builtins": true,
-                    "shell": true,
-                    "comms": true,
-                    "workgraph": true,
-                    "mcp": ["github", "linear"]
-                },
-                "merge_tool_allowed": false
-            })
-        });
-        members.push(json!({
-            "id": spec.id,
-            "profile": spec.profile,
-            "required": spec.required,
-            "merge_tool_allowed": false
-        }));
-    }
     json!({
         "id": format!("final-pr-gate-{}", pr.number.0),
         "owner": "kapellmeister",
         "trigger_mode": trigger_mode,
         "pr": pr,
-        "profiles": profiles,
-        "members": members,
+        "existing_specialist_selection": config.reviewers,
         "authority": {
-            "reviewers_emit_typed_verdicts_only": true,
+            "existing_members_only": true,
+            "native_review_references_only": true,
             "reviewers_may_merge": false,
             "merge_owner": "kapellmeister"
         }
@@ -326,26 +303,13 @@ pub fn final_pr_gate_reviewer_instructions(
     trigger_mode: FinalReviewMode,
 ) -> String {
     format!(
-        "Repo-level final PR gate for PR #{} ({}) via {:?}. Review exact head SHA `{}`. Each configured final reviewer must emit a typed FinalReviewVerdict with reviewer id, status, PR, head_sha, findings, and required_checks. Required reviewers: {}. Optional reviewers: {}. Reviewers must not merge. Each reviewer must independently inspect the diff against the PR base using shell/GitHub tools and query WorkGraph obligations using workgraph_* tools; Fugue does not provide a precomputed diff or WorkGraph dump. If you find a blocking issue, create or update WorkGraph items labeled `fugue`, `issue:{}`, and `blocking`; only reviewer-role agents may close completed review obligations. Kapellmeister aggregates typed verdicts, verifies fresh head and CI, then chooses configured lanes success=`{}`, rework=`{}`, blocked=`{}`.",
+        "Coordinate final review for issue {} and PR #{} ({}) via {:?}. Review exact head {} using independent existing repository specialists. Required profile selectors: {:?}. Choose at least three distinct specialists and enough members to cover every required profile entry. Do not create generic reviewer profiles. Admit native review through fugue_admit_independent_review and complete it through fugue_complete_final_pr_gate using the returned native run references. The host owns merge checks and lane projection: success={}, rework={}, blocked={}.",
+        final_pr_gate_issue_label(issue),
         pr.number.0,
         pr.url,
         trigger_mode,
         pr.head_sha.0,
-        config
-            .reviewers
-            .iter()
-            .filter(|r| r.required)
-            .map(|r| r.id.as_str())
-            .collect::<Vec<_>>()
-            .join(","),
-        config
-            .reviewers
-            .iter()
-            .filter(|r| !r.required)
-            .map(|r| r.id.as_str())
-            .collect::<Vec<_>>()
-            .join(","),
-        final_pr_gate_issue_label(issue),
+        config.reviewers,
         config.success_lane,
         config.rework_lane,
         config.blocked_lane
@@ -654,7 +618,7 @@ pub fn final_pr_gate_ci_status(ci: Option<&CheckCiOutput>) -> FinalPrGateCiStatu
     }
     match ci.status {
         CiStatus::Success | CiStatus::Skipped => FinalPrGateCiStatus::Success,
-        CiStatus::Pending => FinalPrGateCiStatus::Pending,
+        CiStatus::Pending | CiStatus::NoChecks => FinalPrGateCiStatus::Pending,
         CiStatus::Failure | CiStatus::Error | CiStatus::Cancelled => FinalPrGateCiStatus::Failed,
     }
 }
@@ -1012,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_start_request_materializes_meta_visible_reviewers_from_manual_and_auto_triggers() {
+    fn runtime_start_request_selects_existing_specialists_for_manual_and_auto_triggers() {
         let cfg = config();
         let manual = final_pr_gate_start_request(FinalPrGateRuntimeTriggerInput {
             config: cfg.clone(),
@@ -1040,7 +1004,7 @@ mod tests {
                 .instructions
                 .as_deref()
                 .unwrap()
-                .contains("FinalReviewVerdict")
+                .contains("fugue_complete_final_pr_gate")
         );
         assert!(
             manual

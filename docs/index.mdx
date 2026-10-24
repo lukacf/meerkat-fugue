@@ -1,67 +1,41 @@
+---
+title: "Meerkat Fugue"
+description: "Connect repositories, prepare persistent agent teams, and deliver reviewed changes."
+---
+
 # Meerkat Fugue documentation
 
-Meerkat Fugue is a Rust service that turns a Linear project into a safe,
-observable coding-agent queue. It polls eligible Linear issues, prepares an
-isolated workspace for each issue, launches the configured native Meerkat mob,
-and records human-readable handoff evidence in Linear and GitHub.
+Fugue connects GitHub or GitHub Enterprise repositories to built-in tickets,
+Linear or Jira. Each repository has its own persistent specialist team and issue
+queue, with review and delivery evidence visible in one operator application.
 
-## Documentation set
+## Start here
 
-Start with [Overview](./overview.mdx) if you are new to Fugue. A compact ordered sidebar is maintained in [Navigation](./_navigation.mdx).
+- [Your first repository](./getting-started.mdx): install, connect access, prepare
+  the team and run a small issue.
+- [How Fugue works](./overview.mdx): the repository, team, tracker and runtime model.
+- [Daily work](./daily-work.mdx): Home, Board, Agents, review and connection recovery.
 
-- [Overview](./overview.mdx) — what Fugue is, core concepts, and when to use it.
-- [Getting started](./getting-started.mdx) — install prerequisites, create a native
-  `fugue.yaml`, validate safely, and start the service.
-- [Configuration reference](./configuration.mdx) — all user-facing
-  `fugue.yaml` sections, defaults, and examples.
-- [Native mobs](./native-mobs.mdx) — native mob templates,
-  compact Linear lanes, member tools, and handoff rules.
-- [Operations](./operations.mdx) — production setup, monitoring,
-  incidents, rollback, and destructive-test warnings.
-- [Architecture](./architecture.mdx) — service components, lifecycle,
-  recovery evidence, trust boundaries, and source tree map.
-- [Status API](./status-api.mdx) — dashboard and JSON endpoints.
-- [Development guide](./development.mdx) — local validation, coding rules,
-  documentation updates, and real E2E controls.
-- [Troubleshooting](./troubleshooting.mdx) — common symptoms and recovery steps.
-- [Upgrading to 0.9.3](./upgrading-0.9.3.mdx) — configuration migration, durable state, and rollout.
+## Configure and operate
 
-Historical design notes remain in Markdown only when they describe current native behavior.
+- [Jira and GitHub Enterprise](./jira-and-github-enterprise.mdx): authentication,
+  project isolation, workflow mapping and validation.
+- [Repository teams](./ensemble.mdx): mapping, specialists, memory and subscriptions.
+- [Configuration reference](./configuration.mdx): advanced `fugue.yaml` options.
+- [Release bundles](../scripts/distribution/README.md): packaged installation,
+  binary integrity, private hosting and atomic upgrades.
+- [Operations](./operations.mdx): durable state, monitoring, incidents and rollback.
+- [Troubleshooting](./troubleshooting.mdx): symptoms and recovery steps.
+- [Upgrading native runtime storage](./upgrading-0.9.4.mdx): offline census, migration and complete rollback.
+- [Upgrading to 0.9.3](./upgrading-0.9.3.mdx): configuration migration and persistence.
 
-## Core concepts
+## Build and integrate
 
-### Linear is the intake and handoff surface
+- [Architecture](./architecture.mdx): ownership and lifecycle boundaries.
+- [Native mobs](./native-mobs.mdx): member roles, review and handoff contracts.
+- [Status API](./status-api.mdx): browser and JSON endpoints.
+- [Development](./development.mdx): local checks and explicitly scoped live E2E.
 
-Fugue reads Linear issues from configured project lanes. Workers keep exactly
-one persistent comment headed `## Fugue Workpad` with the plan, progress,
-validation, and PR or handoff evidence.
-
-### Workspaces are isolated by issue
-
-Each issue receives a deterministic directory under `workspace.root`. Hooks run
-inside that directory, so operators decide how to clone, sync, and clean the
-repository.
-
-### Native execution is the default
-
-A native `fugue.yaml` with no explicit backend override launches native
-Meerkat/Meta execution mobs. Fugue queues run from `fugue.yaml`.
-
-### Evidence gates completion
-
-Fugue reconciles Meta events, workspace state, Linear workpad content, and
-GitHub pull request evidence. Missing or contradictory evidence sets review
-requirements instead of silently completing an issue.
-
-## Safe validation commands
-
-These checks do not create live Linear, GitHub, or Meta resources:
-
-```bash
-cargo fmt --check
-cargo test
-cargo run -- --help
-```
-
-Do not run the ignored real E2E suite unless you have an operator-approved live
-sandbox. It creates real external resources.
+Keep credentials, deployment configuration, runtime databases and transcripts
+outside the public checkout. Organization-specific installation guides belong
+with the private integration that owns them.
