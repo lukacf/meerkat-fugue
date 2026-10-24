@@ -45,6 +45,23 @@ async function setup(page, initial={}, prefix='', initialWorkflow=null) {
 
 const connected={model:{provider:'openai',model:'example-model',method:'environment'},github:{host:'github.com',method:'gh_cli'},tracker:{kind:'local'}};
 
+test('reviewer policy is saved explicitly and changing it requires preparation',async({page})=>{
+  const {writes}=await setup(page,connected);
+  await page.getByLabel('Repository URL',{exact:true}).fill('https://github.com/example/application');
+  const count=page.getByLabel('Independent specialists required',{exact:true});
+  await expect(count).toHaveValue('1');
+  await page.getByRole('button',{name:'Check and prepare repository'}).click();
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeEnabled();
+  expect(writes.at(-1).value.independent_reviewer_count).toBe(1);
+  await count.fill('3');
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeDisabled();
+  await page.getByRole('button',{name:'Check and prepare repository'}).click();
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeEnabled();
+  await page.reload();
+  await expect(count).toHaveValue('3');
+  expect(writes.at(-1).value.independent_reviewer_count).toBe(3);
+});
+
 async function holdConnectionSave(page,connection) {
   let release,started;
   const pending=new Promise(resolve=>release=resolve);

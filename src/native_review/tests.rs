@@ -172,6 +172,10 @@ impl Fixture {
             ("release", vec!["review-c".into()]),
         ])
         .unwrap();
+        Self::with_reviewers(reviewers)
+    }
+
+    fn with_reviewers(reviewers: FlowRoleTargets) -> Self {
         let intent = ReviewIntent {
             schema_version: SCHEMA.into(),
             round: "work-1-review-1".into(),
@@ -264,6 +268,10 @@ impl Fixture {
     }
 
     fn check(&self) -> Result<VerifiedReview, ReviewProofError> {
+        self.check_count(3)
+    }
+
+    fn check_count(&self, required: usize) -> Result<VerifiedReview, ReviewProofError> {
         let evidence: Vec<_> = self
             .runs
             .iter()
@@ -273,9 +281,24 @@ impl Fixture {
             &self.definition,
             &self.intent.candidate,
             &self.intent,
-            3,
+            required,
             &evidence,
         )
+    }
+}
+
+#[test]
+fn native_review_requires_every_member_of_the_explicit_quorum() {
+    for count in 1..=3 {
+        let members = (0..count).map(|i| AgentIdentity::from(format!("review-{i}")));
+        let fixture = Fixture::with_reviewers(FlowRoleTargets::new([("domain", members)]).unwrap());
+        let proof = fixture.check_count(count).unwrap();
+        proof.require_approval().unwrap();
+        assert_eq!(proof.verdicts().count(), count);
+        assert_eq!(
+            fixture.check_count(count + 1).unwrap_err(),
+            ReviewProofError::ReviewerCount
+        );
     }
 }
 
@@ -557,6 +580,29 @@ fn final_review_policy_requires_distinct_profile_quota_and_at_least_three_member
         final_review_count(&config, &too_few),
         Err(ReviewProofError::ReviewerCount)
     ));
+    config.minimum_reviewers = 1;
+    assert_eq!(final_review_count(&config, &too_few).unwrap(), 2);
+    let one = FlowRoleTargets::new([(
+        "domain",
+        vec![meerkat_meta::member_comms_id::roster_member_id_for_identity("repo:a")],
+    )])
+    .unwrap();
+    // A smaller minimum never removes the two required profile seats.
+    assert_eq!(
+        final_review_count(&config, &one),
+        Err(ReviewProofError::InvalidIntent)
+    );
+    config.reviewers.remove(1);
+    assert_eq!(final_review_count(&config, &one).unwrap(), 1);
+    config.reviewers.insert(
+        1,
+        FinalReviewReviewerConfig {
+            id: "tests".into(),
+            profile: "domain".into(),
+            required: true,
+        },
+    );
+    config.minimum_reviewers = 3;
     let missing_profile = FlowRoleTargets::new([(
         "other",
         ["repo:a", "repo:b", "repo:c"]

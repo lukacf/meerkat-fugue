@@ -44,6 +44,87 @@ pub struct IndependentReviewStartRequest {
     pub orchestrator_profile: String,
 }
 
+/// Public launch intent. Runtime profiles, templates and workspace paths belong
+/// to the configured host, not the agent requesting review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndependentReviewLaunchRequest {
+    pub issue: LinearIssueRef,
+    pub repo: crate::tools::GitHubRepoRef,
+    pub pull_request: crate::tools::GitHubPullRequestNumber,
+    pub head_sha: GitSha,
+    pub idempotency_key: IdempotencyKey,
+}
+
+pub fn independent_review_launch_input_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties": {
+            "issue":{"oneOf":[
+                {"type":"object","properties":{"kind":{"const":"id"},"id":{"type":"string","minLength":1}},"required":["kind","id"],"additionalProperties":false},
+                {"type":"object","properties":{"kind":{"const":"identifier"},"identifier":{"type":"string","minLength":1}},"required":["kind","identifier"],"additionalProperties":false}
+            ]},
+            "repo":{"type":"object","properties":{"host":{"type":"string"},"owner":{"type":"string","minLength":1},"name":{"type":"string","minLength":1}},"required":["owner","name"],"additionalProperties":false},
+            "pull_request":{"type":"integer","minimum":1},
+            "head_sha":{"type":"string","description":"Expected immutable head of the open, ready-for-review PR. The host rechecks it."},
+            "idempotency_key":{"type":"string","minLength":1,"description":"Reuse this key and identical candidate after an uncertain response."}
+        },
+        "required":["issue","repo","pull_request","head_sha","idempotency_key"],
+        "additionalProperties":false
+    })
+}
+
+pub(crate) fn configured_review_launch(
+    config: &IndependentReviewConfig,
+    request: IndependentReviewLaunchRequest,
+    candidate: crate::native_review::ReviewCandidate,
+    pull_request: GitHubPullRequestSnapshot,
+) -> Result<IndependentReviewStartRequest, crate::native_review::ReviewProofError> {
+    use crate::native_review::{ReviewProofError, same_repo};
+    if !config.enabled
+        || request.idempotency_key.0.trim().is_empty()
+        || request.head_sha != candidate.head_sha
+        || request.pull_request != candidate.pull_request
+        || !same_repo(&request.repo, &candidate.repo)
+        || pull_request.head_sha != candidate.head_sha
+        || pull_request.number != candidate.pull_request
+        || !same_repo(&pull_request.repo, &candidate.repo)
+    {
+        return Err(ReviewProofError::InvalidIntent);
+    }
+    let issue = LinearIssueRef::Identifier {
+        identifier: crate::tools::LinearIssueIdentifier(candidate.issue_identifier.clone()),
+    };
+    let instructions = format!(
+        "Review the verified candidate for issue {} (tracker ID {}) in {}/{}/{}: PR #{} ({}), base {}, exact head {}. Select exactly {} distinct independent existing repository specialists. The configured count must not be reduced when capacity is insufficient; report the shortage and keep review blocked. Exclude issue implementers and execution-team members. Use native admission and native run references for completion. The configured review timeout is {} ms and require_all_green is {}. Review requests do not authorize a merge. Keep the candidate and request key unchanged when retrying an uncertain launch.",
+        candidate.issue_identifier,
+        candidate.issue_id.0,
+        candidate.repo.hostname(),
+        candidate.repo.owner.0,
+        candidate.repo.name.0,
+        candidate.pull_request.0,
+        pull_request.url,
+        candidate.base_branch.0,
+        candidate.head_sha.0,
+        config.reviewer_count,
+        config.timeout_ms,
+        config.require_all_green
+    );
+    Ok(IndependentReviewStartRequest {
+        issue: issue.clone(),
+        spawn_input: SpawnOrResumeExecutionInput {
+            issue,
+            workspace_key: crate::tools::WorkspaceKey(candidate.issue_identifier),
+            template_id: crate::tools::MobTemplateId("independent_review".into()),
+            worktree_path: None,
+            instructions: Some(instructions),
+            idempotency_key: request.idempotency_key,
+        },
+        pull_request,
+        orchestrator_profile: config.orchestrator_profile.clone(),
+    })
+}
+
 /// The caller selects members, not a review request identity or verdict. The
 /// host resolves the candidate and atomically creates the current request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -490,6 +571,89 @@ fn independent_review_findings_comment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_review_launch_uses_canonical_issue_and_host_profile() {
+        use crate::tools::*;
+        let config = IndependentReviewConfig {
+            enabled: true,
+            orchestrator_profile: "configured_review_coordinator".into(),
+            ..Default::default()
+        };
+        let request: IndependentReviewLaunchRequest = serde_json::from_value(json!({
+            "issue":{"kind":"id","id":"tracker-row-17"},
+            "repo":{"owner":"example","name":"app"},
+            "pull_request":7,"head_sha":"a".repeat(40),
+            "idempotency_key":"review-start-1"
+        }))
+        .unwrap();
+        let candidate = crate::native_review::ReviewCandidate {
+            tracker_context: "private-tracker-context".into(),
+            issue_id: LinearIssueId("tracker-row-17".into()),
+            issue_identifier: "TEST-17".into(),
+            repo: request.repo.clone(),
+            pull_request: request.pull_request,
+            base_branch: BranchName("main".into()),
+            head_sha: request.head_sha.clone(),
+        };
+        let pr = GitHubPullRequestSnapshot {
+            repo: candidate.repo.clone(),
+            number: candidate.pull_request,
+            title: "Candidate".into(),
+            url: "https://github.com/example/app/pull/7".into(),
+            state: PullRequestState::Open,
+            draft: false,
+            head_branch: BranchName("feature/test-17".into()),
+            base_branch: candidate.base_branch.clone(),
+            head_sha: candidate.head_sha.clone(),
+        };
+        let launch =
+            configured_review_launch(&config, request.clone(), candidate.clone(), pr.clone())
+                .unwrap();
+        assert_eq!(launch.spawn_input.workspace_key.0, "TEST-17");
+        assert_eq!(launch.spawn_input.issue, launch.issue);
+        assert_eq!(launch.orchestrator_profile, "configured_review_coordinator");
+        assert!(launch.spawn_input.worktree_path.is_none());
+        let instructions = launch.spawn_input.instructions.as_deref().unwrap();
+        assert!(instructions.contains("issue TEST-17"));
+        assert!(instructions.contains("github.com/example/app: PR #7"));
+        assert!(instructions.contains(&format!("exact head {}", candidate.head_sha.0)));
+        assert!(
+            instructions.contains("exactly 3 distinct independent existing repository specialists")
+        );
+        assert_eq!(launch.spawn_input.idempotency_key, request.idempotency_key);
+        // The orchestrator resolves the workspace before this real constructor.
+        let mut input = launch.spawn_input.clone();
+        input.worktree_path = Some("/tmp/fugue-review/TEST-17".into());
+        let template =
+            crate::kapellmeister_host::independent_review_native_launch_template(&launch, &[]);
+        crate::mob_tools::NativeMobLaunchPlan::new(
+            input,
+            template,
+            Default::default(),
+            Default::default(),
+            None,
+            Some(candidate.repo.clone()),
+        )
+        .unwrap();
+
+        let replay =
+            configured_review_launch(&config, request.clone(), candidate.clone(), pr.clone())
+                .unwrap();
+        assert_eq!(launch, replay);
+        let mut changed = request.clone();
+        changed.head_sha = GitSha("b".repeat(40));
+        assert!(configured_review_launch(&config, changed, candidate.clone(), pr.clone()).is_err());
+        let mut empty_key = request.clone();
+        empty_key.idempotency_key = IdempotencyKey(" ".into());
+        assert!(
+            configured_review_launch(&config, empty_key, candidate.clone(), pr.clone()).is_err()
+        );
+        assert!(
+            configured_review_launch(&IndependentReviewConfig::default(), request, candidate, pr)
+                .is_err()
+        );
+    }
 
     fn green_verdict() -> IndependentReviewVerdict {
         IndependentReviewVerdict {

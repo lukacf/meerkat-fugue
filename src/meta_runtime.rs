@@ -40,7 +40,7 @@ use crate::config::{
 use crate::deploy_gate::DeployStartRequest;
 use crate::final_pr_gate::FinalPrGateStartRequest;
 use crate::independent_review::{
-    IndependentReviewCompletionRequest, IndependentReviewStartRequest,
+    IndependentReviewCompletionRequest, IndependentReviewLaunchRequest,
     independent_review_completion_input_schema,
 };
 use crate::linear_tools::{
@@ -178,6 +178,65 @@ fn resolve_review_specialists(
         .map_err(|_| crate::review_requests::ReviewRequestError::IneligibleReviewer)
 }
 
+fn require_review_capacity(
+    required: usize,
+    specialists: &[RepositorySpecialist],
+    participants: &BTreeSet<String>,
+) -> Result<(), crate::review_requests::ReviewRequestError> {
+    let eligible: BTreeSet<_> = specialists
+        .iter()
+        .filter_map(|specialist| {
+            let native =
+                meerkat_meta::member_comms_id::roster_member_id_for_identity(&specialist.identity);
+            (!participants.contains(&specialist.identity)
+                && !participants.contains(native.as_str()))
+            .then_some(native)
+        })
+        .collect();
+    if eligible.len() < required {
+        return Err(
+            crate::review_requests::ReviewRequestError::InsufficientCapacity {
+                required,
+                available: eligible.len(),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn review_selection_count(
+    independent: &IndependentReviewConfig,
+    final_review: &crate::config::FinalReviewConfig,
+    reviewers: &meerkat_mob::FlowRoleTargets,
+    specialists: &[RepositorySpecialist],
+    participants: &BTreeSet<String>,
+) -> Result<usize, crate::review_requests::ReviewRequestError> {
+    // Admission supports either enabled procedure. Check the minimum capacity
+    // for any admissible procedure before validating the caller's selection.
+    // Exact counts and required profiles are still checked below.
+    let minimum = independent
+        .enabled
+        .then_some(usize::from(independent.reviewer_count))
+        .into_iter()
+        .chain(final_review.enabled.then(|| {
+            usize::from(final_review.minimum_reviewers).max(
+                final_review
+                    .reviewers
+                    .iter()
+                    .filter(|reviewer| reviewer.required)
+                    .count(),
+            )
+        }))
+        .min()
+        .ok_or(crate::review_requests::ReviewRequestError::Unavailable)?;
+    require_review_capacity(minimum, specialists, participants)?;
+    Ok(crate::native_review::configured_review_count(
+        independent,
+        final_review,
+        reviewers,
+    )?)
+}
+
 #[derive(Clone)]
 pub struct MetaRuntimeRegistry {
     meerkat: MeerkatConfig,
@@ -301,6 +360,13 @@ impl MetaRuntimeRegistry {
             .specialists
             .get()
             .ok_or(ReviewRequestError::Unavailable)?;
+        let required = review_selection_count(
+            &self.independent_review,
+            &self.final_review,
+            &draft.reviewers,
+            specialists,
+            &participants,
+        )?;
         draft.reviewers = resolve_review_specialists(&draft.reviewers, specialists, &participants)?;
         let runtime = self
             .runtime()
@@ -320,7 +386,6 @@ impl MetaRuntimeRegistry {
             }
         }
         let store = self.review_requests();
-        let required = self.configured_review_count(&draft.reviewers)?;
         // Commit the current-request decision before any native admission.
         let intent = tokio::task::spawn_blocking(move || store.reserve(draft, required))
             .await
@@ -1554,12 +1619,8 @@ fn direct_tool_dispatcher(
     )));
     tools.push(Arc::new(ToolDef::new(
         "fugue_start_independent_review",
-        "Ask the Fugue host to start or resume the independent review orchestrator mob from a typed IndependentReviewStartRequest. Use only after a configured Review action-lane observation and only as repo Kapellmeister authority.",
-        json!({
-            "type": "object",
-            "description": "Typed IndependentReviewStartRequest payload prepared by Kapellmeister after inspecting issue and PR evidence.",
-            "additionalProperties": true
-        }),
+        "Request configured independent review for an open, ready-for-review PR after a Review action or holding observation. Supply the inspected issue, repository, PR number, exact head and stable request key. The host resolves current evidence and supplies its own runtime profile, template and workspace. Only repository Kapellmeister authority may start this operation.",
+        crate::independent_review::independent_review_launch_input_schema(),
     )));
     tools.push(Arc::new(ToolDef::new(
         "fugue_admit_independent_review",
@@ -2112,7 +2173,8 @@ async fn call_fugue_start_independent_review(
     host_api_auth: Option<&MetaConsoleBasicAuthConfig>,
     arguments: &Value,
 ) -> (bool, String) {
-    let request = match serde_json::from_value::<IndependentReviewStartRequest>(arguments.clone()) {
+    let request = match serde_json::from_value::<IndependentReviewLaunchRequest>(arguments.clone())
+    {
         Ok(request) => request,
         Err(error) => {
             return (
@@ -2125,97 +2187,13 @@ async fn call_fugue_start_independent_review(
             );
         }
     };
-    let Some(host_api_url) = host_api_url.filter(|url| !url.trim().is_empty()) else {
-        return (
-            true,
-            json!({
-                "error": "fugue_host_unconfigured",
-                "message": "fugue_start_independent_review requires server.port or an explicit Fugue host API URL"
-            })
-            .to_string(),
-        );
-    };
-    let url = format!(
-        "{}/api/v1/kapellmeister/start-independent-review",
-        host_api_url.trim_end_matches('/')
-    );
-    let client = match fugue_host_api_client() {
-        Ok(client) => client,
-        Err(error) => {
-            return (
-                true,
-                json!({
-                    "error": "fugue_host_client_error",
-                    "message": error
-                })
-                .to_string(),
-            );
-        }
-    };
-    let mut http_request = client.post(url).json(&request);
-    if let Some(auth) = host_api_auth {
-        let username = match std::env::var(&auth.username_env) {
-            Ok(value) if !value.trim().is_empty() => value,
-            _ => {
-                return (
-                    true,
-                    json!({
-                        "error": "fugue_host_auth_unavailable",
-                        "message": format!("configured console username env {} is missing or empty", auth.username_env)
-                    })
-                    .to_string(),
-                );
-            }
-        };
-        let password = match std::env::var(&auth.password_env) {
-            Ok(value) if !value.trim().is_empty() => value,
-            _ => {
-                return (
-                    true,
-                    json!({
-                        "error": "fugue_host_auth_unavailable",
-                        "message": format!("configured console password env {} is missing or empty", auth.password_env)
-                    })
-                    .to_string(),
-                );
-            }
-        };
-        http_request = http_request.basic_auth(username, Some(password));
-    }
-    match http_request.send().await {
-        Ok(response) => {
-            let status = response.status();
-            match response.text().await {
-                Ok(text) if status.is_success() => (false, text),
-                Ok(text) => (
-                    true,
-                    json!({
-                        "error": "fugue_host_error",
-                        "status": status.as_u16(),
-                        "body": text
-                    })
-                    .to_string(),
-                ),
-                Err(error) => (
-                    true,
-                    json!({
-                        "error": "fugue_host_error",
-                        "status": status.as_u16(),
-                        "message": error.to_string()
-                    })
-                    .to_string(),
-                ),
-            }
-        }
-        Err(error) => (
-            true,
-            json!({
-                "error": "fugue_host_unreachable",
-                "message": error.to_string()
-            })
-            .to_string(),
-        ),
-    }
+    call_fugue_review_request(
+        host_api_url,
+        host_api_auth,
+        "start-independent-review",
+        &request,
+    )
+    .await
 }
 
 async fn call_fugue_admit_independent_review(
@@ -3933,6 +3911,65 @@ fn block_on<T>(future: impl Future<Output = T>) -> Result<T, String> {
 pub(crate) mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn review_admission_reports_shortage_before_reserving_or_starting_runtime() {
+        for final_only in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut registry =
+                MetaRuntimeRegistry::new(test_meerkat_config(temp.path().join("state")));
+            if final_only {
+                registry.final_review = crate::config::FinalReviewConfig {
+                    enabled: true,
+                    reviewers: vec![crate::config::FinalReviewReviewerConfig {
+                        id: "domain".into(),
+                        profile: "domain".into(),
+                        required: true,
+                    }],
+                    ..Default::default()
+                };
+            } else {
+                registry.independent_review.enabled = true;
+            }
+            registry
+                .specialists
+                .set(vec![RepositorySpecialist {
+                    identity: "repo:domain".into(),
+                    label: "Domain".into(),
+                    focus: "Code".into(),
+                    paths: vec![],
+                }])
+                .unwrap();
+            let candidate = serde_json::from_value(json!({
+                "tracker_context":"example-project", "issue_id":"row-1", "issue_identifier":"TEST-1",
+                "repo":{"owner":"example","name":"app"}, "pull_request":1, "base_branch":"main", "head_sha":"a".repeat(40)
+            })).unwrap();
+            let draft = crate::review_requests::ReviewRequestDraft {
+                candidate,
+                reviewers: meerkat_mob::FlowRoleTargets::new([("domain", ["repo:domain".into()])])
+                    .unwrap(),
+                task: "Review the exact candidate".into(),
+                idempotency_key: IdempotencyKey("review-1".into()),
+                supersedes: None,
+            };
+            assert!(matches!(
+                registry.admit_native_review(draft).await,
+                Err(
+                    crate::review_requests::ReviewRequestError::InsufficientCapacity {
+                        required: 3,
+                        available: 1
+                    }
+                )
+            ));
+            assert!(registry.runtime.lock().await.is_none());
+            assert!(
+                !registry
+                    .state_path()
+                    .join("review-requests.sqlite3")
+                    .exists()
+            );
+        }
+    }
+
     #[test]
     fn review_selection_resolves_durable_aliases_and_excludes_issue_participants() {
         let specialist = RepositorySpecialist {
@@ -3941,6 +3978,31 @@ pub(crate) mod tests {
             focus: "Domain review".into(),
             paths: vec![],
         };
+        assert!(
+            require_review_capacity(1, std::slice::from_ref(&specialist), &BTreeSet::new()).is_ok()
+        );
+        assert!(matches!(
+            require_review_capacity(3, std::slice::from_ref(&specialist), &BTreeSet::new()),
+            Err(
+                crate::review_requests::ReviewRequestError::InsufficientCapacity {
+                    required: 3,
+                    available: 1
+                }
+            )
+        ));
+        assert!(matches!(
+            require_review_capacity(
+                1,
+                std::slice::from_ref(&specialist),
+                &BTreeSet::from([specialist.identity.clone()])
+            ),
+            Err(
+                crate::review_requests::ReviewRequestError::InsufficientCapacity {
+                    required: 1,
+                    available: 0
+                }
+            )
+        ));
         let canonical =
             meerkat_meta::member_comms_id::roster_member_id_for_identity(&specialist.identity);
         let public =
@@ -4318,6 +4380,56 @@ pub(crate) mod tests {
             None,
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn configured_review_launch_accepts_only_operator_visible_candidate_fields() {
+        use axum::{Json, Router, routing::post};
+        let payload = json!({
+            "issue":{"kind":"identifier","identifier":"TEST-1"},
+            "repo":{"owner":"example","name":"app"},
+            "pull_request":7,"head_sha":"a".repeat(40),
+            "idempotency_key":"review-start-1"
+        });
+        let expected = payload.clone();
+        let router = Router::new().route(
+            "/api/v1/kapellmeister/start-independent-review",
+            post(move |Json(body): Json<Value>| {
+                assert_eq!(body, expected);
+                async { Json(json!({"result":{"accepted":true}})) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (error, response) =
+            call_fugue_start_independent_review(Some(&endpoint), None, &payload).await;
+        server.abort();
+        assert!(!error, "{response}");
+        let dispatcher = scoped_direct_tools(HostToolAuthority::Coordinator, None);
+        let tools = dispatcher.tools();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "fugue_start_independent_review")
+            .unwrap();
+        for field in [
+            "issue",
+            "repo",
+            "pull_request",
+            "head_sha",
+            "idempotency_key",
+        ] {
+            assert!(
+                tool.input_schema["properties"].get(field).is_some(),
+                "missing {field}"
+            );
+        }
+        for field in ["spawn_input", "orchestrator_profile", "worktree_path"] {
+            let mut forged = payload.clone();
+            forged[field] = json!("caller-selected");
+            let (error, _) = call_fugue_start_independent_review(None, None, &forged).await;
+            assert!(error);
+        }
     }
 
     #[tokio::test]

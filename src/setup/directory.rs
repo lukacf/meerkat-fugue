@@ -247,6 +247,7 @@ impl Directory {
             lane_configuration: super::workflow::LaneConfiguration::Generated,
             commit_identity: Default::default(),
             allow_no_ci_checks: false,
+            independent_reviewer_count: 1,
             jira_transition_fields: BTreeMap::new(),
             repository_url: Some(repository.https_url()),
             owner: repository.owner.clone(),

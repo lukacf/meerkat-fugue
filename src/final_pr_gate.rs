@@ -303,13 +303,14 @@ pub fn final_pr_gate_reviewer_instructions(
     trigger_mode: FinalReviewMode,
 ) -> String {
     format!(
-        "Coordinate final review for issue {} and PR #{} ({}) via {:?}. Review exact head {} using independent existing repository specialists. Required profile selectors: {:?}. Choose at least three distinct specialists and enough members to cover every required profile entry. Do not create generic reviewer profiles. Admit native review through fugue_admit_independent_review and complete it through fugue_complete_final_pr_gate using the returned native run references. The host owns merge checks and lane projection: success={}, rework={}, blocked={}.",
+        "Coordinate final review for issue {} and PR #{} ({}) via {:?}. Review exact head {} using independent existing repository specialists. Required profile selectors: {:?}. Choose at least {} distinct specialists and enough members to cover every required profile entry. Do not create generic reviewer profiles or reduce the configured count when capacity is insufficient. Admit native review through fugue_admit_independent_review and complete it through fugue_complete_final_pr_gate using the returned native run references. The host owns merge checks and lane projection: success={}, rework={}, blocked={}.",
         final_pr_gate_issue_label(issue),
         pr.number.0,
         pr.url,
         trigger_mode,
         pr.head_sha.0,
         config.reviewers,
+        config.minimum_reviewers,
         config.success_lane,
         config.rework_lane,
         config.blocked_lane
@@ -706,6 +707,7 @@ mod tests {
     fn config() -> FinalReviewConfig {
         FinalReviewConfig {
             enabled: true,
+            minimum_reviewers: 3,
             mode: FinalReviewMode::Manual,
             lane: "Custom Final Gate".to_string(),
             rework_lane: "Custom Rework".to_string(),

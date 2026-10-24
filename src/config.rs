@@ -237,6 +237,8 @@ pub struct MaterializedLinearProjection {
 #[serde(default, deny_unknown_fields)]
 pub struct FinalReviewConfig {
     pub enabled: bool,
+    /// Minimum distinct specialists, in addition to required profile coverage.
+    pub minimum_reviewers: u8,
     pub mode: FinalReviewMode,
     pub lane: String,
     pub rework_lane: String,
@@ -250,6 +252,7 @@ impl Default for FinalReviewConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            minimum_reviewers: 3,
             mode: FinalReviewMode::Manual,
             lane: default_final_review_lane(),
             rework_lane: default_final_review_rework_lane(),
@@ -1935,6 +1938,11 @@ impl FinalReviewConfig {
     }
 
     fn validate_static(&self) -> Result<()> {
+        if self.minimum_reviewers == 0 {
+            return Err(FugueError::InvalidConfig(
+                "final_review.minimum_reviewers must be positive".into(),
+            ));
+        }
         let lanes = [
             ("lane", self.lane.as_str()),
             ("rework_lane", self.rework_lane.as_str()),
@@ -2070,9 +2078,9 @@ impl IndependentReviewConfig {
                 )));
             }
         }
-        if self.enabled && self.reviewer_count != 3 {
+        if self.reviewer_count == 0 {
             return Err(FugueError::InvalidConfig(
-                "independent_review.enabled requires reviewer_count = 3".to_string(),
+                "independent_review.reviewer_count must be positive".to_string(),
             ));
         }
         if self.timeout_ms == 0 {
@@ -4586,7 +4594,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_review_enabled_requires_exactly_three_reviewers() {
+    fn independent_review_reviewer_policy_is_explicit_and_preserves_old_defaults() {
         let definition = WorkflowDefinition {
             config: json!({
                 "tracker": {"kind": "linear", "api_key": "token", "project_slug": "project"},
@@ -4598,11 +4606,45 @@ mod tests {
             prompt_template: "hi".to_string(),
         };
 
-        let err = ServiceConfig::from_definition(PathBuf::from("/tmp/fugue.yaml"), &definition)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("independent_review.enabled requires reviewer_count = 3"));
+        let config =
+            ServiceConfig::from_definition(PathBuf::from("/tmp/fugue.yaml"), &definition).unwrap();
+        assert_eq!(config.independent_review.reviewer_count, 2);
+        for count in [1, 2, 3, 255] {
+            let policy = IndependentReviewConfig {
+                reviewer_count: count,
+                enabled: true,
+                ..Default::default()
+            };
+            assert!(policy.validate_static().is_ok());
+        }
+        assert!(
+            IndependentReviewConfig {
+                reviewer_count: 0,
+                ..Default::default()
+            }
+            .validate_static()
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::from_value::<IndependentReviewConfig>(json!({"enabled":true}))
+                .unwrap()
+                .reviewer_count,
+            3
+        );
+        assert_eq!(
+            serde_json::from_value::<FinalReviewConfig>(json!({}))
+                .unwrap()
+                .minimum_reviewers,
+            3
+        );
+        assert!(
+            FinalReviewConfig {
+                minimum_reviewers: 0,
+                ..Default::default()
+            }
+            .validate_static()
+            .is_err()
+        );
     }
 
     #[test]

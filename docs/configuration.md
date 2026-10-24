@@ -448,6 +448,25 @@ ID in `supersedes` and a new idempotency key. See the
 [review request contract](./development.mdx#current-review-request) for recovery
 and qualification requirements.
 
+New repository setup explicitly selects one independent specialist by default.
+The **Independent specialists required** setting accepts 1-255 and is saved per
+repository. Increase it when additional independent perspectives are needed.
+Existing saved setups and YAML configurations that omit the count retain three;
+changing another setting does not reduce their review requirement. The quorum
+never shrinks to match the available team. An implementer cannot approve their
+own work, and insufficient independent capacity keeps review blocked.
+
+`independent_review.reviewer_count` is the exact required count.
+`final_review.minimum_reviewers` is a minimum (default three), in addition to
+every required `final_review.reviewers` profile entry. A lower minimum does not
+remove profile coverage. Final completion and merge verify the same requirements
+against native evidence for the current PR head.
+
+To request configured review, `fugue_start_independent_review` takes the issue,
+repository, PR number, expected head SHA and a stable idempotency key. Fugue
+resolves the candidate and supplies the review coordinator's runtime settings
+and instructions. Callers do not choose workspace paths, templates or profiles.
+
 `linear_claim_issue` can also request a lane change through `target_state`.
 That change receives the terminal-obligation check before either assignment or
 transition. Claiming is restricted to issue leads and repository coordinators;
@@ -462,6 +481,7 @@ assignment-only claims remain available to authorized callers.
 ```yaml
 independent_review:
   enabled: true
+  reviewer_count: 3
   lane: Review
   success_lane: Active
   rework_lane: Queue

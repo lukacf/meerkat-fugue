@@ -12928,6 +12928,7 @@ worker:
     fn native_pr_handoff_monitor_materializes_final_gate_trigger_evidence() {
         let mut config = service_config(json!({}));
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Auto,
             lane: "Repo Gate".to_string(),
@@ -13007,6 +13008,7 @@ worker:
         let (orchestrator, _native_host) = native_orchestrator_for_definition(definition);
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Auto,
             lane: "Custom Final Gate".to_string(),
@@ -13115,6 +13117,7 @@ worker:
         let (orchestrator, _native_host) = native_orchestrator_for_definition(definition);
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Auto,
             lane: "Custom Final Gate".to_string(),
@@ -13248,6 +13251,7 @@ worker:
         let (mut orchestrator, native_host) = native_orchestrator_for_definition(definition);
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Auto,
             lane: "Custom Final Gate".to_string(),
@@ -13308,6 +13312,7 @@ worker:
         let (mut orchestrator, _native_host) = native_orchestrator_for_definition(definition);
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Auto,
             lane: "Custom Final Gate".to_string(),
@@ -13355,6 +13360,7 @@ worker:
             native_orchestrator_for_definition(native_kapellmeister_workflow_definition());
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Auto,
             lane: "Custom Final Gate".to_string(),
@@ -13401,6 +13407,7 @@ worker:
             native_orchestrator_for_definition(native_kapellmeister_workflow_definition());
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Auto,
             lane: "Custom Final Gate".to_string(),
@@ -13475,6 +13482,7 @@ worker:
             native_orchestrator_for_definition(native_kapellmeister_workflow_definition());
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Auto,
             lane: "Custom Final Gate".to_string(),
@@ -13538,6 +13546,7 @@ worker:
             native_orchestrator_for_definition(native_kapellmeister_workflow_definition());
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Manual,
             lane: "Custom Final Gate".to_string(),
@@ -13662,6 +13671,7 @@ worker:
         )
         .unwrap();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Manual,
             lane: "Custom Final Gate".to_string(),
