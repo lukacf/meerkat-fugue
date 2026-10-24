@@ -23,6 +23,7 @@
   };
   const update = () => {
     for (const [index, page] of ['home', 'board', 'agents'].entries()) tabs[index].href = destination(page, selected);
+    for (const link of document.querySelectorAll('[data-fugue-agents-link]')) link.href = destination('agents', selected);
     document.getElementById('fugueRepositories').href = destination('repositories', selected);
     crumb.href = destination('home', selected);
     settings.hidden = !selected || ['setup', 'agents'].includes(area);

@@ -483,6 +483,70 @@ fn native_review_rejects_foreign_native_mob_even_with_matching_sha() {
 }
 
 #[test]
+fn native_review_accepts_encoded_native_producers_and_their_exact_runtime_aliases() {
+    for use_alias in [false, true] {
+        let identities = [
+            "repo-example:api",
+            "repo-example:runtime",
+            "repo-example:delivery",
+        ]
+        .map(meerkat_meta::member_comms_id::roster_member_id_for_identity);
+        let mut fixture =
+            Fixture::with_reviewers(FlowRoleTargets::new([("specialist", identities)]).unwrap());
+        if use_alias {
+            for (run, events) in &mut fixture.runs {
+                for event in events {
+                    if let MobEventKind::StepTargetCompleted {
+                        output: Some(output),
+                        target,
+                        ..
+                    } = &mut event.kind
+                    {
+                        output["reviewer_id"] =
+                            json!(meerkat_meta::member_comms_id::runtime_alias_str(
+                                target.identity.as_str()
+                            ));
+                        run.root_step_outputs.get_mut(&StepId::from(STEP)).unwrap()
+                            [target.identity.as_str()] = output.clone();
+                    }
+                }
+            }
+        }
+        let verified = fixture.check().unwrap();
+        assert_eq!(verified.verdicts().count(), 3);
+        verified.require_approval().unwrap();
+    }
+}
+
+#[test]
+fn native_review_rejects_another_encoded_identity_or_its_runtime_alias() {
+    let identities = [
+        "repo-example:api",
+        "repo-example:runtime",
+        "repo-example:delivery",
+    ]
+    .map(meerkat_meta::member_comms_id::roster_member_id_for_identity);
+    for reported in [identities[1].to_string(), "repo-example:runtime".into()] {
+        let mut fixture = Fixture::with_reviewers(
+            FlowRoleTargets::new([("specialist", identities.clone())]).unwrap(),
+        );
+        let (run, events) = &mut fixture.runs[0];
+        if let MobEventKind::StepTargetCompleted {
+            output: Some(output),
+            target,
+            ..
+        } = &mut events[1].kind
+        {
+            assert_ne!(target.identity, identities[1]);
+            output["reviewer_id"] = json!(reported);
+            run.root_step_outputs.get_mut(&StepId::from(STEP)).unwrap()[target.identity.as_str()] =
+                output.clone();
+        }
+        assert_eq!(fixture.check().unwrap_err(), ReviewProofError::NotApproved);
+    }
+}
+
+#[test]
 fn native_review_rejects_forged_reviewer_name_or_stale_head_in_accepted_output() {
     for (field, value) in [
         ("reviewer_id", json!("different-reviewer")),

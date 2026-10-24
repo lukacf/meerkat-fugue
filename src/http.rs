@@ -1278,7 +1278,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       <div class="rail-kpis" aria-label="Runtime metrics"><span>RUN <b id="kpiRun">—</b></span><span>RETRY <b id="kpiRetry">—</b></span><span>TOK <b id="kpiTok">unavailable</b></span><span>T <b id="kpiTime">unavailable</b></span><span>SHAD <b id="kpiShad">unavailable</b></span></div>
       <button class="rail-refresh" id="refresh" type="button" title="Refresh" aria-label="Refresh">↻</button>
     </header>
-    <section class="work-heading"><div><h1>Work queue</h1><p id="queueConnection">Loading queue connection...</p></div><div class="fugue-actions"><a class="fugue-button" href="/ensemble">Repository teams</a><a class="fugue-button" href="/console">Talk to queue coordinator</a></div></section>
+    <section class="work-heading"><div><h1>Work queue</h1><p id="queueConnection">Loading queue connection...</p></div><div class="fugue-actions"><a class="fugue-button" href="/ensemble">Repository teams</a><a class="fugue-button" data-fugue-agents-link href="/console">Open agent console</a></div></section>
     <section class="lane-ribbon" id="laneRibbon" aria-label="Lane filter ribbon"></section>
     <section class="toolbar sub-toolbar">
       <div class="summary" id="summary"><span><span class="metric">0</span> shown</span></div>

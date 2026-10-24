@@ -48,3 +48,17 @@ test('mobile shared navigation stays on two non-overlapping rows', async ({page}
   expect(board.x + board.width).toBeLessThan(repositories.x);
   expect(repositories.x + repositories.width).toBeLessThanOrEqual(390);
 });
+
+const queueHeading = source.match(/<section class="work-heading">[\s\S]*?<\/section>/)[0];
+test('board console shortcut preserves repository context without claiming an agent selection', async ({page}) => {
+  const boardDocument = document.replace('data-area="agents"', 'data-area="board"').replace('<script>', queueHeading + '<script>');
+  await page.route('http://fugue.test/**', route => new URL(route.request().url()).pathname === '/api/workspaces'
+    ? route.fulfill({json:listing})
+    : route.fulfill({contentType:'text/html',body:boardDocument}));
+  await page.goto('http://fugue.test/repositories/repository-service/issues');
+  const shortcut = page.getByRole('link',{name:'Open agent console',exact:true});
+  await expect(shortcut).toHaveAttribute('href','/console?workspace=repository-service');
+  await shortcut.click();
+  await expect(page).toHaveURL('http://fugue.test/console?workspace=repository-service');
+  await expect(page.getByRole('link',{name:'Board',exact:true})).toHaveAttribute('href','/repositories/repository-service/issues');
+});

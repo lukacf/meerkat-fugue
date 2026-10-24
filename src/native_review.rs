@@ -746,8 +746,11 @@ fn verify(
                 return Err(ReviewProofError::ProducerEvidence);
             }
             if verdict.validate().is_err()
-                || verdict.reviewer_id
-                    != meerkat_meta::member_comms_id::runtime_alias_str(target.identity.as_str())
+                || (verdict.reviewer_id != target.identity.as_str()
+                    && verdict.reviewer_id
+                        != meerkat_meta::member_comms_id::runtime_alias_str(
+                            target.identity.as_str(),
+                        ))
                 || verdict.evidence.head_sha != candidate.head_sha
                 || verdict.evidence.base != candidate.base_branch.0
             {
