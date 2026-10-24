@@ -4135,7 +4135,7 @@ mod tests {
                 .as_str(),
             meerkat::WorkNamespace::default(),
         );
-        graph
+        let blocker = graph
             .create(meerkat::CreateWorkItemRequest {
                 realm_id: None,
                 namespace: None,
@@ -4186,9 +4186,9 @@ mod tests {
             ci("SUCCESS"),
         ]);
         let replay = crate::http::execute_deploy_transaction_with_host(
-            deploy_config,
+            deploy_config.clone(),
             queue.clone(),
-            deploy_request,
+            deploy_request.clone(),
             host,
         )
         .await;
@@ -4213,6 +4213,16 @@ mod tests {
         assert!(workpad.contains(&format!("\"merged_sha\": \"{}\"", "b".repeat(40))));
         assert!(workpad.contains("### Deployment attempt\n"));
         assert!(workpad.contains("\"status\": \"failed\""));
+        fn confirmed_deployment(body: &str) -> &str {
+            body.split_once("### Deployment\n")
+                .unwrap()
+                .1
+                .split("\n### ")
+                .next()
+                .unwrap()
+                .trim()
+        }
+        let confirmed_before_restart = confirmed_deployment(&workpad).to_owned();
 
         let (host, calls) = crate::github_tools::scripted_host(vec![
             forge_pr("OPEN"),
@@ -4262,6 +4272,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state.issue.state.name, service.final_review.blocked_lane);
+        drop(adapter);
         drop(graph);
         ensemble.shutdown().await.unwrap();
         drop(handle);
@@ -4294,6 +4305,97 @@ mod tests {
             3,
             "restart reads durable results without asking agents again"
         );
+        // Reopen every authority and retry the full transaction, not only the
+        // native proof reader. The persisted blocker still gates the retry.
+        let adapter = crate::linear_adapter::IssueAdapter::from_config(&service.tracker).unwrap();
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("MERGED"),
+            forge_pr("MERGED"),
+            ci("SUCCESS"),
+        ]);
+        let replay = crate::http::execute_deploy_transaction_with_host(
+            deploy_config.clone(),
+            queue.clone(),
+            deploy_request.clone(),
+            host,
+        )
+        .await;
+        assert!(!replay.accepted, "{replay:?}");
+        assert!(replay.message.contains("unresolved blocking WorkGraph"));
+        assert_eq!(calls().len(), 3);
+        assert!(
+            !calls()
+                .iter()
+                .any(|args| args.get(1).is_some_and(|arg| arg == "merge"))
+        );
+        let state = adapter
+            .inspect_issue(crate::tools::InspectIssueInput {
+                issue: issue_ref.clone(),
+            })
+            .await
+            .unwrap();
+        let workpad = state.workpad.unwrap().body_markdown;
+        assert_eq!(confirmed_deployment(&workpad), confirmed_before_restart);
+        assert!(workpad.contains("### Deployment attempt\n"));
+
+        // An explicit native resolution permits the same request to confirm
+        // the existing forge result without another merge or another review.
+        let graph = meerkat::WorkGraphService::with_scope(
+            Arc::new(meerkat::SqliteWorkGraphStore::open(&graph_path).unwrap()),
+            meerkat_core::mob_realm_id(service.meerkat.mob_id().as_ref())
+                .unwrap()
+                .as_str(),
+            meerkat::WorkNamespace::default(),
+        );
+        graph
+            .close(meerkat::CloseWorkItemRequest {
+                id: blocker.id,
+                realm_id: None,
+                namespace: None,
+                expected_revision: blocker.revision,
+                status: meerkat::WorkStatus::Completed,
+            })
+            .await
+            .unwrap();
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("MERGED"),
+            forge_pr("MERGED"),
+            ci("SUCCESS"),
+            forge_pr("MERGED"),
+            json!({"mergeCommit":{"oid":"b".repeat(40)}}).to_string(),
+        ]);
+        let replay = crate::http::execute_deploy_transaction_with_host(
+            deploy_config,
+            queue.clone(),
+            deploy_request,
+            host,
+        )
+        .await;
+        assert!(replay.accepted, "{replay:?}");
+        let outcome = replay.outcome.unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::deploy_gate::DeployOutcomeStatus::Merged
+        );
+        assert_eq!(outcome.merge.unwrap().merged_sha, GitSha("b".repeat(40)));
+        assert_eq!(calls().len(), 5);
+        assert!(
+            !calls()
+                .iter()
+                .any(|args| args.get(1).is_some_and(|arg| arg == "merge"))
+        );
+        assert_eq!(client.reviews.load(Ordering::SeqCst), 3);
+        let state = adapter
+            .inspect_issue(crate::tools::InspectIssueInput {
+                issue: issue_ref.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(state.issue.state.name, service.deploy.success_lane);
+        assert!(
+            confirmed_deployment(&state.workpad.unwrap().body_markdown).contains(&"b".repeat(40))
+        );
+        drop(graph);
         let mut changed = intent.candidate.clone();
         changed.head_sha = GitSha("b".repeat(40));
         assert!(

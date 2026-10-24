@@ -270,6 +270,15 @@ An already merged retry still verifies current authority and actual forge eviden
 but must not issue a second merge command. A historical Workpad receipt cannot
 skip these checks or authorize a changed request under a reused key.
 
+The native review integration test retries the complete merge-only transaction
+after shutting down and reopening the repository runtime and tracker. A persisted
+WorkGraph blocker refuses the retry while preserving the confirmed deployment
+section byte for byte. After explicit native resolution, the same request reads
+the existing merge, restores the success projection, and issues neither another
+merge command nor another review. Forge responses and model output are scripted;
+the native review, WorkGraph and tracker state are real local stores. Hosted
+acceptance must repeat the journey against the intended services.
+
 ### Deployment recovery
 
 Issue-driven OTA execution records its attempt in `deployment-receipts.sqlite3`
