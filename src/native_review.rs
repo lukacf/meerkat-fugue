@@ -224,6 +224,24 @@ pub async fn admit(
     intent: &ReviewIntent,
     required_reviewers: usize,
 ) -> Result<ReviewReference, ReviewAdmissionError> {
+    admit_with_observer(handle, intent, required_reviewers, None).await
+}
+
+pub(crate) async fn admit_observed(
+    handle: &meerkat_mob::MobHandle,
+    intent: &ReviewIntent,
+    required_reviewers: usize,
+    observer: meerkat_mob::run::FlowRunObserver,
+) -> Result<ReviewReference, ReviewAdmissionError> {
+    admit_with_observer(handle, intent, required_reviewers, Some(observer)).await
+}
+
+async fn admit_with_observer(
+    handle: &meerkat_mob::MobHandle,
+    intent: &ReviewIntent,
+    required_reviewers: usize,
+    observer: Option<meerkat_mob::run::FlowRunObserver>,
+) -> Result<ReviewReference, ReviewAdmissionError> {
     intent.validate(required_reviewers)?;
     // Validate every installed definition before admitting any profile.
     for (role, _) in intent.reviewers.bound_roles() {
@@ -243,20 +261,35 @@ pub async fn admit(
     for (role, members) in intent.reviewers.bound_roles() {
         let targets = FlowRoleTargets::new([(role.clone(), members.iter().cloned())])
             .map_err(|_| ReviewProofError::InvalidIntent)?;
-        let run = handle
-            .run_flow_with_role_targets_and_external_identity(
-                flow_id(role),
-                params.clone(),
-                targets,
-                &identity,
-            )
-            .await
-            .map_err(|error| match error {
-                meerkat_mob::MobError::FlowRunIdempotencyConflict { run_id, flow_id } => {
-                    ReviewAdmissionError::Conflict { run_id, flow_id }
-                }
-                error => ReviewAdmissionError::Runtime(error),
-            })?;
+        let admission = match &observer {
+            Some(observer) => {
+                handle
+                    .run_flow_with_role_targets_and_external_identity_observed(
+                        flow_id(role),
+                        params.clone(),
+                        targets,
+                        &identity,
+                        observer.clone(),
+                    )
+                    .await
+            }
+            None => {
+                handle
+                    .run_flow_with_role_targets_and_external_identity(
+                        flow_id(role),
+                        params.clone(),
+                        targets,
+                        &identity,
+                    )
+                    .await
+            }
+        };
+        let run = admission.map_err(|error| match error {
+            meerkat_mob::MobError::FlowRunIdempotencyConflict { run_id, flow_id } => {
+                ReviewAdmissionError::Conflict { run_id, flow_id }
+            }
+            error => ReviewAdmissionError::Runtime(error),
+        })?;
         if run != RunId::for_work_execution(&handle.definition().id, &flow_id(role), &key) {
             return Err(ReviewProofError::ScopeMismatch.into());
         }

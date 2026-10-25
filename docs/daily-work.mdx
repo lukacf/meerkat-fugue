@@ -81,6 +81,20 @@ Before requesting merge, check:
 After the action, confirm the PR is merged and the tracker reflects the result.
 If merge fails, inspect its reason and refresh the evidence before trying again.
 
+## Follow a review
+
+A review coordinator may be quiet while its selected specialists are working.
+Open **Agents** to inspect their conversations and the review's Work Graph
+obligations. The coordinator receives native completion notifications and checks
+the original review results before continuing; you do not need to send it
+reminders or start another review to keep it running.
+
+A completed specialist turn is not a merge approval. The configured merge gate
+still requires all selected reviews, current PR and CI evidence, and resolution
+of blocking obligations. If progress stops, retain the issue, PR head and review
+references and inspect the reported blocker. Do not delete the review or close
+its obligations merely to advance the board.
+
 ## Inspect the team
 
 **Agents** is the native shared Meta console. Use its roster to select an

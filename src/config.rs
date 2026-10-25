@@ -427,6 +427,37 @@ fn default_independent_review_findings_comment_marker() -> String {
 }
 
 impl TrackerConfig {
+    /// Stable tracker identity, excluding credentials and display settings.
+    pub(crate) fn context_id(&self) -> String {
+        // Jira also accepts environment references for its site and project.
+        // Scope the effective values so changing a deployment's environment
+        // cannot reuse another tracker's browser receipts or local files.
+        let jira_endpoint = (self.kind == "jira")
+            .then(|| crate::jira::env_value(&self.endpoint))
+            .flatten();
+        let jira_project = (self.kind == "jira")
+            .then(|| {
+                self.project_slug
+                    .as_deref()
+                    .and_then(crate::jira::env_value)
+            })
+            .flatten();
+        let mut identity = Sha256::new();
+        for component in [
+            self.kind.as_str(),
+            jira_endpoint.as_deref().unwrap_or(&self.endpoint),
+            jira_project
+                .as_deref()
+                .or(self.project_slug.as_deref())
+                .unwrap_or_default()
+                .trim(),
+        ] {
+            identity.update((component.len() as u64).to_le_bytes());
+            identity.update(component.as_bytes());
+        }
+        format!("{:x}", identity.finalize())
+    }
+
     pub fn from_mcp_env(default_kind: &str) -> Result<Self> {
         let kind = env::var("FUGUE_TRACKER_KIND").unwrap_or_else(|_| default_kind.to_string());
         let mut raw = Map::new();
@@ -1346,6 +1377,7 @@ pub struct WorkflowConfigManager {
     definition: WorkflowDefinition,
     effective: ServiceConfig,
     last_reload_error: Option<String>,
+    tracker_context: String,
     connections: Option<std::sync::Arc<crate::setup::connections::Connections>>,
 }
 
@@ -1360,6 +1392,7 @@ impl WorkflowConfigManager {
             workflow_path: path,
             last_modified: None,
             definition,
+            tracker_context: effective.tracker_context_id(),
             effective,
             last_reload_error: None,
             connections: None,
@@ -1377,6 +1410,7 @@ impl WorkflowConfigManager {
             workflow_path: path,
             last_modified: modified,
             definition,
+            tracker_context: effective.tracker_context_id(),
             effective,
             last_reload_error: None,
             connections: None,
@@ -1403,6 +1437,7 @@ impl WorkflowConfigManager {
             workflow_path: path,
             last_modified: modified,
             definition,
+            tracker_context: effective.tracker_context_id(),
             effective,
             last_reload_error: None,
             connections: Some(connections),
@@ -1439,6 +1474,11 @@ impl WorkflowConfigManager {
             }
             let mut effective =
                 ServiceConfig::from_definition(self.workflow_path.clone(), &definition)?;
+            if effective.tracker_context_id() != self.tracker_context {
+                return Err(FugueError::InvalidConfig(
+                    "The running repository cannot change tracker identity. Restore its original tracker settings, or use a new workspace for the new tracker.".into(),
+                ));
+            }
             effective.meerkat.runtime_connections = self.connections.clone();
             if let Some(connections) = &self.connections
                 && let Some(binding) = connections
@@ -1611,34 +1651,7 @@ impl ServiceConfig {
 
     /// Stable tracker identity, excluding credentials and display settings.
     pub(crate) fn tracker_context_id(&self) -> String {
-        // Jira also accepts environment references for its site and project.
-        // Scope the effective values so changing a deployment's environment
-        // cannot reuse another tracker's browser receipts or local files.
-        let jira_endpoint = (self.tracker.kind == "jira")
-            .then(|| crate::jira::env_value(&self.tracker.endpoint))
-            .flatten();
-        let jira_project = (self.tracker.kind == "jira")
-            .then(|| {
-                self.tracker
-                    .project_slug
-                    .as_deref()
-                    .and_then(crate::jira::env_value)
-            })
-            .flatten();
-        let mut identity = Sha256::new();
-        for component in [
-            self.tracker.kind.as_str(),
-            jira_endpoint.as_deref().unwrap_or(&self.tracker.endpoint),
-            jira_project
-                .as_deref()
-                .or(self.tracker.project_slug.as_deref())
-                .unwrap_or_default()
-                .trim(),
-        ] {
-            identity.update((component.len() as u64).to_le_bytes());
-            identity.update(component.as_bytes());
-        }
-        format!("{:x}", identity.finalize())
+        self.tracker.context_id()
     }
 
     fn validate_static(&self) -> Result<()> {
@@ -2709,7 +2722,7 @@ pub fn parse_native_workflow(path: &Path, contents: &str) -> Result<WorkflowDefi
 }
 
 impl NativeFugueConfig {
-    fn into_workflow_definition(self, path: &Path) -> Result<WorkflowDefinition> {
+    pub(crate) fn into_workflow_definition(self, path: &Path) -> Result<WorkflowDefinition> {
         self.validate()?;
         let workflow_dir = path
             .parent()
@@ -4322,6 +4335,42 @@ fn insert_opt_object(
 mod tests {
     use super::*;
     use crate::domain::{Issue, IssueAttachment};
+
+    fn tracker_binding_workflow() -> String {
+        include_str!("../fugue.jira.example.yaml")
+            .replace("$JIRA_BASE_URL", "https://first.example.com")
+            .replace("$JIRA_API_TOKEN", "fixture-token")
+            .replace("$JIRA_EMAIL", "fixture@example.com")
+    }
+
+    #[test]
+    fn tracker_binding_rejects_identity_change_on_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fugue.yaml");
+        let original = tracker_binding_workflow();
+        fs::write(&path, &original).unwrap();
+        let mut manager = WorkflowConfigManager::load(path.clone()).unwrap();
+        let original_context = manager.effective().tracker_context_id();
+        for replacement in [
+            original.replace("https://first.example.com", "https://second.example.com"),
+            original.replace("project_slug: EXAMPLE", "project_slug: OTHER"),
+        ] {
+            fs::write(&path, replacement).unwrap();
+            manager.last_modified = None;
+            assert!(!manager.reload_if_changed());
+            assert_eq!(manager.effective().tracker_context_id(), original_context);
+            assert!(manager.last_reload_error().is_some());
+        }
+        fs::write(&path, original.replace("fixture-token", "rotated-token")).unwrap();
+        manager.last_modified = None;
+        assert!(manager.reload_if_changed());
+        assert_eq!(manager.effective().tracker_context_id(), original_context);
+        assert_eq!(
+            manager.effective().tracker.api_key.as_deref(),
+            Some("rotated-token")
+        );
+        assert!(manager.last_reload_error().is_none());
+    }
 
     #[test]
     fn jira_example_materializes_scope_authentication_and_existing_statuses() {

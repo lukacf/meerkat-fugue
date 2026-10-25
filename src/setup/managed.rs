@@ -75,6 +75,16 @@ pub async fn prepare(
         .parent()
         .context("Fugue executable has no directory")?;
     let mut generated = setup.render(connections, root, port, bin_dir)?;
+    let workflow_path = root.join("fugue.yaml");
+    let definition = generated
+        .workflow
+        .clone()
+        .into_workflow_definition(&workflow_path)?;
+    let config = crate::config::ServiceConfig::from_definition(workflow_path, &definition)?;
+    crate::tracker_binding::validate(
+        &crate::meta_runtime::meta_runtime_state_path(&config.meerkat),
+        &config.tracker_context_id(),
+    )?;
     if matches!(
         connections.tracker,
         Some(super::connections::TrackerConnection::Jira { .. })
@@ -428,6 +438,64 @@ pub async fn shutdown_signal() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tracker_binding_setup_refuses_before_contacting_replacement_tracker() {
+        use super::super::connections::{
+            GitHubConnection, GitHubCredential, ModelConnection, ModelCredential, ModelProvider,
+            TrackerConnection,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut setup = jira_setup();
+        setup.tracker_project = Some("APP".into());
+        let mut connections = Connections {
+            model: Some(ModelConnection {
+                provider: ModelProvider::Openai,
+                model: crate::config::default_agent_model().into(),
+                credential: ModelCredential::Environment,
+            }),
+            github: Some(GitHubConnection {
+                host: "github.com".into(),
+                credential: GitHubCredential::GhCli,
+            }),
+            tracker: Some(serde_json::from_str(
+                r#"{"kind":"jira","site":"https://first.example.com","email":"fixture@example.com","api_token":"fixture-token"}"#,
+            ).unwrap()),
+        };
+        let rendered = setup
+            .render(&connections, root, 8788, Path::new("/opt/fugue/bin"))
+            .unwrap();
+        let path = root.join("fugue.yaml");
+        let definition = rendered.workflow.into_workflow_definition(&path).unwrap();
+        let config = crate::config::ServiceConfig::from_definition(path, &definition).unwrap();
+        let state = crate::meta_runtime::meta_runtime_state_path(&config.meerkat);
+        crate::tracker_binding::bind(&state, &config.tracker_context_id()).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        if let Some(TrackerConnection::Jira { site, .. }) = &mut connections.tracker {
+            *site = format!("https://{}", listener.local_addr().unwrap());
+        }
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            prepare(root, &setup, &connections, 8788),
+        )
+        .await
+        .expect("setup must fail before waiting for provider access")
+        .err()
+        .expect("changed tracker must be refused");
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(crate::tracker_binding::BindingError::DifferentTracker)
+        ));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(!root.join("workspace.json").exists());
+        assert!(!root.join("generations").exists());
+        assert!(!rendered.checkout.exists());
+    }
 
     #[test]
     fn interrupted_activation_keeps_committed_generation_and_allows_retry() {

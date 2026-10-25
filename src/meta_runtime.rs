@@ -96,6 +96,25 @@ impl FugueMobJob {
     }
 }
 
+fn review_job_matches_caller(
+    job: &FugueMobJob,
+    binding: &meerkat_core::MobMemberBinding,
+    candidate: &crate::native_review::ReviewCandidate,
+) -> bool {
+    let same_issue = match &job.run.issue {
+        Some(LinearIssueRef::Id { id }) => id == &candidate.issue_id,
+        Some(LinearIssueRef::Identifier { identifier }) => {
+            identifier.0 == candidate.issue_identifier
+        }
+        None => false,
+    };
+    let review_template = job.run.template_id.as_ref().is_some_and(|template| {
+        template.0 == "independent_review"
+            || template.0 == format!("final-pr-gate-{}", candidate.pull_request.0)
+    });
+    same_issue && review_template && job.member_identities.contains(&binding.member)
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct FugueConsoleVisibilityPolicy;
 
@@ -242,7 +261,9 @@ pub struct MetaRuntimeRegistry {
     meerkat: MeerkatConfig,
     repo_mcp_servers: BTreeMap<String, NativeMcpServerConfig>,
     tracker: TrackerConfig,
+    tracker_context: String,
     host_signal_binding: Option<HostSignalBinding>,
+    review_admission: Option<tokio::sync::mpsc::Sender<crate::orchestrator::InternalMessage>>,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
     templates: BTreeMap<String, MaterializedMobTemplate>,
@@ -349,7 +370,35 @@ impl MetaRuntimeRegistry {
 
     pub(crate) async fn admit_native_review(
         &self,
+        draft: crate::review_requests::ReviewRequestDraft,
+    ) -> Result<
+        (
+            crate::native_review::ReviewIntent,
+            crate::native_review::ReviewReference,
+        ),
+        crate::review_requests::ReviewRequestError,
+    > {
+        self.admit_native_review_for(draft, None).await
+    }
+
+    pub(crate) async fn admit_member_native_review(
+        &self,
+        draft: crate::review_requests::ReviewRequestDraft,
+        caller: &crate::review_admission::ReviewCaller,
+    ) -> Result<
+        (
+            crate::native_review::ReviewIntent,
+            crate::native_review::ReviewReference,
+        ),
+        crate::review_requests::ReviewRequestError,
+    > {
+        self.admit_native_review_for(draft, Some(caller)).await
+    }
+
+    async fn admit_native_review_for(
+        &self,
         mut draft: crate::review_requests::ReviewRequestDraft,
+        caller: Option<&crate::review_admission::ReviewCaller>,
     ) -> Result<
         (
             crate::native_review::ReviewIntent,
@@ -394,6 +443,10 @@ impl MetaRuntimeRegistry {
             .await
             .map_err(|_| ReviewRequestError::Unavailable)?;
         let handle = runtime.mob_handle();
+        if let Some(caller) = caller {
+            self.validate_review_caller(&handle, caller, &draft.candidate)
+                .await?;
+        }
         for (role, identities) in draft.reviewers.bound_roles() {
             for identity in identities {
                 let member = handle
@@ -411,7 +464,13 @@ impl MetaRuntimeRegistry {
         let intent = tokio::task::spawn_blocking(move || store.reserve(draft, required))
             .await
             .map_err(|_| ReviewRequestError::Unavailable)??;
-        let reference = crate::native_review::admit(&handle, &intent, required).await?;
+        let reference = match caller {
+            Some(caller) => {
+                crate::native_review::admit_observed(&handle, &intent, required, caller.observer())
+                    .await?
+            }
+            None => crate::native_review::admit(&handle, &intent, required).await?,
+        };
         let store = self.review_requests();
         tokio::task::spawn_blocking(move || {
             store.require_current(&intent)?;
@@ -419,6 +478,40 @@ impl MetaRuntimeRegistry {
         })
         .await
         .map_err(|_| ReviewRequestError::Unavailable)?
+    }
+
+    async fn validate_review_caller(
+        &self,
+        handle: &MobHandle,
+        caller: &crate::review_admission::ReviewCaller,
+        candidate: &crate::native_review::ReviewCandidate,
+    ) -> Result<(), crate::review_requests::ReviewRequestError> {
+        use crate::review_requests::ReviewRequestError;
+        let binding = caller.binding();
+        if binding.mob_id != self.meerkat.mob_id()
+            || binding.role != self.independent_review.orchestrator_profile
+            || !self
+                .jobs
+                .lock()
+                .map_err(|_| ReviewRequestError::Unavailable)?
+                .values()
+                .any(|job| review_job_matches_caller(job, binding, candidate))
+        {
+            return Err(ReviewRequestError::IneligibleObserver);
+        }
+        let identity = AgentIdentity::from(binding.member.as_str());
+        let member = handle
+            .get_member(&identity)
+            .await
+            .map_err(|_| ReviewRequestError::Unavailable)?
+            .ok_or(ReviewRequestError::IneligibleObserver)?;
+        if member.role.as_str() != binding.role
+            || handle.resolve_bridge_session_id(&identity).await.as_ref()
+                != Some(caller.origin_session_id())
+        {
+            return Err(ReviewRequestError::IneligibleObserver);
+        }
+        Ok(())
     }
 
     pub(crate) async fn read_native_review(
@@ -481,6 +574,11 @@ impl MetaRuntimeRegistry {
         Ok(())
     }
 
+    pub(crate) fn ensure_tracker_binding(&self) -> Result<(), String> {
+        crate::tracker_binding::bind(&self.state_path(), &self.tracker_context)
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn repository_binding(&self) -> Option<&crate::config::RepositoryRuntimeBinding> {
         self.meerkat.repository_runtime.as_ref()
     }
@@ -504,6 +602,7 @@ impl MetaRuntimeRegistry {
             independent_review_enabled: self.reviews_enabled(),
             tracker: self.tracker.clone(),
             host_signal_binding: self.host_signal_binding.clone(),
+            review_admission: self.review_admission.clone(),
             host_api_url: self.host_api_url.clone(),
             host_api_auth: self.host_api_auth.clone(),
             github_repo: github_repo_from_mcp_servers(&self.repo_mcp_servers)?,
@@ -524,6 +623,7 @@ impl MetaRuntimeRegistry {
         runtime: Arc<UnifiedRuntime>,
         specialists: Vec<RepositorySpecialist>,
     ) -> Result<(), String> {
+        self.ensure_tracker_binding()?;
         let binding = self
             .repository_binding()
             .ok_or("queue has no repository binding")?;
@@ -570,8 +670,10 @@ impl MetaRuntimeRegistry {
         Self {
             meerkat,
             repo_mcp_servers,
+            tracker_context: tracker.context_id(),
             tracker,
             host_signal_binding: None,
+            review_admission: None,
             host_api_url,
             host_api_auth,
             templates,
@@ -591,6 +693,14 @@ impl MetaRuntimeRegistry {
             stopping: Arc::new(AtomicBool::new(false)),
             launch_tasks: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub(crate) fn with_review_admission(
+        mut self,
+        sender: tokio::sync::mpsc::Sender<crate::orchestrator::InternalMessage>,
+    ) -> Self {
+        self.review_admission = Some(sender);
+        self
     }
 
     pub fn with_host_signal_binding(mut self, binding: HostSignalBinding) -> Self {
@@ -885,6 +995,7 @@ impl MetaRuntimeRegistry {
     }
 
     async fn runtime(&self) -> Result<Arc<UnifiedRuntime>, String> {
+        self.ensure_tracker_binding()?;
         let mut guard = self.runtime.lock().await;
         if self.stopping.load(Ordering::Acquire) {
             return Err("Fugue runtime is shutting down".to_string());
@@ -912,6 +1023,7 @@ impl MetaRuntimeRegistry {
             self.repo_mcp_servers.clone(),
             self.tracker.clone(),
             self.host_signal_binding.clone(),
+            self.review_admission.clone(),
             self.host_api_url.clone(),
             self.host_api_auth.clone(),
         )?;
@@ -1043,6 +1155,7 @@ impl MetaRuntimeRegistry {
     }
 
     fn restore_jobs(&self) -> Result<(), String> {
+        self.ensure_tracker_binding()?;
         self.jobs_loaded
             .get_or_init(|| {
                 let path = self.state_path().join("fugue-runs.sqlite3");
@@ -1077,6 +1190,7 @@ impl MetaRuntimeRegistry {
 
     /// Application issue/run mapping only. Native member/session state stays in Meta.
     fn persist_jobs(&self, jobs: &BTreeMap<String, FugueMobJob>) -> Result<(), String> {
+        self.ensure_tracker_binding()?;
         let root = self.state_path();
         std::fs::create_dir_all(&root)
             .map_err(|error| format!("create Fugue run directory: {error}"))?;
@@ -1138,6 +1252,7 @@ struct FugueDirectToolSessionHook {
     independent_review_enabled: bool,
     tracker: TrackerConfig,
     host_signal_binding: Option<HostSignalBinding>,
+    review_admission: Option<tokio::sync::mpsc::Sender<crate::orchestrator::InternalMessage>>,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
     github_repo: Option<GitHubRepoRef>,
@@ -1149,6 +1264,14 @@ struct FugueDirectToolSessionHook {
 #[async_trait]
 impl SessionHook for FugueDirectToolSessionHook {
     async fn before_create(&self, req: &mut CreateSessionRequest) -> Result<(), SessionError> {
+        let review_session = req
+            .build
+            .as_ref()
+            .and_then(|build| build.mob_member_binding.as_ref())
+            .zip(self.review_admission.as_ref())
+            .map(|(binding, sender)| {
+                crate::review_admission::ReviewSession::new(binding.clone(), sender.clone())
+            });
         let authority = HostToolAuthority::for_mob_binding(
             req.build
                 .as_ref()
@@ -1219,6 +1342,7 @@ impl SessionHook for FugueDirectToolSessionHook {
             self.independent_review_enabled,
             self.connections.clone(),
             self.host_signal_binding.clone(),
+            review_session,
         );
         let existing_tools = build.external_tools.take();
         let fugue_tools = match workspace_root {
@@ -1410,6 +1534,7 @@ struct FugueDirectToolDispatcher {
     github: crate::github_tools::GitHubToolHost,
     tracker: TrackerConfig,
     host_signal_binding: Option<HostSignalBinding>,
+    review_session: Option<crate::review_admission::ReviewSession>,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
     allow_issue_mutation: bool,
@@ -1422,6 +1547,44 @@ struct FugueDirectToolDispatcher {
 
 #[async_trait]
 impl AgentToolDispatcher for FugueDirectToolDispatcher {
+    async fn dispatch_with_context(
+        &self,
+        call: ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+    ) -> Result<meerkat_core::ops::ToolDispatchOutcome, meerkat_core::error::ToolError> {
+        if call.name != "fugue_admit_independent_review" {
+            return self.dispatch(call).await;
+        }
+        if !self.tools.iter().any(|tool| tool.name == call.name) {
+            return Err(meerkat_core::error::ToolError::NotFound {
+                name: call.name.to_owned(),
+            });
+        }
+        let request = serde_json::from_str::<
+            crate::independent_review::IndependentReviewAdmissionRequest,
+        >(call.args.get())
+        .map_err(|error| meerkat_core::error::ToolError::InvalidArguments {
+            name: call.name.to_owned(),
+            reason: error.to_string(),
+        })?;
+        let Some(session) = &self.review_session else {
+            return Ok(crate::review_admission::AdmissionFailure::MissingCaller
+                .tool_result(call.id)
+                .into());
+        };
+        match session.admit(request, context).await {
+            Ok(result) => {
+                let content = serde_json::to_string(&result).map_err(|error| {
+                    meerkat_core::error::ToolError::ExecutionFailed {
+                        message: format!("encode admitted native review: {error}"),
+                    }
+                })?;
+                Ok(ToolResult::new(call.id.to_owned(), content, false).into())
+            }
+            Err(error) => Ok(error.tool_result(call.id).into()),
+        }
+    }
+
     fn tools(&self) -> Arc<[Arc<ToolDef>]> {
         Arc::clone(&self.tools)
     }
@@ -1442,6 +1605,13 @@ impl AgentToolDispatcher for FugueDirectToolDispatcher {
             return Err(meerkat_core::error::ToolError::NotFound {
                 name: call.name.to_string(),
             });
+        }
+        if call.name == "fugue_admit_independent_review" {
+            return Ok(
+                crate::review_admission::AdmissionFailure::MissingRetainedWork
+                    .tool_result(call.id)
+                    .into(),
+            );
         }
         let arguments: serde_json::Value =
             serde_json::from_str(call.args.get()).map_err(|error| {
@@ -1554,15 +1724,6 @@ impl AgentToolDispatcher for FugueDirectToolDispatcher {
             .await;
             return Ok(ToolResult::new(call.id.to_string(), content, is_error).into());
         }
-        if call.name == "fugue_admit_independent_review" {
-            let (is_error, content) = call_fugue_admit_independent_review(
-                self.host_api_url.as_deref(),
-                self.host_api_auth.as_ref(),
-                &arguments,
-            )
-            .await;
-            return Ok(ToolResult::new(call.id.to_string(), content, is_error).into());
-        }
         if matches!(
             call.name,
             "fugue_complete_independent_review" | "fugue_complete_final_pr_gate"
@@ -1613,6 +1774,7 @@ fn direct_tool_dispatcher(
     independent_review_enabled: bool,
     connections: Option<Arc<crate::setup::connections::Connections>>,
     host_signal_binding: Option<HostSignalBinding>,
+    review_session: Option<crate::review_admission::ReviewSession>,
 ) -> Arc<dyn AgentToolDispatcher> {
     let allow_issue_mutation = authority.can_move_issue();
     let tracker = tracker.clone();
@@ -1713,6 +1875,7 @@ fn direct_tool_dispatcher(
         github: crate::github_tools::GitHubToolHost::with_connections(connections),
         tracker,
         host_signal_binding,
+        review_session,
         host_api_url,
         host_api_auth,
         allow_issue_mutation,
@@ -1859,6 +2022,7 @@ fn build_unified_runtime(
     servers: BTreeMap<String, NativeMcpServerConfig>,
     tracker: TrackerConfig,
     host_signal_binding: Option<HostSignalBinding>,
+    review_admission: Option<tokio::sync::mpsc::Sender<crate::orchestrator::InternalMessage>>,
     host_api_url: Option<String>,
     host_api_auth: Option<MetaConsoleBasicAuthConfig>,
 ) -> Result<(UnifiedRuntime, Option<tokio::runtime::Runtime>), String> {
@@ -1903,6 +2067,7 @@ fn build_unified_runtime(
                 independent_review_enabled: independent_review.enabled,
                 tracker,
                 host_signal_binding,
+                review_admission,
                 host_api_url,
                 host_api_auth,
                 github_repo,
@@ -2215,32 +2380,6 @@ async fn call_fugue_start_independent_review(
         host_api_url,
         host_api_auth,
         "start-independent-review",
-        &request,
-    )
-    .await
-}
-
-async fn call_fugue_admit_independent_review(
-    host_api_url: Option<&str>,
-    host_api_auth: Option<&MetaConsoleBasicAuthConfig>,
-    arguments: &Value,
-) -> (bool, String) {
-    let request = match serde_json::from_value::<
-        crate::independent_review::IndependentReviewAdmissionRequest,
-    >(arguments.clone())
-    {
-        Ok(request) => request,
-        Err(_) => {
-            return (
-                true,
-                json!({"error":"invalid_review_assignment"}).to_string(),
-            );
-        }
-    };
-    call_fugue_review_request(
-        host_api_url,
-        host_api_auth,
-        "admit-independent-review",
         &request,
     )
     .await
@@ -4020,6 +4159,81 @@ fn block_on<T>(future: impl Future<Output = T>) -> Result<T, String> {
 pub(crate) mod tests {
     use super::*;
 
+    #[test]
+    fn native_review_caller_requires_recorded_issue_and_review_job_membership() {
+        let candidate = serde_json::from_value(json!({
+            "tracker_context":"project", "issue_id":"row-1", "issue_identifier":"APP-1",
+            "repo":{"owner":"example","name":"app"}, "pull_request":7,
+            "base_branch":"main", "head_sha":"a".repeat(40)
+        }))
+        .unwrap();
+        let binding = meerkat_core::MobMemberBinding {
+            mob_id: "repository-one".into(),
+            role: "review_orchestrator".into(),
+            member: "recorded-coordinator".into(),
+        };
+        let mut job = FugueMobJob::new(
+            MobRunSnapshot {
+                run_id: MobRunId("review-job".into()),
+                meta_flow_run_id: None,
+                flow_id: None,
+                issue: Some(LinearIssueRef::Id {
+                    id: crate::tools::LinearIssueId("row-1".into()),
+                }),
+                workspace_key: None,
+                template_id: Some(crate::tools::MobTemplateId("independent_review".into())),
+                status: MobRunStatus::Succeeded,
+                started_at: None,
+                updated_at: Utc::now(),
+                completed_at: None,
+            },
+            vec![binding.member.clone()],
+        );
+        // A native follow-up can outlive the outer flow's first turn. The host
+        // must check assignment, not infer native liveness from job status.
+        assert!(review_job_matches_caller(&job, &binding, &candidate));
+        job.run.issue = Some(LinearIssueRef::Identifier {
+            identifier: crate::tools::LinearIssueIdentifier("APP-1".into()),
+        });
+        assert!(review_job_matches_caller(&job, &binding, &candidate));
+        job.run.template_id = Some(crate::tools::MobTemplateId("final-pr-gate-7".into()));
+        assert!(review_job_matches_caller(&job, &binding, &candidate));
+        for template in ["implementation_mob", "final-pr-gate-8"] {
+            job.run.template_id = Some(crate::tools::MobTemplateId(template.into()));
+            assert!(!review_job_matches_caller(&job, &binding, &candidate));
+        }
+        job.run.template_id = Some(crate::tools::MobTemplateId("independent_review".into()));
+        job.run.issue = Some(LinearIssueRef::Id {
+            id: crate::tools::LinearIssueId("row-2".into()),
+        });
+        assert!(!review_job_matches_caller(&job, &binding, &candidate));
+        job.run.issue = None;
+        assert!(!review_job_matches_caller(&job, &binding, &candidate));
+        job.run.issue = Some(LinearIssueRef::Id {
+            id: crate::tools::LinearIssueId("row-1".into()),
+        });
+        job.member_identities = vec!["another-coordinator".into()];
+        assert!(!review_job_matches_caller(&job, &binding, &candidate));
+    }
+
+    #[tokio::test]
+    async fn native_review_admission_refuses_missing_context_without_http_fallback() {
+        let tools = scoped_direct_tools(HostToolAuthority::ReviewOrchestrator, None);
+        let args = serde_json::value::to_raw_value(&json!({})).unwrap();
+        let outcome = tools
+            .dispatch(ToolCallView {
+                id: "admit",
+                name: "fugue_admit_independent_review",
+                args: &args,
+            })
+            .await
+            .unwrap();
+        assert!(outcome.result.is_error);
+        assert!(
+            format!("{:?}", outcome.result.content).contains("native_review_work_context_required")
+        );
+    }
+
     #[tokio::test]
     async fn review_admission_reports_shortage_before_reserving_or_starting_runtime() {
         for final_only in [false, true] {
@@ -4488,6 +4702,7 @@ pub(crate) mod tests {
             true,
             None,
             None,
+            None,
         )
     }
 
@@ -4554,6 +4769,7 @@ pub(crate) mod tests {
             Vec::new(),
             WorkGraphTerminalGate::new("/unused/workgraph.sqlite3", Vec::new(), Vec::new()),
             false,
+            None,
             None,
             None,
         );
@@ -4933,6 +5149,7 @@ pub(crate) mod tests {
                     false,
                     None,
                     None,
+                    None,
                 );
                 let mut input = json!({
                     "issue": issue_ref, "assignee": {"kind":"id", "id":"operator"},
@@ -5171,6 +5388,7 @@ pub(crate) mod tests {
             independent_review_enabled: false,
             tracker: tracker_with_key(),
             host_signal_binding: None,
+            review_admission: None,
             host_api_url: None,
             host_api_auth: None,
             github_repo: None,
@@ -5299,6 +5517,7 @@ pub(crate) mod tests {
             independent_review_enabled: false,
             tracker: tracker_with_key(),
             host_signal_binding: None,
+            review_admission: None,
             host_api_url: None,
             host_api_auth: None,
             github_repo: None,
@@ -5522,6 +5741,7 @@ pub(crate) mod tests {
             false,
             None,
             Some(binding.clone()),
+            None,
         );
         let args = serde_json::value::to_raw_value(&json!({
             "issue": {"kind": "identifier", "identifier": "APP-1"},
@@ -6959,6 +7179,63 @@ pub(crate) mod tests {
                 .is_some()
         );
         registry.shutdown().await.expect("shutdown");
+    }
+
+    #[test]
+    fn tracker_binding_rejects_retained_jobs_from_another_jira_site() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = test_meerkat_config(temp.path().join("state"));
+        let mut tracker = default_tracker_config();
+        tracker.kind = "jira".into();
+        tracker.endpoint = "https://first.example.com".into();
+        tracker.project_slug = Some("APP".into());
+        let make_registry = |tracker| {
+            MetaRuntimeRegistry::with_config(
+                config.clone(),
+                tracker,
+                None,
+                None,
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+        };
+        let registry = make_registry(tracker.clone());
+        let plan = launch_plan();
+        let run_id = MobRunId(plan.input.idempotency_key.0.clone());
+        let job = FugueMobJob::new(
+            meta_runtime_run_snapshot_from_plan(&run_id, &plan, Utc::now()),
+            member_identities_for_plan(&plan),
+        );
+        registry
+            .persist_jobs(&BTreeMap::from([(run_id.0.clone(), job)]))
+            .expect("persist");
+        let path = registry.state_path().join("fugue-runs.sqlite3");
+        let original = std::fs::read(&path).expect("original bytes");
+        let mut other = tracker.clone();
+        other.endpoint = "https://second.example.com".into();
+        let switched = make_registry(other);
+        assert!(
+            switched.restore_jobs().is_err(),
+            "must not restore another site's issue/run mapping"
+        );
+        assert!(
+            switched.persist_jobs(&BTreeMap::new()).is_err(),
+            "must not replace another site's jobs"
+        );
+        assert!(switched.jobs.lock().expect("jobs").is_empty());
+        assert_eq!(std::fs::read(&path).expect("retained bytes"), original);
+        tracker.api_key = Some("rotated-token".into());
+        let restarted = make_registry(tracker);
+        restarted
+            .restore_jobs()
+            .expect("same tracker with new credentials");
+        assert!(
+            restarted
+                .jobs
+                .lock()
+                .expect("restored jobs")
+                .contains_key(&run_id.0)
+        );
     }
 
     #[test]

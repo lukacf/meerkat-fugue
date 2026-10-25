@@ -123,6 +123,7 @@ pub struct Orchestrator {
 
 #[derive(Debug)]
 pub enum InternalMessage {
+    NativeReviewAdmission(Box<crate::review_admission::NativeReviewAdmission>),
     Worker(Box<WorkerMessage>),
     RetryDue {
         issue_id: String,
@@ -734,6 +735,7 @@ impl Orchestrator {
             ),
             effective.mob.templates.clone(),
         )
+        .with_review_admission(internal_tx.clone())
         .with_host_signal_binding(host_signal_binding.clone())
         .with_final_review_config(effective.final_review.clone())
         .with_independent_review_config(effective.independent_review.clone());
@@ -4264,6 +4266,11 @@ impl Orchestrator {
 
     async fn handle_internal(&mut self, message: InternalMessage) {
         match message {
+            InternalMessage::NativeReviewAdmission(command) => {
+                command
+                    .execute(self.config.effective(), &self.meta_runtime_registry)
+                    .await;
+            }
             InternalMessage::Worker(message) => match *message {
                 WorkerMessage::AgentUpdate { issue_id, update } => {
                     self.apply_agent_update(&issue_id, *update).await;

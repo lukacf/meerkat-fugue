@@ -256,6 +256,9 @@ impl EnsembleRuntime {
             }
         }
         let state_guard = config.claim_state()?;
+        if let Some(queue) = &queue {
+            queue.ensure_tracker_binding().map_err(anyhow::Error::msg)?;
+        }
         let mut this = Self {
             config,
             repositories: BTreeMap::new(),

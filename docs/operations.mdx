@@ -63,6 +63,13 @@ service definitions with the backup so rollback can restore a matching pair.
 Stop the service or use an explicitly supported consistent snapshot mechanism;
 a copy of live SQLite files alone is not a proven consistent backup.
 
+Include `fugue-tracker-context.json` with each repository's native databases.
+It records the original tracker scope as a credential-free hash. Restore it with
+the matching workflow and state; do not generate a replacement binding from new
+tracker settings. A running workflow also refuses tracker identity changes
+through hot reload. See [tracker setup recovery](./troubleshooting.mdx#setup-will-not-prepare-or-start)
+for the supported options when changing configuration.
+
 Include `.fugue/host-signals.sqlite3` beside each repository workflow. It stores
 observed changes and saved notifications to the repository coordinator. Preserve
 it with the matching workflow and native runtime state, including when moving

@@ -112,6 +112,27 @@ Graph evidence. The standalone `fugue-github-mcp` server does not offer merge;
 The MCP boundary must expose protocol-compatible `tools/list` descriptors with
 `inputSchema`, not provider-style `input_schema`.
 
+## Native review completion
+
+Review admission binds the coordinator's actual native member and retained work
+to the selected review runs. Caller identity comes from the native dispatch
+context, not from model-supplied arguments. Retrying the same request and key
+recovers the original run references rather than creating replacement reviews.
+
+After its initial status read, a coordinator with pending reviews ends its turn.
+The native runtime queues completion notifications, allowing the coordinator to
+resume without polling or a monitoring helper. A notification reports terminal
+status; it does not carry an approval verdict. The coordinator re-reads all
+original references and invokes the configured completion action only after
+every selected review is terminal. Failed or canceled reviews remain blockers.
+
+The host verifies native results, reviewer independence and the current PR head.
+The configured final merge gate also checks required CI and Work Graph
+obligations before merging. Recovery must preserve the original requests and both native mob and runtime stores.
+Restore them together with the matching executable release when rolling back;
+replacing only the binary does not undo changes to stored observer or
+continuation data.
+
 ## Workpad handoff contract
 
 Workers maintain exactly one persistent tracker comment headed

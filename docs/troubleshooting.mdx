@@ -53,10 +53,25 @@ values saved. You have newer unsaved changes.** Review those newer values and
 save that connection again. Preparation remains disabled while connection
 changes are unsaved. Keep the page open until they are saved.
 
-Changing the tracker can change its default lane mapping. Review the workflow
-after a successful tracker switch, then check the workspace again. For Jira,
-use the project's actual statuses. Do not create statuses in a shared Jira
-workflow just to match Fugue's built-in defaults.
+Before the first start, changing the tracker can change its default lane
+mapping. Review the workflow and use the Jira project's actual statuses. Do not
+create statuses in a shared Jira workflow to match Fugue's built-in defaults.
+
+Once a repository has native state, its tracker kind, endpoint and project are
+fixed for that state. Credentials can be replaced for the same tracker. If setup
+reports that saved work belongs to another tracker, restore the original tracker
+settings and prepare again. Changing the endpoint or project cannot reuse old
+agents, review runs or issue records, even when ticket keys happen to match.
+
+Moving that repository to a different tracker requires a fresh, isolated
+installation managed by the host operator. The managed host does not allow a
+second workspace for the same repository address. Preserve the original state
+and stop its execution before starting replacement work. Do not delete its
+tracker binding or databases to bypass the check.
+
+An older development installation without a tracker binding also refuses to
+attach its saved native state to replacement settings. Preserve it for separate
+recovery; a new installation starts with its own binding automatically.
 
 ## No issues are picked up
 

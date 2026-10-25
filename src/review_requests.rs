@@ -49,6 +49,8 @@ pub(crate) enum ReviewRequestError {
     Corrupt,
     #[error("selected reviewer is not an eligible existing repository specialist")]
     IneligibleReviewer,
+    #[error("review caller is not the current native coordinator for this issue and review job")]
+    IneligibleObserver,
     #[error(
         "review requires {required} independent specialists, but only {available} are eligible; keep review blocked or explicitly change the repository policy in setup"
     )]
