@@ -258,7 +258,10 @@ impl Directory {
             jira_issue_type: Some("Task".into()),
             jira_jql: None,
             jira_issue_labels: Vec::new(),
-            lanes: crate::config::TrackerLaneRoles::default(),
+            lanes: crate::config::TrackerLaneRoles {
+                deploy_action: "Merge".into(),
+                ..Default::default()
+            },
         };
         super::save_json(&root.join("workflow-draft.json"), &draft)?;
         // Publish the entry last, after its private connections and initial

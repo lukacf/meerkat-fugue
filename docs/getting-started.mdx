@@ -69,9 +69,11 @@ or external project to enter. Each repository gets its own queue. Repository
 access and an AI account are still needed to develop code.
 
 The default **Backlog** lane holds drafts; **Queue** starts work. **Review**
-requests review. The default action lane is named **Deploy**, but browser setup
-configures it to request a guarded PR merge. It does not deploy your application.
-Read the action shown in the issue editor before confirming it.
+requests review and **Merge** requests a guarded PR merge. Merging does not deploy
+your application. Existing saved status mappings are preserved; a merge-only
+board displays its action as Merge even if its underlying tracker status was
+previously named Deploy. Read the action shown in the issue editor before
+confirming it.
 
 After preparation, choose **New issue** on that repository's Board. Write the
 ticket in Backlog and move it to Queue when its acceptance criteria are ready.

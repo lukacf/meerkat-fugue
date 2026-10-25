@@ -45,6 +45,24 @@ async function setup(page, initial={}, prefix='', initialWorkflow=null) {
 
 const connected={model:{provider:'openai',model:'example-model',method:'environment'},github:{host:'github.com',method:'gh_cli'},tracker:{kind:'local'}};
 
+test('new built-in queues save a Merge lane and keep it after reload',async({page})=>{
+  const {writes}=await setup(page,connected);
+  await page.getByLabel('Repository URL',{exact:true}).fill('https://github.com/example/application');
+  await expect(page.getByLabel('Merge',{exact:true})).toHaveValue('Merge');
+  await page.getByRole('button',{name:'Check and prepare repository'}).click();
+  await expect(page.getByRole('button',{name:'Start Fugue'})).toBeEnabled();
+  expect(writes.at(-1).value.lanes.deploy_action).toBe('Merge');
+  await page.reload();
+  await expect(page.getByLabel('Merge',{exact:true})).toHaveValue('Merge');
+});
+
+test('saved built-in merge status names are preserved when reopening setup',async({page})=>{
+  await setup(page,connected,'',{...structuredClone(managedDraft),lane_configuration:'local'});
+  await expect(page.getByLabel('Merge',{exact:true})).toHaveValue('Deploy');
+  await page.reload();
+  await expect(page.getByLabel('Merge',{exact:true})).toHaveValue('Deploy');
+});
+
 test('reviewer policy is saved explicitly and changing it requires preparation',async({page})=>{
   const {writes}=await setup(page,connected);
   await page.getByLabel('Repository URL',{exact:true}).fill('https://github.com/example/application');
@@ -294,7 +312,7 @@ for(const tracker of ['local','linear']) test(`switching from Jira to ${tracker}
   await expect(page.getByLabel('Draft tickets',{exact:true})).toHaveValue('Backlog');
   await expect(page.getByLabel('Ready to start',{exact:true})).toHaveValue('Queue');
   await expect(page.getByLabel('Review',{exact:true})).toHaveValue('Review');
-  await expect(page.getByLabel('Deploy',{exact:true})).toHaveValue('Deploy');
+  await expect(page.getByLabel('Merge',{exact:true})).toHaveValue(tracker==='local'?'Merge':'Deploy');
   await page.getByLabel('Repository URL',{exact:true}).fill('https://github.com/example/application');
   if(tracker==='linear') {
     await page.getByLabel('Tracker project',{exact:true}).fill('example-project');
@@ -302,7 +320,7 @@ for(const tracker of ['local','linear']) test(`switching from Jira to ${tracker}
   }
   await page.getByRole('button',{name:'Check and prepare repository'}).click();
   await expect(page.getByRole('button',{name:'Start Fugue'})).toBeEnabled();
-  expect(writes.find(write=>write.connection==='workflow').value.lanes).toMatchObject({parked:'Backlog',intake:'Queue',review_action:'Review',deploy_action:'Deploy'});
+  expect(writes.find(write=>write.connection==='workflow').value.lanes).toMatchObject({parked:'Backlog',intake:'Queue',review_action:'Review',deploy_action:tracker==='local'?'Merge':'Deploy'});
 });
 
 test('a rejected tracker change preserves workflow mappings and blocks preparation',async({page})=>{
