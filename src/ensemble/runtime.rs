@@ -1980,6 +1980,7 @@ pub(crate) fn write_fixture_teams(config: &EnsembleConfig) {
 mod tests {
     mod cold_restart_tests;
     mod fork_tests;
+    mod review_context_tests;
 
     use super::*;
     use meerkat_core::{Message, Provider, StopReason, TurnUsage, Usage};

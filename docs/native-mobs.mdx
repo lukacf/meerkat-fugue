@@ -114,10 +114,13 @@ The MCP boundary must expose protocol-compatible `tools/list` descriptors with
 
 ## Native review completion
 
-Review admission binds the coordinator's actual native member and retained work
-to the selected review runs. Caller identity comes from the native dispatch
-context, not from model-supplied arguments. Retrying the same request and key
-recovers the original run references rather than creating replacement reviews.
+Review admission binds the coordinator's actual native member and session to the
+selected review runs. Caller identity comes from the native dispatch context,
+not from model-supplied arguments. When that context includes retained work,
+Fugue forwards it unchanged; the native runtime enforces whether governed work
+is required. Ordinary native sessions can admit review without it. Retrying the
+same request and key recovers the original run references rather than creating
+replacement reviews.
 
 After its initial status read, a coordinator with pending reviews ends its turn.
 The native runtime queues completion notifications, allowing the coordinator to

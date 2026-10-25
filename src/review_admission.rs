@@ -30,17 +30,13 @@ impl ReviewSession {
         request: IndependentReviewAdmissionRequest,
         context: &ToolDispatchContext,
     ) -> Result<AdmittedReview, AdmissionFailure> {
-        let retained_work = context
-            .retained_work()
-            .cloned()
-            .ok_or(AdmissionFailure::MissingRetainedWork)?;
         let origin_session_id = context
             .origin_session_id()
             .cloned()
             .ok_or(AdmissionFailure::MissingCaller)?;
         let caller = ReviewCaller {
             binding: self.binding.clone(),
-            retained_work,
+            retained_work: context.retained_work().cloned(),
             origin_session_id,
         };
         let (response, result) = oneshot::channel();
@@ -101,7 +97,7 @@ impl NativeReviewAdmission {
 #[derive(Debug)]
 pub(crate) struct ReviewCaller {
     binding: MobMemberBinding,
-    retained_work: RetainedWorkIdentity,
+    retained_work: Option<RetainedWorkIdentity>,
     origin_session_id: meerkat_core::SessionId,
 }
 
@@ -115,8 +111,13 @@ impl ReviewCaller {
     }
 
     pub(crate) fn observer(&self) -> FlowRunObserver {
-        FlowRunObserver::new(self.binding.member.as_str().into())
-            .with_retained_work(self.retained_work.clone())
+        let observer = FlowRunObserver::new(self.binding.member.as_str().into());
+        // Ordinary native sessions have no retained work. Core owns whether
+        // this observer requires governed work and validates any supplied identity.
+        match &self.retained_work {
+            Some(work) => observer.with_retained_work(work.clone()),
+            None => observer,
+        }
     }
 }
 
@@ -131,8 +132,6 @@ pub(crate) struct AdmittedReview {
 pub(crate) enum AdmissionFailure {
     #[error("Independent review is disabled for this repository.")]
     Disabled,
-    #[error("Review admission requires the native session's retained work context.")]
-    MissingRetainedWork,
     #[error("Review admission requires the native repository session binding.")]
     MissingCaller,
     #[error("The PR head changed. Inspect it before requesting review.")]
@@ -170,7 +169,6 @@ impl AdmissionFailure {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::Disabled => "independent_review_disabled",
-            Self::MissingRetainedWork => "native_review_work_context_required",
             Self::MissingCaller => "native_review_caller_required",
             Self::CandidateChanged => "review_candidate_changed",
             Self::Candidate(_) => "review_candidate_unavailable",

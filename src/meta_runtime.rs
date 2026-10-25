@@ -1607,11 +1607,9 @@ impl AgentToolDispatcher for FugueDirectToolDispatcher {
             });
         }
         if call.name == "fugue_admit_independent_review" {
-            return Ok(
-                crate::review_admission::AdmissionFailure::MissingRetainedWork
-                    .tool_result(call.id)
-                    .into(),
-            );
+            return Ok(crate::review_admission::AdmissionFailure::MissingCaller
+                .tool_result(call.id)
+                .into());
         }
         let arguments: serde_json::Value =
             serde_json::from_str(call.args.get()).map_err(|error| {
@@ -4229,9 +4227,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(outcome.result.is_error);
-        assert!(
-            format!("{:?}", outcome.result.content).contains("native_review_work_context_required")
-        );
+        assert!(format!("{:?}", outcome.result.content).contains("native_review_caller_required"));
     }
 
     #[tokio::test]
