@@ -109,6 +109,71 @@ def managed_link(link):
     return value
 
 
+def sync_directory(directory):
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def finish_activation(prefix):
+    (prefix / '.activation.json').unlink()
+    sync_directory(prefix)
+
+
+def recover_activation(prefix):
+    """Restore an interrupted switch, or recognize its completed activation."""
+    journal = prefix / '.activation.json'
+    if journal.is_symlink():
+        raise ValueError('Activation recovery record must not be a symbolic link.')
+    if not journal.exists():
+        return
+    record = json.loads(journal.read_text())
+    if (not isinstance(record, dict)
+            or set(record) != {'schema', 'current', 'previous', 'candidate'}
+            or type(record['schema']) is not int or record['schema'] != 1):
+        raise ValueError('Activation recovery record is invalid; installation stopped.')
+    for name in ('current', 'previous', 'candidate'):
+        value = record[name]
+        if name == 'previous' and value is None:
+            continue
+        if not isinstance(value, str) or not re.fullmatch(r'versions/[0-9a-f]{40}-[0-9a-f]{16}', value):
+            raise ValueError('Activation recovery record is invalid; installation stopped.')
+    current = managed_link(prefix / 'current')
+    previous = managed_link(prefix / 'previous')
+    if (record['current'] == record['candidate']
+            or current not in (record['current'], record['candidate'])
+            or previous not in (record['previous'], record['current'])
+            or (current == record['candidate'] and previous != record['current'])):
+        raise ValueError('Release selections differ from the interrupted activation; installation stopped.')
+    if current == record['current'] and previous != record['previous']:
+        if record['previous'] is None:
+            (prefix / 'previous').unlink()
+        else:
+            replace_link(prefix / 'previous', record['previous'])
+        sync_directory(prefix)
+    finish_activation(prefix)
+
+
+def begin_activation(prefix, current, previous, candidate):
+    record = {'schema': 1, 'current': current, 'previous': previous, 'candidate': candidate}
+    with tempfile.NamedTemporaryFile(mode='w', prefix='.activation-', dir=prefix, delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            json.dump(record, output)
+            output.flush()
+            os.fsync(output.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, prefix / '.activation.json')
+        sync_directory(prefix)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def verify_installed_release(prefix, relative):
     """Do not promote a damaged current release to the rollback target."""
     release = prefix / relative
@@ -144,6 +209,7 @@ def install(archive, expected, prefix):
                 raise ValueError('Installation layout contains an unexpected symbolic link.')
         versions = prefix / 'versions'
         versions.mkdir(exist_ok=True)
+        recover_activation(prefix)
         current = prefix / 'current'
         previous = prefix / 'previous'
         old = managed_link(current)
@@ -187,18 +253,19 @@ def install(archive, expected, prefix):
                     link.symlink_to(f'../current/bin/{binary}')
             changing_previous = old is not None and old != f'versions/{name}'
             if changing_previous:
-                replace_link(previous, old)
+                begin_activation(prefix, old, prior, f'versions/{name}')
             try:
-                replace_link(current, f'versions/{name}')
-            except OSError:
-                # A failed activation must not erase the earlier rollback
-                # target or suggest that the still-current release is previous.
                 if changing_previous:
-                    if prior is None:
-                        previous.unlink()
-                    else:
-                        replace_link(previous, prior)
+                    replace_link(previous, old)
+                    sync_directory(prefix)
+                replace_link(current, f'versions/{name}')
+                sync_directory(prefix)
+            except OSError:
+                if changing_previous:
+                    recover_activation(prefix)
                 raise
+            if changing_previous:
+                finish_activation(prefix)
     return manifest
 
 

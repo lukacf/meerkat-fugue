@@ -34,11 +34,10 @@ Repository and tracker credentials are entered through Fugue's setup page.
 The installer verifies the complete archive before executing any candidate
 binary, checks every binary's build identity, and then atomically switches the
 `current` link. A repeated install verifies and reuses the exact same release.
-An upgrade retains the earlier release as `previous`. If activating `current`
-fails, the installer restores the prior `previous` link before reporting the
-error. It refuses unmanaged `current`, `previous` and executable paths before
-running candidate binaries. It never modifies the
-application state directory. Stop the service and back up its state before an
+An upgrade retains the earlier release as `previous`. If `current` cannot be
+switched, the installer restores the earlier rollback selection before reporting
+the error. It refuses unmanaged `current`, `previous` and executable paths before
+running candidate binaries. It never modifies the application state directory. Stop the service and back up its state before an
 upgrade; changing the executable link alone does not restart a running process
 or roll back state migrations. Retain the matching state snapshot for rollback.
 
@@ -49,6 +48,14 @@ Keep the error and the release checksum. Inspect the executable selections with
 not exist before the first successful upgrade. The running service keeps its
 already loaded binary until you restart it.
 
+After an interrupted installer process, rerun the same verified installation
+command before using `previous` for rollback. The installer first recovers the
+release switch: it restores the earlier rollback selection if activation did
+not finish, or keeps the newly selected release and the release it replaced if
+activation finished. This recovery can itself be retried after an interruption.
+An I/O error after the active link changed does not mean that change was undone;
+inspect the selections after recovery before restarting the service.
+
 | Error | Next step |
 | --- | --- |
 | Download or file checksum mismatch | Download the archive again and compare it with the checksum for that exact release. |
@@ -56,8 +63,9 @@ already loaded binary until you restart it.
 | Executable identity or rkat version differs | Obtain a complete matching bundle; do not combine executables from different releases. |
 | Unmanaged executable or release link | Inspect the named path and choose a separate installation prefix if it belongs to another installation. Do not delete it to force an upgrade. |
 | Another process holds the installation lock | Let the other installer finish, then retry. Removing the lock file does not release that process's lock. |
-| Existing release files or executable permissions changed | Restore the verified current release and its executable permissions before upgrading. The installer preserves the previous rollback target. |
-| Activation fails | Resolve the reported filesystem error, inspect `current` and `previous`, and retry the same archive. A verified staged release can be reused. |
+| Existing release files or executable permissions changed | Inspect the current release and any retained copy of the bundle being installed. Restore the damaged release from a verified backup, including its regular files and executable permissions. Validation refusal preserves the recovered release selections; downloading the same archive does not repair that retained directory. |
+| Activation or recovery reports an I/O error | Resolve the filesystem error and retry the same archive. Inspect the recovered `current` and `previous` selections before restarting the service. A verified staged release can be reused. |
+| Invalid activation record or conflicting release selections | Preserve the installation directory, including `.activation.json`. Restore a consistent installation backup or choose a separate prefix. Do not edit or delete the recovery record to force an upgrade. |
 
 An installer error does not require deleting application state, model accounts
 or repository checkouts. If the service was already stopped for an upgrade,

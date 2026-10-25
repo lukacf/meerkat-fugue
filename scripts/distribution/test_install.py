@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 import tarfile
@@ -324,6 +325,99 @@ class InstallTests(unittest.TestCase):
                 installer.install(*bundle(self.root, 'b'), self.prefix)
         self.assertEqual((self.prefix / 'current').readlink(), current)
         self.assertFalse((self.prefix / 'previous').is_symlink())
+
+    def interrupt_install(self, candidate, prefix, boundary):
+        code = '''
+import importlib.util, os, signal, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('installer', sys.argv[1])
+installer = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(installer)
+original = installer.os.replace
+def interrupt(source, destination):
+    if sys.argv[5] == 'before-previous' and Path(destination) == Path(sys.argv[4]) / 'previous':
+        os.kill(os.getpid(), signal.SIGKILL)
+    original(source, destination)
+    if Path(destination) == Path(sys.argv[4]) / sys.argv[5]:
+        os.kill(os.getpid(), signal.SIGKILL)
+installer.os.replace = interrupt
+installer.install(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]))
+'''
+        result = subprocess.run([sys.executable, '-c', code, str(Path(installer.__file__)),
+                                 str(candidate[0]), candidate[1], str(prefix), boundary],
+                                capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, -signal.SIGKILL, result.stderr)
+
+    def test_process_death_preserves_rollback_before_and_after_activation(self):
+        for boundary in ('before-previous', 'previous', 'current'):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                prefix = root / 'install'
+                first, second, third = (bundle(root, commit) for commit in ('a', 'b', 'c'))
+                installer.install(*first, prefix)
+                installer.install(*second, prefix)
+                before = {name: (prefix / name).readlink() for name in ('current', 'previous')}
+                state = root / 'private-state'
+                state.write_bytes(b'credentials and sessions')
+                self.interrupt_install(third, prefix, boundary)
+                installed = (prefix / 'current').readlink()
+                retry = third if boundary == 'current' else second
+                installer.install(*retry, prefix)
+                self.assertEqual((prefix / 'current').readlink(), installed)
+                expected_previous = before['current'] if boundary == 'current' else before['previous']
+                self.assertEqual((prefix / 'previous').readlink(), expected_previous)
+                self.assertFalse((prefix / '.activation.json').exists())
+                self.assertEqual(state.read_bytes(), b'credentials and sessions')
+
+    def test_process_death_on_first_upgrade_does_not_invent_rollback(self):
+        first, second = bundle(self.root, 'a'), bundle(self.root, 'b')
+        installer.install(*first, self.prefix)
+        current = (self.prefix / 'current').readlink()
+        self.interrupt_install(second, self.prefix, 'previous')
+        installer.install(*first, self.prefix)
+        self.assertEqual((self.prefix / 'current').readlink(), current)
+        self.assertFalse((self.prefix / 'previous').is_symlink())
+        self.assertFalse((self.prefix / '.activation.json').exists())
+
+    def test_process_death_during_recovery_is_repeatable(self):
+        first, second, third = (bundle(self.root, commit) for commit in ('a', 'b', 'c'))
+        installer.install(*first, self.prefix)
+        installer.install(*second, self.prefix)
+        before = {name: (self.prefix / name).readlink() for name in ('current', 'previous')}
+        self.interrupt_install(third, self.prefix, 'previous')
+        self.interrupt_install(second, self.prefix, 'previous')
+        installer.install(*second, self.prefix)
+        self.assertEqual({name: (self.prefix / name).readlink() for name in before}, before)
+        self.assertFalse((self.prefix / '.activation.json').exists())
+
+    def test_invalid_or_conflicting_activation_record_preserves_selections(self):
+        first, second, third = (bundle(self.root, commit) for commit in ('a', 'b', 'c'))
+        installer.install(*first, self.prefix)
+        installer.install(*second, self.prefix)
+        before = {name: (self.prefix / name).readlink() for name in ('current', 'previous')}
+        self.interrupt_install(third, self.prefix, 'before-previous')
+        journal = self.prefix / '.activation.json'
+        valid = json.loads(journal.read_text())
+        malformed = [[], {}, {**valid, 'schema': True}, {**valid, 'previous': '../outside'},
+                     {**valid, 'candidate': valid['current']}, {**valid, 'unexpected': None},
+                     {**valid, 'current': 'versions/' + 'd' * 40 + '-' + 'd' * 16}]
+        for record in malformed:
+            with self.subTest(record=record):
+                journal.write_text(json.dumps(record))
+                with mock.patch.object(installer.subprocess, 'check_output') as execute:
+                    with self.assertRaises(ValueError):
+                        installer.install(*second, self.prefix)
+                    execute.assert_not_called()
+                self.assertEqual(json.loads(journal.read_text()), record)
+                self.assertEqual({name: (self.prefix / name).readlink() for name in before}, before)
+        journal.write_text(json.dumps(valid))
+        outside = self.root / 'record'
+        journal.rename(outside)
+        journal.symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, 'symbolic link'):
+            installer.install(*second, self.prefix)
+        self.assertTrue(journal.is_symlink())
+        self.assertEqual(json.loads(outside.read_text()), valid)
 
     def test_candidate_identity_and_timeout_failures_leave_both_releases_untouched(self):
         installer.install(*bundle(self.root), self.prefix)
