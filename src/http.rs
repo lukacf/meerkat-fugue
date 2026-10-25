@@ -2947,6 +2947,9 @@ async fn api_issue_move(
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
+    if let Err(response) = validate_browser_tracker_context(&app.config, &headers) {
+        return response.into_response();
+    }
     let state = request.state.trim();
     if state.is_empty() {
         return bad_request("missing_state", "state must be non-empty");
@@ -2979,6 +2982,9 @@ async fn api_issue_upsert_workpad(
 ) -> axum::response::Response {
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
+    }
+    if let Err(response) = validate_browser_tracker_context(&app.config, &headers) {
+        return response.into_response();
     }
     let adapter = match IssueAdapter::from_config(&app.config.tracker) {
         Ok(adapter) => adapter,
@@ -6773,6 +6779,115 @@ mod tests {
         }
         assert!(mock.requests.lock().unwrap().is_empty());
         assert!(!storage.exists());
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_state_and_workpad_reject_old_browser_context() {
+        use crate::jira::tests::{issue, mock_jira, reply, tracker};
+        use tower::ServiceExt;
+
+        let mut observed = Vec::new();
+        for context in ["stale", "missing", "current", "api"] {
+            for endpoint in ["state", "workpad"] {
+                let mut replies = vec![reply("GET", "/rest/api/3/issue/TEST-1", issue("To Do"))];
+                let (method, body) = if endpoint == "state" {
+                    replies.extend([
+                        reply(
+                            "GET",
+                            "/rest/api/3/issue/TEST-1/transitions",
+                            json!({
+                                "transitions": [{"id":"21", "to": {
+                                    "id":"3", "name":"In Progress",
+                                    "statusCategory":{"key":"indeterminate"}
+                                }}]
+                            }),
+                        ),
+                        reply("POST", "/rest/api/3/issue/TEST-1/transitions", json!({})),
+                        reply("GET", "/rest/api/3/issue/TEST-1", issue("In Progress")),
+                    ]);
+                    ("PATCH", json!({"state":"In Progress"}))
+                } else {
+                    replies.extend([
+                        reply(
+                            "GET",
+                            "/rest/api/3/issue/TEST-1/comment",
+                            json!({
+                                "comments":[], "total":0
+                            }),
+                        ),
+                        reply(
+                            "POST",
+                            "/rest/api/3/issue/TEST-1/comment",
+                            json!({
+                                "id":"101", "body":"## Fugue Workpad\n\nCurrent work"
+                            }),
+                        ),
+                    ]);
+                    ("PUT", json!({"body_markdown":"Current work"}))
+                };
+                let expected_requests = replies.len();
+                let mock = mock_jira(replies).await;
+                let root = tempfile::tempdir().unwrap();
+                let (_, mut config, owner) =
+                    attachment_scope_test_router(root.path(), "TEST").await;
+                config.tracker = tracker("https://previous.example.test");
+                let old_context = config.tracker_context_id();
+                config.tracker = tracker(&mock.endpoint);
+                let current_context = config.tracker_context_id();
+                assert_ne!(old_context, current_context);
+                let (refresh, _receiver) = mpsc::channel(1);
+                let app = router(
+                    owner.shared_state(),
+                    config,
+                    refresh,
+                    owner.internal_sender(),
+                    owner.meta_runtime_registry(),
+                    None,
+                )
+                .await
+                .unwrap();
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri(format!("/api/v1/issues/TEST-1/{endpoint}"))
+                    .header("Host", "127.0.0.1:8788")
+                    .header(CONTENT_TYPE, "application/json");
+                if context != "api" {
+                    request = request.header("Origin", "http://127.0.0.1:8788");
+                }
+                if context == "stale" {
+                    request = request.header("x-fugue-tracker-scope", &old_context);
+                } else if context == "current" {
+                    request = request.header("x-fugue-tracker-scope", &current_context);
+                }
+                let response = app
+                    .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                    .await
+                    .unwrap();
+                let denied = matches!(context, "stale" | "missing");
+                let expected_status = if denied {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::OK
+                };
+                let request_count = mock.requests.lock().unwrap().len();
+                let expected_count = if denied { 0 } else { expected_requests };
+                observed.push((
+                    context,
+                    endpoint,
+                    response.status(),
+                    request_count,
+                    expected_status,
+                    expected_count,
+                ));
+            }
+        }
+        for (context, endpoint, status, count, expected_status, expected_count) in &observed {
+            assert_eq!(
+                (status, count),
+                (expected_status, expected_count),
+                "{context} {endpoint}; all observed outcomes: {observed:?}"
+            );
+        }
     }
 
     #[tokio::test]
