@@ -2603,6 +2603,7 @@ pub(crate) fn repo_kapellmeister_signal_message_with_lanes(
     independent_review_lane: Option<&str>,
 ) -> std::result::Result<String, serde_json::Error> {
     let payload = serde_json::to_string_pretty(signals)?;
+    let workgraph_contract = crate::workgraph_gate::WORKGRAPH_PREREQUISITE_CONTRACT;
     let handoff_instruction = match review_ready {
         Some(lane)
             if independent_review_lane.is_some_and(|review| {
@@ -2673,7 +2674,7 @@ pub(crate) fn repo_kapellmeister_signal_message_with_lanes(
          but it is not merge authorization. Do not merge a PR unless Deploy policy or an operator \
          explicitly approves that specific PR merge in the current session. \
          If a Meerkat mob operator tool such as list_members returns access_denied, treat that as a scope boundary and continue from these signals and comms peers.\n\n\
-         ```json\n{payload}\n```"
+         {workgraph_contract}\n\n```json\n{payload}\n```"
     ))
 }
 
