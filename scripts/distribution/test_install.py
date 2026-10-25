@@ -158,6 +158,44 @@ class InstallTests(unittest.TestCase):
         for name in installer.BINARIES:
             self.assertTrue((self.prefix / 'bin' / name).is_file())
 
+    def test_damaged_retained_candidate_cannot_replace_current_or_rollback(self):
+        for damage in ('not-executable', 'binary-link', 'directory-link', 'manifest-link'):
+            with self.subTest(damage=damage), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                prefix = root / 'install'
+                candidate = bundle(root)
+                installer.install(*candidate, prefix)
+                release = (prefix / 'current').resolve()
+                installer.install(*bundle(root, 'b'), prefix)
+                links = {name: (prefix / name).readlink() for name in ('current', 'previous')}
+                state = root / 'private-state'
+                state.write_bytes(b'private credentials and sessions')
+                target = release / {'not-executable': 'bin/rkat', 'binary-link': 'bin/rkat',
+                                    'directory-link': 'bin', 'manifest-link': 'manifest.json'}[damage]
+                outside = root / 'retained-original'
+                if damage == 'not-executable':
+                    target.chmod(0o644)
+                else:
+                    target.rename(outside)
+                    target.symlink_to(outside, target_is_directory=damage == 'directory-link')
+                with self.assertRaises(ValueError):
+                    installer.install(*candidate, prefix)
+                self.assertEqual({name: (prefix / name).readlink() for name in links}, links)
+                self.assertEqual(state.read_bytes(), b'private credentials and sessions')
+                self.assertEqual(list(prefix.glob('.unpack-*')), [])
+                if damage == 'not-executable':
+                    self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+                    target.chmod(0o755)
+                else:
+                    self.assertTrue(target.is_symlink())
+                    target.unlink()
+                    outside.rename(target)
+                # Repairing the retained payload allows the same verified
+                # archive to be selected without discarding the running release.
+                installer.install(*candidate, prefix)
+                self.assertEqual((prefix / 'current').resolve(), release)
+                self.assertEqual((prefix / 'previous').readlink(), links['current'])
+
     def test_service_account_can_traverse_release_after_private_staging(self):
         first = bundle(self.root)
         installer.install(*first, self.prefix)

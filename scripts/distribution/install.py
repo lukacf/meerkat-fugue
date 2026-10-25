@@ -121,16 +121,16 @@ def verify_installed_release(prefix, relative):
         manifest = json.loads(manifest_path.read_text())
         validate_manifest(manifest)
     except ValueError as error:
-        raise ValueError('Existing release manifest is invalid; installation stopped. Restore the verified current release before upgrading; the previous release is preserved.') from error
+        raise ValueError('Existing release manifest is invalid; installation stopped. Restore the affected release before installing; the current and previous links are preserved.') from error
     if manifest['fugue']['commit'] != release.name.split('-')[0]:
         raise ValueError('Existing release manifest has changed; installation stopped.')
     for name, checksum in manifest['files'].items():
         path = release / name
         if path.is_symlink() or not path.is_file() or digest(path) != checksum:
-            raise ValueError('Existing release files have changed; installation stopped. Restore the verified current release before upgrading; the previous release is preserved.')
+            raise ValueError('Existing release files have changed; installation stopped. Restore the affected release before installing; the current and previous links are preserved.')
         if name.startswith('bin/') and ((path.stat().st_mode & 0o111) != 0o111
                                         or not os.access(path, os.R_OK | os.X_OK)):
-            raise ValueError('Existing release binary is not executable; installation stopped. Restore its permissions before upgrading; the previous release is preserved.')
+            raise ValueError('Existing release binary is not executable; installation stopped. Restore its permissions before installing; the current and previous links are preserved.')
 
 
 def install(archive, expected, prefix):
@@ -170,9 +170,9 @@ def install(archive, expected, prefix):
             if release.exists():
                 if release.is_symlink() or (release / 'manifest.json').read_bytes() != (stage / 'manifest.json').read_bytes():
                     raise ValueError('Existing release directory does not match this bundle.')
-                for filename, checksum in manifest['files'].items():
-                    if digest(release / filename) != checksum:
-                        raise ValueError('Existing release files have changed; installation stopped.')
+                # Activate the retained files, not the freshly checked stage.
+                # Recheck their layout and execute permissions as well as bytes.
+                verify_installed_release(prefix, f'versions/{name}')
             else:
                 os.replace(stage, release)
             # TemporaryDirectory is deliberately private during verification.
