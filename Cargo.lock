@@ -2342,7 +2342,7 @@ dependencies = [
 [[package]]
 name = "meerkat-meta"
 version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat-meta.git?rev=ca4845c38fd0fcc4090b16cd489c98b24beeb39a#ca4845c38fd0fcc4090b16cd489c98b24beeb39a"
+source = "git+https://github.com/lukacf/meerkat-meta.git?rev=ce4f3587bf0b6fc2596974b80e8962cc13500b99#ce4f3587bf0b6fc2596974b80e8962cc13500b99"
 dependencies = [
  "anyhow",
  "async-stream",

@@ -60,7 +60,7 @@ meerkat-providers = { version = "=0.9.5", default-features = false }
 # Fugue qualifies these commits with its consumer checks; upstream CI is informational.
 # Retire the temporary pins when a released pair passes the same Fugue acceptance.
 [patch.crates-io]
-meerkat-meta = { version = "=0.9.5", git = "https://github.com/lukacf/meerkat-meta.git", rev = "ca4845c38fd0fcc4090b16cd489c98b24beeb39a" }
+meerkat-meta = { version = "=0.9.5", git = "https://github.com/lukacf/meerkat-meta.git", rev = "ce4f3587bf0b6fc2596974b80e8962cc13500b99" }
 meerkat = { version = "=0.9.5", git = "https://github.com/lukacf/meerkat.git", rev = "74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838" }
 meerkat-anthropic = { version = "=0.9.5", git = "https://github.com/lukacf/meerkat.git", rev = "74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838" }
 meerkat-auth-core = { version = "=0.9.5", git = "https://github.com/lukacf/meerkat.git", rev = "74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838" }
