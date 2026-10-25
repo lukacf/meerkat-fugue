@@ -36,6 +36,76 @@ test('Jira statuses remain literal and the configured merge action stays availab
   await expect(page.locator('#save')).toContainText('SAVE & RUN MERGE');
 });
 
+for (const mutation of ['comment', 'attachment']) {
+  for (const selectedLane of [null, 'Reopened']) {
+    test(`${mutation} refresh preserves only an explicit lane edit (${selectedLane || 'untouched'})`, async ({page}) => {
+      const detail={issue:{identifier:'TEST-1',title:'Concurrent progress',state:{name:'Open'},labels:[],description:''},comments:[],attachments:[],workpad:null,runtime:null,lanes:['Open','In Progress','Resolved','Reopened'],lane_actions:{Reopened:'merge'}};
+      const stateChanges=[];
+      await page.route('http://fugue.test/**',async route=>{
+        const request=route.request();
+        if(request.method()==='PATCH') {
+          stateChanges.push(request.postDataJSON());
+          return route.fulfill({json:{}});
+        }
+        if(request.method()==='POST') {
+          detail.issue.state.name='In Progress';
+          detail.comments=[{comment_id:'comment-1',body_markdown:'Keep the new status.'}];
+          detail.attachments=mutation==='attachment'?[{title:'trace.txt',url:'https://jira.example.test/attachment/1'}]:[];
+          return route.fulfill({json:{result:{comment_id:'comment-1'},attachments:detail.attachments}});
+        }
+        return request.url().includes('/api/')?route.fulfill({json:detail}):route.fulfill({contentType:'text/html',body:browserDocument(html)});
+      });
+      await page.goto('http://fugue.test/issues/TEST-1');
+      await expect(page.locator('#stateChip')).toContainText('Open',{ignoreCase:true});
+      if(selectedLane) await page.locator(`[data-lane="${selectedLane}"]`).click();
+      await page.locator('#commentEditor').fill('Keep the new status.');
+      if(mutation==='comment') await page.locator('#postComment').click();
+      else await page.locator('#issueAttachmentInput').setInputFiles({name:'trace.txt',mimeType:'text/plain',buffer:Buffer.from('trace')});
+      await expect(page.locator('#stateChip')).toContainText('In Progress',{ignoreCase:true});
+      await expect(page.locator('#commentEditor')).toHaveValue(mutation==='attachment'?'Keep the new status.':'');
+      if(selectedLane) {
+        await expect(page.locator('#save')).toBeEnabled();
+        await expect(page.locator('#save')).toContainText('SAVE & RUN MERGE');
+        await expect(page.locator('#diff')).toContainText('In Progress → Reopened');
+      } else {
+        await expect(page.locator('#save')).toBeDisabled();
+        await expect(page.locator('#dirtyFlag')).toBeHidden();
+        await expect(page.locator('#diff')).toHaveText('No changes');
+        await page.locator('#save').dispatchEvent('click');
+      }
+      expect(stateChanges).toEqual([]);
+    });
+  }
+}
+
+test('lane selection made during a comment refresh survives the response',async({page})=>{
+  const detail={issue:{identifier:'TEST-1',title:'Edit during refresh',state:{name:'Open'},labels:[],description:''},comments:[],attachments:[],workpad:null,runtime:null,lanes:['Open','In Progress','Reopened'],lane_actions:{Reopened:'merge'}};
+  let reads=0,release;
+  const gate=new Promise(resolve=>{release=resolve;});
+  await page.route('http://fugue.test/**',async route=>{
+    const request=route.request();
+    if(request.method()==='POST') return route.fulfill({json:{result:{comment_id:'comment-1'},attachments:[]}});
+    if(request.url().endsWith('/api/v1/issues/TEST-1')) {
+      reads++;
+      if(reads===2) {
+        await gate;
+        detail.issue.state.name='In Progress';
+      }
+      return route.fulfill({json:detail});
+    }
+    return request.url().includes('/api/')?route.fulfill({json:detail}):route.fulfill({contentType:'text/html',body:browserDocument(html)});
+  });
+  await page.goto('http://fugue.test/issues/TEST-1');
+  await page.locator('#commentEditor').fill('Refresh without discarding my later choice.');
+  await page.locator('#postComment').click();
+  await expect.poll(()=>reads).toBe(2);
+  await page.locator('[data-lane="Reopened"]').click();
+  release();
+  await expect(page.locator('#stateChip')).toContainText('In Progress',{ignoreCase:true});
+  await expect(page.locator('#diff')).toContainText('In Progress → Reopened');
+  await expect(page.locator('#save')).toContainText('SAVE & RUN MERGE');
+});
+
 test('saved attachments keep their repository scope after reload',async({page})=>{
   const prefix='/repositories/repository-test';
   const local='/api/v1/issues/TEST-1/attachments/trace.txt';
