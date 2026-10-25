@@ -113,16 +113,28 @@ in [the 0.9.3 guide](./upgrading-0.9.3.mdx).
    release and its matching state snapshot and service definition. Then verify
    the prior service has actually recovered.
 
-The public bundle installer atomically changes executable links. It does not
-stop your service or roll back application-state migrations for you. Deployment
-integrations may automate these steps; follow their verified recovery procedure.
+The public bundle installer recovers unfinished upgrades and atomically switches
+the active executable release. It does not stop your service or roll back
+application-state migrations for you. Deployment integrations may automate these
+steps; follow their verified recovery procedure.
+
+If the installer process is interrupted, rerun the same verified installation
+command before using the rollback selection. If activation did not finish, the
+installer restores the earlier rollback selection. If activation finished, it
+keeps the newly selected release and the release it replaced. Recovery happens
+before validating or executing the next candidate. See the
+[bundle recovery guide](../scripts/distribution/README.md#if-installation-stops)
+if recovery reports an error.
 
 If the installer rejects a candidate's manifest or checksum, obtain the verified
-archive and its matching checksum again, then retry. Rejection leaves the current
-and previous executable releases in place. If it reports an invalid **existing**
-manifest, restore that release from your verified backup before upgrading. The
-installer preserves the previous release and refuses to promote a damaged current
-release to the rollback target. Do not edit manifest fields to bypass validation.
+archive and its matching checksum again, then retry. After any interrupted switch
+has been recovered, validation refusal preserves those release selections. If it reports invalid **existing**
+release files, inspect the current release and any retained copy of the bundle
+you are trying to install. Restore the damaged release from your verified backup,
+including regular files and executable permissions, before retrying the same
+archive. Downloading the archive again does not repair a damaged retained
+directory. Do not edit manifest fields or delete release links
+to bypass validation.
 
 Do not change a shared dependency pin merely because upstream merged a fix.
 Qualify the exact replacement source against the same persistence and E2E checks.
