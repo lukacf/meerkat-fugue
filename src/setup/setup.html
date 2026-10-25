@@ -56,7 +56,9 @@ const $=id=>document.getElementById(id);
 const recommendedModels={openai:'__OPENAI_MODEL__',anthropic:'__ANTHROPIC_MODEL__',gemini:'__GEMINI_MODEL__'};
 const jiraLaneDefaults={parked:'Open',intake:'Open',active:'In Progress',review_action:'Resolved',deploy_action:'Reopened',blocked:'In Progress',success:'Closed',canceled:'Closed'};
 const laneDefaults={parked:'Backlog',intake:'Queue',active:'Active',review_action:'Review',deploy_action:'Deploy',blocked:'Blocked',success:'Done',canceled:'Canceled'};
-const laneNames={parked:'Draft tickets',intake:'Ready to start',active:'In progress',review_action:'Review',deploy_action:'Deploy',blocked:'Blocked',success:'Completed',canceled:'Canceled'};
+const localLaneDefaults={...laneDefaults,deploy_action:'Merge'};
+const defaultLanesFor=tracker=>tracker==='jira'?jiraLaneDefaults:tracker==='linear'?laneDefaults:localLaneDefaults;
+const laneNames={parked:'Draft tickets',intake:'Ready to start',active:'In progress',review_action:'Review',deploy_action:'Merge',blocked:'Blocked',success:'Completed',canceled:'Canceled'};
 for(const [key,value]of Object.entries(laneDefaults)){const group=document.createElement('div'),label=document.createElement('label'),input=document.createElement('input');label.htmlFor='lane-'+key;label.textContent=laneNames[key];input.id='lane-'+key;input.value=value;input.required=true;group.append(label,input);$('laneFields').append(group);}
 let preparing=false, setupReady=false, workflowRevision=0, preparedRevision=0, preparationAttempt=0;
 const unsavedConnections=new Set();
@@ -85,7 +87,7 @@ async function save(form,result,connection,value){
     if(connection==='tracker'&&previousTracker!==saved.tracker.kind){
       // Keep statuses edited while the request was in flight. Untouched fields
       // receive the new tracker's defaults only after its connection is saved.
-      const defaults=saved.tracker.kind==='jira'?jiraLaneDefaults:laneDefaults;
+      const defaults=defaultLanesFor(saved.tracker.kind);
       for(const [key,lane]of Object.entries(defaults))if($('lane-'+key).value===laneValues[key])$('lane-'+key).value=lane;
     }
     if(unchanged)unsavedConnections.delete(form.id);else unsavedConnections.add(form.id);
@@ -161,7 +163,7 @@ Promise.all([restoreWorkflow(),api('/api/setup/connections').then(restore),refre
   // for its recorded tracker; unannotated existing workflows keep their lanes.
   const configuredFor=draft?.lane_configuration;
   if(!draft||configuredFor==='generated'||(['local','linear','jira'].includes(configuredFor)&&configuredFor!==current?.tracker?.kind)){
-    const defaults=current?.tracker?.kind==='jira'?jiraLaneDefaults:laneDefaults;
+    const defaults=defaultLanesFor(current?.tracker?.kind);
     for(const [key,value]of Object.entries(defaults))$('lane-'+key).value=value;
   }
   setupReady=true;

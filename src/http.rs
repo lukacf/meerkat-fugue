@@ -1437,6 +1437,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       Queue: "◉",
       Active: "◐",
       Review: "◇",
+      Merge: "↑",
       Deploy: "↑",
       Blocked: "!",
       Done: "✓",
@@ -2373,7 +2374,7 @@ const ISSUE_DETAIL_HTML: &str = r#"<!doctype html>
   const api = async (url, options = {}) => { const response = await fugueFetch(url, { ...options, headers: { "Accept":"application/json", "X-Fugue-Tracker-Scope":trackerScope, ...(options.body ? {"Content-Type":"application/json"} : {}), ...(options.headers || {}) }}); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload?.error?.message || `Request failed: ${response.status}`); return payload; };
   const showNotice = (message) => { $("notice").textContent = message; $("notice").style.display = "block"; };
   const clearNotice = () => { $("notice").textContent = ""; $("notice").style.display = "none"; };
-  const laneGlyph = (name) => ({Backlog:"○", Queue:"◉", Active:"◐", Review:"◇", Deploy:"↑", Blocked:"!", Done:"✓", Canceled:"×"}[name] || "○");
+  const laneGlyph = (name) => ({Backlog:"○", Queue:"◉", Active:"◐", Review:"◇", Merge:"↑", Deploy:"↑", Blocked:"!", Done:"✓", Canceled:"×"}[name] || "○");
   const isAction = (lane) => detail?.lane_actions?.[lane];
   const renderKpis = () => { const runtime = detail.runtime; $("kpiTime").textContent = "unavailable"; $("kpiShadow").textContent = "unavailable"; if (!runtime) { $("kpiRun").textContent = "unavailable"; $("kpiRetry").textContent = "unavailable"; $("kpiTok").textContent = "unavailable"; return; } if (runtime.launch_failure) { $("kpiRun").textContent = "0"; $("kpiRetry").textContent = "0"; $("kpiTok").textContent = String(runtime.token_total ?? "unavailable"); return; } if (runtime.kind === "running") { $("kpiRun").textContent = "1"; $("kpiRetry").textContent = "0"; $("kpiTok").textContent = String(runtime.token_total ?? "unavailable"); return; } if (runtime.kind === "retrying") { $("kpiRun").textContent = "0"; $("kpiRetry").textContent = String(runtime.attempt ?? "1"); $("kpiTok").textContent = "unavailable"; return; } $("kpiRun").textContent = "unavailable"; $("kpiRetry").textContent = "unavailable"; $("kpiTok").textContent = "unavailable"; };
   const formatFileSize = (bytes) => bytes < 1024 ? `${bytes} B` : bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KiB` : `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
@@ -2692,7 +2693,7 @@ fn lane_action(config: &ServiceConfig, lane: &str) -> Option<LaneAction> {
         "Review" if config.final_review.enabled || config.independent_review.enabled => {
             Some(LaneAction::Review)
         }
-        "Deploy" if config.deploy.enabled && config.deploy.procedure == "merge-only" => {
+        "Merge" | "Deploy" if config.deploy.enabled && config.deploy.procedure == "merge-only" => {
             Some(LaneAction::Merge)
         }
         "Deploy" if config.deploy.enabled => Some(LaneAction::Deploy),
@@ -4136,8 +4137,20 @@ fn issue_board_lanes(config: &ServiceConfig) -> Vec<String> {
     if config.tracker.kind == "jira" {
         tracker_fetch_lanes(config)
     } else {
-        canonical_issue_board_lanes()
+        let mut lanes = canonical_issue_board_lanes();
+        if merge_only_board(config)
+            && let Some(lane) = lanes.iter_mut().find(|lane| lane.as_str() == "Deploy")
+        {
+            *lane = "Merge".to_string();
+        }
+        lanes
     }
+}
+
+fn merge_only_board(config: &ServiceConfig) -> bool {
+    config.tracker.kind != "jira"
+        && config.deploy.enabled
+        && config.deploy.procedure == "merge-only"
 }
 
 fn tracker_fetch_lanes(config: &ServiceConfig) -> Vec<String> {
@@ -4245,7 +4258,12 @@ fn canonical_role_for_state(config: &ServiceConfig, state: &str) -> String {
         || (config.deploy.enabled && state.eq_ignore_ascii_case(&config.deploy.lane))
         || matches!(normalized.as_str(), "deploy" | "ready for deploy")
     {
-        return "Deploy".to_string();
+        return if merge_only_board(config) {
+            "Merge"
+        } else {
+            "Deploy"
+        }
+        .to_string();
     }
     if config
         .linear
@@ -4277,7 +4295,7 @@ fn canonical_lane_kind(lane: &str) -> IssueBoardLaneKind {
     match lane {
         "Backlog" => IssueBoardLaneKind::Parked,
         "Queue" => IssueBoardLaneKind::Intake,
-        "Review" | "Deploy" | "Blocked" => IssueBoardLaneKind::Attention,
+        "Review" | "Merge" | "Deploy" | "Blocked" => IssueBoardLaneKind::Attention,
         "Done" | "Canceled" => IssueBoardLaneKind::Terminal,
         "Active" => IssueBoardLaneKind::Active,
         _ => IssueBoardLaneKind::Other,
@@ -4292,7 +4310,15 @@ fn tracker_state_for_canonical_lane(config: &ServiceConfig, lane: &str) -> Strin
     {
         return state;
     }
-    match lane.trim().to_ascii_lowercase().as_str() {
+    // Accept the previous canonical name for existing clients, while the
+    // board and editor describe a merge-only procedure as Merge.
+    let normalized = lane.trim().to_ascii_lowercase();
+    let normalized = if normalized == "merge" && merge_only_board(config) {
+        "deploy"
+    } else {
+        normalized.as_str()
+    };
+    match normalized {
         "backlog" => config.linear.lanes.parked.clone(),
         "queue" => config
             .tracker
@@ -7815,6 +7841,62 @@ mod tests {
         assert_eq!(canonical_lane_for_state(&config, "Open"), "Queue");
         assert_eq!(canonical_lane_for_state(&config, "Resolved"), "Done");
         assert_eq!(canonical_lane_for_state(&config, "Closed"), "Done");
+    }
+
+    #[test]
+    fn merge_only_boards_name_the_action_without_rewriting_tracker_states() {
+        for tracker in ["local", "linear"] {
+            let mut config = issue_board_config();
+            config.tracker.kind = tracker.into();
+            config.deploy.enabled = true;
+            config.deploy.procedure = "merge-only".into();
+            config.deploy.lane = "Deploy".into();
+            config.linear.lanes.deploy = Some("Deploy".into());
+
+            assert!(issue_board_lanes(&config).contains(&"Merge".into()));
+            assert!(!issue_board_lanes(&config).contains(&"Deploy".into()));
+            assert_eq!(canonical_lane_for_state(&config, "Deploy"), "Merge");
+            assert_eq!(tracker_state_for_canonical_lane(&config, "Merge"), "Deploy");
+            assert_eq!(lane_action(&config, "Merge"), Some(LaneAction::Merge));
+            // Existing API clients can still use the former canonical name.
+            assert_eq!(lane_action(&config, "Deploy"), Some(LaneAction::Merge));
+            assert_eq!(
+                tracker_state_for_canonical_lane(&config, "Deploy"),
+                "Deploy"
+            );
+            assert_eq!(config.deploy.lane, "Deploy");
+            assert_eq!(canonical_lane_kind("Merge"), IssueBoardLaneKind::Attention);
+        }
+    }
+
+    #[test]
+    fn deployment_boards_do_not_acquire_a_merge_alias() {
+        let mut config = issue_board_config();
+        config.deploy.enabled = true;
+        config.deploy.procedure = "release".into();
+        config.linear.lanes.deploy = Some("Ship".into());
+        assert!(issue_board_lanes(&config).contains(&"Deploy".into()));
+        assert!(!issue_board_lanes(&config).contains(&"Merge".into()));
+        assert_eq!(canonical_lane_for_state(&config, "Ship"), "Deploy");
+        assert_eq!(lane_action(&config, "Deploy"), Some(LaneAction::Deploy));
+        assert_eq!(lane_action(&config, "Merge"), None);
+        assert_eq!(tracker_state_for_canonical_lane(&config, "Merge"), "Merge");
+    }
+
+    #[test]
+    fn jira_merge_actions_keep_their_configured_status_names() {
+        let mut config = issue_board_config();
+        config.tracker.kind = "jira".into();
+        config.deploy.enabled = true;
+        config.deploy.procedure = "merge-only".into();
+        config.deploy.lane = "Reopened".into();
+        config.linear.lanes.deploy = Some("Reopened".into());
+        assert!(issue_board_lanes(&config).contains(&"Reopened".into()));
+        assert!(!issue_board_lanes(&config).contains(&"Merge".into()));
+        assert_eq!(canonical_lane_for_state(&config, "Reopened"), "Reopened");
+        assert_eq!(lane_action(&config, "Reopened"), Some(LaneAction::Merge));
+        assert_eq!(lane_action(&config, "Merge"), None);
+        assert_eq!(tracker_state_for_canonical_lane(&config, "Merge"), "Merge");
     }
 
     #[test]
