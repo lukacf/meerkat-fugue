@@ -18,6 +18,21 @@ pub const WORKGRAPH_MOB_ID_ENV: &str = "FUGUE_WORKGRAPH_MOB_ID";
 pub const FUGUE_WORKGRAPH_LABEL: &str = "fugue";
 pub const FUGUE_WORKGRAPH_BLOCKING_LABEL: &str = "blocking";
 
+/// Shared meaning of the native labels used by Fugue's existing merge gate.
+pub(crate) const WORKGRAPH_PREREQUISITE_CONTRACT: &str = "WorkGraph prerequisite contract: \
+Use blocking only for prerequisites that can be completed before the guarded merge, \
+such as implementation, review execution, failing checks and actionable findings. \
+Do not create a blocking item for performing the host-owned merge, deployment, or \
+recording its eventual receipt: that would require the action to complete before \
+its own gate permits it. The host's typed deployment transaction owns execution \
+and its receipt. Optional follow-up notes may remain open with fugue and issue \
+labels, without blocking. Never remove blocking from an unresolved prerequisite \
+to force progress, and never claim a future action completed. A misclassified \
+follow-up requires reviewer inspection of the actual item and evidence, with \
+explicit classification correction preserved in its history; any remaining \
+prerequisite must stay blocking. Only an observed successful merge can establish \
+merge completion.";
+
 /// Extract the lane change before dispatch, including the optional change in a claim.
 /// Invalid arguments must fail before either assignment or state mutation occurs.
 pub(crate) fn lane_move_for_tool(
