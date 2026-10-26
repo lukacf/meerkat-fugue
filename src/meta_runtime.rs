@@ -158,6 +158,7 @@ fn is_raw_comms_admission_prompt(prompt: &str) -> bool {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RepositorySpecialist {
+    pub profile: ProfileName,
     pub identity: String,
     pub label: String,
     pub focus: String,
@@ -839,12 +840,16 @@ impl MetaRuntimeRegistry {
         for specialist in self.specialists.get().into_iter().flatten() {
             let _ = writeln!(
                 directory,
-                "- {}: {}. {}. Paths: {:?}",
-                specialist.identity, specialist.label, specialist.focus, specialist.paths
+                "- Native profile: {}. Identity: {}. {}. {}. Paths: {:?}",
+                specialist.profile,
+                specialist.identity,
+                specialist.label,
+                specialist.focus,
+                specialist.paths
             );
         }
         format!(
-            "{prompt}\n\nRepository specialist directory:\n{directory}\nYou share this repository mob with its persistent domain specialists and representative. Use native peers to discover them. Consult the relevant domain specialist before planning or implementing a change, and include its response as evidence in your handoff. Consult an independent specialist for review where its charter applies. These specialists retain repository knowledge between tickets. After changing their domain, send the affected specialists a change summary, changed paths, tests, and commit SHA. Share the ticket worktree path and commit SHA; specialists can use repository_read_revision to inspect that commit without changing the checkout. Include an uncommitted diff directly when no commit exists yet; do not ask them to mutate the main checkout. WorkGraph is the same shared ledger for this whole repository. If consultation fails, report the blocker rather than silently substituting a generic role."
+            "{prompt}\n\nRepository specialist directory:\n{directory}\nYou share this repository mob with its persistent domain specialists and representative. Use each directory entry's Native profile as the reviewers map key and its Identity as the selected member for fugue_admit_independent_review; do not substitute a generic reviewer profile. Use native peers to discover them. Consult the relevant domain specialist before planning or implementing a change, and include its response as evidence in your handoff. Consult an independent specialist for review where its charter applies. These specialists retain repository knowledge between tickets. After changing their domain, send the affected specialists a change summary, changed paths, tests, and commit SHA. Share the ticket worktree path and commit SHA; specialists can use repository_read_revision to inspect that commit without changing the checkout. Include an uncommitted diff directly when no commit exists yet; do not ask them to mutate the main checkout. WorkGraph is the same shared ledger for this whole repository. If consultation fails, report the blocker rather than silently substituting a generic role."
         )
     }
 
@@ -4252,6 +4257,7 @@ pub(crate) mod tests {
             registry
                 .specialists
                 .set(vec![RepositorySpecialist {
+                    profile: "domain".into(),
                     identity: "repo:domain".into(),
                     label: "Domain".into(),
                     focus: "Code".into(),
@@ -4290,8 +4296,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn review_specialist_directory_exposes_native_profile_and_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = test_meerkat_config(temp.path().join("state"));
+        config.repository_runtime = Some(crate::config::RepositoryRuntimeBinding {
+            repository: "repo-example".to_owned().try_into().unwrap(),
+            state_path: temp.path().join("repository"),
+        });
+        let registry = MetaRuntimeRegistry::new(config);
+        registry
+            .specialists
+            .set(vec![RepositorySpecialist {
+                profile: "toolbox".into(),
+                identity: "repo-example:toolbox".into(),
+                label: "Toolbox specialist".into(),
+                focus: "Iterator APIs".into(),
+                paths: vec!["toolbox.py".into()],
+            }])
+            .unwrap();
+        let prompt = registry.repository_collaboration_prompt("Review the candidate".into());
+        assert!(prompt.contains("Native profile: toolbox"), "{prompt}");
+        assert!(prompt.contains("repo-example:toolbox"));
+        assert!(prompt.contains("reviewers map key"));
+        assert!(prompt.contains("Toolbox specialist"));
+        assert!(prompt.contains("Iterator APIs"));
+        assert!(prompt.contains("toolbox.py"));
+    }
+
+    #[test]
     fn review_selection_resolves_durable_aliases_and_excludes_issue_participants() {
         let specialist = RepositorySpecialist {
+            profile: "domain".into(),
             identity: "repo:domain".into(),
             label: "Domain".into(),
             focus: "Domain review".into(),
