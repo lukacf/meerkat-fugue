@@ -1828,7 +1828,7 @@ fn direct_tool_dispatcher(
     )));
     tools.push(Arc::new(ToolDef::new(
         "fugue_run_deploy",
-        "Run the configured guarded merge-only or merge-and-OTA action. Use only as repository authority after explicit action-lane/operator intent. Replay lost responses unchanged. For a failed or uncertain deployment, report the attempt ID and wait for operator inspection and authorization before supplying retry_deployment with a new key.",
+        crate::deploy_gate::DEPLOY_TOOL_DESCRIPTION,
         crate::deploy_gate::deploy_start_input_schema(),
     )));
     tools.retain(|tool| {
@@ -4818,6 +4818,38 @@ pub(crate) mod tests {
                 .iter()
                 .any(|tool| tool.name == "fugue_run_deploy")
         );
+    }
+
+    #[test]
+    fn deploy_tool_catalog_exposes_typed_evidence_contract_to_coordinator() {
+        let coordinator = scoped_direct_tools(HostToolAuthority::Coordinator, None);
+        let tools = coordinator.tools();
+        let deploy = tools
+            .iter()
+            .find(|tool| tool.name == "fugue_run_deploy")
+            .unwrap();
+        assert_eq!(
+            deploy.input_schema,
+            crate::deploy_gate::deploy_start_input_schema()
+        );
+        assert_eq!(
+            deploy.description,
+            crate::deploy_gate::DEPLOY_TOOL_DESCRIPTION
+        );
+        for field in [
+            "issue",
+            "pull_request",
+            "recorded_head_sha",
+            "ci_status",
+            "unresolved_workgraph_blockers",
+            "idempotency_key",
+            "retry_deployment",
+        ] {
+            assert!(
+                deploy.input_schema["properties"].get(field).is_some(),
+                "missing {field}"
+            );
+        }
     }
 
     #[tokio::test]

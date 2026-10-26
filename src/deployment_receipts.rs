@@ -18,10 +18,12 @@ use crate::tools::{GitHubRepoRef, GitSha, IdempotencyKey, InspectIssueInput, Lin
 
 /// Explicit repository-operator decision to retry a prior deployment attempt.
 /// Use a new request key. An uncertain attempt must be inspected before retry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentRetry {
+    #[schemars(length(min = 1))]
     pub attempt_id: String,
+    #[schemars(length(min = 1))]
     pub reason: String,
 }
 

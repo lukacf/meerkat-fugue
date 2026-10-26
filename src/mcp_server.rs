@@ -270,7 +270,7 @@ pub async fn run_host_mcp_server() -> anyhow::Result<()> {
         }),
         json!({
             "name": "fugue_run_deploy",
-            "description": "Run the guarded Fugue deploy action. Replay lost responses unchanged. For a failed or uncertain deployment, wait for operator inspection and authorization before supplying retry_deployment with a new key.",
+            "description": crate::deploy_gate::DEPLOY_TOOL_DESCRIPTION,
             "input_schema": crate::deploy_gate::deploy_start_input_schema()
         }),
     ];
