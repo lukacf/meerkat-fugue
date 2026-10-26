@@ -13,6 +13,8 @@ remember their domains and collaborate with the execution agents. One shared
 [Meta console](https://github.com/lukacf/meerkat-meta) exposes the teams,
 conversations, memory, work graphs and topology.
 
+![Fugue Home with repository setup and work overview](docs/images/home.jpg)
+
 ## Install and start
 
 Install Git, GitHub CLI, Node.js and Rust through [rustup](https://rustup.rs/).
@@ -38,6 +40,10 @@ For packaged installation, the [bundle guide](scripts/distribution/README.md)
 covers all five cooperating Fugue executables, pinned rkat, checksums and upgrades.
 Source installations need rkat separately to create and select native model
 accounts in setup; existing environment credentials are also supported.
+
+![Fugue getting-started guide showing how to prepare a repository team](docs/images/prepare-team.jpg)
+
+*The built-in guide walks you through connecting tools, preparing a team and reviewing changes.*
 
 ## Work with your team
 
