@@ -52,37 +52,53 @@ pub struct DeployOutcome {
     pub completed_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Evidence for the configured guarded merge-only or merge-and-deploy action.
+/// Inspect the current issue, PR, CI and repository Work Graph before submitting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeployStartRequest {
+    /// Issue in this repository's configured tracker, using its inspected ID or identifier.
     pub issue: LinearIssueRef,
+    /// Full current snapshot returned by github_inspect_pr. Preserve the repository
+    /// host, PR number, title, URL, state, draft flag, branches and exact head SHA.
     pub pull_request: GitHubPullRequestSnapshot,
+    /// Head SHA recorded by the issue's durable PR handoff/review evidence. Supply
+    /// it when fresh-head policy is enabled; compare it with the inspected PR head.
+    /// A mismatch requires refreshed review evidence, not overwriting this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded_head_sha: Option<GitSha>,
+    /// Status returned by github_check_ci for that exact PR head. Supply it when
+    /// CI is required. no_checks means no checks exist, not success; only an
+    /// explicit repository policy permits it. Never infer CI success from prose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_status: Option<CiStatus>,
+    /// Count unresolved blocking prerequisites from the issue's native Work Graph
+    /// in this repository. Supply the observed count; do not assume zero.
     #[serde(default)]
     pub unresolved_workgraph_blockers: usize,
+    /// Stable key for this exact issue, PR head and action. Replay a lost response
+    /// with the identical request and key. Do not change keys to bypass a refusal.
     pub idempotency_key: IdempotencyKey,
+    /// Omit for the initial action or unchanged replay. After a failed or uncertain
+    /// deployment, only explicit operator inspection and authorization permits a
+    /// retry with the prior attempt ID, reason and a new idempotency key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_deployment: Option<crate::DeploymentRetry>,
 }
 
+pub(crate) const DEPLOY_TOOL_DESCRIPTION: &str = "Run the configured guarded merge-only or merge-and-OTA action as repository Kapellmeister after explicit action-lane/operator intent. First inspect the issue and its durable PR handoff/review, use github_inspect_pr for the full current PR snapshot and github_check_ci for that exact head, and inspect the issue's native Work Graph blocking prerequisites. Supply the recorded head, observed CI status and blocker count; never invent evidence to satisfy a guard. The host rechecks current evidence and selects the configured procedure and merge method, so do not supply policy overrides. Replay lost responses with the identical request and key. For a failed or uncertain deployment, report the attempt ID and wait for operator inspection and authorization before supplying retry_deployment with a new key.";
+
 pub(crate) fn deploy_start_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "description": "Typed DeployStartRequest with issue, PR snapshot, recorded head, CI status, WorkGraph blocker count and idempotency key. Replay unchanged requests with the same key. An intentional deployment retry requires a new key and retry_deployment; it does not waive review, PR, CI or WorkGraph checks.",
-        "properties": {
-            "retry_deployment": {
-                "type":"object", "additionalProperties":false,
-                "description":"Use only after the operator inspected a failed or uncertain attempt and explicitly authorized another execution. Do not automatically retry an uncertain deployment.",
-                "properties": {
-                    "attempt_id":{"type":"string", "minLength":1},
-                    "reason":{"type":"string", "minLength":1}
-                }, "required":["attempt_id","reason"]
-            }
-        }, "additionalProperties":true
-    })
+    // Keep both native and MCP tool contracts aligned with the wire type. Inline
+    // references because this schema is embedded in each provider's tool catalog.
+    schemars::generate::SchemaSettings::draft2020_12()
+        .with(|settings| {
+            settings.inline_subschemas = true;
+            settings.meta_schema = None;
+        })
+        .into_generator()
+        .into_root_schema_for::<DeployStartRequest>()
+        .into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -525,6 +541,107 @@ mod tests {
             deploy_auth_available: true,
             idempotency_key: IdempotencyKey("deploy:LUC-631:201:abc123".to_string()),
         }
+    }
+
+    #[test]
+    fn deploy_tool_schema_exposes_the_complete_typed_request() {
+        let schema = deploy_start_input_schema();
+        let request = DeployStartRequest {
+            issue: LinearIssueRef::Identifier {
+                identifier: crate::tools::LinearIssueIdentifier("LUC-631".to_string()),
+            },
+            pull_request: pr_snapshot(),
+            recorded_head_sha: Some(GitSha("abc123".to_string())),
+            ci_status: Some(CiStatus::Success),
+            unresolved_workgraph_blockers: 0,
+            idempotency_key: IdempotencyKey("deploy:LUC-631:201:abc123".to_string()),
+            retry_deployment: Some(crate::DeploymentRetry {
+                attempt_id: "previous-attempt".to_string(),
+                reason: "Operator inspected the failed attempt and authorized retry".to_string(),
+            }),
+        };
+        let wire = serde_json::to_value(&request).unwrap();
+        let properties = schema["properties"].as_object().unwrap();
+        for field in wire.as_object().unwrap().keys() {
+            assert!(
+                properties.contains_key(field),
+                "missing advertised field: {field}"
+            );
+        }
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&wire));
+        assert_eq!(
+            serde_json::from_value::<DeployStartRequest>(wire.clone()).unwrap(),
+            request
+        );
+        // The model must discover the actual nested reference and snapshot shapes.
+        for pointer in [
+            "/issue/kind",
+            "/pull_request/repo/owner",
+            "/pull_request/head_sha",
+            "/pull_request/title",
+            "/idempotency_key",
+        ] {
+            let mut invalid = wire.clone();
+            *invalid.pointer_mut(pointer).unwrap() = serde_json::json!(false);
+            assert!(
+                !validator.is_valid(&invalid),
+                "schema accepted wrong shape at {pointer}"
+            );
+        }
+        for field in ["issue", "pull_request", "idempotency_key"] {
+            let mut missing = wire.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                !validator.is_valid(&missing),
+                "schema omitted required field: {field}"
+            );
+        }
+        let mut unknown = wire;
+        unknown["operator_approved"] = serde_json::json!(true);
+        assert!(!validator.is_valid(&unknown));
+    }
+
+    #[test]
+    fn deploy_tool_schema_preserves_policy_evidence_and_retry_shapes() {
+        let schema = deploy_start_input_schema();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let mut wire = serde_json::json!({
+            "issue": {"kind": "id", "id": "issue-631"},
+            "pull_request": pr_snapshot(),
+            "idempotency_key": "deploy:issue-631:201:abc123"
+        });
+        // Existing HTTP callers may omit policy-dependent evidence. The host still
+        // rejects missing evidence when that repository policy requires it.
+        assert!(validator.is_valid(&wire));
+        for status in [
+            CiStatus::NoChecks,
+            CiStatus::Pending,
+            CiStatus::Success,
+            CiStatus::Failure,
+            CiStatus::Error,
+            CiStatus::Skipped,
+            CiStatus::Cancelled,
+        ] {
+            wire["ci_status"] = serde_json::to_value(status).unwrap();
+            assert!(validator.is_valid(&wire));
+            assert_eq!(
+                serde_json::from_value::<DeployStartRequest>(wire.clone())
+                    .unwrap()
+                    .ci_status,
+                Some(status)
+            );
+        }
+        wire["ci_status"] = serde_json::json!("green");
+        assert!(!validator.is_valid(&wire));
+        wire["ci_status"] = serde_json::Value::Null;
+        wire["unresolved_workgraph_blockers"] = serde_json::json!(-1);
+        assert!(!validator.is_valid(&wire));
+        wire["unresolved_workgraph_blockers"] = serde_json::json!(0);
+        wire["retry_deployment"] = serde_json::json!({"attempt_id":"a"});
+        assert!(!validator.is_valid(&wire));
+        wire["retry_deployment"] = serde_json::json!({"attempt_id":"a", "reason":""});
+        assert!(!validator.is_valid(&wire));
     }
 
     #[test]
