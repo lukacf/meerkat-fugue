@@ -288,6 +288,55 @@ impl Fixture {
 }
 
 #[test]
+fn native_review_preserves_structured_command_evidence() {
+    let mut fixture = Fixture::new();
+    let commands = json!([
+        "git diff --check",
+        {"command":"python3 -m unittest discover -v", "result":"66 tests passed"}
+    ]);
+    for (run, events) in &mut fixture.runs {
+        for event in events {
+            if let MobEventKind::StepTargetCompleted {
+                output: Some(output),
+                target,
+                ..
+            } = &mut event.kind
+            {
+                output["evidence"]["commands"] = commands.clone();
+                run.root_step_outputs.get_mut(&StepId::from(STEP)).unwrap()
+                    [target.identity.as_str()] = output.clone();
+            }
+        }
+    }
+    let verified = fixture.check().unwrap();
+    verified.require_approval().unwrap();
+    for verdict in verified.verdicts() {
+        assert_eq!(
+            serde_json::to_value(&verdict.evidence.commands).unwrap(),
+            commands
+        );
+    }
+    let (run, _) = &mut fixture.runs[0];
+    run.root_step_outputs.get_mut(&StepId::from(STEP)).unwrap()["review-a"]["evidence"]["commands"]
+        [1]["result"] = json!("Different retained output");
+    assert_eq!(
+        fixture.check().unwrap_err(),
+        ReviewProofError::ProducerEvidence
+    );
+
+    for invalid in [
+        json!({"command":"check"}),
+        json!({"command":"check","result":true}),
+        json!({"command":"check","result":"ok","verdict":"green"}),
+        json!(17),
+    ] {
+        let mut verdict = serde_json::to_value(verified.verdicts().next().unwrap()).unwrap();
+        verdict["evidence"]["commands"] = json!([invalid]);
+        assert!(serde_json::from_value::<IndependentReviewVerdict>(verdict).is_err());
+    }
+}
+
+#[test]
 fn native_review_requires_every_member_of_the_explicit_quorum() {
     for count in 1..=3 {
         let members = (0..count).map(|i| AgentIdentity::from(format!("review-{i}")));

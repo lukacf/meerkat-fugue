@@ -889,6 +889,7 @@ impl EnsembleRuntime {
                 .specialists
                 .iter()
                 .map(|(id, spec)| crate::meta_runtime::RepositorySpecialist {
+                    profile: id.as_str().into(),
                     identity: format!("{}:{id}", binding.repository),
                     label: spec.label.clone(),
                     focus: spec.focus.clone(),
