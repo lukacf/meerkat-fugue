@@ -1,7 +1,30 @@
-# Status API
+---
+title: "Status and browser API"
+description: "Repository-scoped queue endpoints and the shared native console."
+---
 
-Fugue can expose a loopback dashboard and JSON API for operational visibility.
-Enable it with CLI `--port` or `server.port` in `fugue.yaml`.
+# Status and browser API
+
+Fugue exposes the browser application and operational APIs on its loopback
+listener. In managed multi-repository mode, directory routes are instance-wide
+and queue routes use the repository prefix `/repositories/<id>`.
+
+| Managed host route | Purpose |
+| --- | --- |
+| `/`, `/overview` | Home, with read-only projections from repository boards. |
+| `/queues` | All-repository board; each repository keeps its own workflow. |
+| `/ensemble` | Repository setup and preparation. |
+| `/api/workspaces` | Repository IDs, same-origin URLs and configured/running state. |
+| `/repositories/<id>/overview` | One repository's Home. |
+| `/repositories/<id>/issues` | One repository's interactive board. |
+| `/repositories/<id>/api/v1/issues/board` | Typed board lanes, actions, issues and runtime status. |
+| `/repositories/<id>/api/v1/state` | That repository's orchestrator state. |
+| `/console` | One shared native console for all registered teams. |
+| `/api/v1/build` | Running build identity. |
+
+The queue endpoints below are unprefixed when running a single workflow directly.
+In a managed host, prepend `/repositories/<id>` for that repository. Shared
+console and directory endpoints remain at the origin root.
 
 ## Starting with a status server
 
@@ -12,13 +35,16 @@ cargo run -- ./fugue.yaml --port 0
 `--port 0` binds an available port. The default bind address is `127.0.0.1`.
 Use `--host` only when you have separate access controls. For raw public-IP
 access, configure `server.meta_console.basic_auth` and protect the transport
-with HTTPS, an SSH/IAP tunnel, or a source-IP firewall rule.
+with HTTPS or an SSH/IAP tunnel. Source-IP firewall rules can further restrict
+access; they do not encrypt credentials.
 
 ## Endpoints
 
 | Endpoint | Method | Purpose |
 | --- | --- | --- |
-| `/` | `GET` | Minimal HTML dashboard. |
+| `/` | `GET` | Redirect to Home. |
+| `/overview` | `GET` | Repository Home. |
+| `/api/v1/issues/board` | `GET` | Board snapshot with typed lane kinds and actions. |
 | `/console` | `GET` | Authenticated stock Meta console served by the Meta console router. |
 | `/console/rpc` | `POST` | Authenticated Meta console JSON-RPC through the Meta console router. |
 | `/api/v1/state` | `GET` | Full orchestrator snapshot. |
@@ -26,6 +52,20 @@ with HTTPS, an SSH/IAP tunnel, or a source-IP firewall rule.
 | `/api/v1/refresh` | `POST` | Request an immediate poll. |
 | `/api/v1/meta/rpc` | `POST` | Forward a typed JSON body to `FUGUE_META_RPC_TCP_ADDR` as a Meta JSON-RPC request. Requires `Authorization: Bearer $TOKEN` from `FUGUE_META_RPC_BEARER_TOKEN`. |
 | `/api/v1/ota-update` | `POST` | Trigger configured authorized OTA fetch/staging-build/deploy flow. |
+
+## Team startup failures
+
+A failure while admitting an issue team is recorded separately from native
+member or flow outcomes. `mob_inspect_run.launch_failure` retains its timestamp
+and diagnostic message across restart. The issue status exposes the same
+object as `native_recovery.launch_failure`, and its lifecycle status becomes
+`launch_failed`.
+
+The board exposes `runtime.launch_failure` and `totals.launch_failed`. Failed
+admissions are excluded from the board's running total and appear under Home's
+attention section, even when the issue remains in an active Jira status. The
+tracker lane stays under coordinator control. A failure observation does not
+schedule a replacement team or claim that existing members have been retired.
 
 ## Meta console
 
@@ -67,9 +107,8 @@ server:
 `basic_auth` uses standard HTTP Basic Auth and works with a raw IP address; it
 does not require an OAuth callback domain. It protects the dashboard,
 `/console`, read-only status APIs, refresh, and console RPC when configured.
-Use HTTPS, an SSH/IAP tunnel, or a source-IP firewall rule for
-untrusted networks because Basic Auth credentials are only safe in transit when
-the transport is protected.
+Use HTTPS or an SSH/IAP tunnel across untrusted networks. Basic Auth credentials
+are only safe in transit when the transport is encrypted.
 
 Scripted clients that need the persistent TCP bridge can still use
 `/api/v1/meta/rpc`. Before forwarding any method to
@@ -96,7 +135,7 @@ Current work. Production native rows report `backend: native_mob`.
 
 Look for:
 
-- issue identifier and Linear state;
+- issue identifier and configured tracker state;
 - workspace path;
 - selected template and policy owner;
 - last event and recent events;
@@ -118,19 +157,32 @@ Native recovery facts used after restarts and during completion checks:
 - Meta run id and status evidence;
 - workspace branch and head SHA;
 - dirty workspace flag;
-- Linear Workpad run id and PR mentions;
+- tracker Workpad run id and PR mentions;
 - GitHub PR URL, state, and head SHA;
 - `review_required` reason when evidence is not safe to accept.
 
 ## Refreshing immediately
 
-Use refresh after fixing credentials, hooks, or Linear lanes:
+Use refresh after fixing credentials, hooks, or tracker configuration. It requests
+a poll; it does not bypass admission, review or retry rules. The Board's
+**Refresh** control reloads its display and is separate from this poll request.
+
+For a directly launched single workflow:
 
 ```bash
 curl -X POST http://127.0.0.1:PORT/api/v1/refresh
 ```
 
-Replace `PORT` with the port printed by the running process.
+Replace `PORT` with the port printed by the running process. For a managed
+multi-repository host, use the selected repository's prefix instead:
+
+```bash
+curl -X POST http://127.0.0.1:PORT/repositories/REPOSITORY_ID/api/v1/refresh
+```
+
+Get `REPOSITORY_ID` from `/api/workspaces` or that repository's Board URL. Use
+the installation's authenticated access method when required; the examples
+assume access to its loopback listener.
 
 ## Security notes
 
@@ -138,8 +190,9 @@ The status API is intended for local operators. It can reveal issue identifiers,
 workspace paths, PR URLs, error text, and operational state. Do not expose it on
 an untrusted network without authentication. The built-in
 `server.meta_console.basic_auth` gate is intentionally provider-neutral and
-works on a raw IP address, but use HTTPS, an SSH/IAP tunnel, or source-IP
-firewalling so credentials are not sent over cleartext HTTP.
+works on a raw IP address, but use HTTPS or an SSH/IAP tunnel so credentials are
+not sent over cleartext HTTP across an untrusted network. Source-IP firewalling
+is an additional access restriction, not transport encryption.
 
 The canonical Meta console RPC can invoke methods through the configured
 Meerkat command and is treated as an operator control surface. Keep it

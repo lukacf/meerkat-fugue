@@ -1,8 +1,9 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,10 +19,8 @@ use axum::{Json, Router};
 use base64::Engine;
 use chrono::Utc;
 use indexmap::IndexMap;
-use meerkat::{
-    CreateWorkItemRequest, SqliteWorkGraphStore, WorkCompletionPolicy, WorkGraphService,
-    WorkItemFilter, WorkNamespace, WorkPriority, WorkStatus,
-};
+#[cfg(test)]
+use meerkat::{SqliteWorkGraphStore, WorkGraphService, WorkItemFilter, WorkNamespace};
 use meerkat_meta::ConsolePolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -40,14 +39,15 @@ use crate::deploy_gate::{
 };
 use crate::domain::Issue;
 use crate::final_pr_gate::FinalPrGateStartRequest;
-use crate::github_tools::GitHubToolHost;
+#[cfg(test)]
+use crate::independent_review::{IndependentReviewAggregationInput, aggregate_independent_review};
 use crate::independent_review::{
-    IndependentReviewAggregationInput, IndependentReviewCompletionRequest,
-    IndependentReviewDecision, IndependentReviewStartRequest, IndependentReviewWorkGraphScope,
-    aggregate_independent_review,
+    IndependentReviewCompletionRequest, IndependentReviewLaunchRequest,
 };
 use crate::linear_adapter::IssueAdapter;
-use crate::meta_runtime::{MetaRuntimeRegistry, meta_runtime_state_path};
+use crate::meta_runtime::MetaRuntimeRegistry;
+#[cfg(test)]
+use crate::meta_runtime::meta_runtime_state_path;
 use crate::orchestrator::{
     InternalMessage, RetryRow, RunningRow, SharedState, issue_snapshot, snapshot,
 };
@@ -67,6 +67,7 @@ struct AppState {
     config: ServiceConfig,
     refresh_tx: mpsc::Sender<()>,
     internal_tx: mpsc::Sender<InternalMessage>,
+    meta_runtime_registry: MetaRuntimeRegistry,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,7 +92,7 @@ pub async fn serve(
     refresh_tx: mpsc::Sender<()>,
     internal_tx: mpsc::Sender<InternalMessage>,
     meta_runtime_registry: MetaRuntimeRegistry,
-    ensemble: Option<Arc<crate::ensemble::runtime::EnsembleRuntime>>,
+    ensemble: Option<Router>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     serve_on_listener(
@@ -113,7 +114,7 @@ pub async fn serve_on_listener(
     refresh_tx: mpsc::Sender<()>,
     internal_tx: mpsc::Sender<InternalMessage>,
     meta_runtime_registry: MetaRuntimeRegistry,
-    ensemble: Option<Arc<crate::ensemble::runtime::EnsembleRuntime>>,
+    ensemble: Option<Router>,
 ) -> anyhow::Result<()> {
     let local_addr = listener.local_addr()?;
     let app = router(
@@ -125,6 +126,13 @@ pub async fn serve_on_listener(
         ensemble,
     )
     .await?;
+    let app = if local_addr.ip().is_loopback() {
+        app.layer(middleware::from_fn(
+            crate::ensemble::http::local_origin_guard,
+        ))
+    } else {
+        app
+    };
     tracing::info!(address = %local_addr, "http_status listening");
     axum::serve(listener, app).await?;
     Ok(())
@@ -136,18 +144,28 @@ pub(crate) async fn router(
     refresh_tx: mpsc::Sender<()>,
     internal_tx: mpsc::Sender<InternalMessage>,
     meta_runtime_registry: MetaRuntimeRegistry,
-    ensemble: Option<Arc<crate::ensemble::runtime::EnsembleRuntime>>,
+    ensemble: Option<Router>,
 ) -> anyhow::Result<Router> {
+    let managed_repository = config.meerkat.repository_runtime.is_some();
     let app_state = AppState {
         state,
         config: config.clone(),
         refresh_tx,
         internal_tx,
+        meta_runtime_registry: meta_runtime_registry.clone(),
     };
     let app = Router::new()
         .route("/api/v1/build", get(crate::build_identity::endpoint))
-        .route("/", get(dashboard))
+        .route("/api/v1/workspace", get(workspace_context))
+        .route(
+            "/",
+            get(|| async { axum::response::Redirect::temporary("/overview") }),
+        )
         .route("/overview", get(dashboard))
+        .route(
+            "/queues",
+            get(|| async { axum::response::Redirect::temporary("/issues") }),
+        )
         .route("/issues", get(issues_board))
         .route("/issues/{issue_identifier}", get(issue_detail_page))
         .route("/api/v1/state", get(api_state))
@@ -156,11 +174,13 @@ pub(crate) async fn router(
         .route("/api/v1/issues/{issue_identifier}", get(api_issue_detail))
         .route(
             "/api/v1/issues/{issue_identifier}/comments",
-            post(api_issue_add_comment),
+            post(api_issue_add_comment)
+                .layer(axum::extract::DefaultBodyLimit::max(101 * 1024 * 1024)),
         )
         .route(
             "/api/v1/issues/{issue_identifier}/attachments",
-            post(api_issue_upload_attachments),
+            post(api_issue_upload_attachments)
+                .layer(axum::extract::DefaultBodyLimit::max(101 * 1024 * 1024)),
         )
         .route(
             "/api/v1/issues/{issue_identifier}/attachments/{file_name}",
@@ -188,8 +208,16 @@ pub(crate) async fn router(
             post(api_kapellmeister_start_independent_review),
         )
         .route(
+            "/api/v1/kapellmeister/admit-independent-review",
+            post(api_kapellmeister_admit_independent_review),
+        )
+        .route(
             "/api/v1/kapellmeister/complete-independent-review",
             post(api_kapellmeister_complete_independent_review),
+        )
+        .route(
+            "/api/v1/kapellmeister/complete-final-pr-gate",
+            post(api_kapellmeister_complete_final_pr_gate),
         )
         .route(
             "/api/v1/kapellmeister/deploy",
@@ -217,8 +245,7 @@ pub(crate) async fn router(
         app = app.route("/ensemble", get(ensemble_page));
     }
     let mut app = app.with_state(app_state);
-    if let Some(runtime) = ensemble {
-        let routes = crate::ensemble::http::integrated_router(runtime).await?;
+    if let Some(routes) = ensemble {
         app = app.merge(
             routes.layer(middleware::from_fn(move |request: Request, next: Next| {
                 let config = config.clone();
@@ -230,6 +257,11 @@ pub(crate) async fn router(
                 }
             })),
         );
+    }
+    if managed_repository {
+        app = app.layer(middleware::from_fn(
+            crate::ensemble::http::local_origin_guard,
+        ));
     }
     Ok(app)
 }
@@ -245,7 +277,14 @@ async fn authorize_meta_console_request(
     inject_console_browser_compat(next.run(request).await).await
 }
 
-async fn inject_console_browser_compat(response: Response) -> Response {
+pub(crate) async fn inject_console_browser_compat(response: Response) -> Response {
+    inject_console_browser_compat_for_workspace(response, true).await
+}
+
+pub(crate) async fn inject_console_browser_compat_for_workspace(
+    response: Response,
+    queue_enabled: bool,
+) -> Response {
     let is_html = response
         .headers()
         .get(CONTENT_TYPE)
@@ -270,17 +309,18 @@ async fn inject_console_browser_compat(response: Response) -> Response {
     let Ok(html) = String::from_utf8(bytes.to_vec()) else {
         return Response::from_parts(parts, Body::from(bytes));
     };
-    let html = inject_console_browser_compat_html(&html);
+    let html = inject_console_browser_compat_html(&html, queue_enabled);
     parts.headers.remove(CONTENT_LENGTH);
     Response::from_parts(parts, Body::from(html))
 }
 
-fn inject_console_browser_compat_html(html: &str) -> String {
+fn inject_console_browser_compat_html(html: &str, queue_enabled: bool) -> String {
     let mut patched = html.to_string();
+
     if let Some(next) = inject_random_uuid_polyfill(&patched) {
         patched = next;
     }
-    if let Some(next) = inject_console_app_chrome(&patched) {
+    if let Some(next) = inject_app_chrome(&patched, AppPage::Console, queue_enabled) {
         patched = next;
     }
     patched
@@ -324,14 +364,14 @@ fn inject_random_uuid_polyfill(html: &str) -> Option<String> {
     Some(patched)
 }
 
-fn inject_console_app_chrome(html: &str) -> Option<String> {
-    inject_app_chrome(html, AppPage::Console, true)
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AppPage {
+    Home,
+    Work,
     Console,
     Ensemble,
+    Settings,
+    Setup,
 }
 
 pub(crate) fn inject_app_chrome(
@@ -340,65 +380,83 @@ pub(crate) fn inject_app_chrome(
     queue_enabled: bool,
 ) -> Option<String> {
     const MARKER: &str = "data-fugue-console-chrome";
-    const STYLE: &str = r#"<style data-fugue-console-chrome>
-:root { color-scheme: light; --bs-paper: #ECEAE4; --bs-paper-soft: #F6F4EE; --bs-paper-raised: #FAF8F2; --bs-ink: #1C1A17; --bs-muted: #6B6760; --bs-subtle: #A8A49B; --bs-line: #D6D2C8; --bs-accent: #D95A1E; --bs-accent-dark: #E76A2F; --bs-ok: #3E6B4F; --bs-warn: #A56A18; --bs-crit: #A43F32; --bs-font-sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --bs-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; --bg: var(--bs-paper); --surface: var(--bs-paper-soft); --ink: var(--bs-ink); --muted: var(--bs-muted); --hair: var(--bs-line); --accent: var(--bs-accent); --r-sm: 2px; --r-md: 6px; --type-micro: 10px; --type-rail: 11px; --type-meta: 12px; --type-body: 13px; --type-card: 14px; --type-panel-heading: 15px; --type-heading: 16px; --line-compact: 1.35; --control-h: 38px; }
-body.fugue-console-embedded { margin:0; padding-top:var(--control-h); background:var(--bg); color:var(--ink); }
-.fugue-console-rail { position:fixed; z-index:2147483000; inset:0 0 auto 0; height:var(--control-h); display:flex; align-items:center; border-bottom:1px solid var(--ink); background:var(--surface); color:var(--ink); font-family:var(--bs-font-mono); font-size:var(--type-rail); letter-spacing:.12em; text-transform:uppercase; line-height:var(--line-compact); }
-.fugue-console-rail a { color:inherit; text-decoration:none; }
-.fugue-console-brand { height:var(--control-h); display:flex; align-items:center; gap:10px; padding:0 16px; border-right:1px solid var(--hair); font-weight:500; }
-.fugue-console-mark { width:12px; height:12px; border:1px solid var(--ink); transform:rotate(45deg); flex:0 0 auto; }
-.fugue-console-tabs { display:flex; height:var(--control-h); }
-.fugue-console-tabs a { display:flex; align-items:center; padding:0 18px; border-right:1px solid var(--hair); }
-.fugue-console-tabs a.active { background:var(--ink); color:var(--bg); }
-.fugue-console-spacer { flex:1; }
-.fugue-console-meta { display:flex; height:var(--control-h); }
-.fugue-console-meta span { display:flex; align-items:center; padding:0 10px; border-left:1px solid var(--hair); color:var(--muted); }
-@media(max-width:760px) { .fugue-console-meta { display:none; } .fugue-console-brand { padding:0 10px; font-size:9px; } .fugue-console-brand span:last-child { display:none; } .fugue-console-tabs { overflow-x:auto; } .fugue-console-tabs a { padding:0 10px; font-size:10px; white-space:nowrap; } }
-</style>"#;
+    let style = format!(
+        "<style data-fugue-console-chrome>{}</style>",
+        include_str!("ui/app.css")
+    );
     let mut nav = String::new();
-    if queue_enabled {
-        nav.push_str(r#"<a href="/overview">OVERVIEW</a><a href="/issues">IMS</a>"#);
-        nav.push_str(if active == AppPage::Console {
-            r#"<a class="active" href="/console">CONSOLE</a>"#
+    for (page, href, label) in [
+        (AppPage::Home, "/overview", "Home"),
+        (AppPage::Work, "/queues", "Board"),
+        (AppPage::Console, "/console", "Agents"),
+    ] {
+        let selected = if page == active {
+            " class=\"active\" aria-current=\"page\""
         } else {
-            r#"<a href="/console">CONSOLE</a>"#
-        });
+            ""
+        };
+        nav.push_str(&format!(r#"<a href="{href}"{selected}>{label}</a>"#));
     }
-    nav.push_str(if active == AppPage::Ensemble {
-        r#"<a class="active" href="/ensemble">ENSEMBLE</a>"#
-    } else {
-        r#"<a href="/ensemble">ENSEMBLE</a>"#
-    });
-    let home = if queue_enabled {
-        "/overview"
-    } else {
-        "/ensemble"
+    let account = crate::browser_access::logout_url()
+        .map(|logout| format!(r#"<a href="{logout}">Sign out of this browser</a>"#))
+        .unwrap_or_else(|| "<p>Access is managed by this Fugue host.</p>".to_owned());
+    let (area, title) = match active {
+        AppPage::Home => ("home", "Home"),
+        AppPage::Work => ("board", "Board"),
+        AppPage::Console => ("agents", "Agents"),
+        AppPage::Ensemble => ("repositories", "Repositories"),
+        AppPage::Settings => ("settings", "Repository settings"),
+        AppPage::Setup => ("setup", "Connect repository"),
     };
-    let label = if active == AppPage::Ensemble {
-        "REPOSITORY TEAMS"
+    let repositories_selected = if matches!(
+        active,
+        AppPage::Ensemble | AppPage::Settings | AppPage::Setup
+    ) {
+        " class=\"active\" aria-current=\"page\""
     } else {
-        "META CONSOLE"
+        ""
     };
+    let brand = include_str!("ui/brand.svg");
     let chrome = format!(
-        r#"<div class="fugue-console-rail" data-fugue-console-chrome><a class="fugue-console-brand" href="{home}" aria-label="Meerkat Fugue overview"><span class="fugue-console-mark" aria-hidden="true"></span><span>MEERKAT FUGUE</span></a><nav class="fugue-console-tabs" aria-label="Primary app navigation">{nav}</nav><div class="fugue-console-spacer"></div><div class="fugue-console-meta" aria-label="Console context"><span>{label}</span></div></div>"#
+        r#"<div class="fugue-console-rail" data-fugue-console-chrome data-area="{area}"><a class="fugue-console-brand" href="/overview" aria-label="Meerkat Fugue home"><span class="fugue-console-mark">{brand}</span><span class="fugue-wordmark"><small>Meerkat</small><span>Fugue</span></span></a><div class="fugue-scope"><label for="fugueScope">Repository</label><select id="fugueScope" aria-label="Repository scope"><option value="">All repositories</option></select></div><nav class="fugue-console-tabs" aria-label="Primary app navigation">{nav}</nav><div class="fugue-console-spacer"></div><a id="fugueRepositories" href="/ensemble"{repositories_selected}>Repositories</a><details class="fugue-account"><summary>Session</summary><div class="fugue-account-menu"><strong>Browser session</strong><p>Signing out leaves your teams running. Repository and AI credentials are managed in Repositories.</p><button class="fugue-button quiet" data-fugue-welcome>Getting started</button>{account}</div></details></div><div class="fugue-breadcrumb"><a id="fugueScopeCrumb" href="/overview">All repositories</a><span aria-hidden="true">/</span><span>{title}</span><a id="fugueRepoSettings" href="./settings" hidden>Repository settings</a></div>"#
     );
 
     if html.contains(MARKER) {
         return None;
     }
 
-    let mut patched = html.to_string();
+    // Scope page-owned links before adding the origin-wide primary navigation.
+    let mut patched =
+        browser_document(html).replace("__PORTFOLIO_JS__", include_str!("ui/portfolio.js"));
+    let context_script = format!(
+        "<script>{}</script>{}<script>{}</script>",
+        include_str!("ui/navigation.js"),
+        include_str!("ui/welcome.html"),
+        include_str!("ui/welcome.js")
+    );
+    patched = patched.replace("</body>", &format!("{context_script}</body>"));
+    if active == AppPage::Work {
+        let script = format!("<script>{}</script>", include_str!("ui/work-context.js"));
+        patched = patched.replace("</body>", &format!("{script}</body>"));
+    }
+    if !queue_enabled {
+        patched = patched.replace(
+            "<div class=\"queue-context\">",
+            "<div class=\"queue-context\" hidden>",
+        );
+        patched = patched.replace("<body>", "<body data-queue-enabled=\"false\">");
+    }
     let head_insertion = patched
         .find("</head>")
         .or_else(|| patched.find("<body"))
         .unwrap_or(0);
-    patched.insert_str(head_insertion, STYLE);
+    patched.insert_str(head_insertion, &style);
 
     let Some(body_start) = patched.find("<body") else {
-        return Some(format!("{STYLE}{chrome}{patched}"));
+        return Some(format!("{style}{chrome}{patched}"));
     };
     let Some(body_tag_end_offset) = patched[body_start..].find('>') else {
-        return Some(format!("{STYLE}{chrome}{patched}"));
+        return Some(format!("{style}{chrome}{patched}"));
     };
     let body_tag_end = body_start + body_tag_end_offset;
     let body_tag = &patched[body_start..=body_tag_end];
@@ -409,6 +467,9 @@ body.fugue-console-embedded { margin:0; padding-top:var(--control-h); background
         replacement.insert_str(replacement.len() - 1, " class=\"fugue-console-embedded\"");
         replacement
     };
+    if !queue_enabled && !replacement.contains("data-queue-enabled=") {
+        replacement.insert_str(replacement.len() - 1, " data-queue-enabled=\"false\"");
+    }
     if !replacement.contains("data-bs-theme=") {
         replacement.insert_str(replacement.len() - 1, " data-bs-theme=\"paper\"");
     }
@@ -418,304 +479,54 @@ body.fugue-console-embedded { margin:0; padding-top:var(--control-h); background
     Some(patched)
 }
 
-struct DashboardView {
-    running: usize,
-    retrying: usize,
-    tokens: u64,
-    seconds: f64,
-    error: Option<String>,
-    shadow_health: String,
-    shadow_recommendations: usize,
-    shadow_comparisons: usize,
-    shadow_authority: String,
-    running_rows: String,
-    retry_rows: String,
-    console_enabled: bool,
-    in_flight_count: usize,
-    picker_tabs: String,
-    focus_identifier: String,
-    focus_title: String,
-    focus_lane: String,
-    focus_runtime: String,
-    active_role: String,
-    current_action: String,
-    workpad_files: String,
-    activity_rows: String,
+pub(crate) fn browser_document(html: &str) -> String {
+    let script = format!("<script>{}</script>", include_str!("ui/browser-paths.js"));
+    html.replacen("<head>", &format!("<head>{script}"), 1)
+        .replace("href=\"/", "href=\"./")
 }
 
-async fn dashboard(State(app): State<AppState>, headers: HeaderMap) -> axum::response::Response {
+pub(crate) fn render_home_html(queue_enabled: bool) -> String {
+    inject_app_chrome(
+        include_str!("ui/overview.html"),
+        AppPage::Home,
+        queue_enabled,
+    )
+    .unwrap_or_else(|| include_str!("ui/overview.html").to_owned())
+}
+
+async fn dashboard(State(app): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
-    let snapshot = snapshot(&app.state, &app.config).await;
-    let focus = snapshot.running.first();
-    let in_flight_count = snapshot.running.len();
-    let focus_identifier = focus
-        .map(|row| row.issue_identifier.clone())
-        .unwrap_or_else(|| "NO MOB".to_string());
-    let focus_title = focus
-        .map(|row| row.issue.title.clone())
-        .unwrap_or_else(|| "Nothing is running right now.".to_string());
-    let focus_lane = focus
-        .map(|row| row.state.clone())
-        .unwrap_or_else(|| "idle".to_string());
-    let focus_runtime = focus
-        .map(|row| compact_duration((Utc::now() - row.started_at).num_seconds().max(0) as u64))
-        .unwrap_or_else(|| "unavailable".to_string());
-    let active_role = focus
-        .and_then(|row| role_from_state(&row.state))
-        .unwrap_or("MOB")
-        .to_string();
-    let current_action = focus
-        .and_then(|row| row.last_message.as_ref().or(row.last_event.as_ref()))
-        .cloned()
-        .unwrap_or_else(|| "Awaiting runtime event from Fugue.".to_string());
-    let picker_tabs = dashboard_picker_tabs(&snapshot.running);
-    let activity_rows = dashboard_activity_rows(&snapshot.running, &snapshot.retrying);
-    // rework-note: the current runtime snapshot does not expose a structured workpad diff or live topology stream here; render honest runtime evidence instead of prototype file fixtures.
-    let workpad_files = focus
-        .map(|row| {
-            format!(
-                r#"<div class="file"><span class="meta">{} · {}</span><span class="meta">{}t</span></div>"#,
-                html_escape(&row.workspace_key),
-                html_escape(&row.state),
-                row.turn_count
-            )
-        })
-        .unwrap_or_else(|| {
-            // rework-note: no focused runtime means the dashboard has no live workpad or turn-count evidence; render an explicit unavailable state instead of a measured-looking zero.
-            r#"<div class="file unavailable"><span class="meta">No active mob workpad evidence available</span><span class="meta">turns unavailable</span></div>"#.to_string()
-        });
-    let view = DashboardView {
-        running: snapshot.counts.running,
-        retrying: snapshot.counts.retrying,
-        tokens: snapshot.meerkat_totals.total_tokens,
-        seconds: snapshot.meerkat_totals.seconds_running,
-        error: snapshot.last_error.clone(),
-        shadow_health: format!("{:?}", snapshot.kapellmeister_shadow.health),
-        shadow_recommendations: snapshot.kapellmeister_shadow.recommendation_count,
-        shadow_comparisons: snapshot.kapellmeister_shadow.comparison_count,
-        shadow_authority: format!("{:?}", snapshot.kapellmeister_shadow.authority.mode),
-        running_rows: snapshot
-            .running
+    Html(render_home_html(true)).into_response()
+}
+
+#[derive(Serialize)]
+struct WorkspaceContext {
+    tracker: String,
+    project: Option<String>,
+    repositories: Vec<String>,
+}
+
+async fn workspace_context(State(app): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = authorize_console_browser(&app.config, &headers) {
+        return response;
+    }
+    Json(WorkspaceContext {
+        tracker: app.config.tracker.kind.clone(),
+        project: app.config.tracker.project_slug.clone(),
+        repositories: app
+            .config
+            .kapellmeister
+            .shadow_mode
+            .authority
+            .safe_selectors
+            .repositories
             .iter()
-            .map(|row| {
-                format!(
-                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                    html_escape(&row.issue_identifier),
-                    html_escape(&format!("{:?}", row.policy_mode)),
-                    html_escape(&row.state),
-                    row.session_id
-                        .as_deref()
-                        .map(html_escape)
-                        .unwrap_or_default(),
-                    row.turn_count,
-                    row.last_event
-                        .as_deref()
-                        .map(html_escape)
-                        .unwrap_or_default(),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        retry_rows: snapshot
-            .retrying
-            .iter()
-            .map(|row| {
-                format!(
-                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                    html_escape(&row.issue_identifier),
-                    html_escape(&format!("{:?}", row.policy_mode)),
-                    row.attempt,
-                    row.due_at,
-                    row.error.as_deref().map(html_escape).unwrap_or_default(),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        console_enabled: meta_console_enabled(&app.config),
-        in_flight_count,
-        picker_tabs,
-        focus_identifier,
-        focus_title,
-        focus_lane,
-        focus_runtime,
-        active_role,
-        current_action,
-        workpad_files,
-        activity_rows,
-    };
-    Html(render_dashboard_html(&view)).into_response()
-}
-
-fn compact_duration(seconds: u64) -> String {
-    if seconds >= 3600 {
-        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
-    } else if seconds >= 60 {
-        format!("{}m {}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{}s", seconds)
-    }
-}
-
-fn role_from_state(state: &str) -> Option<&'static str> {
-    let state = state.to_ascii_lowercase();
-    if state.contains("plan") {
-        Some("PLANNER")
-    } else if state.contains("review") {
-        Some("REVIEWER")
-    } else if state.contains("final") {
-        Some("PUBLISHER")
-    } else if state.contains("implement") || state.contains("progress") || state.contains("active")
-    {
-        Some("CODER")
-    } else {
-        None
-    }
-}
-
-fn phase_label_for_runtime_state(state: &str) -> String {
-    phase_label_for_state(state)
-        .unwrap_or("fugue:phase:implementing")
-        .to_string()
-}
-
-fn dashboard_picker_tabs(running: &[RunningRow]) -> String {
-    if running.is_empty() {
-        return r#"<div class="mob-tab focused"><span class="radio"></span><span class="mob-tab-main"><span class="meta">NO MOB IN FLIGHT</span><div class="mob-tab-title">Move an issue to Queue or Active to start one.</div></span><span class="meta">0s<br>OPEN IMS</span></div>"#.to_string();
-    }
-    running
-        .iter()
-        .take(3)
-        .enumerate()
-        .map(|(index, row)| {
-            let focused = index == 0;
-            let runtime = compact_duration((Utc::now() - row.started_at).num_seconds().max(0) as u64);
-            let state_label = if focused {
-                r#"<span class="badge">● FOCUSED</span>"#.to_string()
-            } else {
-                html_escape(&phase_label_for_runtime_state(&row.state))
-            };
-            format!(
-                r#"<a class="mob-tab {focused_class}" href="/issues/{id}"><span class="radio"></span><span class="mob-tab-main"><span class="meta">{id} {state_label}</span><div class="mob-tab-title">{title}</div></span><span class="meta">{runtime}<br>{role}</span></a>"#,
-                focused_class = if focused { "focused" } else { "" },
-                id = html_escape(&row.issue_identifier),
-                state_label = state_label,
-                title = html_escape(&row.issue.title),
-                runtime = html_escape(&runtime),
-                role = if focused {
-                    html_escape(role_from_state(&row.state).unwrap_or("MOB"))
-                } else {
-                    "SWITCH →".to_string()
-                },
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-fn dashboard_activity_rows(running: &[RunningRow], retrying: &[RetryRow]) -> String {
-    let mut rows = Vec::new();
-    for row in running.iter().take(5) {
-        rows.push(format!(
-            r#"<div class="log-row"><span class="meta">{time}</span><span class="meta">{id}</span><span>{message}</span></div>"#,
-            time = row
-                .last_event_at
-                .map(|time| time.format("%H:%M:%S").to_string())
-                .unwrap_or_else(|| "running".to_string()),
-            id = html_escape(&row.issue_identifier),
-            message = html_escape(row.last_event.as_deref().unwrap_or("mob running")),
-        ));
-    }
-    for row in retrying.iter().take(3) {
-        rows.push(format!(
-            r#"<div class="log-row"><span class="meta">retry</span><span class="meta">{id}</span><span>{message}</span></div>"#,
-            id = html_escape(&row.issue_identifier),
-            message = html_escape(row.error.as_deref().unwrap_or("retry scheduled")),
-        ));
-    }
-    if rows.is_empty() {
-        rows.push(r#"<div class="log-row"><span class="meta">idle</span><span class="meta">—</span><span>No mob runtime events are currently active.</span></div>"#.to_string());
-    }
-    rows.join("")
-}
-
-fn render_dashboard_html(view: &DashboardView) -> String {
-    let console_hint = if view.console_enabled { "LIVE" } else { "OFF" };
-    let _legacy_runtime_tables = (
-        &view.shadow_health,
-        &view.shadow_comparisons,
-        &view.shadow_authority,
-        &view.running_rows,
-        &view.retry_rows,
-    );
-    let error = view
-        .error
-        .as_ref()
-        .map(|error| format!(r#"<p class="error">{}</p>"#, html_escape(error)))
-        .unwrap_or_default();
-    let html = r##"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Meerkat Fugue</title>
-  <style>
-    :root { color-scheme: light; --bs-paper: #ECEAE4; --bs-paper-soft: #F6F4EE; --bs-paper-raised: #FAF8F2; --bs-ink: #1C1A17; --bs-muted: #6B6760; --bs-subtle: #A8A49B; --bs-line: #D6D2C8; --bs-accent: #D95A1E; --bs-accent-dark: #E76A2F; --bs-ok: #3E6B4F; --bs-warn: #A56A18; --bs-crit: #A43F32; --bs-font-sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --bs-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; --bg: var(--bs-paper); --surface: var(--bs-paper-soft); --paper: var(--bs-paper-raised); --ink: var(--bs-ink); --muted: var(--bs-muted); --subtle: var(--bs-subtle); --hair: var(--bs-line); --accent: var(--bs-accent); --ok: var(--bs-ok); --warn: var(--bs-warn); --crit: var(--bs-crit); --r-sm: 2px; --r-md: 6px; --type-micro: 10px; --type-rail: 11px; --type-meta: 12px; --type-body: 13px; --type-card: 14px; --type-panel-heading: 15px; --type-heading: 16px; --line-compact: 1.35; --control-h: 38px; --font-display: var(--bs-font-sans); --shadow-sheet: 0 24px 60px rgba(28,26,23,.28); }
-    * { box-sizing: border-box; } body { margin:0; min-height:100vh; overflow:auto; background:var(--bg); color:var(--ink); font-family:var(--bs-font-sans); font-size:var(--type-body); line-height:var(--line-compact); } a { color:inherit; text-decoration:none; }
-    .mono, .top-rail, .eyebrow, .chip, .meta { font-family:var(--bs-font-mono); text-transform:uppercase; letter-spacing:.12em; font-size:var(--type-rail); line-height:var(--line-compact); }
-    .top-rail { min-height:var(--control-h); display:flex; align-items:stretch; flex-wrap:nowrap; border-bottom:1px solid var(--ink); background:var(--surface); position:sticky; top:0; z-index:4; }
-    .brand { height:var(--control-h); display:flex; align-items:center; gap:10px; padding:0 16px; border-right:1px solid var(--hair); font-weight:500; } .mark { width:12px; height:12px; border:1px solid var(--ink); transform:rotate(45deg); }
-    .tabs { display:flex; height:var(--control-h); } .tabs a { display:flex; align-items:center; padding:0 18px; border-right:1px solid var(--hair); } .tabs a.active { background:var(--ink); color:var(--bg); }
-    .spacer { flex:1 1 auto; min-width:12px; } .kpis { display:flex; min-height:var(--control-h); flex:0 1 auto; overflow-x:auto; max-width:100%; } .kpis span { display:flex; align-items:center; gap:6px; padding:0 10px; border-left:1px solid var(--hair); color:var(--muted); white-space:nowrap; } .kpis b { color:var(--ink); font-variant-numeric:tabular-nums; } .refresh { width:var(--control-h); height:var(--control-h); flex:0 0 var(--control-h); display:grid; place-items:center; border-left:1px solid var(--ink); }
-    .picker { min-height:64px; display:flex; flex-wrap:wrap; align-items:stretch; border-bottom:1px solid var(--ink); background:var(--surface); } .picker-eye { flex:0 0 160px; min-height:64px; padding:9px 14px; background:var(--paper); border-right:1px solid var(--ink); } .picker-eye strong { font:600 var(--type-heading)/1 var(--bs-font-sans); margin-right:5px; }
-    .mob-tab { flex:1 1 240px; min-width:220px; min-height:64px; display:flex; align-items:center; gap:14px; padding:8px 16px; border-right:1px solid var(--hair); border-top:3px solid transparent; color:var(--muted); } .mob-tab.focused { background:var(--bg); border-top-color:var(--accent); color:var(--ink); border-bottom:1px solid var(--bg); } .radio { width:18px; height:18px; flex:0 0 18px; border:1px solid var(--hair); border-radius:50%; background:var(--bg); position:relative; } .focused .radio { border-color:var(--accent); background:var(--accent); box-shadow:0 0 0 4px color-mix(in oklch, var(--accent) 18%, transparent); } .focused .radio::after { content:""; position:absolute; width:5px; height:5px; border-radius:50%; background:white; left:50%; top:50%; transform:translate(-50%, -50%); }
-    .mob-tab-main { min-width:0; flex:1; } .mob-tab-title { font-size:var(--type-card); font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; } .badge { border:1px solid var(--accent); color:var(--accent); padding:1px 5px; background:color-mix(in oklch, var(--accent) 8%, transparent); }
-    .focus-other { flex:0 0 170px; min-height:64px; display:grid; place-items:center; border-left:1px solid var(--ink); color:var(--ink); }
-    .hero { min-height:520px; display:grid; grid-template-rows:auto auto minmax(360px,1fr); border-bottom:1px solid var(--ink); } .identity { min-height:42px; display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding:8px 14px; border-bottom:1px solid var(--hair); } .identity h1 { margin:0; font-size:var(--type-heading); font-weight:500; flex:1 1 260px; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; } .identity .eyebrow, .identity .meta { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .chip { display:inline-flex; border:1px solid color-mix(in oklch, var(--accent) 35%, var(--hair)); color:var(--accent); padding:1px 6px; text-transform:none; } .chip.template { color:var(--muted); border-color:var(--hair); }
-    .timeline { display:grid; grid-template-columns:repeat(4,minmax(180px,1fr)); background:var(--surface); border-bottom:1px solid var(--hair); overflow-x:auto; } .phase { min-width:0; min-height:72px; display:flex; align-items:center; gap:10px; padding:10px 18px; border-right:1px solid var(--hair); } .phase span:last-child { min-width:0; overflow:hidden; text-overflow:ellipsis; } .disc { width:22px; height:22px; flex:0 0 22px; border:1px solid var(--hair); display:grid; place-items:center; border-radius:50%; font-family:var(--bs-font-mono); font-size:var(--type-rail); } .phase.done .disc { background:var(--ok); color:white; border-color:var(--ok); } .phase.active { background:color-mix(in oklch, var(--accent) 8%, transparent); color:var(--accent); } .phase.active .disc { background:var(--accent); color:white; border-color:var(--accent); }
-    .hero-body { min-height:0; display:grid; grid-template-columns:minmax(420px,1fr) minmax(280px,340px); align-items:stretch; } .flow { border-right:1px solid var(--hair); padding:24px; min-width:0; overflow:auto; } svg { width:100%; height:100%; min-width:520px; min-height:260px; } .agent { min-width:0; display:grid; grid-template-rows:minmax(0,1fr) minmax(0,1fr); } .agent-card { min-width:0; padding:18px; border-bottom:1px solid var(--hair); overflow:auto; } .agent-card h2 { margin:12px 0 4px; font-size:var(--type-heading); line-height:1.25; } .stats { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); border-top:1px solid var(--hair); border-bottom:1px solid var(--hair); margin:16px 0; } .stats div { min-width:0; padding:8px; border-right:1px solid var(--hair); overflow:hidden; text-overflow:ellipsis; } .file { display:flex; justify-content:space-between; gap:10px; padding:7px 0; border-bottom:1px solid var(--hair); } .file span { min-width:0; overflow:hidden; text-overflow:ellipsis; }
-    .lower { min-height:220px; display:grid; grid-template-columns:minmax(0,1.4fr) minmax(280px,1fr); border-top:1px solid var(--ink); } .activity, .lanes { min-width:0; padding:14px 18px; overflow:auto; } .activity { border-right:1px solid var(--hair); } .log-row { display:grid; grid-template-columns:minmax(64px,74px) minmax(60px,72px) minmax(0,1fr); gap:12px; padding:8px 0; border-bottom:1px solid var(--hair); font-size:var(--type-body); line-height:var(--line-compact); } .log-row span { min-width:0; overflow:hidden; text-overflow:ellipsis; } .bar { display:grid; grid-template-columns:repeat(8,minmax(72px,1fr)); min-height:32px; overflow-x:auto; border:1px solid var(--ink); margin:12px 0; } .bar span { display:grid; place-items:center; min-width:0; padding:0 6px; color:white; background:var(--accent); border-right:1px solid var(--bg); text-align:center; } .lane-row { display:grid; grid-template-columns:28px minmax(0,1fr) minmax(70px,88px) auto; gap:8px; padding:5px 0; border-bottom:1px solid var(--hair); } .lane-row span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .error { color:var(--crit); padding:8px 14px; margin:0; border-bottom:1px solid var(--crit); }
-    @media (max-height: 720px), (max-width: 980px) { body { min-height:100vh; overflow:auto; } .top-rail { flex-wrap:wrap; align-items:stretch; } .brand, .tabs, .refresh { flex:0 0 auto; } .kpis { order:2; flex:1 0 100%; border-top:1px solid var(--hair); } .picker { min-width:0; height:auto; } .picker-eye { flex:0 0 160px; } .mob-tab { flex:1 1 280px; } .hero { height:auto; min-height:0; grid-template-rows:auto auto auto; } .timeline { grid-template-columns:repeat(2,minmax(220px,1fr)); } .hero-body { grid-template-columns:1fr; } .flow { min-height:320px; border-right:0; border-bottom:1px solid var(--hair); } .agent { grid-template-columns:1fr 1fr; grid-template-rows:auto; } .lower { height:auto; min-height:220px; grid-template-columns:1fr; } .activity { border-right:0; border-bottom:1px solid var(--hair); } }
-    @media (max-width: 720px) { .top-rail { position:sticky; top:0; } .tabs { overflow-x:auto; max-width:100%; } .picker { min-width:0; height:auto; flex-direction:column; } .picker-eye, .focus-other { width:100%; flex-basis:auto; min-height:48px; border-right:0; border-left:0; } .mob-tab { min-width:0; min-height:64px; } .timeline { grid-template-columns:1fr; } .phase { min-height:64px; } .agent { grid-template-columns:1fr; } .stats { grid-template-columns:1fr; } .log-row { grid-template-columns:64px minmax(0,1fr); } .log-row span:last-child { grid-column:1 / -1; } }
-  </style>
-</head>
-<body data-bs-theme="paper">
-  <div class="top-rail"><a class="brand" href="/overview"><span class="mark"></span><span>MEERKAT FUGUE</span></a><nav class="tabs"><a class="active" href="/overview">OVERVIEW</a><a href="/issues">IMS</a><a href="/console">CONSOLE</a><a href="/ensemble">ENSEMBLE</a></nav><div class="spacer"></div><div class="kpis"><span>RUN <b>__RUNNING__</b></span><span>RETRY <b>__RETRYING__</b></span><span>TOK <b>__TOKENS__</b></span><span>T <b>__SECONDS__s</b></span><span>SHAD <b>__SHADOW__r</b></span><span>CON <b>__CONSOLE_HINT__</b></span></div><a class="refresh" href="/overview">↻</a></div>
-  __ERROR__
-  <section class="picker"><div class="picker-eye"><div class="eyebrow">FOCUS MOB</div><strong>__IN_FLIGHT_COUNT__</strong><span class="meta">in flight</span></div>__PICKER_TABS__<a class="focus-other mono" href="/issues">◇ FOCUS OTHER</a></section>
-
-  <main class="hero"><section class="identity"><span class="eyebrow">__FOCUS_IDENTIFIER__ · __FOCUS_LANE__</span><h1>__FOCUS_TITLE__</h1><span class="chip">__FOCUS_PHASE__</span><span class="chip template">fugue:template:planner-coder-reviewer</span><span class="meta">RUNTIME · __FOCUS_RUNTIME__</span><a class="meta" href="/issues">OPEN IMS</a><a class="meta" href="/console">CONSOLE</a></section><section class="timeline"><div class="phase done"><span class="disc">✓</span><span><span class="chip">fugue:phase:planning</span><br><span class="meta">done when runtime reports it</span></span></div><div class="phase active"><span class="disc">2</span><span><span class="chip">__FOCUS_PHASE__</span><br><span class="meta">active when mob is running</span></span></div><div class="phase"><span class="disc">3</span><span><span class="chip">fugue:phase:reviewing</span><br><span class="meta">pending</span></span></div><div class="phase"><span class="disc">4</span><span><span class="chip">fugue:phase:finalizing</span><br><span class="meta">pending</span></span></div></section><section class="hero-body"><div class="flow"><svg viewBox="0 0 760 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="actual Fugue mob topology: issue lead hub, planner coder reviewer worker mesh, and repo handoff"><defs><marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#D95A1E"/></marker><marker id="arr-ok" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#3E6B4F"/></marker></defs><g font-family="JetBrains Mono,monospace" font-size="11"><rect x="24" y="34" width="148" height="58" fill="#ECEAE4" stroke="#A8A49B"/><text x="38" y="58" fill="#6B6760">REPO MOB</text><text x="38" y="80" font-family="Inter,sans-serif" font-size="14" font-weight="600" fill="#1C1A17">Kapellmeister</text><rect x="296" y="24" width="168" height="72" fill="#F5E6DF" stroke="#D95A1E"/><text x="312" y="50" fill="#D95A1E">ISSUE COORDINATOR</text><text x="312" y="75" font-family="Inter,sans-serif" font-size="16" font-weight="600" fill="#1C1A17">Issue lead</text><text x="312" y="90" fill="#6B6760">Linear lane + Workpad</text><rect x="72" y="174" width="148" height="70" fill="#F6F4EE" stroke="#3E6B4F"/><text x="88" y="198" fill="#3E6B4F">PLANNER</text><text x="88" y="222" font-family="Inter,sans-serif" font-size="14" font-weight="600" fill="#1C1A17">Plan</text><rect x="306" y="174" width="148" height="70" fill="#F5E6DF" stroke="#D95A1E"/><text x="322" y="198" fill="#D95A1E">CODER</text><text x="322" y="222" font-family="Inter,sans-serif" font-size="14" font-weight="600" fill="#1C1A17">Implement</text><rect x="540" y="174" width="148" height="70" fill="#F6F4EE" stroke="#3E6B4F"/><text x="556" y="198" fill="#3E6B4F">REVIEWER</text><text x="556" y="222" font-family="Inter,sans-serif" font-size="14" font-weight="600" fill="#1C1A17">Gate</text><rect x="566" y="34" width="160" height="58" fill="#ECEAE4" stroke="#3E6B4F" stroke-dasharray="4 4"/><text x="582" y="58" fill="#3E6B4F">PR HANDOFF</text><text x="582" y="80" font-family="Inter,sans-serif" font-size="14" font-weight="600" fill="#1C1A17">Repo boundary</text><path d="M172 63 L296 60" stroke="#A8A49B" stroke-width="1.4" marker-end="url(#arr)"/><path d="M296 70 L172 72" stroke="#A8A49B" stroke-width="1.4" marker-end="url(#arr)"/><path d="M350 96 L168 174" stroke="#D95A1E" stroke-width="1.2" marker-end="url(#arr)"/><path d="M380 96 L380 174" stroke="#D95A1E" stroke-width="1.2" marker-end="url(#arr)"/><path d="M410 96 L592 174" stroke="#D95A1E" stroke-width="1.2" marker-end="url(#arr)"/><path d="M220 202 L306 202" stroke="#3E6B4F" stroke-width="1.4" marker-end="url(#arr-ok)"/><path d="M454 202 L540 202" stroke="#3E6B4F" stroke-width="1.4" marker-end="url(#arr-ok)"/><path d="M160 244 C250 286 510 286 600 244" stroke="#A8A49B" stroke-width="1.1" stroke-dasharray="4 4" fill="none" marker-end="url(#arr)"/><path d="M200 174 C285 130 475 130 560 174" stroke="#A8A49B" stroke-width="1.1" stroke-dasharray="4 4" fill="none" marker-end="url(#arr)"/><path d="M632 174 L646 92" stroke="#3E6B4F" stroke-width="1.4" stroke-dasharray="4 4" marker-end="url(#arr-ok)"/><text x="252" y="152" fill="#6B6760">issue lead wires every worker</text><text x="254" y="270" fill="#6B6760">worker peer mesh: planner↔coder · planner↔reviewer · coder↔reviewer</text><text x="70" y="116" fill="#6B6760">repo lead ↔ issue lead</text><text x="468" y="116" fill="#6B6760">review green → PR/check handoff</text></g></svg></div><aside class="agent"><div class="agent-card"><span class="eyebrow">ACTIVE AGENT <span class="badge">● RUNTIME</span></span><h2>__ACTIVE_ROLE__</h2><div class="meta">live state snapshot</div><div class="stats"><div><span class="meta">Runtime</span><br>__FOCUS_RUNTIME__</div><div><span class="meta">Tokens</span><br>__TOKENS__</div><div><span class="meta">Turn</span><br>runtime</div></div><div class="meta">CURRENT ACTION</div><p>→ __CURRENT_ACTION__</p><p class="meta">No live topology/workpad diff stream is exposed yet; showing runtime snapshot evidence only.</p></div><div class="agent-card"><span class="eyebrow">WORKPAD · RUNTIME EVIDENCE</span>__WORKPAD_FILES__</div></aside></section></main>
-
-  <section class="lower"><div class="activity"><div class="eyebrow">RUNTIME · LAST EVENTS · TAIL -f</div>__ACTIVITY_ROWS__</div><div class="lanes"><div class="eyebrow">8 LANES · ISSUES</div><div class="bar"><span>Backlog</span><span>Queue</span><span>Active</span><span>Review</span><span>Deploy</span><span>Blocked</span><span>Done</span><span>Canceled</span></div><div class="lane-row"><span>◇</span><span>Review</span><span class="meta">▸ ACTION</span><span class="meta">see IMS</span></div><div class="lane-row"><span>↑</span><span>Deploy</span><span class="meta">▸ ACTION</span><span class="meta">see IMS</span></div><div class="lane-row"><span>≋</span><span>Ensemble</span><span class="meta">▸ LOCAL</span><a class="meta" href="/ensemble">open teams</a></div></div></section>
-</body>
-</html>"##;
-    html.replace("__RUNNING__", &view.running.to_string())
-        .replace("__RETRYING__", &view.retrying.to_string())
-        .replace("__TOKENS__", &view.tokens.to_string())
-        .replace("__SECONDS__", &format!("{:.1}", view.seconds))
-        .replace("__SHADOW__", &view.shadow_recommendations.to_string())
-        .replace("__ERROR__", &error)
-        .replace("__IN_FLIGHT_COUNT__", &view.in_flight_count.to_string())
-        .replace("__PICKER_TABS__", &view.picker_tabs)
-        .replace("__FOCUS_IDENTIFIER__", &html_escape(&view.focus_identifier))
-        .replace("__FOCUS_TITLE__", &html_escape(&view.focus_title))
-        .replace(
-            "__FOCUS_LANE__",
-            &html_escape(&view.focus_lane.to_ascii_uppercase()),
-        )
-        .replace("__FOCUS_RUNTIME__", &html_escape(&view.focus_runtime))
-        .replace(
-            "__FOCUS_PHASE__",
-            &html_escape(&phase_label_for_runtime_state(&view.focus_lane)),
-        )
-        .replace("__ACTIVE_ROLE__", &html_escape(&view.active_role))
-        .replace("__CURRENT_ACTION__", &html_escape(&view.current_action))
-        .replace("__WORKPAD_FILES__", &view.workpad_files)
-        .replace("__ACTIVITY_ROWS__", &view.activity_rows)
-        .replace("__CONSOLE_HINT__", console_hint)
+            .map(|repo| format!("{}/{}/{}", repo.hostname(), repo.owner.0, repo.name.0))
+            .collect(),
+    })
+    .into_response()
 }
 
 async fn issues_board(State(app): State<AppState>, headers: HeaderMap) -> axum::response::Response {
@@ -756,9 +567,7 @@ fn create_issue_editor_html(lane_options: &str) -> String {
         "createDescription",
         Some("description"),
         "Description",
-        Some(
-            "Write the issue in Markdown. Attachments are submitted to the create API for explicit backend handling.",
-        ),
+        Some("Describe the change, the expected result, and how to verify it."),
         "",
     );
     format!(
@@ -782,7 +591,7 @@ fn create_issue_editor_html(lane_options: &str) -> String {
               <span>Attach files</span>
               <input id="createAttachments" name="attachments" type="file" multiple>
             </label>
-            <span>Attachments upload after issue creation and are persisted as issue attachment comments.</span>
+            <span>Add screenshots, logs, or other files that help explain the issue.</span>
           </div>
           <div class="attachment-drop-affordance" aria-hidden="true">Drop files here to attach them</div>
           <div class="create-attachments" id="createAttachmentList" aria-live="polite"></div>
@@ -809,10 +618,13 @@ fn create_issue_lane_options(config: &ServiceConfig) -> String {
 
 fn render_issues_board_html(config: &ServiceConfig) -> String {
     let lane_options = create_issue_lane_options(config);
-    ISSUES_BOARD_HTML.replace(
-        "__FUGUE_CREATE_EDITOR__",
-        &create_issue_editor_html(&lane_options),
-    )
+    let html = ISSUES_BOARD_HTML
+        .replace("__FUGUE_TRACKER_SCOPE__", &config.tracker_context_id())
+        .replace(
+            "__FUGUE_CREATE_EDITOR__",
+            &create_issue_editor_html(&lane_options),
+        );
+    inject_app_chrome(&html, AppPage::Work, true).unwrap_or(html)
 }
 
 async fn issue_detail_page(
@@ -823,7 +635,9 @@ async fn issue_detail_page(
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
-    Html(ISSUE_DETAIL_HTML).into_response()
+    let html =
+        ISSUE_DETAIL_HTML.replace("__FUGUE_TRACKER_SCOPE__", &app.config.tracker_context_id());
+    Html(inject_app_chrome(&html, AppPage::Work, true).unwrap_or(html)).into_response()
 }
 
 async fn ensemble_page(
@@ -847,8 +661,9 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Fugue IMS</title>
+  <title>Work queue | Fugue</title>
   <style>
+    #createSubmit[hidden] { display: none; }
     :root {
       color-scheme: light;
       --bs-paper: #ECEAE4;
@@ -1463,10 +1278,11 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       <div class="rail-kpis" aria-label="Runtime metrics"><span>RUN <b id="kpiRun">—</b></span><span>RETRY <b id="kpiRetry">—</b></span><span>TOK <b id="kpiTok">unavailable</b></span><span>T <b id="kpiTime">unavailable</b></span><span>SHAD <b id="kpiShad">unavailable</b></span></div>
       <button class="rail-refresh" id="refresh" type="button" title="Refresh" aria-label="Refresh">↻</button>
     </header>
+    <section class="work-heading"><div><h1>Work queue</h1><p id="queueConnection">Loading queue connection...</p></div><div class="fugue-actions"><a class="fugue-button" href="/ensemble">Repository teams</a><a class="fugue-button" data-fugue-agents-link href="/console">Open agent console</a></div></section>
     <section class="lane-ribbon" id="laneRibbon" aria-label="Lane filter ribbon"></section>
     <section class="toolbar sub-toolbar">
       <div class="summary" id="summary"><span><span class="metric">0</span> shown</span></div>
-      <div class="toolbar-actions"><button class="active" type="button">VIEW: BOARD</button><button type="button">VIEW: LIST</button><label class="command" for="search"><span class="kbd">/</span><input id="search" autocomplete="off" placeholder="to search…"></label><button id="newIssue" type="button">+ NEW</button><button class="icon ghost" id="shortcutButton" type="button" title="Shortcuts" aria-label="Shortcuts">?</button><span class="updated" id="selectionHint"></span></div>
+      <div class="toolbar-actions"><label class="command" for="search"><span class="kbd">/</span><input id="search" autocomplete="off" placeholder="to search…"></label><button id="newIssue" type="button" class="primary">+ New issue</button><button class="icon ghost" id="shortcutButton" type="button" title="Shortcuts" aria-label="Shortcuts">?</button><span class="updated" id="selectionHint"></span></div>
     </section>
     <section class="create-panel" id="createPanel" aria-label="Create issue">
       __FUGUE_CREATE_EDITOR__
@@ -1534,6 +1350,11 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
     const createCancel = document.getElementById("createCancel");
     const createError = document.getElementById("createError");
     const createAttachmentState = [];
+    let createdIssueReceipt = null;
+    let creationWarning = null;
+    const trackerScope = "__FUGUE_TRACKER_SCOPE__";
+    let creationUploadBlocked = false;
+    const creationReceiptKey = `fugue.created-issue:v2:${location.pathname}:${trackerScope}`;
     const detailAttachmentState = [];
     const maxCreateAttachmentCount = 20;
     const maxCreateAttachmentBytes = 25 * 1024 * 1024;
@@ -1586,10 +1407,11 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
     };
 
     const api = async (url, options = {}) => {
-      const response = await fetch(url, {
+      const response = await fugueFetch(url, {
         ...options,
         headers: {
           "Accept": "application/json",
+          "X-Fugue-Tracker-Scope": trackerScope,
           ...(options.body ? { "Content-Type": "application/json" } : {}),
           ...(options.headers || {}),
         },
@@ -1609,12 +1431,13 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
     };
 
 
-    const isActionLane = (name) => name === "Review" || name === "Deploy";
+    const isActionLane = (name) => app.board?.lanes.find(lane=>lane.name===name)?.action;
     const laneGlyph = (name) => ({
       Backlog: "○",
       Queue: "◉",
       Active: "◐",
       Review: "◇",
+      Merge: "↑",
       Deploy: "↑",
       Blocked: "!",
       Done: "✓",
@@ -1627,6 +1450,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
 
     const runtimePill = (runtime) => {
       if (!runtime) return "";
+      if (runtime.launch_failure) return `<span class="pill retry" title="${escapeHtml(runtime.launch_failure.message)}">Team startup failed</span>`;
       if (runtime.kind === "running") {
         const turns = runtime.turn_count === 1 ? "1 turn" : `${runtime.turn_count} turns`;
         return `<span class="pill run">Running &middot; ${escapeHtml(turns)}</span>`;
@@ -1637,7 +1461,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       return "";
     };
 
-    const runtimeKind = (runtime) => runtime ? runtime.kind : "none";
+    const runtimeKind = (runtime) => runtime?.launch_failure ? "launch_failed" : runtime ? runtime.kind : "none";
     const newtype = (value) => value && typeof value === "object" && "0" in value ? value["0"] : value;
     const issueByIdentifier = (identifier) => app.flatIssues.find((issue) => issue.identifier === identifier);
     const selectedIssueList = () => [...app.selectedIssues].map(issueByIdentifier).filter(Boolean);
@@ -1658,13 +1482,13 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       const selected = issue.identifier === app.selected ? " selected" : "";
       const multiSelected = app.selectedIssues.has(issue.identifier) ? " multi-selected" : "";
       // rework-note: non-running issue cards do not have measured turn evidence in this payload; avoid rendering a fabricated zero-turn count.
-      const turns = issue.runtime?.kind === "running" ? `${escapeHtml(issue.runtime.turn_count)}t` : "turns unavailable";
+      const turns = running ? `${escapeHtml(issue.runtime.turn_count)}t` : "";
       return `
         <button class="card${selected}${multiSelected}" data-issue="${escapeHtml(issue.identifier)}" data-runtime="${runtimeKind(issue.runtime)}" draggable="true" type="button">
           <div class="keyrow"><span class="key">${escapeHtml(issue.identifier)}</span>${priority}</div>
           <div class="title">${escapeHtml(issue.title)}</div>
           <div class="meta">${labels}</div>
-          <div class="footer"><span class="${running ? "run-state" : ""}">${running ? '<span class="run-dot"></span>Running · ' : ""}${turns}</span><span>${updated ? escapeHtml(updated) : ""}</span></div>
+          <div class="footer"><span class="${running ? "run-state" : ""}">${issue.runtime?.launch_failure ? "Team startup failed" : running ? '<span class="run-dot"></span>Running · ' : ""}${turns}</span><span>${updated ? escapeHtml(updated) : ""}</span></div>
         </button>
       `;
     };
@@ -1672,11 +1496,8 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
     const renderLane = (lane) => {
       const issues = lane.issues.filter(issueMatchesFilter);
       const action = isActionLane(lane.name);
-      if (!issues.length && !action) {
-        return `<section class="lane empty-strip" data-lane="${escapeHtml(lane.name)}" data-kind="${escapeHtml(lane.kind)}"><div class="lane-head">${laneGlyph(lane.name)}</div><div class="rotated">${escapeHtml(lane.name)} · 0</div></section>`;
-      }
-      const cards = issues.length ? issues.map(renderIssue).join("") : '<div class="empty action-drop">empty · action drop target</div>';
-      const hint = action ? `<div class="lane-action-hint">▸ Drop to run ${lane.name.toLowerCase()} procedure</div>` : "";
+      const cards = issues.length ? issues.map(renderIssue).join("") : '<div class="empty">No issues in this lane</div>';
+      const hint = action ? `<div class="lane-action-hint">▸ Drop to run ${escapeHtml(lane.action)} procedure</div>` : "";
       return `
         <section class="lane full ${lane.name === "Active" && issues.length ? "active-lane" : ""}" data-lane="${escapeHtml(lane.name)}" data-kind="${escapeHtml(lane.kind)}">
           <div class="lane-head"><div class="lane-title"><span aria-hidden="true">${laneGlyph(lane.name)}</span><strong>${escapeHtml(lane.name)}</strong></div><span class="count">${issues.length}</span></div>
@@ -1806,7 +1627,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
 
     const openFullDetail = (identifier = app.selected) => {
       if (!identifier) return;
-      window.location.href = `/issues/${encodeURIComponent(identifier)}`;
+      window.fugueNavigate(`/issues/${encodeURIComponent(identifier)}`);
     };
 
     const renderDetail = () => {
@@ -1818,8 +1639,9 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
         `<option value="${escapeHtml(lane)}" ${lane === issue.state.name ? "selected" : ""}>${escapeHtml(lane)}</option>`
       ).join("");
       const labels = issue.labels.map((label) => `<span class="pill">${escapeHtml(label)}</span>`).join("");
-      const comments = detail.comments.length
-        ? detail.comments.map(renderComment).join("")
+      const activity = detail.comments.filter(comment => newtype(comment.comment_id) !== newtype(detail.workpad?.comment_id));
+      const comments = activity.length
+        ? activity.map(renderComment).join("")
         : '<div class="empty">No comments</div>';
       drawerInner.innerHTML = `
         <div class="drawer-head">
@@ -1833,7 +1655,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
           <section class="section">
             <div class="section-head">
               <h3>Issue</h3>
-              ${issue.url ? `<a class="pill" href="${escapeHtml(issue.url)}">Open Linear</a>` : ""}
+              ${/^https?:\/\//.test(issue.url || "") ? `<a class="pill" href="${escapeHtml(issue.url)}" target="_blank" rel="noopener">Open in tracker</a>` : ""}
             </div>
             <div class="fields">
               <div class="field"><span>Status</span><strong>${escapeHtml(issue.state.name)}</strong></div>
@@ -1855,11 +1677,11 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
             <div class="description">${escapeHtml(issue.description || "No description")}</div>
           </section>
           <section class="section">
-            <div class="section-head"><h3>Workpad</h3></div>
+            <details><summary>Agent workpad</summary>
             <textarea id="workpadEditor" class="issue-markdown-editor" spellcheck="false">${escapeHtml(workpad)}</textarea>
             <div class="editor-actions">
               <button id="saveWorkpad" class="primary" type="button">Save Workpad</button>
-            </div>
+            </div></details>
           </section>
           <section class="section attachment-drop-zone" id="detailAttachmentDropZone" data-attachment-drop-zone aria-label="Drop files to attach them to this issue">
             <div class="section-head"><h3>Attachments</h3></div>
@@ -1920,7 +1742,10 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
         : `<span class="updated">${escapeHtml(emptyLabel)}</span>`;
     };
 
-    const renderCreateAttachments = () => renderAttachmentList(createAttachmentList, createAttachmentState, "No attachments selected.");
+    const renderCreateAttachments = () => {
+      renderAttachmentList(createAttachmentList, createAttachmentState, "No attachments selected.");
+      syncCreateControls();
+    };
     const renderDetailAttachments = () => renderAttachmentList(document.getElementById("detailAttachmentList"), detailAttachmentState, "No attachments added for this issue editor.");
 
     const dataTransferHasFiles = (event) => Array.from(event.dataTransfer?.types || []).includes("Files");
@@ -2016,63 +1841,179 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       for (const attachment of attachments) {
         form.append("attachments", attachment.file, attachment.name);
       }
-      const response = await fetch(`/api/v1/issues/${encodeURIComponent(identifier)}/attachments`, {
-        method: "POST",
-        headers: { "Accept": "application/json" },
-        body: form,
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(payload?.error?.message || `Attachment upload failed: ${response.status}`);
-      }
-      const message = `Attached ${payload.attachments?.length || attachments.length} file(s).`;
+      const payload = await fugueIssueMutation(`/api/v1/issues/${encodeURIComponent(identifier)}/attachments`, {
+        method: "POST", headers: {"Accept":"application/json", "X-Fugue-Tracker-Scope":trackerScope}, body: form,
+      }, {kind:"upload", fileCount:attachments.length});
+      const message = payload.warning?.message || `Attached ${payload.attachments?.length || attachments.length} file(s).`;
       if (errorTarget) errorTarget.textContent = message;
       showNotice(message);
       return payload;
     };
 
+    const syncCreateControls = () => {
+      const created = !!createdIssueReceipt;
+      for (const field of [createTitle, createDescription, createLane]) field.disabled = created;
+      createSubmit.textContent = created ? "Retry attachments" : "Create issue";
+      createSubmit.hidden = created && (creationUploadBlocked || !createAttachmentState.length);
+      createCancel.textContent = created ? "Done" : "Cancel";
+    };
+
+    const creationReceipt = (issue) => {
+      if (!issue || typeof issue.id !== "string" || !issue.id || typeof issue.identifier !== "string" || !issue.identifier) {
+        throw new Error("Creation returned no usable issue reference. Check your tracker before creating the issue again.");
+      }
+      return {id: issue.id, identifier: issue.identifier};
+    };
+
+    const saveCreationReceipt = () => {
+      try {
+        if (createdIssueReceipt) {
+          sessionStorage.setItem(creationReceiptKey, JSON.stringify({
+            issue: createdIssueReceipt, warning: creationWarning, uploadBlocked: creationUploadBlocked,
+            title: createTitle.value, description: createDescription.value, lane: createLane.value,
+          }));
+        } else {
+          sessionStorage.removeItem(creationReceiptKey);
+        }
+        return true;
+      } catch (error) {
+        console.warn("Could not persist the issue creation receipt", error);
+        return false;
+      }
+    };
+
+    const showCreatedIssue = (message) => {
+      createError.replaceChildren(document.createTextNode(message + " "));
+      const link = document.createElement("a");
+      link.href = fugueUrl(`/issues/${encodeURIComponent(createdIssueReceipt.identifier)}`);
+      link.textContent = `Open ${createdIssueReceipt.identifier}`;
+      createError.append(link);
+      syncCreateControls();
+    };
+
     const resetCreateForm = () => {
+      createdIssueReceipt = null;
+      creationWarning = null;
+      creationUploadBlocked = false;
+      saveCreationReceipt();
       createForm.reset();
       createAttachmentState.length = 0;
       renderCreateAttachments();
     };
 
+    const restoreCreationReceipt = () => {
+      try {
+        const saved = JSON.parse(sessionStorage.getItem(creationReceiptKey) || "null");
+        if (!saved) return;
+        createdIssueReceipt = creationReceipt(saved.issue);
+        creationUploadBlocked = saved.uploadBlocked === true;
+        creationWarning = typeof saved.warning === "string" ? saved.warning : null;
+        createTitle.value = typeof saved.title === "string" ? saved.title : "";
+        createDescription.value = typeof saved.description === "string" ? saved.description : "";
+        createLane.value = typeof saved.lane === "string" ? saved.lane : createLane.value;
+        createPanel.classList.add("open");
+        showCreatedIssue(creationWarning || `Created ${createdIssueReceipt.identifier}. Re-select any files that still need uploading, or choose Done.`);
+      } catch (error) {
+        console.warn("Could not read the saved issue creation receipt", error);
+        showNotice("Saved creation details could not be read. Check your tracker before creating the issue again.");
+      }
+    };
+
     const createIssue = async () => {
+      if (createSubmit.disabled || creationUploadBlocked) return;
       const title = createTitle.value.trim();
-      const lane = createLane.value;
       createError.textContent = "";
-      if (!title) {
+      if (!createdIssueReceipt && !title) {
         createError.textContent = "Title is required.";
         createTitle.focus();
         return;
       }
+      if (createdIssueReceipt && !createAttachmentState.length) {
+        showCreatedIssue(creationWarning || `Created ${createdIssueReceipt.identifier}. Choose Done or open the issue.`);
+        return;
+      }
       createSubmit.disabled = true;
+      createCancel.disabled = true;
+      newIssue.disabled = true;
       try {
-        const payload = await api("/api/v1/issues", {
-          method: "POST",
-          body: JSON.stringify({
-            title,
-            description: createDescription.value,
-            lane,
-            attachments: createAttachmentPayload(),
-          }),
-        });
-        const createdIdentifier = payload.issue?.identifier;
-        if (createdIdentifier && createAttachmentState.length) {
-          await uploadIssueAttachments(createdIdentifier, createAttachmentState, createError);
+        if (!createdIssueReceipt) {
+          const payload = await api("/api/v1/issues", {
+            method: "POST",
+            body: JSON.stringify({
+              title,
+              description: createDescription.value,
+              lane: createLane.value,
+              attachments: createAttachmentPayload(),
+            }),
+          });
+          createdIssueReceipt = creationReceipt(payload.created_issue || {
+            id: payload.issue?.issue_id,
+            identifier: payload.issue?.identifier,
+          });
+          creationWarning = typeof payload.warning?.message === "string" ? payload.warning.message : null;
+          if (!saveCreationReceipt()) {
+            creationWarning = `Created ${createdIssueReceipt.identifier}. Keep this tab open until you finish; its recovery details could not be saved.`;
+          }
+          syncCreateControls();
+        }
+        const createdIdentifier = createdIssueReceipt.identifier;
+        if (createAttachmentState.length) {
+          const pending = createAttachmentState.slice();
+          const previousWarning = creationWarning;
+          creationUploadBlocked = true;
+          creationWarning = "The upload is not confirmed. Check the existing issue before uploading any files again.";
+          if (!saveCreationReceipt()) throw Object.assign(new Error(creationWarning + " Recovery details could not be saved."), {uploadUncertain:true});
+          let upload;
+          try { upload = await uploadIssueAttachments(createdIdentifier, pending, createError); }
+          catch (error) {
+            if (error.confirmedRejected) {
+              creationUploadBlocked = false;
+              creationWarning = previousWarning;
+              saveCreationReceipt();
+            }
+            throw error;
+          }
+          creationUploadBlocked = false;
+          creationWarning = previousWarning;
+          saveCreationReceipt();
+          if (upload?.warning) {
+            creationWarning = upload.warning.message;
+            creationUploadBlocked = true;
+            saveCreationReceipt();
+          }
+          for (const attachment of pending) {
+            const index = createAttachmentState.indexOf(attachment);
+            if (index >= 0) createAttachmentState.splice(index, 1);
+          }
+          renderCreateAttachments();
+        }
+        app.selected = createdIdentifier;
+        if (creationWarning || createAttachmentState.length) {
+          showCreatedIssue(creationWarning || `Created ${createdIdentifier}. Upload the remaining attachments or choose Done.`);
+          await loadBoard();
+          return;
         }
         resetCreateForm();
         createPanel.classList.remove("open");
-        if (createdIdentifier) {
-          app.selected = createdIdentifier;
-        }
         await loadBoard();
-        showNotice(`Created ${createdIdentifier || "issue"}.`);
+        showNotice(`Created ${createdIdentifier}.`);
       } catch (error) {
-        createError.textContent = error.message;
+        if (createdIssueReceipt) {
+          if (error.uploadUncertain) {
+            creationUploadBlocked = true;
+            creationWarning = error.message;
+            saveCreationReceipt();
+          }
+          showCreatedIssue(`${creationWarning || `Created ${createdIssueReceipt.identifier}.`} ${error.message}${creationUploadBlocked ? "" : " Retry attachments here or open the existing issue."}`);
+        } else {
+          createError.textContent = error.message;
+        }
         showNotice(error.message);
       } finally {
         createSubmit.disabled = false;
+        createCancel.disabled = false;
+        newIssue.disabled = false;
+        syncCreateControls();
       }
     };
 
@@ -2294,11 +2235,12 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       renderBoard();
     });
     newIssue.addEventListener("click", () => {
-      createError.textContent = "";
+      if (!createdIssueReceipt) createError.textContent = "";
       createPanel.classList.toggle("open");
       if (createPanel.classList.contains("open")) createTitle.focus();
     });
     createCancel.addEventListener("click", () => {
+      if (createdIssueReceipt) resetCreateForm();
       createPanel.classList.remove("open");
       createError.textContent = "";
     });
@@ -2311,6 +2253,7 @@ const ISSUES_BOARD_HTML: &str = r#"<!doctype html>
       errorTarget: createError,
     });
     renderCreateAttachments();
+    restoreCreationReceipt();
     createForm.addEventListener("submit", async (event) => {
       event.preventDefault();
       await createIssue();
@@ -2417,7 +2360,7 @@ const ISSUE_DETAIL_HTML: &str = r#"<!doctype html>
   <div class="top-rail"><a class="brand" href="/overview"><span class="mark"></span><span>MEERKAT FUGUE</span></a><nav class="tabs"><a href="/overview">OVERVIEW</a><a class="active" href="/issues">IMS</a><a href="/console">CONSOLE</a><a href="/ensemble">ENSEMBLE</a></nav><div class="spacer"></div><div class="kpis"><span>RUN&nbsp;<b id="kpiRun">—</b></span><span>RETRY&nbsp;<b id="kpiRetry">—</b></span><span>TOK&nbsp;<b id="kpiTok">—</b></span><span>T&nbsp;<b id="kpiTime">unavailable</b></span><span>SHAD&nbsp;<b id="kpiShadow">unavailable</b></span></div></div>
   <div class="notice" id="notice"></div>
   <main class="sheet" id="sheet">
-    <header class="sheet-head"><div class="state-chip" id="stateChip">◐ RUNNING</div><div class="issue-id" id="issueId">ISSUE</div><div class="sheet-title" id="title">loading…</div><div class="dirty" id="dirtyFlag" hidden>● UNSAVED · 1 CHANGE</div><button class="close" id="close" type="button">×</button></header>
+    <header class="sheet-head"><div class="state-chip" id="stateChip">Loading</div><div class="issue-id" id="issueId">ISSUE</div><div class="sheet-title" id="title">loading…</div><div class="dirty" id="dirtyFlag" hidden>● UNSAVED · 1 CHANGE</div><button class="close" id="close" type="button">×</button></header>
     <section class="body"><aside class="props" id="props"></aside><section class="middle" id="middle"><div class="meta">loading…</div></section><aside class="lanes" id="lanePicker"></aside></section>
     <footer class="footer"><div class="diff" id="diff">No changes</div><button class="cancel" id="cancel" type="button">CANCEL <span class="meta">ESC</span></button><button class="save" id="save" type="button" disabled>SAVE CHANGES <span class="meta">⌘S</span></button></footer>
   </main>
@@ -2427,30 +2370,236 @@ const ISSUE_DETAIL_HTML: &str = r#"<!doctype html>
   let detail = null; let targetLane = null; const issueAttachmentState = []; const commentAttachmentState = []; const maxAttachmentCount = 20; const maxAttachmentBytes = 25 * 1024 * 1024; const maxAttachmentTotalBytes = 100 * 1024 * 1024;
   const escapeHtml = (value) => String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;");
   const newtype = (value) => value && typeof value === "object" && "0" in value ? value["0"] : value;
-  const api = async (url, options = {}) => { const response = await fetch(url, { ...options, headers: { "Accept":"application/json", ...(options.body ? {"Content-Type":"application/json"} : {}), ...(options.headers || {}) }}); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload?.error?.message || `Request failed: ${response.status}`); return payload; };
+  const trackerScope = "__FUGUE_TRACKER_SCOPE__";
+  const api = async (url, options = {}) => { const response = await fugueFetch(url, { ...options, headers: { "Accept":"application/json", "X-Fugue-Tracker-Scope":trackerScope, ...(options.body ? {"Content-Type":"application/json"} : {}), ...(options.headers || {}) }}); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload?.error?.message || `Request failed: ${response.status}`); return payload; };
   const showNotice = (message) => { $("notice").textContent = message; $("notice").style.display = "block"; };
   const clearNotice = () => { $("notice").textContent = ""; $("notice").style.display = "none"; };
-  const laneGlyph = (name) => ({Backlog:"○", Queue:"◉", Active:"◐", Review:"◇", Deploy:"↑", Blocked:"!", Done:"✓", Canceled:"×"}[name] || "○");
-  const isAction = (lane) => lane === "Review" || lane === "Deploy";
-  const renderKpis = () => { const runtime = detail.runtime; $("kpiTime").textContent = "unavailable"; $("kpiShadow").textContent = "unavailable"; if (!runtime) { $("kpiRun").textContent = "unavailable"; $("kpiRetry").textContent = "unavailable"; $("kpiTok").textContent = "unavailable"; return; } if (runtime.kind === "running") { $("kpiRun").textContent = "1"; $("kpiRetry").textContent = "0"; $("kpiTok").textContent = String(runtime.token_total ?? "unavailable"); return; } if (runtime.kind === "retrying") { $("kpiRun").textContent = "0"; $("kpiRetry").textContent = String(runtime.attempt ?? "1"); $("kpiTok").textContent = "unavailable"; return; } $("kpiRun").textContent = "unavailable"; $("kpiRetry").textContent = "unavailable"; $("kpiTok").textContent = "unavailable"; };
+  const laneGlyph = (name) => ({Backlog:"○", Queue:"◉", Active:"◐", Review:"◇", Merge:"↑", Deploy:"↑", Blocked:"!", Done:"✓", Canceled:"×"}[name] || "○");
+  const isAction = (lane) => detail?.lane_actions?.[lane];
+  const renderKpis = () => { const runtime = detail.runtime; $("kpiTime").textContent = "unavailable"; $("kpiShadow").textContent = "unavailable"; if (!runtime) { $("kpiRun").textContent = "unavailable"; $("kpiRetry").textContent = "unavailable"; $("kpiTok").textContent = "unavailable"; return; } if (runtime.launch_failure) { $("kpiRun").textContent = "0"; $("kpiRetry").textContent = "0"; $("kpiTok").textContent = String(runtime.token_total ?? "unavailable"); return; } if (runtime.kind === "running") { $("kpiRun").textContent = "1"; $("kpiRetry").textContent = "0"; $("kpiTok").textContent = String(runtime.token_total ?? "unavailable"); return; } if (runtime.kind === "retrying") { $("kpiRun").textContent = "0"; $("kpiRetry").textContent = String(runtime.attempt ?? "1"); $("kpiTok").textContent = "unavailable"; return; } $("kpiRun").textContent = "unavailable"; $("kpiRetry").textContent = "unavailable"; $("kpiTok").textContent = "unavailable"; };
   const formatFileSize = (bytes) => bytes < 1024 ? `${bytes} B` : bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KiB` : `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
   const attachmentCommentId = (attachment) => newtype(attachment?.source?.Comment?.comment_id ?? attachment?.source?.comment?.comment_id ?? attachment?.source?.comment_id ?? null);
   const persistedCommentAttachments = (commentId) => (detail.attachments || []).filter((attachment) => attachmentCommentId(attachment) === commentId);
-  const renderPersistedAttachmentChip = (attachment) => { const label = attachment.title || attachment.url || "attachment"; const size = attachment.byte_len ? ` · ${escapeHtml(formatFileSize(attachment.byte_len))}` : ""; return `<a class="attachment-chip" href="${escapeHtml(attachment.url)}" target="_blank" rel="noopener">${escapeHtml(label)}${size}</a>`; };
+  const renderPersistedAttachmentChip = (attachment) => { const label = attachment.title || attachment.url || "attachment"; const size = attachment.byte_len ? ` · ${escapeHtml(formatFileSize(attachment.byte_len))}` : ""; return `<a class="attachment-chip" href="${escapeHtml(fugueUrl(attachment.url))}" target="_blank" rel="noopener">${escapeHtml(label)}${size}</a>`; };
   const renderComment = (comment) => { const attachments = persistedCommentAttachments(newtype(comment.comment_id)); const chips = attachments.length ? `<div class="attachment-list comment-attachments" aria-label="Comment attachments">${attachments.map(renderPersistedAttachmentChip).join("")}</div>` : ""; return `<article class="comment"><span class="meta">${escapeHtml(newtype(comment.comment_id))}</span><br>${escapeHtml(comment.body_markdown)}${chips}</article>`; };
   const dataTransferHasFiles = (event) => Array.from(event.dataTransfer?.types || []).includes("Files");
   const renderIssueAttachments = () => { const list = $("issueAttachmentList"); if (!list) return; const persistedHtml = (detail.attachments || []).map(renderPersistedAttachmentChip).join(""); const pendingHtml = issueAttachmentState.length ? issueAttachmentState.map((attachment) => `<span class="attachment-chip">${escapeHtml(attachment.name)} · ${escapeHtml(formatFileSize(attachment.size))}</span>`).join("") : ""; list.innerHTML = persistedHtml || pendingHtml ? `${persistedHtml}${pendingHtml}` : '<span class="meta">No attachments added for this issue editor.</span>'; };
   const validateIssueAttachment = (file, state = issueAttachmentState) => { if (state.length >= maxAttachmentCount) throw new Error("At most 20 attachments can be added."); if (file.size > maxAttachmentBytes) throw new Error(`${file.name} exceeds the 25 MiB per-file attachment limit.`); const nextTotal = state.reduce((sum, attachment) => sum + attachment.size, 0) + file.size; if (nextTotal > maxAttachmentTotalBytes) throw new Error("Attachments exceed the 100 MiB total attachment limit."); return { name:file.name, size:file.size, content_type:file.type || null, file }; };
-  const uploadIssueAttachments = async (attachments) => { const form = new FormData(); for (const attachment of attachments) form.append("attachments", attachment.file, attachment.name); const response = await fetch(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/attachments`, { method:"POST", headers:{"Accept":"application/json"}, body:form }); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload?.error?.message || `Attachment upload failed: ${response.status}`); return payload; };
+  const recoveryKey = `fugue.issue-mutations:v1:${location.pathname}:${trackerScope}`;
+  let issueUploadPending = false;
+  let issueUploadWarning = "";
+  let commentSubmissionPending = false;
+  let commentSubmissionUncertain = false;
+  let commentSubmissionWarning = "";
+  let recoveredCommentDraft = "";
+  const uncertainMessage = "The result was not confirmed. Check the existing issue before posting the comment or uploading files again.";
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(recoveryKey) || "null");
+    if (saved) {
+      if (typeof saved.uploadWarning !== "string" || typeof saved.commentWarning !== "string" || typeof saved.commentDraft !== "string") throw new Error("Invalid recovery record");
+      issueUploadWarning = saved.uploadWarning;
+      commentSubmissionWarning = saved.commentWarning;
+      commentSubmissionUncertain = Boolean(commentSubmissionWarning);
+      recoveredCommentDraft = saved.commentDraft;
+    }
+  } catch {
+    issueUploadWarning = commentSubmissionWarning = uncertainMessage;
+    commentSubmissionUncertain = true;
+  }
+  const persistMutationRecovery = () => {
+    sessionStorage.setItem(recoveryKey, JSON.stringify({
+      uploadWarning:issueUploadWarning, commentWarning:commentSubmissionWarning,
+      commentDraft:$("commentEditor")?.value ?? recoveredCommentDraft,
+    }));
+  };
+  const renderUploadAvailability = () => {
+    $("issueAttachmentInput").disabled = issueUploadPending || Boolean(issueUploadWarning);
+    $("issueAttachmentError").textContent = issueUploadWarning;
+    $("resolveIssueUpload").hidden = !issueUploadWarning || issueUploadPending;
+  };
+  const renderCommentAvailability = () => {
+    $("postComment").disabled = commentSubmissionPending || commentSubmissionUncertain;
+    $("commentEditor").disabled = commentSubmissionPending;
+    $("commentAttachmentInput").disabled = commentSubmissionPending || commentSubmissionUncertain;
+    $("commentError").textContent = commentSubmissionWarning;
+    $("resolveComment").hidden = !commentSubmissionUncertain || commentSubmissionPending;
+  };
+  const uploadIssueAttachments = async (attachments) => {
+    const form = new FormData();
+    for (const attachment of attachments) form.append("attachments", attachment.file, attachment.name);
+    // Record the in-flight ambiguity before dispatch, including reloads while
+    // the request is pending. A storage failure must prevent dispatch.
+    issueUploadWarning = uncertainMessage;
+    persistMutationRecovery();
+    try {
+      const payload = await fugueIssueMutation(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/attachments`, {
+        method:"POST", headers:{"Accept":"application/json","X-Fugue-Tracker-Scope":trackerScope}, body:form
+      }, {kind:"upload", fileCount:attachments.length});
+      issueUploadWarning = payload.warning?.message || "";
+      persistMutationRecovery();
+      return payload;
+    } catch (error) {
+      issueUploadWarning = error.confirmedRejected ? "" : uncertainMessage;
+      persistMutationRecovery();
+      throw error;
+    }
+  };
   const renderCommentAttachments = () => { const list = $("commentAttachmentList"); if (!list) return; list.innerHTML = commentAttachmentState.length ? commentAttachmentState.map((attachment, index) => `<span class="attachment-chip">${escapeHtml(attachment.name)} · ${escapeHtml(formatFileSize(attachment.size))} <button type="button" data-comment-attachment-remove="${index}" aria-label="Remove ${escapeHtml(attachment.name)}">×</button></span>`).join("") : '<span class="meta">No files selected for this comment.</span>'; };
   const installCommentAttachmentInput = () => { const input = $("commentAttachmentInput"); if (!input || input.dataset.attachmentReady === "true") return; input.dataset.attachmentReady = "true"; input.addEventListener("change", () => { const error = $("commentError"); try { for (const file of Array.from(input.files || [])) commentAttachmentState.push(validateIssueAttachment(file, commentAttachmentState)); renderCommentAttachments(); } catch (caught) { if (error) error.textContent = caught.message; showNotice(caught.message); } finally { input.value = ""; } }); };
-  const installAttachmentDropTarget = () => { const zone = $("issueAttachmentDropZone"); if (!zone || zone.dataset.dropReady === "true") return; zone.dataset.dropReady = "true"; const error = $("issueAttachmentError"); const setActive = (active) => zone.classList.toggle("drag-over", active); for (const type of ["dragenter", "dragover"]) zone.addEventListener(type, (event) => { if (!dataTransferHasFiles(event)) return; event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = "copy"; setActive(true); }); zone.addEventListener("dragleave", (event) => { if (!zone.contains(event.relatedTarget)) setActive(false); }); const addFiles = async (files) => { error.textContent = ""; const added = []; for (const file of Array.from(files || [])) { const attachment = validateIssueAttachment(file); issueAttachmentState.push(attachment); added.push(attachment); } renderIssueAttachments(); if (added.length) { const payload = await uploadIssueAttachments(added); error.textContent = `Attached ${payload.attachments?.length || added.length} file(s).`; showNotice(error.textContent); await load(true); } }; zone.addEventListener("drop", async (event) => { if (!dataTransferHasFiles(event)) return; event.preventDefault(); event.stopPropagation(); setActive(false); try { await addFiles(event.dataTransfer.files); } catch (caught) { error.textContent = caught.message; showNotice(caught.message); } }); const input = $("issueAttachmentInput"); input?.addEventListener("change", async () => { try { await addFiles(input.files); } catch (caught) { error.textContent = caught.message; showNotice(caught.message); } finally { input.value = ""; } }); };
+  const installAttachmentDropTarget = () => {
+    const zone = $("issueAttachmentDropZone");
+    if (!zone || zone.dataset.dropReady === "true") return;
+    zone.dataset.dropReady = "true";
+    const setActive = (active) => zone.classList.toggle("drag-over", active);
+    for (const type of ["dragenter", "dragover"]) zone.addEventListener(type, (event) => {
+      if (!dataTransferHasFiles(event)) return;
+      event.preventDefault(); event.stopPropagation();
+      event.dataTransfer.dropEffect = issueUploadPending || issueUploadWarning ? "none" : "copy";
+      setActive(!issueUploadPending && !issueUploadWarning);
+    });
+    zone.addEventListener("dragleave", (event) => { if (!zone.contains(event.relatedTarget)) setActive(false); });
+    const addFiles = async (files) => {
+      if (issueUploadPending || issueUploadWarning) return;
+      const added = [];
+      let attemptError = "";
+      try {
+        for (const file of Array.from(files || [])) added.push(validateIssueAttachment(file, added));
+        if (!added.length) return;
+        issueAttachmentState.push(...added);
+        issueUploadPending = true;
+        renderIssueAttachments(); renderUploadAvailability();
+        const payload = await uploadIssueAttachments(added);
+        showNotice(issueUploadWarning || `Attached ${payload.attachments?.length || added.length} file(s).`);
+        await load(true);
+      } catch (caught) {
+        attemptError = caught.message;
+        showNotice(caught.message);
+        $("issueAttachmentError").textContent = caught.message;
+      } finally {
+        for (const attachment of added) {
+          const index = issueAttachmentState.indexOf(attachment);
+          if (index >= 0) issueAttachmentState.splice(index, 1);
+        }
+        issueUploadPending = false;
+        renderIssueAttachments();
+        renderUploadAvailability();
+        if (!issueUploadWarning && attemptError) $("issueAttachmentError").textContent = attemptError;
+      }
+    };
+    zone.addEventListener("drop", async (event) => {
+      if (!dataTransferHasFiles(event)) return;
+      event.preventDefault(); event.stopPropagation(); setActive(false);
+      await addFiles(event.dataTransfer.files);
+    });
+    const input = $("issueAttachmentInput");
+    input?.addEventListener("change", async () => {
+      await addFiles(input.files);
+      input.value = "";
+    });
+  };
   document.addEventListener("dragover", (event) => { if (dataTransferHasFiles(event)) event.preventDefault(); }, true); document.addEventListener("drop", (event) => { if (dataTransferHasFiles(event)) event.preventDefault(); }, true);
-  const render = () => { renderKpis(); const issue = detail.issue; const id = newtype(issue.identifier); const current = issue.state.name; targetLane = targetLane || current; $("issueId").textContent = id; $("title").textContent = issue.title; $("stateChip").textContent = `${laneGlyph(current)} ${current.toUpperCase()}`; const dirty = targetLane !== current; $("dirtyFlag").hidden = !dirty; $("save").disabled = !dirty; $("save").innerHTML = dirty && isAction(targetLane) ? `SAVE & RUN ${targetLane.toUpperCase()} <span class="meta">⌘S</span>` : `SAVE CHANGES <span class="meta">⌘S</span>`; $("diff").innerHTML = dirty ? `● 1 UNSAVED CHANGE&nbsp;&nbsp; Lane: ${escapeHtml(current)} → ${escapeHtml(targetLane)} ${isAction(targetLane) ? `<span class="trigger">▸ triggers ${targetLane.toLowerCase()} procedure</span>` : ""}` : "No changes"; $("props").innerHTML = `<div class="field ${dirty ? "dirty" : ""}"><div class="field-head"><span>LANE</span>${dirty ? "<span>● CHANGED</span>" : ""}</div><div class="value">${dirty ? `<del>${escapeHtml(current)}</del> → <strong>${escapeHtml(targetLane)}</strong>` : escapeHtml(current)}</div></div><div class="field"><div class="field-head"><span>LABELS</span></div><div>${issue.labels.map((l) => `<span class="label-chip">${escapeHtml(l)}</span>`).join("")}</div></div><div class="field"><div class="field-head"><span>ASSIGNEE</span></div><div>${escapeHtml(issue.assignee?.name || "Unassigned")}</div></div><div class="field"><div class="field-head"><span>BRANCH</span></div><div>${escapeHtml(newtype(issue.branch_name) || "None")}</div></div>`; $("middle").innerHTML = `<h2 class="section-title mono">DESCRIPTION</h2><div class="description">${escapeHtml(issue.description || "No description")}</div><h2 class="section-title mono">ACTIVITY</h2>${detail.comments.map(renderComment).join("") || '<div class="meta">No comments</div>'}<h2 class="section-title mono">ATTACHMENTS</h2><section class="attachment-drop-zone" id="issueAttachmentDropZone" data-attachment-drop-zone aria-label="Drop files to attach them to this issue"><label class="attachment-input-label" for="issueAttachmentInput"><span>Choose files</span><input id="issueAttachmentInput" type="file" multiple></label><div class="attachment-drop-affordance" aria-hidden="true">Drop files here to attach them to this issue</div><div class="attachment-list" id="issueAttachmentList" aria-live="polite"></div><div class="attachment-error meta" id="issueAttachmentError" role="alert"></div></section><h2 class="section-title mono">NEW COMMENT</h2><section class="comment-composer" aria-label="New comment"><textarea id="commentEditor" class="issue-markdown-editor" spellcheck="true" placeholder="Add a comment…"></textarea><label class="attachment-input-label" for="commentAttachmentInput"><span>Attach files to this comment</span><input id="commentAttachmentInput" type="file" multiple></label><div class="attachment-list" id="commentAttachmentList" aria-live="polite"></div><div class="comment-actions"><div class="comment-error meta" id="commentError" role="alert"></div><button class="comment-submit" id="postComment" type="button">POST COMMENT <span class="meta">C</span></button></div></section><h2 class="section-title mono">WORKPAD</h2><textarea id="workpadEditor" class="issue-markdown-editor">${escapeHtml(detail.workpad?.body_markdown || "")}</textarea>`; $("lanePicker").innerHTML = detail.lanes.map((lane) => `<button class="lane-row ${targetLane === lane ? "target" : ""}" data-lane="${escapeHtml(lane)}" type="button"><span>${laneGlyph(lane)}</span><span>${escapeHtml(lane)}${isAction(lane) ? `<span class="sub">▸ runs ${lane.toLowerCase()} procedure</span>` : ""}</span><span class="meta">${lane === current ? "FROM" : targetLane === lane ? "NEW LANE" : ""}</span></button>`).join(""); renderIssueAttachments(); renderCommentAttachments(); installAttachmentDropTarget(); installCommentAttachmentInput(); };
-  const load = async (preserveTarget = false) => { const previousTarget = targetLane; try { detail = await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}`); targetLane = preserveTarget && previousTarget ? previousTarget : detail.issue.state.name; render(); } catch (error) { showNotice(error.message); } };
-  const postComment = async () => { const editor = $("commentEditor"); const button = $("postComment"); const error = $("commentError"); if (!editor || !button || !error) return; const body = editor.value.trim(); clearNotice(); error.textContent = ""; if (!body && commentAttachmentState.length === 0) { error.textContent = "Comment or attachment is required."; editor.focus(); return; } button.disabled = true; try { if (commentAttachmentState.length) { const form = new FormData(); form.append("body_markdown", body); for (const attachment of commentAttachmentState) form.append("attachments", attachment.file, attachment.name); const response = await fetch(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/comments`, { method:"POST", headers:{"Accept":"application/json"}, body:form }); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload?.error?.message || `Comment failed: ${response.status}`); commentAttachmentState.length = 0; renderCommentAttachments(); } else { await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/comments`, { method: "POST", body: JSON.stringify({ body_markdown: body }) }); } editor.value = ""; await load(true); } catch (caught) { error.textContent = caught.message; showNotice(caught.message); } finally { button.disabled = false; } };
-  document.addEventListener("click", async (event) => { if (event.target.id === "close" || event.target.id === "cancel" || event.target === document.body) location.href = "/issues"; const row = event.target.closest(".lane-row"); if (row) { targetLane = row.dataset.lane; render(); } if (event.target.dataset.commentAttachmentRemove) { commentAttachmentState.splice(Number(event.target.dataset.commentAttachmentRemove), 1); renderCommentAttachments(); } if (event.target.id === "postComment") { await postComment(); } if (event.target.id === "save" && detail && targetLane !== detail.issue.state.name) { try { await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/state`, { method:"PATCH", body: JSON.stringify({ state: targetLane }) }); location.href = "/issues"; } catch (error) { showNotice(error.message); } } });
-  document.addEventListener("keydown", async (event) => { const target = event.target; const editing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement; if (event.key === "Escape") location.href = "/issues"; if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") { event.preventDefault(); $("save").click(); } else if (!editing && event.key.toLowerCase() === "c") { event.preventDefault(); $("commentEditor")?.focus(); } });
+  const render = () => { const commentDraft = $("commentEditor")?.value ?? recoveredCommentDraft; const workpadOpen = $("agentWorkpad")?.open || false; renderKpis(); const issue = detail.issue; const id = newtype(issue.identifier); const current = issue.state.name; targetLane = targetLane || current; $("issueId").textContent = id; $("title").textContent = issue.title; $("stateChip").textContent = `${laneGlyph(current)} ${current.toUpperCase()}`; const dirty = targetLane !== current; $("dirtyFlag").hidden = !dirty; $("save").disabled = !dirty; $("save").innerHTML = dirty && isAction(targetLane) ? `SAVE & RUN ${escapeHtml(isAction(targetLane).toUpperCase())} <span class="meta">⌘S</span>` : `SAVE CHANGES <span class="meta">⌘S</span>`; $("diff").innerHTML = dirty ? `● 1 UNSAVED CHANGE&nbsp;&nbsp; Lane: ${escapeHtml(current)} → ${escapeHtml(targetLane)} ${isAction(targetLane) ? `<span class="trigger">▸ triggers ${escapeHtml(isAction(targetLane))} procedure</span>` : ""}` : "No changes"; $("props").innerHTML = `<div class="field ${dirty ? "dirty" : ""}"><div class="field-head"><span>LANE</span>${dirty ? "<span>● CHANGED</span>" : ""}</div><div class="value">${dirty ? `<del>${escapeHtml(current)}</del> → <strong>${escapeHtml(targetLane)}</strong>` : escapeHtml(current)}</div></div><div class="field"><div class="field-head"><span>LABELS</span></div><div>${issue.labels.map((l) => `<span class="label-chip">${escapeHtml(l)}</span>`).join("")}</div></div><div class="field"><div class="field-head"><span>ASSIGNEE</span></div><div>${escapeHtml(issue.assignee?.name || "Unassigned")}</div></div><div class="field"><div class="field-head"><span>BRANCH</span></div><div>${escapeHtml(newtype(issue.branch_name) || "None")}</div></div>`; $("middle").innerHTML = `${detail.runtime?.launch_failure ? `<section role="alert"><h2 class="section-title">Team startup failed</h2><p class="description">${escapeHtml(detail.runtime.launch_failure.message)}</p></section>` : ""}<h2 class="section-title mono">DESCRIPTION</h2><div class="description">${escapeHtml(issue.description || "No description")}</div><h2 class="section-title mono">ACTIVITY</h2>${detail.comments.filter(comment => newtype(comment.comment_id) !== newtype(detail.workpad?.comment_id)).map(renderComment).join("") || '<div class="meta">No comments</div>'}<h2 class="section-title mono">ATTACHMENTS</h2><section class="attachment-drop-zone" id="issueAttachmentDropZone" data-attachment-drop-zone aria-label="Drop files to attach them to this issue"><label class="attachment-input-label" for="issueAttachmentInput"><span>Choose files</span><input id="issueAttachmentInput" type="file" multiple></label><div class="attachment-drop-affordance" aria-hidden="true">Drop files here to attach them to this issue</div><div class="attachment-list" id="issueAttachmentList" aria-live="polite"></div><div class="attachment-error meta" id="issueAttachmentError" role="alert"></div><button id="resolveIssueUpload" type="button" hidden>I've checked the issue</button></section><h2 class="section-title mono">NEW COMMENT</h2><section class="comment-composer" aria-label="New comment"><textarea id="commentEditor" class="issue-markdown-editor" spellcheck="true" placeholder="Add a comment…"></textarea><label class="attachment-input-label" for="commentAttachmentInput"><span>Attach files to this comment</span><input id="commentAttachmentInput" type="file" multiple></label><div class="attachment-list" id="commentAttachmentList" aria-live="polite"></div><div class="comment-actions"><div class="comment-error meta" id="commentError" role="alert"></div><button id="resolveComment" type="button" hidden>I've checked the issue</button><button class="comment-submit" id="postComment" type="button">POST COMMENT <span class="meta">C</span></button></div></section><details id="agentWorkpad" ${workpadOpen ? "open" : ""}><summary class="section-title mono">AGENT WORKPAD</summary><p class="meta">Execution notes and validation evidence maintained by the agents.</p><textarea id="workpadEditor" class="issue-markdown-editor" aria-label="Agent workpad" readonly>${escapeHtml(detail.workpad?.body_markdown || "No workpad yet.")}</textarea></details>`; $("lanePicker").innerHTML = detail.lanes.map((lane) => `<button class="lane-row ${targetLane === lane ? "target" : ""}" data-lane="${escapeHtml(lane)}" type="button"><span>${laneGlyph(lane)}</span><span>${escapeHtml(lane)}${isAction(lane) ? `<span class="sub">▸ runs ${escapeHtml(isAction(lane))} procedure</span>` : ""}</span><span class="meta">${lane === current ? "FROM" : targetLane === lane ? "NEW LANE" : ""}</span></button>`).join(""); $("commentEditor").value = commentDraft; renderIssueAttachments(); renderCommentAttachments(); installAttachmentDropTarget(); installCommentAttachmentInput(); renderCommentAvailability(); renderUploadAvailability(); };
+  const load = async (preserveTarget = false) => {
+    try {
+      const refreshed = await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}`);
+      // Preserve a real edit against the displayed snapshot, including a choice
+      // made while this request was in flight. An untouched lane follows the
+      // tracker instead of turning its old value into an unsaved transition.
+      const pendingTarget = preserveTarget && detail && targetLane !== detail.issue.state.name
+        ? targetLane : null;
+      detail = refreshed;
+      targetLane = pendingTarget ?? detail.issue.state.name;
+      render();
+    } catch (error) {
+      showNotice(error.message);
+    }
+  };
+  const postComment = async () => {
+    const editor = $("commentEditor");
+    if (!editor || commentSubmissionUncertain || commentSubmissionPending) return;
+    const body = editor.value.trim();
+    clearNotice();
+    if (!body && commentAttachmentState.length === 0) {
+      $("commentError").textContent = "Comment or attachment is required.";
+      editor.focus();
+      return;
+    }
+    const pending = commentAttachmentState.slice();
+    let attemptError = "";
+    commentSubmissionPending = true;
+    commentSubmissionUncertain = true;
+    commentSubmissionWarning = uncertainMessage;
+    renderCommentAvailability();
+    try {
+      persistMutationRecovery();
+      let options;
+      if (pending.length) {
+        const form = new FormData();
+        form.append("body_markdown", body);
+        for (const attachment of pending) form.append("attachments", attachment.file, attachment.name);
+        options = {method:"POST", headers:{"Accept":"application/json","X-Fugue-Tracker-Scope":trackerScope}, body:form};
+      } else {
+        options = {method:"POST", headers:{"Accept":"application/json","Content-Type":"application/json","X-Fugue-Tracker-Scope":trackerScope}, body:JSON.stringify({body_markdown:body})};
+      }
+      const payload = await fugueIssueMutation(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/comments`, options, {kind:"comment", fileCount:pending.length});
+      for (const attachment of pending) {
+        const index = commentAttachmentState.indexOf(attachment);
+        if (index >= 0) commentAttachmentState.splice(index, 1);
+      }
+      renderCommentAttachments();
+      commentSubmissionWarning = payload.warning?.message || "";
+      commentSubmissionUncertain = Boolean(commentSubmissionWarning);
+      if (!commentSubmissionUncertain) {
+        $("commentEditor").value = "";
+        recoveredCommentDraft = "";
+      }
+      persistMutationRecovery();
+      if (commentSubmissionWarning) showNotice(commentSubmissionWarning);
+      await load(true);
+    } catch (caught) {
+      // Keep the pre-dispatch record on storage failure as well. Only a known
+      // HTTP rejection permits another submission.
+      if (caught.confirmedRejected) {
+        commentSubmissionUncertain = false;
+        commentSubmissionWarning = "";
+      }
+      attemptError = caught.message;
+      try { persistMutationRecovery(); } catch (storageError) {
+        commentSubmissionUncertain = true;
+        commentSubmissionWarning = uncertainMessage;
+        console.warn("Could not save comment recovery state", storageError);
+      }
+      showNotice(caught.message);
+      $("commentError").textContent = caught.message;
+    } finally {
+      commentSubmissionPending = false;
+      renderCommentAvailability();
+      if (!commentSubmissionUncertain && attemptError) $("commentError").textContent = attemptError;
+    }
+  };
+  document.addEventListener("click", (event) => {
+    const upload = event.target.id === "resolveIssueUpload";
+    const comment = event.target.id === "resolveComment";
+    if ((!upload && !comment) || issueUploadPending || commentSubmissionPending) return;
+    if (!window.confirm("Have you checked the existing issue for the comment and files? Continue only after reconciling the result. This clears the warning and pending files without resending anything. Your comment draft is kept.")) return;
+    const previousUploadWarning = issueUploadWarning;
+    const previousCommentWarning = commentSubmissionWarning;
+    if (upload) issueUploadWarning = "";
+    if (comment) { commentSubmissionWarning = ""; commentSubmissionUncertain = false; }
+    try {
+      persistMutationRecovery();
+      if (comment) commentAttachmentState.length = 0;
+      renderCommentAttachments(); renderCommentAvailability(); renderUploadAvailability();
+      clearNotice();
+    } catch (error) {
+      issueUploadWarning = previousUploadWarning;
+      commentSubmissionWarning = previousCommentWarning;
+      commentSubmissionUncertain = Boolean(previousCommentWarning);
+      showNotice("The reconciliation could not be saved. " + error.message);
+    }
+  });
+  document.addEventListener("click", async (event) => { if (event.target.id === "close" || event.target.id === "cancel" || event.target === document.body) fugueNavigate("/issues"); const row = event.target.closest(".lane-row"); if (row) { targetLane = row.dataset.lane; render(); } if (event.target.dataset.commentAttachmentRemove) { commentAttachmentState.splice(Number(event.target.dataset.commentAttachmentRemove), 1); renderCommentAttachments(); } if (event.target.id === "postComment") { await postComment(); } if (event.target.id === "save" && detail && targetLane !== detail.issue.state.name) { try { await api(`/api/v1/issues/${encodeURIComponent(issueIdentifier)}/state`, { method:"PATCH", body: JSON.stringify({ state: targetLane }) }); fugueNavigate("/issues"); } catch (error) { showNotice(error.message); } } });
+  document.addEventListener("keydown", async (event) => { const target = event.target; const editing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement; if (event.key === "Escape") fugueNavigate("/issues"); if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") { event.preventDefault(); $("save").click(); } else if (!editing && event.key.toLowerCase() === "c") { event.preventDefault(); $("commentEditor")?.focus(); } });
   load();
 </script>
 </body>
@@ -2483,6 +2632,7 @@ struct IssueBoardSnapshot {
 
 #[derive(Debug, Serialize)]
 struct IssueBoardTotals {
+    launch_failed: usize,
     issues: usize,
     running: usize,
     retrying: usize,
@@ -2492,6 +2642,7 @@ struct IssueBoardTotals {
 struct IssueBoardLane {
     name: String,
     kind: IssueBoardLaneKind,
+    action: Option<LaneAction>,
     issues: Vec<IssueBoardIssue>,
 }
 
@@ -2504,6 +2655,50 @@ enum IssueBoardLaneKind {
     Attention,
     Terminal,
     Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LaneAction {
+    Review,
+    Merge,
+    Deploy,
+}
+
+fn lane_action(config: &ServiceConfig, lane: &str) -> Option<LaneAction> {
+    if config.tracker.kind == "jira" {
+        // Only configured action statuses trigger a procedure. A Jira status
+        // named "Deploy" or "Review" is not itself authorization to run one.
+        if config.deploy.enabled && lane.eq_ignore_ascii_case(&config.deploy.lane) {
+            return Some(if config.deploy.procedure == "merge-only" {
+                LaneAction::Merge
+            } else {
+                LaneAction::Deploy
+            });
+        }
+        if (config.final_review.enabled || config.independent_review.enabled)
+            && config
+                .linear
+                .lanes
+                .do_review
+                .as_ref()
+                .or(config.linear.lanes.review_ready.as_ref())
+                .is_some_and(|state| state.eq_ignore_ascii_case(lane))
+        {
+            return Some(LaneAction::Review);
+        }
+        return None;
+    }
+    match lane {
+        "Review" if config.final_review.enabled || config.independent_review.enabled => {
+            Some(LaneAction::Review)
+        }
+        "Merge" | "Deploy" if config.deploy.enabled && config.deploy.procedure == "merge-only" => {
+            Some(LaneAction::Merge)
+        }
+        "Deploy" if config.deploy.enabled => Some(LaneAction::Deploy),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2531,6 +2726,8 @@ struct IssueBoardBlocker {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum IssueBoardRuntimeStatus {
     Running {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        launch_failure: Option<crate::tools::NativeLaunchFailure>,
         backend: String,
         policy_mode: String,
         turn_count: u64,
@@ -2555,6 +2752,7 @@ struct IssueDetailSnapshot {
     attachments: Vec<crate::tools::LinearFileAttachmentSnapshot>,
     runtime: Option<IssueBoardRuntimeStatus>,
     lanes: Vec<String>,
+    lane_actions: BTreeMap<String, LaneAction>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2601,6 +2799,25 @@ struct IssueCommentRequest {
 struct ParsedIssueCommentRequest {
     body_markdown: String,
     attachments: Vec<LinearCommentAttachmentInput>,
+    uploads: Vec<IssueUploadedAttachment>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum IssueCreateResponse {
+    Created {
+        issue: Box<IssueBoardIssue>,
+    },
+    CreatedWithWarning {
+        created_issue: crate::domain::CreatedIssueReceipt,
+        warning: IssueCreationWarning,
+    },
+}
+
+#[derive(Serialize)]
+struct IssueCreationWarning {
+    code: &'static str,
+    message: String,
 }
 
 async fn api_issue_create(
@@ -2610,6 +2827,9 @@ async fn api_issue_create(
 ) -> axum::response::Response {
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
+    }
+    if let Err(response) = validate_browser_tracker_context(&app.config, &headers) {
+        return response.into_response();
     }
     let (title, lane) =
         match validate_issue_create_request(&app.config, &request.title, &request.lane) {
@@ -2639,12 +2859,47 @@ async fn api_issue_create(
         )
         .await
     {
-        Ok(issue) => Json(
-            json!({ "issue": issue_board_issue(issue, "Queue", &HashMap::new(), &HashMap::new()) }),
-        )
-        .into_response(),
+        Ok(issue) => {
+            let lane = canonical_lane_for_state(&app.config, &issue.state);
+            (
+                StatusCode::CREATED,
+                Json(IssueCreateResponse::Created {
+                    issue: Box::new(issue_board_issue(
+                        issue,
+                        &lane,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                    )),
+                }),
+            )
+                .into_response()
+        }
+        Err(crate::error::FugueError::IssueCreatedNeedsAttention { created, source }) => {
+            tracing::warn!(issue = %created.identifier, error = %source, "created issue needs follow-up");
+            created_issue_attention_response(created)
+        }
         Err(error) => issue_adapter_error_response(error),
     }
+}
+
+fn created_issue_attention_response(
+    created: crate::domain::CreatedIssueReceipt,
+) -> axum::response::Response {
+    let message = format!(
+        "Created {}. Fugue could not confirm its initial status. Open the existing issue to check it.",
+        created.identifier,
+    );
+    (
+        StatusCode::CREATED,
+        Json(IssueCreateResponse::CreatedWithWarning {
+            created_issue: created,
+            warning: IssueCreationWarning {
+                code: "issue_created_followup_failed",
+                message,
+            },
+        }),
+    )
+        .into_response()
 }
 
 async fn api_issue_board(
@@ -2692,6 +2947,9 @@ async fn api_issue_move(
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
+    if let Err(response) = validate_browser_tracker_context(&app.config, &headers) {
+        return response.into_response();
+    }
     let state = request.state.trim();
     if state.is_empty() {
         return bad_request("missing_state", "state must be non-empty");
@@ -2725,6 +2983,9 @@ async fn api_issue_upsert_workpad(
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
+    if let Err(response) = validate_browser_tracker_context(&app.config, &headers) {
+        return response.into_response();
+    }
     let adapter = match IssueAdapter::from_config(&app.config.tracker) {
         Ok(adapter) => adapter,
         Err(error) => return linear_config_error_response(error),
@@ -2750,6 +3011,14 @@ async fn api_issue_upsert_workpad(
 struct IssueAttachmentUploadResponse {
     attachments: Vec<IssueUploadedAttachment>,
     comment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<IssueUploadWarning>,
+}
+
+#[derive(Debug, Serialize)]
+struct IssueUploadWarning {
+    code: &'static str,
+    message: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -2760,6 +3029,58 @@ struct IssueUploadedAttachment {
     url: String,
     #[serde(skip_serializing)]
     path: Option<String>,
+    #[serde(skip_serializing)]
+    bytes: Vec<u8>,
+}
+
+impl From<LinearCommentAttachmentInput> for IssueUploadedAttachment {
+    fn from(attachment: LinearCommentAttachmentInput) -> Self {
+        Self {
+            name: attachment.title.unwrap_or_else(|| "attachment".to_string()),
+            size: attachment.byte_len,
+            content_type: attachment.content_type,
+            url: attachment.url,
+            path: None,
+            bytes: Vec::new(),
+        }
+    }
+}
+
+async fn publish_jira_uploads(
+    client: &crate::jira::JiraClient,
+    issue: &LinearIssueRef,
+    uploaded: Vec<IssueUploadedAttachment>,
+) -> crate::error::Result<crate::jira::JiraUploadReceipt> {
+    client
+        .upload_browser_files(
+            issue,
+            uploaded
+                .into_iter()
+                .map(|file| crate::jira::JiraUploadFile {
+                    name: file.name,
+                    content_type: file.content_type,
+                    bytes: file.bytes,
+                })
+                .collect(),
+        )
+        .await
+}
+
+fn jira_upload_attention_response(
+    attachments: Vec<LinearCommentAttachmentInput>,
+    comment_attempted: bool,
+) -> Response {
+    Json(IssueAttachmentUploadResponse {
+        attachments: attachments.into_iter().map(Into::into).collect(),
+        comment_id: None,
+        warning: Some(if comment_attempted {
+            IssueUploadWarning { code: "comment_not_confirmed", message:
+                "Jira accepted the files, but the comment was not confirmed. Check the existing issue before posting the comment again. Do not upload these files again." }
+        } else {
+            IssueUploadWarning { code: "upload_not_confirmed", message:
+                "Jira did not confirm the complete upload. Some files may already be attached. Check the existing issue before uploading any files again." }
+        }),
+    }).into_response()
 }
 
 async fn api_issue_upload_attachments(
@@ -2771,6 +3092,15 @@ async fn api_issue_upload_attachments(
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
+    if let Err(response) = validate_browser_tracker_context(&app.config, &headers) {
+        return response.into_response();
+    }
+    let (adapter, issue_identifier) =
+        match attachment_issue_access(&app.config, &issue_identifier).await {
+            Ok(access) => access,
+            Err(response) => return response,
+        };
+    let issue_identifier = issue_identifier.0;
     let mut uploaded = Vec::new();
     let upload_dir = issue_attachment_dir(&app.config, &issue_identifier);
     if let Err(error) = tokio::fs::create_dir_all(&upload_dir).await {
@@ -2779,7 +3109,17 @@ async fn api_issue_upload_attachments(
             &format!("failed to prepare attachment storage: {error}"),
         );
     }
-    while let Ok(Some(field)) = multipart.next_field().await {
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => {
+                return bad_request(
+                    "invalid_attachment_upload",
+                    &format!("failed to read multipart upload: {error}"),
+                );
+            }
+        };
         if field.name() != Some("attachments") {
             continue;
         }
@@ -2834,6 +3174,7 @@ async fn api_issue_upload_attachments(
                 percent_encode_path_segment(&stored_name)
             ),
             path: Some(path.display().to_string()),
+            bytes: bytes.to_vec(),
         });
     }
     if uploaded.is_empty() {
@@ -2841,6 +3182,24 @@ async fn api_issue_upload_attachments(
             "missing_attachment",
             "at least one attachment file is required",
         );
+    }
+    if let IssueAdapter::Jira(client) = &adapter {
+        return match publish_jira_uploads(
+            client,
+            &issue_ref_for_identifier(&issue_identifier),
+            uploaded,
+        )
+        .await
+        {
+            Ok(receipt) if receipt.complete => Json(IssueAttachmentUploadResponse {
+                attachments: receipt.attachments.into_iter().map(Into::into).collect(),
+                comment_id: None,
+                warning: None,
+            })
+            .into_response(),
+            Ok(receipt) => jira_upload_attention_response(receipt.attachments, false),
+            Err(error) => issue_adapter_error_response(error),
+        };
     }
     let attachments = uploaded
         .iter()
@@ -2852,10 +3211,6 @@ async fn api_issue_upload_attachments(
             byte_len: attachment.size,
         })
         .collect();
-    let adapter = match IssueAdapter::from_config(&app.config.tracker) {
-        Ok(adapter) => adapter,
-        Err(error) => return linear_config_error_response(error),
-    };
     let comment_id = match adapter
         .add_comment(AddCommentInput {
             issue: issue_ref_for_identifier(&issue_identifier),
@@ -2870,6 +3225,7 @@ async fn api_issue_upload_attachments(
     Json(IssueAttachmentUploadResponse {
         attachments: uploaded,
         comment_id,
+        warning: None,
     })
     .into_response()
 }
@@ -2885,7 +3241,12 @@ async fn api_issue_attachment_download(
     if file_name != sanitize_attachment_component(&file_name) {
         return bad_request("invalid_attachment_path", "attachment file name is invalid");
     }
-    let path = issue_attachment_dir(&app.config, &issue_identifier).join(&file_name);
+    let (_, issue_identifier) = match attachment_issue_access(&app.config, &issue_identifier).await
+    {
+        Ok(access) => access,
+        Err(response) => return response,
+    };
+    let path = issue_attachment_dir(&app.config, &issue_identifier.0).join(&file_name);
     match tokio::fs::read(&path).await {
         Ok(bytes) => (
             StatusCode::OK,
@@ -2908,10 +3269,55 @@ async fn api_issue_attachment_download(
     }
 }
 
+#[derive(Debug)]
+struct TrackerContextChanged;
+
+impl IntoResponse for TrackerContextChanged {
+    fn into_response(self) -> Response {
+        (StatusCode::CONFLICT, Json(json!({"error": {
+            "code": "tracker_context_changed",
+            "message": "The repository's issue tracker changed. Reload the page and check the original tracker before retrying."
+        }}))).into_response()
+    }
+}
+
+fn validate_browser_tracker_context(
+    config: &ServiceConfig,
+    headers: &HeaderMap,
+) -> std::result::Result<(), TrackerContextChanged> {
+    let scope = headers.get("x-fugue-tracker-scope");
+    let browser_request = headers.contains_key("origin")
+        || headers
+            .keys()
+            .any(|key| key.as_str().starts_with("sec-fetch-"));
+    // Non-browser API clients retain the existing optional-header contract.
+    // Browsers cannot suppress Origin/Fetch Metadata on these mutations, so
+    // an already-open legacy page must refresh after tracker reconfiguration.
+    if (browser_request && scope.is_none())
+        || scope
+            .is_some_and(|scope| scope.to_str().ok() != Some(config.tracker_context_id().as_str()))
+    {
+        return Err(TrackerContextChanged);
+    }
+    Ok(())
+}
+
+async fn attachment_issue_access(
+    config: &ServiceConfig,
+    identifier: &str,
+) -> std::result::Result<(IssueAdapter, LinearIssueIdentifier), Response> {
+    let adapter =
+        IssueAdapter::from_config(&config.tracker).map_err(linear_config_error_response)?;
+    let identifier = adapter
+        .resolve_issue_identifier(&issue_ref_for_identifier(identifier))
+        .await
+        .map_err(issue_adapter_error_response)?;
+    Ok((adapter, identifier))
+}
+
 fn issue_attachment_dir(config: &ServiceConfig, issue_identifier: &str) -> PathBuf {
     config
-        .workflow_dir
-        .join(".fugue")
+        .attachment_storage_root()
         .join("issue-attachments")
         .join(sanitize_attachment_component(issue_identifier))
 }
@@ -3013,6 +3419,7 @@ async fn parse_json_issue_comment_request(
     Ok(ParsedIssueCommentRequest {
         body_markdown: request.body_markdown,
         attachments: request.attachments,
+        uploads: Vec::new(),
     })
 }
 
@@ -3032,7 +3439,12 @@ async fn parse_multipart_issue_comment_request(
     let mut body_markdown = String::new();
     let mut uploaded = Vec::new();
     let upload_dir = issue_attachment_dir(&app.config, issue_identifier);
-    while let Ok(Some(field)) = multipart.next_field().await {
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        bad_request(
+            "invalid_comment_multipart",
+            &format!("failed to read multipart comment: {error}"),
+        )
+    })? {
         match field.name() {
             Some("body_markdown") => {
                 body_markdown = field.text().await.map_err(|error| {
@@ -3056,16 +3468,8 @@ async fn parse_multipart_issue_comment_request(
     }
     Ok(ParsedIssueCommentRequest {
         body_markdown,
-        attachments: uploaded
-            .into_iter()
-            .map(|attachment| LinearCommentAttachmentInput {
-                title: Some(attachment.name),
-                url: attachment.url,
-                path: attachment.path,
-                content_type: attachment.content_type,
-                byte_len: attachment.size,
-            })
-            .collect(),
+        attachments: Vec::new(),
+        uploads: uploaded,
     })
 }
 
@@ -3127,6 +3531,7 @@ async fn persist_issue_comment_attachment(
             percent_encode_path_segment(&stored_name)
         ),
         path: Some(path.display().to_string()),
+        bytes: bytes.to_vec(),
     });
     Ok(())
 }
@@ -3180,21 +3585,58 @@ async fn api_issue_add_comment(
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
-    let parsed = match parse_issue_comment_request(&app, &issue_identifier, &headers, request).await
+    if let Err(response) = validate_browser_tracker_context(&app.config, &headers) {
+        return response.into_response();
+    }
+    let (adapter, issue_identifier) =
+        match attachment_issue_access(&app.config, &issue_identifier).await {
+            Ok(access) => access,
+            Err(response) => return response,
+        };
+    let issue_identifier = issue_identifier.0;
+    let mut parsed =
+        match parse_issue_comment_request(&app, &issue_identifier, &headers, request).await {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+    if parsed.body_markdown.trim().is_empty()
+        && parsed.attachments.is_empty()
+        && parsed.uploads.is_empty()
     {
-        Ok(parsed) => parsed,
-        Err(response) => return response,
-    };
-    if parsed.body_markdown.trim().is_empty() && parsed.attachments.is_empty() {
         return bad_request(
             "missing_comment",
             "body_markdown or at least one attachment must be provided",
         );
     }
-    let adapter = match IssueAdapter::from_config(&app.config.tracker) {
-        Ok(adapter) => adapter,
-        Err(error) => return linear_config_error_response(error),
-    };
+    let mut native_uploads = Vec::new();
+    if !parsed.uploads.is_empty() {
+        if let IssueAdapter::Jira(client) = &adapter {
+            match publish_jira_uploads(
+                client,
+                &issue_ref_for_identifier(&issue_identifier),
+                parsed.uploads,
+            )
+            .await
+            {
+                Ok(receipt) if receipt.complete => native_uploads = receipt.attachments,
+                Ok(receipt) => return jira_upload_attention_response(receipt.attachments, false),
+                Err(error) => return issue_adapter_error_response(error),
+            }
+            parsed.attachments.extend(native_uploads.clone());
+        } else {
+            parsed
+                .attachments
+                .extend(parsed.uploads.into_iter().map(|attachment| {
+                    LinearCommentAttachmentInput {
+                        title: Some(attachment.name),
+                        url: attachment.url,
+                        path: attachment.path,
+                        content_type: attachment.content_type,
+                        byte_len: attachment.size,
+                    }
+                }));
+        }
+    }
     match adapter
         .add_comment(AddCommentInput {
             issue: issue_ref_for_identifier(&issue_identifier),
@@ -3205,6 +3647,10 @@ async fn api_issue_add_comment(
     {
         Ok(output) => {
             Json(json!({ "result": output, "attachments": parsed.attachments })).into_response()
+        }
+        Err(error) if !native_uploads.is_empty() => {
+            tracing::warn!(error = %error, "Jira accepted files but comment was not confirmed");
+            jira_upload_attention_response(native_uploads, true)
         }
         Err(error) => issue_adapter_error_response(error),
     }
@@ -3223,7 +3669,8 @@ async fn issue_detail_snapshot(
         })
         .await
         .map_err(issue_adapter_error_response)?;
-    // rework-note: the adapter may still project Linear/Todo/Planning-style states; the UI exposes only Fugue canonical lanes and keeps phase information on labels.
+    // Jira statuses may combine multiple roles, so preserve their real names.
+    // Other trackers retain the existing canonical board projection.
     let canonical_lane = canonical_lane_for_state(&app.config, &inspected.issue.state.name);
     if let Some(phase) = phase_label_for_state(&inspected.issue.state.name)
         && !inspected
@@ -3252,7 +3699,11 @@ async fn issue_detail_snapshot(
         attachments: inspected.attachments,
         comments,
         runtime,
-        lanes: canonical_issue_board_lanes(),
+        lane_actions: issue_board_lanes(&app.config)
+            .into_iter()
+            .filter_map(|name| lane_action(&app.config, &name).map(|action| (name, action)))
+            .collect(),
+        lanes: issue_board_lanes(&app.config),
     })
 }
 
@@ -3315,7 +3766,7 @@ fn issue_board_snapshot_from_rows(
         runtime_by_identifier.insert(row.issue_identifier.clone(), status);
     }
 
-    let lanes = canonical_issue_board_lanes();
+    let lanes = issue_board_lanes(config);
     let mut grouped = lanes
         .iter()
         .map(|lane| (lane.clone(), Vec::new()))
@@ -3349,20 +3800,34 @@ fn issue_board_snapshot_from_rows(
         .map(|(name, mut issues)| {
             sort_issue_board_issues(&mut issues);
             IssueBoardLane {
-                kind: canonical_lane_kind(&name),
+                kind: if config.tracker.kind == "jira" {
+                    canonical_lane_kind(&canonical_role_for_state(config, &name))
+                } else {
+                    canonical_lane_kind(&name)
+                },
+                action: lane_action(config, &name),
                 name,
                 issues,
             }
         })
         .collect::<Vec<_>>();
-    // rework-note: the IMS board always renders the eight canonical Fugue lanes; empty non-action lanes collapse in the client instead of disappearing into a sidebar.
+    // Keep empty lanes visible so operators can move tickets into them.
     let issue_count = lanes.iter().map(|lane| lane.issues.len()).sum();
+    let launch_failed = running
+        .iter()
+        .filter(|row| {
+            row.native_recovery
+                .as_ref()
+                .is_some_and(|run| run.launch_failure.is_some())
+        })
+        .count();
     IssueBoardSnapshot {
         generated_at: Utc::now(),
         lanes,
         totals: IssueBoardTotals {
             issues: issue_count,
-            running: running_count,
+            launch_failed,
+            running: running_count.saturating_sub(launch_failed),
             retrying: retrying_count,
         },
     }
@@ -3438,7 +3903,12 @@ fn validate_issue_create_attachments(
     Ok(())
 }
 
-fn issue_creation_lanes(_config: &ServiceConfig) -> Vec<String> {
+fn issue_creation_lanes(config: &ServiceConfig) -> Vec<String> {
+    if config.tracker.kind == "jira" {
+        let mut lanes = vec![config.linear.lanes.parked.clone()];
+        push_unique_lane(&mut lanes, config.linear.lanes.ready.clone());
+        return lanes;
+    }
     vec!["Backlog".to_string(), "Queue".to_string()]
 }
 
@@ -3477,6 +3947,21 @@ fn linear_config_error_response(error: crate::error::FugueError) -> axum::respon
 }
 
 fn issue_adapter_error_response(error: crate::error::FugueError) -> axum::response::Response {
+    if let crate::error::FugueError::JiraApiStatus { status } = &error
+        && matches!(
+            status,
+            400 | 401 | 403 | 404 | 405 | 409 | 413 | 415 | 422 | 429
+        )
+        && let Ok(status) = StatusCode::from_u16(*status)
+    {
+        return (
+            status,
+            Json(json!({"error": {
+                "code": "jira_request_rejected", "message": error.to_string()
+            }})),
+        )
+            .into_response();
+    }
     (
         StatusCode::BAD_GATEWAY,
         Json(json!({
@@ -3504,6 +3989,10 @@ fn bad_request(code: &str, message: &str) -> axum::response::Response {
 
 fn running_issue_board_status(row: &RunningRow) -> IssueBoardRuntimeStatus {
     IssueBoardRuntimeStatus::Running {
+        launch_failure: row
+            .native_recovery
+            .as_ref()
+            .and_then(|run| run.launch_failure.clone()),
         backend: format!("{:?}", row.backend),
         policy_mode: format!("{:?}", row.policy_mode),
         turn_count: row.turn_count,
@@ -3591,7 +4080,16 @@ fn add_missing_runtime_rows(
         if seen_issue_ids.contains(&row.issue_id) {
             continue;
         }
-        let lane = "Active".to_string();
+        let lane = if config.tracker.kind == "jira" {
+            config
+                .tracker
+                .in_flight_states
+                .first()
+                .cloned()
+                .unwrap_or_else(|| config.linear.lanes.ready.clone())
+        } else {
+            "Active".to_string()
+        };
         let issue = synthetic_issue_board_issue(
             &row.issue_id,
             &row.issue_identifier,
@@ -3639,6 +4137,26 @@ fn canonical_issue_board_lanes() -> Vec<String> {
         .iter()
         .map(|lane| (*lane).to_string())
         .collect()
+}
+
+fn issue_board_lanes(config: &ServiceConfig) -> Vec<String> {
+    if config.tracker.kind == "jira" {
+        tracker_fetch_lanes(config)
+    } else {
+        let mut lanes = canonical_issue_board_lanes();
+        if merge_only_board(config)
+            && let Some(lane) = lanes.iter_mut().find(|lane| lane.as_str() == "Deploy")
+        {
+            *lane = "Merge".to_string();
+        }
+        lanes
+    }
+}
+
+fn merge_only_board(config: &ServiceConfig) -> bool {
+    config.tracker.kind != "jira"
+        && config.deploy.enabled
+        && config.deploy.procedure == "merge-only"
 }
 
 fn tracker_fetch_lanes(config: &ServiceConfig) -> Vec<String> {
@@ -3689,6 +4207,14 @@ fn tracker_fetch_lanes(config: &ServiceConfig) -> Vec<String> {
 }
 
 fn canonical_lane_for_state(config: &ServiceConfig, state: &str) -> String {
+    if config.tracker.kind == "jira" {
+        state.to_string()
+    } else {
+        canonical_role_for_state(config, state)
+    }
+}
+
+fn canonical_role_for_state(config: &ServiceConfig, state: &str) -> String {
     let normalized = state.trim().to_ascii_lowercase();
     if config.tracker.is_intake_state(state) {
         return "Queue".to_string();
@@ -3738,7 +4264,12 @@ fn canonical_lane_for_state(config: &ServiceConfig, state: &str) -> String {
         || (config.deploy.enabled && state.eq_ignore_ascii_case(&config.deploy.lane))
         || matches!(normalized.as_str(), "deploy" | "ready for deploy")
     {
-        return "Deploy".to_string();
+        return if merge_only_board(config) {
+            "Merge"
+        } else {
+            "Deploy"
+        }
+        .to_string();
     }
     if config
         .linear
@@ -3770,7 +4301,7 @@ fn canonical_lane_kind(lane: &str) -> IssueBoardLaneKind {
     match lane {
         "Backlog" => IssueBoardLaneKind::Parked,
         "Queue" => IssueBoardLaneKind::Intake,
-        "Review" | "Deploy" | "Blocked" => IssueBoardLaneKind::Attention,
+        "Review" | "Merge" | "Deploy" | "Blocked" => IssueBoardLaneKind::Attention,
         "Done" | "Canceled" => IssueBoardLaneKind::Terminal,
         "Active" => IssueBoardLaneKind::Active,
         _ => IssueBoardLaneKind::Other,
@@ -3778,7 +4309,22 @@ fn canonical_lane_kind(lane: &str) -> IssueBoardLaneKind {
 }
 
 fn tracker_state_for_canonical_lane(config: &ServiceConfig, lane: &str) -> String {
-    match lane.trim().to_ascii_lowercase().as_str() {
+    if config.tracker.kind == "jira"
+        && let Some(state) = tracker_fetch_lanes(config)
+            .into_iter()
+            .find(|state| state.eq_ignore_ascii_case(lane.trim()))
+    {
+        return state;
+    }
+    // Accept the previous canonical name for existing clients, while the
+    // board and editor describe a merge-only procedure as Merge.
+    let normalized = lane.trim().to_ascii_lowercase();
+    let normalized = if normalized == "merge" && merge_only_board(config) {
+        "deploy"
+    } else {
+        normalized.as_str()
+    };
+    match normalized {
         "backlog" => config.linear.lanes.parked.clone(),
         "queue" => config
             .tracker
@@ -3796,8 +4342,9 @@ fn tracker_state_for_canonical_lane(config: &ServiceConfig, lane: &str) -> Strin
         "review" => config
             .linear
             .lanes
-            .review_ready
+            .do_review
             .clone()
+            .or_else(|| config.linear.lanes.review_ready.clone())
             .unwrap_or_else(|| "In Review".to_string()),
         "deploy" => config
             .linear
@@ -4035,11 +4582,44 @@ async fn api_kapellmeister_start_final_pr_gate(
 async fn api_kapellmeister_start_independent_review(
     State(app): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<IndependentReviewStartRequest>,
+    Json(request): Json<IndependentReviewLaunchRequest>,
 ) -> axum::response::Response {
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
+    if !app.config.independent_review.enabled {
+        return bad_request(
+            "independent_review_disabled",
+            "Independent review is disabled for this repository.",
+        );
+    }
+    let (candidate, pull_request) = match crate::native_review::resolve_candidate(
+        &app.config,
+        request.issue.clone(),
+        &request.repo,
+        crate::tools::GitHubPullRequestRef::Number {
+            number: request.pull_request,
+        },
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return bad_request(
+                "review_candidate_unavailable",
+                &format!("Review needs an open, ready-for-review PR in this repository: {error}"),
+            );
+        }
+    };
+    let request = match crate::independent_review::configured_review_launch(
+        &app.config.independent_review,
+        request,
+        candidate,
+        pull_request,
+    ) {
+        Ok(request) => request,
+        Err(error) => return bad_request("review_candidate_changed", &error.to_string()),
+    };
     let (response_tx, response_rx) = oneshot::channel();
     if app
         .internal_tx
@@ -4094,106 +4674,149 @@ async fn api_kapellmeister_start_independent_review(
     }
 }
 
+async fn api_kapellmeister_admit_independent_review(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<crate::independent_review::IndependentReviewAdmissionRequest>,
+) -> axum::response::Response {
+    if let Err(response) = authorize_console_browser(&app.config, &headers) {
+        return response;
+    }
+    if !app.config.independent_review.enabled && !app.config.final_review.enabled {
+        return bad_request(
+            "independent_review_disabled",
+            "Independent review is disabled for this repository.",
+        );
+    }
+    let (candidate, _) = match crate::native_review::resolve_candidate(
+        &app.config,
+        request.issue,
+        &request.repo,
+        crate::tools::GitHubPullRequestRef::Number {
+            number: request.pull_request,
+        },
+    )
+    .await
+    {
+        Ok(candidate) => candidate,
+        Err(error) => return bad_request("review_candidate_unavailable", &error.to_string()),
+    };
+    if candidate.head_sha != request.head_sha {
+        return bad_request(
+            "review_candidate_changed",
+            "The PR head changed. Inspect it before requesting review.",
+        );
+    }
+    let draft = crate::review_requests::ReviewRequestDraft {
+        candidate,
+        reviewers: request.reviewers,
+        task: request.task,
+        idempotency_key: request.idempotency_key,
+        supersedes: request.supersedes,
+    };
+    match app.meta_runtime_registry.admit_native_review(draft).await {
+        Ok((intent, native_review)) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "result": {"accepted":true, "intent":intent, "native_review":native_review}
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            use crate::review_requests::ReviewRequestError;
+            let current = match &error {
+                ReviewRequestError::CurrentChanged { current } => current.as_deref(),
+                _ => None,
+            };
+            let message = match &error {
+                ReviewRequestError::CurrentChanged { .. } => {
+                    "A review request already exists. Explicitly supersede its current request ID."
+                }
+                ReviewRequestError::KeyConflict => {
+                    "This idempotency key belongs to another assignment. Retry unchanged or supersede explicitly with a new key."
+                }
+                ReviewRequestError::Superseded => {
+                    "This request has been superseded and cannot be restored by retrying."
+                }
+                ReviewRequestError::IneligibleReviewer => {
+                    "Select existing repository specialists outside this issue's execution team, using their actual native profiles."
+                }
+                _ => {
+                    "Review admission could not be confirmed. Retry the unchanged request and key; inspect native runs if it remains unavailable."
+                }
+            };
+            tracing::warn!(%error, "native review admission rejected");
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "result": {"accepted":false, "message":message, "current_request":current}
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn api_kapellmeister_complete_independent_review(
     State(app): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<IndependentReviewCompletionRequest>,
 ) -> axum::response::Response {
+    complete_native_review_response(
+        app,
+        headers,
+        request,
+        crate::review_completion::ReviewCompletionKind::Independent,
+    )
+    .await
+}
+
+async fn api_kapellmeister_complete_final_pr_gate(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<IndependentReviewCompletionRequest>,
+) -> axum::response::Response {
+    complete_native_review_response(
+        app,
+        headers,
+        request,
+        crate::review_completion::ReviewCompletionKind::Final,
+    )
+    .await
+}
+
+async fn complete_native_review_response(
+    app: AppState,
+    headers: HeaderMap,
+    request: IndependentReviewCompletionRequest,
+    kind: crate::review_completion::ReviewCompletionKind,
+) -> axum::response::Response {
     if let Err(response) = authorize_console_browser(&app.config, &headers) {
         return response;
     }
-    let issue_identifier =
-        issue_identifier_from_ref_http(&request.issue).unwrap_or_else(|| "unknown".to_string());
-    if !app.config.independent_review.enabled {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "result": {
-                    "accepted": false,
-                    "issue_identifier": issue_identifier,
-                    "message": "independent review lane is disabled by configuration"
-                }
-            })),
+    // Finish an accepted operation even if the browser disconnects. An unchanged
+    // final-review retry also accepts an already-confirmed merge for projection.
+    let completion = tokio::spawn(async move {
+        let host = crate::github_tools::GitHubToolHost::with_connections(
+            app.config.meerkat.runtime_connections.clone(),
+        );
+        crate::review_completion::complete(
+            &app.config,
+            &app.meta_runtime_registry,
+            request,
+            kind,
+            host,
         )
-            .into_response();
-    }
-    if let Err(error) = request.workgraph_scope.validate() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "result": {
-                    "accepted": false,
-                    "issue_identifier": issue_identifier,
-                    "message": format!("invalid independent review WorkGraph scope: {error}")
-                }
-            })),
-        )
-            .into_response();
-    }
-    for verdict in &request.verdicts {
-        if let Err(error) = verdict.validate() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "result": {
-                        "accepted": false,
-                        "issue_identifier": issue_identifier,
-                        "message": format!("invalid independent review verdict: {error}")
-                    }
-                })),
-            )
-                .into_response();
-        }
-    }
-    let plan = aggregate_independent_review(IndependentReviewAggregationInput {
-        config: app.config.independent_review.clone(),
-        issue_identifier: issue_identifier.clone(),
-        head_sha: request.head_sha.clone(),
-        verdicts: request.verdicts.clone(),
-        timed_out: request.timed_out,
-    });
-    if plan.decision == IndependentReviewDecision::Waiting {
-        return (
-            StatusCode::ACCEPTED,
-            Json(json!({
-                "result": {
-                    "accepted": true,
-                    "issue_identifier": issue_identifier,
-                    "message": plan.reasons.join("; "),
-                    "plan": plan
-                }
-            })),
-        )
-            .into_response();
-    }
-    match record_independent_review_projection(&app.config, &request, &issue_identifier, &plan)
         .await
-    {
-        Ok(result) => (
-            StatusCode::ACCEPTED,
-            Json(json!({
-                "result": {
-                    "accepted": true,
-                    "issue_identifier": issue_identifier,
-                    "message": "independent review completion recorded",
-                    "plan": plan,
-                    "projection": result
-                }
-            })),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({
-                "result": {
-                    "accepted": false,
-                    "issue_identifier": issue_identifier,
-                    "message": error.to_string(),
-                    "plan": plan
-                }
-            })),
-        )
-            .into_response(),
+    })
+    .await;
+    match completion {
+        Ok(Ok(result)) => (StatusCode::ACCEPTED, Json(json!({"result":result}))).into_response(),
+        Ok(Err(error)) => {
+            let status = if error.code == "review_projection_failed" { StatusCode::BAD_GATEWAY } else { StatusCode::CONFLICT };
+            (status, Json(json!({"result":{"accepted":false,"message":error.message}, "error":{"code":error.code}}))).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"result":{"accepted":false,"message":"Review completion was interrupted. Inspect current review and remote PR state before retrying."}}))).into_response(),
     }
 }
 
@@ -4227,7 +4850,7 @@ async fn execute_kapellmeister_deploy(
     app: AppState,
     request: DeployStartRequest,
 ) -> axum::response::Response {
-    let result = execute_deploy_transaction(app.config, request).await;
+    let result = execute_deploy_transaction(app.config, app.meta_runtime_registry, request).await;
     let status = if result.accepted {
         StatusCode::ACCEPTED
     } else {
@@ -4250,7 +4873,20 @@ async fn execute_kapellmeister_deploy(
 
 pub async fn execute_deploy_transaction(
     config: ServiceConfig,
+    registry: MetaRuntimeRegistry,
     request: DeployStartRequest,
+) -> DeployTransactionResult {
+    let host = crate::github_tools::GitHubToolHost::with_connections(
+        config.meerkat.runtime_connections.clone(),
+    );
+    execute_deploy_transaction_with_host(config, registry, request, host).await
+}
+
+pub(crate) async fn execute_deploy_transaction_with_host(
+    config: ServiceConfig,
+    registry: MetaRuntimeRegistry,
+    request: DeployStartRequest,
+    host: crate::github_tools::GitHubToolHost,
 ) -> DeployTransactionResult {
     let issue_identifier =
         issue_identifier_from_ref_http(&request.issue).unwrap_or_else(|| "unknown".to_string());
@@ -4265,33 +4901,23 @@ pub async fn execute_deploy_transaction(
             ota: None,
         };
     }
-    match deploy_idempotency_already_recorded(&config, &request.issue, &request.idempotency_key)
-        .await
-    {
-        Ok(true) => {
-            return DeployTransactionResult {
-                accepted: true,
-                issue_identifier,
-                message: "deploy idempotency key is already recorded; skipping duplicate merge/OTA attempt".to_string(),
-                failure_category: None,
-                plan: None,
-                outcome: None,
-                ota: None,
-            };
-        }
-        Ok(false) => {}
-        Err(error) => {
-            return DeployTransactionResult {
-                accepted: false,
-                issue_identifier,
-                message: error.to_string(),
-                failure_category: Some(DeployFailureCategory::Unknown),
-                plan: None,
-                outcome: None,
-                ota: None,
-            };
-        }
-    }
+    let issue_identifier =
+        match crate::workgraph_gate::canonical_issue_identifier(&config.tracker, &request.issue)
+            .await
+        {
+            Ok(identifier) => identifier,
+            Err(error) => {
+                return DeployTransactionResult {
+                    accepted: false,
+                    issue_identifier,
+                    message: format!("Cannot resolve the deployment issue: {error}"),
+                    failure_category: Some(DeployFailureCategory::UnsafeDeploy),
+                    plan: None,
+                    outcome: None,
+                    ota: None,
+                };
+            }
+        };
     let ota_update = config.ota_update.clone();
     let ota_update_enabled = ota_update.as_ref().is_some_and(|config| config.enabled);
     let plan = plan_deploy_gate(DeployGateInput {
@@ -4339,7 +4965,15 @@ pub async fn execute_deploy_transaction(
             ota: None,
         };
     };
-    let merge_result = GitHubToolHost::new().merge_pr(merge_input);
+    let merge_result = crate::merge_gate::merge_with_host(
+        &config,
+        &registry,
+        request.issue.clone(),
+        merge_input,
+        crate::merge_gate::MergePurpose::Deploy,
+        host,
+    )
+    .await;
     let merge_output = match merge_result {
         crate::tools::FugueToolResult::Ok {
             output: FugueToolOutput::GitHubMergePr(output),
@@ -4471,16 +5105,35 @@ pub async fn execute_deploy_transaction(
             ota: None,
         };
     };
-    let ota_report = match run_ota_update(&ota_config).await {
-        Ok(report) => report,
+    // The receipt retains deployment ownership through every projection below.
+    let receipt = match crate::deployment_receipts::run(&config, &request, &merged_sha).await {
+        Ok(receipt) => receipt,
         Err(error) => {
-            let outcome = deploy_failure_outcome(
+            return DeployTransactionResult {
+                accepted: false,
+                issue_identifier,
+                message: error.to_string(),
+                failure_category: Some(DeployFailureCategory::UnsafeDeploy),
+                plan: Some(plan),
+                outcome: None,
+                ota: None,
+            };
+        }
+    };
+    let ota_report = match &receipt.outcome {
+        Ok(report) => report.clone(),
+        Err(error) => {
+            let mut outcome = deploy_failure_outcome(
                 issue_identifier.clone(),
                 &request,
                 DeployFailureCategory::OtaFailed,
                 Utc::now(),
                 Utc::now(),
             );
+            outcome.merge = Some(crate::deploy_gate::DeployMergeEvidence {
+                method: config.deploy.merge_method,
+                merged_sha: merged_sha.clone(),
+            });
             if let Err(projection_error) = record_failed_deploy_projection(
                 &config,
                 &request,
@@ -4656,8 +5309,15 @@ async fn record_deploy_projection(
             issue: request.issue.clone(),
         })
         .await?;
+    // A refused retry is diagnostic evidence, not a replacement for an
+    // already observed merge or deployment. Keep both in the same Workpad.
+    let heading = if outcome.merge.is_none() && outcome.ota.is_none() {
+        "### Deployment attempt"
+    } else {
+        "### Deployment"
+    };
     let deployment = format!(
-        "### Deployment\n\nIdempotency-Key: `{}`\n\n```json\n{evidence}\n```",
+        "{heading}\n\nIdempotency-Key: `{}`\n\n```json\n{evidence}\n```",
         request.idempotency_key.0
     );
     let body_markdown = crate::orchestrator::upsert_markdown_section(
@@ -4665,7 +5325,7 @@ async fn record_deploy_projection(
             .workpad
             .as_ref()
             .map_or("", |workpad| workpad.body_markdown.as_str()),
-        "### Deployment",
+        heading,
         &deployment,
     );
     adapter
@@ -4680,22 +5340,35 @@ async fn record_deploy_projection(
             )),
         })
         .await?;
-    adapter
-        .move_issue(MoveIssueInput {
-            issue: request.issue.clone(),
-            state: LinearStateRef::Name {
-                name: target_lane.to_string(),
-            },
-            expected_updated_at: None,
-            idempotency_key: IdempotencyKey(format!(
-                "{}:{}:{}",
-                move_key_prefix, outcome.issue_identifier, request.idempotency_key.0
-            )),
-        })
-        .await?;
+    let movement = MoveIssueInput {
+        issue: request.issue.clone(),
+        state: LinearStateRef::Name {
+            name: target_lane.to_string(),
+        },
+        expected_updated_at: None,
+        idempotency_key: IdempotencyKey(format!(
+            "{}:{}:{}",
+            move_key_prefix, outcome.issue_identifier, request.idempotency_key.0
+        )),
+    };
+    let mut graph = crate::workgraph_gate::WorkGraphTerminalGate::for_service(config);
+    graph
+        .terminal_states
+        .push(config.deploy.success_lane.clone());
+    if outcome.status == DeployOutcomeStatus::Failed {
+        graph
+            .allowed_terminal_states
+            .push(config.deploy.blocked_lane.clone());
+    }
+    graph
+        .guard_terminal_move(&config.tracker, &movement)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    crate::linear_adapter::move_issue_with_observation(config, movement).await?;
     Ok(())
 }
 
+#[cfg(test)]
 async fn deploy_idempotency_already_recorded(
     config: &ServiceConfig,
     issue: &LinearIssueRef,
@@ -4712,6 +5385,7 @@ async fn deploy_idempotency_already_recorded(
     }))
 }
 
+#[cfg(test)]
 fn deploy_success_idempotency_recorded_in_workpad(
     body_markdown: &str,
     idempotency_key: &IdempotencyKey,
@@ -4864,177 +5538,24 @@ fn deploy_post_merge_ota_failure_outcome(
     }
 }
 
-#[derive(Debug, Serialize)]
-struct IndependentReviewProjectionResult {
-    target_lane: String,
-    workpad_comment_id: String,
-    findings_comment_id: Option<String>,
-    workgraph_items: Vec<IndependentReviewWorkGraphItemRef>,
-}
-
-#[derive(Debug, Serialize)]
-struct IndependentReviewWorkGraphItemRef {
-    id: String,
-    realm_id: String,
-    namespace: String,
-}
-
+#[cfg(test)]
 async fn record_independent_review_projection(
     config: &ServiceConfig,
     request: &IndependentReviewCompletionRequest,
     issue_identifier: &str,
     plan: &crate::independent_review::IndependentReviewAggregationPlan,
-) -> anyhow::Result<IndependentReviewProjectionResult> {
-    let target_lane = plan
-        .target_lane
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("independent review projection has no target lane"))?;
-    let adapter = IssueAdapter::from_config(&config.tracker)?;
-    let review_summary = serde_json::to_string_pretty(&json!({
-        "schema_version": crate::independent_review::INDEPENDENT_REVIEW_SCHEMA_VERSION,
-        "issue_identifier": issue_identifier,
-        "pull_request": request.pull_request,
-        "head_sha": request.head_sha,
-        "decision": plan.decision,
-        "target_lane": target_lane,
-        "reasons": plan.reasons,
-        "verdicts": request.verdicts,
-        "timed_out": request.timed_out,
-    }))?;
-    let workpad = adapter
-        .upsert_workpad(UpsertWorkpadInput {
-            issue: request.issue.clone(),
-            heading: "## Fugue Workpad".to_string(),
-            body_markdown: format!("### Independent Review\n\n```json\n{review_summary}\n```"),
-            create_if_missing: true,
-            idempotency_key: IdempotencyKey(format!(
-                "independent-review-workpad:{}:{}",
-                issue_identifier, request.idempotency_key.0
-            )),
-        })
-        .await?;
-
-    let workgraph_projection =
-        create_independent_review_workgraph_items(config, &request.workgraph_scope, plan).await?;
-
-    let mut findings_comment_id = None;
-    if let Some(comment) = &plan.consolidated_comment
-        && (workgraph_projection.created_any || workgraph_projection.item_refs.is_empty())
-    {
-        let comment = adapter
-            .add_comment(AddCommentInput {
-                issue: request.issue.clone(),
-                body_markdown: format!(
-                    "{}\n\nIdempotency-Key: `{}`",
-                    comment, request.idempotency_key.0
-                ),
-                attachments: Vec::new(),
-            })
-            .await?;
-        findings_comment_id = Some(comment.comment_id.0);
-    }
-
-    adapter
-        .move_issue(MoveIssueInput {
-            issue: request.issue.clone(),
-            state: LinearStateRef::Name {
-                name: target_lane.clone(),
-            },
-            expected_updated_at: None,
-            idempotency_key: IdempotencyKey(format!(
-                "independent-review-move:{}:{}",
-                issue_identifier, request.idempotency_key.0
-            )),
-        })
-        .await?;
-
-    Ok(IndependentReviewProjectionResult {
-        target_lane,
-        workpad_comment_id: workpad.comment_id.0,
-        findings_comment_id,
-        workgraph_items: workgraph_projection.item_refs,
-    })
-}
-
-struct IndependentReviewWorkGraphProjection {
-    item_refs: Vec<IndependentReviewWorkGraphItemRef>,
-    created_any: bool,
-}
-
-async fn create_independent_review_workgraph_items(
-    config: &ServiceConfig,
-    scope: &IndependentReviewWorkGraphScope,
-    plan: &crate::independent_review::IndependentReviewAggregationPlan,
-) -> anyhow::Result<IndependentReviewWorkGraphProjection> {
-    if plan.workgraph_items.is_empty() {
-        return Ok(IndependentReviewWorkGraphProjection {
-            item_refs: Vec::new(),
-            created_any: false,
-        });
-    }
-    scope.validate()?;
-    let workgraph_path = meta_runtime_state_path(&config.meerkat).join("workgraph.sqlite3");
-    if let Some(parent) = workgraph_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let store = SqliteWorkGraphStore::open(&workgraph_path)?;
-    let namespace = WorkNamespace::new(scope.namespace.clone())?;
-    let service = WorkGraphService::with_scope(Arc::new(store), &scope.realm_id, namespace.clone());
-    let mut item_refs = Vec::new();
-    let mut created_any = false;
-    for item in &plan.workgraph_items {
-        let labels = item.labels.iter().cloned().collect::<BTreeSet<_>>();
-        let existing = service
-            .list(WorkItemFilter {
-                realm_id: Some(scope.realm_id.clone()),
-                namespace: Some(namespace.clone()),
-                all_namespaces: false,
-                statuses: Vec::new(),
-                labels: item.labels.clone(),
-                include_terminal: false,
-                limit: None,
-            })
-            .await?
-            .into_iter()
-            .find(|existing| {
-                existing.title == item.title
-                    && existing.description.as_deref() == Some(item.detail.as_str())
-            });
-        let work_item = match existing {
-            Some(existing) => existing,
-            None => {
-                created_any = true;
-                service
-                    .create(CreateWorkItemRequest {
-                        realm_id: Some(scope.realm_id.clone()),
-                        namespace: Some(namespace.clone()),
-                        title: item.title.clone(),
-                        description: Some(item.detail.clone()),
-                        priority: WorkPriority::High,
-                        completion_policy: WorkCompletionPolicy::SelfAttest,
-                        failed_child_join_policy: Default::default(),
-                        cancelled_child_join_policy: Default::default(),
-                        labels,
-                        due_at: None,
-                        not_before: None,
-                        snoozed_until: None,
-                        external_refs: Vec::new(),
-                        evidence_refs: Vec::new(),
-                        status: Some(WorkStatus::Open),
-                    })
-                    .await?
-            }
-        };
-        item_refs.push(IndependentReviewWorkGraphItemRef {
-            id: work_item.id.to_string(),
-            realm_id: work_item.realm_id,
-            namespace: work_item.namespace.to_string(),
-        });
-    }
-    Ok(IndependentReviewWorkGraphProjection {
-        item_refs,
-        created_any,
-    })
+    verdicts: &[crate::independent_review::IndependentReviewVerdict],
+) -> anyhow::Result<crate::review_completion::IndependentReviewProjectionResult> {
+    crate::review_completion::record_review_projection(
+        config,
+        request,
+        issue_identifier,
+        plan,
+        verdicts,
+        None,
+        crate::review_completion::ReviewCompletionKind::Independent,
+    )
+    .await
 }
 
 async fn api_ota_update(State(app): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -5671,6 +6192,975 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
 
+    async fn managed_test_router(
+        root: &std::path::Path,
+        extra: Option<Router>,
+    ) -> (Router, crate::orchestrator::Orchestrator) {
+        let definition = WorkflowDefinition {
+            config: json!({
+                "tracker": {"kind": "fugue-ims", "endpoint": root.join("ims.sqlite"), "project_slug": "test/repository"},
+                "meerkat": {"repository_runtime": {
+                    "repository": "test-repository", "state_path": root.join("team")
+                }},
+                "server": {"meta_console": {"enabled": false}}
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            prompt_template: "test".into(),
+        };
+        let manager = crate::config::WorkflowConfigManager::from_definition_for_test(
+            root.join("fugue.yaml"),
+            definition,
+        )
+        .unwrap();
+        let (refresh, receiver) = mpsc::channel(8);
+        let owner = crate::orchestrator::Orchestrator::new(manager, receiver).unwrap();
+        let app = router(
+            owner.shared_state(),
+            owner.config().effective().clone(),
+            refresh,
+            owner.internal_sender(),
+            owner.meta_runtime_registry(),
+            extra,
+        )
+        .await
+        .unwrap();
+        (app, owner)
+    }
+
+    #[tokio::test]
+    async fn jira_create_http_preserves_acknowledgement_when_initial_status_fails() {
+        use crate::jira::tests::{issue, mock_jira, reply, tracker};
+        use tower::ServiceExt;
+
+        for partial in [false, true] {
+            let mut responses = vec![reply(
+                "POST",
+                "/rest/api/3/issue",
+                json!({"id":"10001","key":"TEST-1"}),
+            )];
+            if partial {
+                responses.push(reply(
+                    "GET",
+                    "/rest/api/3/issue/10001",
+                    issue("In Progress"),
+                ));
+                responses.push(reply(
+                    "GET",
+                    "/rest/api/3/issue/TEST-1/transitions",
+                    json!({"transitions":[]}),
+                ));
+            } else {
+                responses.push(reply("GET", "/rest/api/3/issue/10001", issue("To Do")));
+                responses.push(reply("GET", "/rest/api/3/issue/10001", issue("To Do")));
+            }
+            let mock = mock_jira(responses).await;
+            let root = tempfile::tempdir().unwrap();
+            let (_, owner) = managed_test_router(root.path(), None).await;
+            let mut config = owner.config().effective().clone();
+            config.tracker = tracker(&mock.endpoint);
+            config.linear.lanes.parked = "To Do".to_owned();
+            config.linear.lanes.ready = "To Do".to_owned();
+            let (refresh, _receiver) = mpsc::channel(1);
+            let app = router(
+                owner.shared_state(),
+                config.clone(),
+                refresh,
+                owner.internal_sender(),
+                owner.meta_runtime_registry(),
+                None,
+            )
+            .await
+            .unwrap();
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/issues")
+                        .header("Host", "127.0.0.1:8788")
+                        .header("Origin", "http://127.0.0.1:8788")
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("x-fugue-tracker-scope", config.tracker_context_id())
+                        .body(Body::from(r#"{"title":"One issue","lane":"To Do"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if partial {
+                assert_eq!(payload["outcome"], "created_with_warning");
+                assert_eq!(
+                    payload["created_issue"],
+                    json!({
+                        "id":"10001", "identifier":"TEST-1", "url":format!("{}/browse/TEST-1", mock.endpoint),
+                    })
+                );
+                assert_eq!(payload["warning"]["code"], "issue_created_followup_failed");
+                assert!(
+                    payload["warning"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("TEST-1")
+                );
+                assert!(
+                    payload.get("issue").is_none(),
+                    "do not invent confirmed issue state"
+                );
+            } else {
+                assert_eq!(payload["outcome"], "created");
+                assert_eq!(payload["issue"]["issue_id"], "10001");
+                assert_eq!(payload["issue"]["identifier"], "TEST-1");
+                assert!(payload["issue"].get("id").is_none());
+            }
+            assert!(mock.responses.lock().unwrap().is_empty());
+            assert_eq!(
+                mock.requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(uri, _)| uri == "/rest/api/3/issue")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_attachment_download_requires_issue_membership() {
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let (own, own_config, _owner) =
+            attachment_scope_test_router(root.path(), "owner/one").await;
+        let (foreign, foreign_config, _other) =
+            attachment_scope_test_router(root.path(), "owner/two").await;
+        crate::fugue_ims::create_issue_for_config(
+            &own_config.tracker,
+            CreateFugueIssue {
+                key: ImsIssueKey("TEST-1".into()),
+                repo: "owner/one".into(),
+                title: "Private issue".into(),
+                description: None,
+                stage: ImsStageName("Todo".into()),
+                labels: vec![],
+            },
+        )
+        .unwrap();
+        // Even a file copied into the wrong scoped directory must not be read
+        // when the tracker says the issue belongs to another repository.
+        assert_ne!(
+            own_config.attachment_storage_root(),
+            foreign_config.attachment_storage_root()
+        );
+        for config in [&own_config, &foreign_config] {
+            let files = issue_attachment_dir(config, "TEST-1");
+            std::fs::create_dir_all(&files).unwrap();
+            std::fs::write(files.join("trace.txt"), "private file contents").unwrap();
+        }
+        for (app, allowed) in [(foreign, false), (own, true)] {
+            let response = app
+                .oneshot(attachment_test_request(
+                    None,
+                    "GET",
+                    "/api/v1/issues/TEST-1/attachments/trace.txt",
+                    Body::empty(),
+                    None,
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+            if allowed {
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(bytes.as_ref(), b"private file contents");
+            } else {
+                assert!(!status.is_success(), "foreign project read the file");
+                assert!(!String::from_utf8_lossy(&bytes).contains("private file contents"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_attachment_upload_denies_before_filesystem_writes() {
+        use tower::ServiceExt;
+        for endpoint in ["attachments", "comments"] {
+            let root = tempfile::tempdir().unwrap();
+            let (_, own_config, _owner) =
+                attachment_scope_test_router(root.path(), "owner/one").await;
+            let (foreign, foreign_config, _other) =
+                attachment_scope_test_router(root.path(), "owner/two").await;
+            crate::fugue_ims::create_issue_for_config(
+                &own_config.tracker,
+                CreateFugueIssue {
+                    key: ImsIssueKey("TEST-1".into()),
+                    repo: "owner/one".into(),
+                    title: "Private issue".into(),
+                    description: None,
+                    stage: ImsStageName("Todo".into()),
+                    labels: vec![],
+                },
+            )
+            .unwrap();
+            let directory = issue_attachment_dir(&foreign_config, "TEST-1");
+            assert!(!directory.exists());
+            let response = foreign
+                .oneshot(attachment_test_request(
+                    Some(&foreign_config),
+                    "POST",
+                    &format!("/api/v1/issues/TEST-1/{endpoint}"),
+                    attachment_test_body(),
+                    Some("multipart/form-data; boundary=fixture"),
+                ))
+                .await
+                .unwrap();
+            assert!(!response.status().is_success());
+            assert!(
+                !directory.exists(),
+                "{endpoint} wrote to a foreign issue before refusing it"
+            );
+        }
+    }
+
+    async fn attachment_scope_test_router(
+        root: &Path,
+        project: &str,
+    ) -> (Router, ServiceConfig, crate::orchestrator::Orchestrator) {
+        let (_, owner) = managed_test_router(root, None).await;
+        let mut config = owner.config().effective().clone();
+        config.tracker.project_slug = Some(project.to_owned());
+        let (refresh, _receiver) = mpsc::channel(1);
+        let app = router(
+            owner.shared_state(),
+            config.clone(),
+            refresh,
+            owner.internal_sender(),
+            owner.meta_runtime_registry(),
+            None,
+        )
+        .await
+        .unwrap();
+        (app, config, owner)
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_owned_attachment_uploads_and_downloads_still_work() {
+        use tower::ServiceExt;
+        for endpoint in ["attachments", "comments"] {
+            let root = tempfile::tempdir().unwrap();
+            let (app, config, _owner) =
+                attachment_scope_test_router(root.path(), "owner/one").await;
+            crate::fugue_ims::create_issue_for_config(
+                &config.tracker,
+                CreateFugueIssue {
+                    key: ImsIssueKey("TEST-1".into()),
+                    repo: "owner/one".into(),
+                    title: "Owned issue".into(),
+                    description: None,
+                    stage: ImsStageName("Todo".into()),
+                    labels: vec![],
+                },
+            )
+            .unwrap();
+            let response = app
+                .clone()
+                .oneshot(attachment_test_request(
+                    Some(&config),
+                    "POST",
+                    &format!("/api/v1/issues/TEST-1/{endpoint}"),
+                    attachment_test_body(),
+                    Some("multipart/form-data; boundary=fixture"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let url = payload["attachments"][0]["url"].as_str().unwrap();
+            let response = app
+                .oneshot(attachment_test_request(
+                    None,
+                    "GET",
+                    url,
+                    Body::empty(),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(response.into_body(), 8192).await.unwrap().as_ref(),
+                b"attachment contents"
+            );
+            assert_eq!(
+                IssueAdapter::from_config(&config.tracker)
+                    .unwrap()
+                    .issue_comments(&issue_ref_for_identifier("TEST-1"))
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_malformed_multipart_never_posts_partial_comment() {
+        use tower::ServiceExt;
+        for endpoint in ["attachments", "comments"] {
+            let root = tempfile::tempdir().unwrap();
+            let (app, config, _owner) =
+                attachment_scope_test_router(root.path(), "owner/one").await;
+            crate::fugue_ims::create_issue_for_config(
+                &config.tracker,
+                CreateFugueIssue {
+                    key: ImsIssueKey("TEST-1".into()),
+                    repo: "owner/one".into(),
+                    title: "Owned issue".into(),
+                    description: None,
+                    stage: ImsStageName("Todo".into()),
+                    labels: vec![],
+                },
+            )
+            .unwrap();
+            let response = app
+                .oneshot(attachment_test_request(
+                    Some(&config),
+                    "POST",
+                    &format!("/api/v1/issues/TEST-1/{endpoint}"),
+                    Body::from("--fixture\r\nContent-Disposition: form-data; name=\"attachments\"; filename=\"trace.txt\"\r\nContent-Type: text/plain\r\n\r\nvalid first file\r\n--fixture\r\nInvalid header without a colon\r\n\r\npartial second file\r\n--fixture--\r\n"),
+                    Some("multipart/form-data; boundary=fixture"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{endpoint}");
+            assert!(
+                IssueAdapter::from_config(&config.tracker)
+                    .unwrap()
+                    .issue_comments(&issue_ref_for_identifier("TEST-1"))
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{endpoint} posted a comment from an incomplete request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_jira_browser_uploads_publish_native_files() {
+        use crate::jira::tests::{issue, mock_jira, reply, tracker};
+        use tower::ServiceExt;
+        for endpoint in ["attachments", "comments"] {
+            let contents = if endpoint == "attachments" {
+                "x".repeat(2 * 1024 * 1024 + 1)
+            } else {
+                "attachment contents".to_string()
+            };
+            let mock = mock_jira(vec![]).await;
+            let content_url = format!("{}/secure/attachment/7/trace.txt", mock.endpoint);
+            let mut replies = vec![
+                reply("GET", "/rest/api/3/issue/10001", issue("To Do")),
+                reply("GET", "/rest/api/3/issue/TEST-1", issue("To Do")),
+                reply(
+                    "POST",
+                    "/rest/api/3/issue/TEST-1/attachments",
+                    json!([
+                        {"filename":"trace.txt","content":content_url,"size":contents.len(),"mimeType":"text/plain"}
+                    ]),
+                ),
+            ];
+            if endpoint == "comments" {
+                replies.push(reply("GET", "/rest/api/3/issue/TEST-1", issue("To Do")));
+                replies.push(reply(
+                    "POST",
+                    "/rest/api/3/issue/TEST-1/comment",
+                    json!({"id":"comment-7","body":"Attached"}),
+                ));
+            }
+            mock.responses.lock().unwrap().extend(replies);
+            let root = tempfile::tempdir().unwrap();
+            let (_, mut config, owner) = attachment_scope_test_router(root.path(), "TEST").await;
+            config.tracker = tracker(&mock.endpoint);
+            let (refresh, _receiver) = mpsc::channel(1);
+            let app = router(
+                owner.shared_state(),
+                config.clone(),
+                refresh,
+                owner.internal_sender(),
+                owner.meta_runtime_registry(),
+                None,
+            )
+            .await
+            .unwrap();
+            let response = app
+                .oneshot(attachment_test_request(
+                    Some(&config),
+                    "POST",
+                    &format!("/api/v1/issues/10001/{endpoint}"),
+                    Body::from(format!("--fixture\r\nContent-Disposition: form-data; name=\"attachments\"; filename=\"trace.txt\"\r\nContent-Type: text/plain\r\n\r\n{contents}\r\n--fixture--\r\n")),
+                    Some("multipart/form-data; boundary=fixture"),
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+            let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(payload["attachments"][0]["url"], content_url);
+            assert!(mock.responses.lock().unwrap().is_empty());
+            let requests = mock.requests.lock().unwrap();
+            let files = &requests[2].1["files"];
+            assert_eq!(files[0]["name"], "trace.txt");
+            assert_eq!(files[0]["bytes"], json!(contents.as_bytes().to_vec()));
+            if endpoint == "comments" {
+                assert!(requests[4].1.to_string().contains(&content_url));
+                assert!(!requests[4].1.to_string().contains("/api/v1/issues"));
+                assert!(
+                    !requests[4]
+                        .1
+                        .to_string()
+                        .contains(root.path().to_str().unwrap())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_jira_upload_failures_retain_acknowledged_files() {
+        use crate::jira::tests::{issue, mock_jira, reply, tracker};
+        use tower::ServiceExt;
+        for scenario in [
+            "server",
+            "malformed",
+            "incomplete",
+            "partial",
+            "comment",
+            "foreign_url",
+            "rejected",
+        ] {
+            let mock = mock_jira(vec![]).await;
+            let url = format!("{}/secure/attachment/7/trace.txt", mock.endpoint);
+            let response_body = match scenario {
+                "malformed" => json!({"private":"private-response-sentinel"}),
+                "incomplete" => json!([]),
+                "foreign_url" => {
+                    json!([{"id":"7","filename":"trace.txt","content":"https://foreign.example.test/private","size":19}])
+                }
+                _ => json!([{"id":"7","filename":"trace.txt","content":url,"size":19}]),
+            };
+            let status = match scenario {
+                "server" => StatusCode::SERVICE_UNAVAILABLE,
+                "rejected" => StatusCode::FORBIDDEN,
+                _ => StatusCode::OK,
+            };
+            let mut replies = vec![
+                reply("GET", "/rest/api/3/issue/TEST-1", issue("To Do")),
+                reply("GET", "/rest/api/3/issue/TEST-1", issue("To Do")),
+                reply(
+                    "POST",
+                    "/rest/api/3/issue/TEST-1/attachments",
+                    response_body,
+                )
+                .with_status(status),
+            ];
+            if scenario == "comment" {
+                replies.push(reply("GET", "/rest/api/3/issue/TEST-1", issue("To Do")));
+                replies.push(
+                    reply(
+                        "POST",
+                        "/rest/api/3/issue/TEST-1/comment",
+                        json!({"private":"private-response-sentinel"}),
+                    )
+                    .with_status(StatusCode::SERVICE_UNAVAILABLE),
+                );
+            }
+            mock.responses.lock().unwrap().extend(replies);
+            let root = tempfile::tempdir().unwrap();
+            let (_, mut config, owner) = attachment_scope_test_router(root.path(), "TEST").await;
+            config.tracker = tracker(&mock.endpoint);
+            let (refresh, _receiver) = mpsc::channel(1);
+            let app = router(
+                owner.shared_state(),
+                config.clone(),
+                refresh,
+                owner.internal_sender(),
+                owner.meta_runtime_registry(),
+                None,
+            )
+            .await
+            .unwrap();
+            let response = app
+                .oneshot(attachment_test_request(
+                    Some(&config),
+                    "POST",
+                    "/api/v1/issues/TEST-1/comments",
+                    if scenario == "partial" {
+                        Body::from("--fixture\r\nContent-Disposition: form-data; name=\"attachments\"; filename=\"trace.txt\"\r\n\r\nattachment contents\r\n--fixture\r\nContent-Disposition: form-data; name=\"attachments\"; filename=\"second.txt\"\r\n\r\nsecond\r\n--fixture--\r\n")
+                    } else { attachment_test_body() },
+                    Some("multipart/form-data; boundary=fixture"),
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("private-response-sentinel"));
+            let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if scenario == "rejected" {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert_eq!(payload["error"]["code"], "jira_request_rejected");
+            } else {
+                assert_eq!(status, StatusCode::OK, "{scenario}: {payload}");
+                assert_eq!(
+                    payload["warning"]["code"],
+                    if scenario == "comment" {
+                        "comment_not_confirmed"
+                    } else {
+                        "upload_not_confirmed"
+                    }
+                );
+                assert_eq!(
+                    payload["attachments"].as_array().unwrap().len(),
+                    usize::from(matches!(scenario, "comment" | "partial"))
+                );
+                assert!(payload["comment_id"].is_null());
+                if scenario == "comment" {
+                    assert_eq!(payload["attachments"][0]["url"], url);
+                }
+            }
+            assert!(mock.responses.lock().unwrap().is_empty(), "{scenario}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_stale_browser_context_denied_before_provider_or_storage() {
+        use crate::jira::tests::{mock_jira, tracker};
+        use tower::ServiceExt;
+        let mock = mock_jira(vec![]).await;
+        let root = tempfile::tempdir().unwrap();
+        let (_, mut config, owner) = attachment_scope_test_router(root.path(), "TEST").await;
+        let old_context = config.tracker_context_id();
+        config.tracker = tracker(&mock.endpoint);
+        let storage = issue_attachment_dir(&config, "TEST-1");
+        let (refresh, _receiver) = mpsc::channel(1);
+        let app = router(
+            owner.shared_state(),
+            config,
+            refresh,
+            owner.internal_sender(),
+            owner.meta_runtime_registry(),
+            None,
+        )
+        .await
+        .unwrap();
+        for missing in [false, true] {
+            for endpoint in ["attachments", "comments"] {
+                let mut request = attachment_test_request(
+                    None,
+                    "POST",
+                    &format!("/api/v1/issues/TEST-1/{endpoint}"),
+                    attachment_test_body(),
+                    Some("multipart/form-data; boundary=fixture"),
+                );
+                if !missing {
+                    request.headers_mut().insert(
+                        "x-fugue-tracker-scope",
+                        HeaderValue::from_str(&old_context).unwrap(),
+                    );
+                }
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+            }
+        }
+        assert!(mock.requests.lock().unwrap().is_empty());
+        assert!(!storage.exists());
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_state_and_workpad_reject_old_browser_context() {
+        use crate::jira::tests::{issue, mock_jira, reply, tracker};
+        use tower::ServiceExt;
+
+        let mut observed = Vec::new();
+        for context in ["stale", "missing", "current", "api"] {
+            for endpoint in ["state", "workpad"] {
+                let mut replies = vec![reply("GET", "/rest/api/3/issue/TEST-1", issue("To Do"))];
+                let (method, body) = if endpoint == "state" {
+                    replies.extend([
+                        reply(
+                            "GET",
+                            "/rest/api/3/issue/TEST-1/transitions",
+                            json!({
+                                "transitions": [{"id":"21", "to": {
+                                    "id":"3", "name":"In Progress",
+                                    "statusCategory":{"key":"indeterminate"}
+                                }}]
+                            }),
+                        ),
+                        reply("POST", "/rest/api/3/issue/TEST-1/transitions", json!({})),
+                        reply("GET", "/rest/api/3/issue/TEST-1", issue("In Progress")),
+                    ]);
+                    ("PATCH", json!({"state":"In Progress"}))
+                } else {
+                    replies.extend([
+                        reply(
+                            "GET",
+                            "/rest/api/3/issue/TEST-1/comment",
+                            json!({
+                                "comments":[], "total":0
+                            }),
+                        ),
+                        reply(
+                            "POST",
+                            "/rest/api/3/issue/TEST-1/comment",
+                            json!({
+                                "id":"101", "body":"## Fugue Workpad\n\nCurrent work"
+                            }),
+                        ),
+                    ]);
+                    ("PUT", json!({"body_markdown":"Current work"}))
+                };
+                let expected_requests = replies.len();
+                let mock = mock_jira(replies).await;
+                let root = tempfile::tempdir().unwrap();
+                let (_, mut config, owner) =
+                    attachment_scope_test_router(root.path(), "TEST").await;
+                config.tracker = tracker("https://previous.example.test");
+                let old_context = config.tracker_context_id();
+                config.tracker = tracker(&mock.endpoint);
+                let current_context = config.tracker_context_id();
+                assert_ne!(old_context, current_context);
+                let (refresh, _receiver) = mpsc::channel(1);
+                let app = router(
+                    owner.shared_state(),
+                    config,
+                    refresh,
+                    owner.internal_sender(),
+                    owner.meta_runtime_registry(),
+                    None,
+                )
+                .await
+                .unwrap();
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri(format!("/api/v1/issues/TEST-1/{endpoint}"))
+                    .header("Host", "127.0.0.1:8788")
+                    .header(CONTENT_TYPE, "application/json");
+                if context != "api" {
+                    request = request.header("Origin", "http://127.0.0.1:8788");
+                }
+                if context == "stale" {
+                    request = request.header("x-fugue-tracker-scope", &old_context);
+                } else if context == "current" {
+                    request = request.header("x-fugue-tracker-scope", &current_context);
+                }
+                let response = app
+                    .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                    .await
+                    .unwrap();
+                let denied = matches!(context, "stale" | "missing");
+                let expected_status = if denied {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::OK
+                };
+                let request_count = mock.requests.lock().unwrap().len();
+                let expected_count = if denied { 0 } else { expected_requests };
+                observed.push((
+                    context,
+                    endpoint,
+                    response.status(),
+                    request_count,
+                    expected_status,
+                    expected_count,
+                ));
+            }
+        }
+        for (context, endpoint, status, count, expected_status, expected_count) in &observed {
+            assert_eq!(
+                (status, count),
+                (expected_status, expected_count),
+                "{context} {endpoint}; all observed outcomes: {observed:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_jira_json_cannot_upload_host_paths() {
+        use crate::jira::tests::{issue, mock_jira, reply, tracker};
+        use tower::ServiceExt;
+        let mock = mock_jira(vec![reply(
+            "GET",
+            "/rest/api/3/issue/TEST-1",
+            issue("To Do"),
+        )])
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let secret = root.path().join("private.txt");
+        std::fs::write(&secret, "private-file-sentinel").unwrap();
+        let (_, mut config, owner) = attachment_scope_test_router(root.path(), "TEST").await;
+        config.tracker = tracker(&mock.endpoint);
+        let (refresh, _receiver) = mpsc::channel(1);
+        let app = router(
+            owner.shared_state(),
+            config.clone(),
+            refresh,
+            owner.internal_sender(),
+            owner.meta_runtime_registry(),
+            None,
+        )
+        .await
+        .unwrap();
+        let body = json!({"body_markdown":"Example", "attachments":[{"title":"private", "url":"https://example.test/file", "path":secret,"byte_len":21}]}).to_string();
+        let response = app
+            .oneshot(attachment_test_request(
+                Some(&config),
+                "POST",
+                "/api/v1/issues/TEST-1/comments",
+                Body::from(body),
+                Some("application/json"),
+            ))
+            .await
+            .unwrap();
+        assert!(!response.status().is_success());
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tracker_boundary_jira_download_resolves_key_without_comments_or_remote_files() {
+        use crate::jira::tests::{issue, mock_jira, reply, tracker};
+        use tower::ServiceExt;
+        let mock = mock_jira(vec![reply(
+            "GET",
+            "/rest/api/3/issue/10001",
+            issue("To Do"),
+        )])
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let (_, mut config, owner) = attachment_scope_test_router(root.path(), "TEST").await;
+        config.tracker = tracker(&mock.endpoint);
+        let files = issue_attachment_dir(&config, "TEST-1");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::write(files.join("trace.txt"), "owned Jira attachment").unwrap();
+        let (refresh, _receiver) = mpsc::channel(1);
+        let app = router(
+            owner.shared_state(),
+            config,
+            refresh,
+            owner.internal_sender(),
+            owner.meta_runtime_registry(),
+            None,
+        )
+        .await
+        .unwrap();
+        let response = app
+            .oneshot(attachment_test_request(
+                None,
+                "GET",
+                "/api/v1/issues/10001/attachments/trace.txt",
+                Body::empty(),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), 8192).await.unwrap().as_ref(),
+            b"owned Jira attachment"
+        );
+        assert!(mock.responses.lock().unwrap().is_empty());
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tracker_boundary_jira_environment_references_scope_actual_site_and_project() {
+        const MARKER: &str = "FUGUE_TEST_TRACKER_SCOPE_ENV";
+        if std::env::var_os(MARKER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "http::tests::tracker_boundary_jira_environment_references_scope_actual_site_and_project",
+                    "--exact", "--nocapture",
+                ])
+                .env(MARKER, "1")
+                .env("FUGUE.TEST.TRACKER.SITE", "https://jira.example.test")
+                .env("FUGUE.TEST.TRACKER.PROJECT", "TEST")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let mut referenced = issue_board_config();
+        referenced.tracker.kind = "jira".into();
+        referenced.tracker.endpoint = "$FUGUE.TEST.TRACKER.SITE".into();
+        referenced.tracker.project_slug = Some("$FUGUE.TEST.TRACKER.PROJECT".into());
+        let mut literal = referenced.clone();
+        literal.tracker.endpoint = "https://jira.example.test".into();
+        literal.tracker.project_slug = Some("TEST".into());
+        assert_eq!(
+            referenced.tracker_context_id(),
+            literal.tracker_context_id()
+        );
+        assert_eq!(
+            referenced.attachment_storage_root(),
+            literal.attachment_storage_root()
+        );
+        literal.tracker.endpoint = "https://other.example.test".into();
+        assert_ne!(
+            referenced.tracker_context_id(),
+            literal.tracker_context_id()
+        );
+    }
+
+    #[test]
+    fn tracker_boundary_attachment_roots_are_scope_specific_and_credential_independent() {
+        for managed in [false, true] {
+            let mut first = issue_board_config();
+            if managed {
+                first.meerkat.repository_runtime = Some(crate::config::RepositoryRuntimeBinding {
+                    repository: crate::ensemble::config::RepoId::try_from("first".to_owned())
+                        .unwrap(),
+                    state_path: PathBuf::from("/tmp/test-repository-state"),
+                });
+            }
+            let root = first.attachment_storage_root();
+            first.tracker.api_key = Some("changed-credential".into());
+            assert_eq!(first.attachment_storage_root(), root);
+            for component in ["provider", "endpoint", "project"] {
+                let mut other = first.clone();
+                match component {
+                    "provider" => other.tracker.kind = "jira".into(),
+                    "endpoint" => {
+                        other.tracker.endpoint = "https://other.example.test/graphql".into()
+                    }
+                    _ => other.tracker.project_slug = Some("other-project".into()),
+                }
+                assert_ne!(root, other.attachment_storage_root(), "{component}");
+            }
+            first.tracker.project_slug =
+                first.tracker.project_slug.map(|scope| format!(" {scope} "));
+            assert_eq!(first.attachment_storage_root(), root);
+        }
+    }
+
+    fn attachment_test_request(
+        config: Option<&ServiceConfig>,
+        method: &str,
+        path: &str,
+        body: Body,
+        content_type: Option<&str>,
+    ) -> Request {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("Host", "127.0.0.1:8788")
+            .header("Origin", "http://127.0.0.1:8788");
+        if let Some(config) = config {
+            request = request.header("x-fugue-tracker-scope", config.tracker_context_id());
+        }
+        if let Some(value) = content_type {
+            request = request.header(CONTENT_TYPE, value);
+        }
+        request.body(body).unwrap()
+    }
+
+    fn attachment_test_body() -> Body {
+        Body::from(
+            "--fixture\r\nContent-Disposition: form-data; name=\"attachments\"; filename=\"trace.txt\"\r\nContent-Type: text/plain\r\n\r\nattachment contents\r\n--fixture--\r\n",
+        )
+    }
+
+    #[tokio::test]
+    async fn managed_queue_guards_direct_child_reads_mutations_and_fallbacks() {
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let (app, _owner) = managed_test_router(
+            root.path(),
+            Some(Router::new().fallback(|| async { "console" })),
+        )
+        .await;
+        for (method, path) in [
+            ("GET", "/api/v1/state"),
+            ("POST", "/api/v1/refresh"),
+            ("GET", "/console"),
+        ] {
+            for (host, origin, expected) in [
+                (
+                    "untrusted.example",
+                    "https://untrusted.example",
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    "127.0.0.1:8788",
+                    "https://untrusted.example",
+                    StatusCode::FORBIDDEN,
+                ),
+                ("127.0.0.1:8788", "http://127.0.0.1:8788", StatusCode::OK),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method(method)
+                            .uri(path)
+                            .header("Host", host)
+                            .header("Origin", origin)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                if expected == StatusCode::OK {
+                    assert!(
+                        response.status().is_success(),
+                        "{method} {path}: {}",
+                        response.status()
+                    );
+                } else {
+                    assert_eq!(response.status(), expected, "{method} {path}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_with_repository_directory_has_one_owner_per_page() {
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let directory =
+            crate::setup::directory::Directory::open(root.path().join("directory"), 8788).unwrap();
+        let (app, _owner) = managed_test_router(
+            root.path(),
+            Some(crate::setup::directory::api_router(directory)),
+        )
+        .await;
+        for path in ["/overview", "/queues", "/api/workspaces"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(path)
+                        .header("Host", "127.0.0.1:8788")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                response.status().is_success() || response.status().is_redirection(),
+                "{path}"
+            );
+        }
+    }
+
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     const CONSOLE_TEST_USER_ENV: &str = "FUGUE_TEST_CONSOLE_USER";
     const CONSOLE_TEST_PASSWORD_ENV: &str = "FUGUE_TEST_CONSOLE_PASSWORD";
@@ -5766,264 +7256,42 @@ mod tests {
         }
     }
 
-    fn sample_dashboard_view(console_enabled: bool) -> DashboardView {
-        DashboardView {
-            running: 2,
-            retrying: 1,
-            tokens: 144,
-            seconds: 12.5,
-            error: None,
-            shadow_health: "Healthy".to_string(),
-            shadow_recommendations: 3,
-            shadow_comparisons: 4,
-            shadow_authority: "ObserveOnly".to_string(),
-            running_rows: "<tr><td>LUC-621</td><td>Native</td><td>Implementing</td><td>s1</td><td>2</td><td>started</td></tr>".to_string(),
-            retry_rows: "<tr><td>LUC-620</td><td>Native</td><td>1</td><td>soon</td><td>retry</td></tr>".to_string(),
-            console_enabled,
-            in_flight_count: 1,
-            picker_tabs: r#"<a class="mob-tab focused" href="/issues/TEST-1"><span class="radio"></span><span class="mob-tab-main"><span class="meta">TEST-1 <span class="badge">● FOCUSED</span></span><div class="mob-tab-title">Runtime supplied issue</div></span><span class="meta">42s<br>CODER</span></a>"#.to_string(),
-            focus_identifier: "TEST-1".to_string(),
-            focus_title: "Runtime supplied issue".to_string(),
-            focus_lane: "Active".to_string(),
-            focus_runtime: "42s".to_string(),
-            active_role: "CODER".to_string(),
-            current_action: "Runtime supplied event".to_string(),
-            workpad_files: r#"<div class="file"><span class="meta">runtime evidence</span><span class="meta">2t</span></div>"#.to_string(),
-            activity_rows: r#"<div class="log-row"><span class="meta">now</span><span class="meta">TEST-1</span><span>Runtime supplied event</span></div>"#.to_string(),
-        }
-    }
-
-    fn assert_banana_sorbet_contract(html: &str) {
-        for required in [
-            "--bs-paper: #ECEAE4",
-            "--bs-paper-soft: #F6F4EE",
-            "--bs-paper-raised: #FAF8F2",
-            "--bs-ink: #1C1A17",
-            "--bs-muted: #6B6760",
-            "--bs-line: #D6D2C8",
-            "--bs-accent: #D95A1E",
-            "--bs-accent-dark: #E76A2F",
-            "--bs-font-sans: Inter",
-            r#"--bs-font-mono: "JetBrains Mono""#,
-            "--r-sm: 2px",
-            "--r-md: 6px",
-            "--type-micro: 10px",
-            "--type-rail: 11px",
-            "--type-meta: 12px",
-            "--type-body: 13px",
-            "--type-card: 14px",
-            "--type-panel-heading: 15px",
-            "--type-heading: 16px",
-            "--line-compact: 1.35",
-            "--control-h: 38px",
-            r#"data-bs-theme="paper""#,
-        ] {
-            assert!(
-                html.contains(required),
-                "missing Banana Sorbet token: {required}"
-            );
-        }
-        for banned in [
-            &format!("--{}cc", "_"),
-            &format!("data-{}-theme", "cc"),
-            &format!("{}-gradient", "linear"),
-            &format!("border-radius: {}px", 12),
-            &format!("border-left: {}px solid var(--accent)", 3),
-            &format!("border-left: {}px solid var(--brand)", 3),
-            &format!("border-top: {}px solid var(--accent)", 2),
-            &format!("border-top: {}px solid var(--brand)", 2),
-            &format!("deck{}reveal", "-"),
-            &format!("{}: translateY(", "transform"),
-            &format!("{}: deck", "animation"),
-            &format!("{}px", 999),
-            &format!("#{}{}", "78", "f7ff"),
-            &format!("#{}{}", "6c", "f5ff"),
-            &format!("cockpit{}scan", "-"),
-            "font:600 28px",
-            "font-size:20px",
-            "font-size: 20px",
-            "font-size:17px",
-            "font-size: 17px",
-            "font-size=\"22\"",
-        ] {
-            assert!(
-                !html.contains(banned),
-                "found stale console styling token: {banned}"
-            );
-        }
+    fn assert_document_contract(html: &str) {
+        assert!(html.contains("<!doctype html>"));
+        assert!(html.contains("name=\"viewport\""));
+        assert!(html.contains("charset=\"utf-8\""));
     }
 
     #[test]
-    fn fugue_status_shells_use_meta_console_compact_type_scale() {
-        let dashboard = render_dashboard_html(&sample_dashboard_view(true));
-        let ims = render_issues_board_html(&issue_board_config());
-
-        for (name, html) in [
-            ("dashboard", dashboard.as_str()),
-            ("ims", ims.as_str()),
-            ("issue detail", ISSUE_DETAIL_HTML),
+    fn home_and_work_share_navigation_and_real_data_sources() {
+        for html in [
+            render_home_html(true),
+            render_home_html(false),
+            render_issues_board_html(&issue_board_config()),
         ] {
-            assert_banana_sorbet_contract(html);
-            for token in [
-                "--type-rail",
-                "--type-body",
-                "--type-card",
-                "--type-panel-heading",
-                "--type-heading",
-                "--line-compact",
-            ] {
-                assert!(
-                    html.contains(token),
-                    "{name} missing compact type-scale token {token}"
-                );
+            for destination in ["/overview", "/queues", "/console"] {
+                assert!(html.contains(&format!("href=\"{destination}\"")));
             }
+            assert!(html.contains("Primary app navigation"));
+            assert!(html.contains("Repository scope"));
         }
-
-        assert!(dashboard.contains(
-            ".agent-card h2 { margin:12px 0 4px; font-size:var(--type-heading); line-height:1.25; }"
-        ));
-        assert!(
-            ims.contains("button.icon { width: 32px; padding: 0; font-size: var(--type-card); }")
-        );
-        assert!(ims.contains(".palette-input"));
-        assert!(ims.contains("font-size: var(--type-body);"));
-        assert!(ISSUE_DETAIL_HTML.contains(
-            ".sheet-title { flex:1; padding:0 14px; font-size:var(--type-panel-heading);"
-        ));
-        assert!(
-            ISSUE_DETAIL_HTML
-                .contains(".lane-row { width:100%; min-height:50px; font-size:var(--type-meta);")
-        );
-    }
-
-    #[test]
-    fn dashboard_renders_framing_and_console_issues_tabs() {
-        let html = render_dashboard_html(&sample_dashboard_view(true));
-
-        assert_banana_sorbet_contract(&html);
-        assert!(html.contains("MEERKAT FUGUE"));
-        assert!(html.contains("FOCUS MOB"));
-        assert!(html.contains(".top-rail"));
-        assert!(html.contains(".hero {"));
-        assert!(html.contains("actual Fugue mob topology"));
-        assert!(html.contains("Issue lead"));
-        assert!(html.contains("Kapellmeister"));
-        assert!(
-            html.contains("worker peer mesh: planner↔coder · planner↔reviewer · coder↔reviewer")
-        );
-        assert!(html.contains("review green → PR/check handoff"));
-        assert!(!html.contains("Active role"));
-        assert!(!html.contains("FLOW</text>"));
-        assert!(html.contains("fugue:phase:implementing"));
-        assert!(html.contains("CON <b>LIVE</b>"));
-        assert!(html.contains("@media (max-height: 720px), (max-width: 980px)"));
-        assert!(html.contains("see IMS"));
-        assert!(
-            !html.contains("<span>Review</span><span class=\"meta\">▸ ACTION</span><span>0</span>")
-        );
-        assert!(html.contains("Runtime supplied issue"));
-        assert!(html.contains("--shadow-sheet"));
-        assert!(html.contains(r#"href="/issues""#));
-        assert!(html.contains(r#"href="/console""#));
-        assert!(html.contains(r#"href="/console""#));
-        assert!(html.contains(r#"href="/issues""#));
-        assert!(html.contains("CONSOLE"));
-        assert!(html.contains(r#"href="/issues""#));
-        assert!(html.contains("TEST-1"));
-        for fabricated in ["LUC-642", "Tracker simplification", "29m 46s", "12m 08s"] {
-            assert!(
-                !html.contains(fabricated),
-                "dashboard leaked fabricated prototype value: {fabricated}"
-            );
-        }
-    }
-
-    #[test]
-    fn dashboard_no_focus_workpad_empty_state_is_honest() {
-        let mut view = sample_dashboard_view(true);
-        view.focus_runtime = "unavailable".to_string();
-        view.workpad_files = r#"<div class="file unavailable"><span class="meta">No active mob workpad evidence available</span><span class="meta">turns unavailable</span></div>"#.to_string();
-        let html = render_dashboard_html(&view);
-
-        assert!(html.contains("No active mob workpad evidence available"));
-        assert!(html.contains("turns unavailable"));
-        assert!(!html.contains(concat!("No active ", "workpad files")));
-        assert!(!html.contains(concat!(">", "0", "t<")));
-    }
-
-    #[test]
-    fn dashboard_renders_disabled_console_panel_without_losing_issues_tab() {
-        let html = render_dashboard_html(&sample_dashboard_view(false));
-
-        assert_banana_sorbet_contract(&html);
-        assert!(html.contains("CONSOLE"));
-        assert!(html.contains("MEERKAT FUGUE"));
-        assert!(html.contains("CON <b>OFF</b>"));
-        assert!(html.contains("FOCUS MOB"));
-        assert!(html.contains("OPEN IMS"));
-        assert!(html.contains(r#"href="/issues""#));
-    }
-
-    #[test]
-    fn dashboard_overview_layout_is_responsive_and_readable() {
-        let html = render_dashboard_html(&sample_dashboard_view(true));
-
-        assert_banana_sorbet_contract(&html);
-        for required in [
-            "body { margin:0; min-height:100vh; overflow:auto;",
-            ".top-rail { min-height:var(--control-h); display:flex; align-items:stretch; flex-wrap:nowrap;",
-            ".kpis { display:flex; min-height:var(--control-h); flex:0 1 auto; overflow-x:auto;",
-            ".picker { min-height:64px; display:flex; flex-wrap:wrap; align-items:stretch;",
-            ".mob-tab { flex:1 1 240px; min-width:220px; min-height:64px;",
-            ".hero { min-height:520px; display:grid; grid-template-rows:auto auto minmax(360px,1fr);",
-            ".identity h1 { margin:0; font-size:var(--type-heading); font-weight:500; flex:1 1 260px;",
-            ".timeline { display:grid; grid-template-columns:repeat(4,minmax(180px,1fr));",
-            ".hero-body { min-height:0; display:grid; grid-template-columns:minmax(420px,1fr) minmax(280px,340px);",
-            ".flow { border-right:1px solid var(--hair); padding:24px; min-width:0; overflow:auto;",
-            "svg { width:100%; height:100%; min-width:520px; min-height:260px; }",
-            ".agent-card { min-width:0; padding:18px; border-bottom:1px solid var(--hair); overflow:auto; }",
-            ".lower { min-height:220px; display:grid; grid-template-columns:minmax(0,1.4fr) minmax(280px,1fr);",
-            ".log-row { display:grid; grid-template-columns:minmax(64px,74px) minmax(60px,72px) minmax(0,1fr);",
-            ".lane-row { display:grid; grid-template-columns:28px minmax(0,1fr) minmax(70px,88px) auto;",
-            "@media (max-height: 720px), (max-width: 980px) { body { min-height:100vh; overflow:auto; } .top-rail { flex-wrap:wrap;",
-            ".kpis { order:2; flex:1 0 100%; border-top:1px solid var(--hair); }",
-            "@media (max-width: 720px) { .top-rail { position:sticky; top:0; } .tabs { overflow-x:auto; max-width:100%; }",
-        ] {
-            assert!(
-                html.contains(required),
-                "dashboard missing responsive layout contract: {required}"
-            );
-        }
-
-        for preserved in [
-            r#"href="/overview""#,
-            r#"href="/issues""#,
-            r#"href="/console""#,
-            "CON <b>LIVE</b>",
-            "Runtime supplied issue",
-            "worker peer mesh: planner↔coder · planner↔reviewer · coder↔reviewer",
-        ] {
-            assert!(
-                html.contains(preserved),
-                "dashboard lost protected behavior while changing layout: {preserved}"
-            );
-        }
-
-        assert!(!html.contains("height:100vh; overflow:hidden;"));
-        assert!(!html.contains(".picker { min-width:900px;"));
-        assert!(!html.contains("height:calc(100vh - 38px - 64px - 220px)"));
-        assert!(!html.contains(".activity, .lanes { padding:14px 18px; overflow:hidden;"));
+        let html = render_home_html(true);
+        assert!(html.contains("/api/ensemble"));
+        assert!(html.contains("/api/v1/issues/board"));
+        assert!(html.contains("/api/workspaces"));
+        assert!(html.contains("/ensemble#add"));
+        assert!(!html.contains("__PORTFOLIO_JS__"));
     }
 
     #[test]
     fn issue_routes_keep_dashboard_navigation_targets() {
         let html = render_issues_board_html(&issue_board_config());
 
-        assert_banana_sorbet_contract(&html);
-        assert!(html.contains(r#"href="/overview""#));
-        assert!(html.contains(r#"href="/console""#));
-        assert!(html.contains(r#"href="/ensemble""#));
-        assert!(html.contains(r#"href="/issues""#));
+        assert_document_contract(&html);
+        assert!(html.contains(r#"href="./overview""#));
+        assert!(html.contains(r#"href="./console""#));
+        assert!(html.contains(r#"href="./ensemble""#));
+        assert!(html.contains(r#"href="./issues""#));
         assert!(html.contains("banana-sorbet ims-subsystem"));
         assert!(html.contains("MEERKAT FUGUE"));
         assert!(html.contains("to search…"));
@@ -6049,7 +7317,7 @@ mod tests {
                 ".palette-row:hover, .palette-row.active { background: var(--bg-elev-2);"
             )
         );
-        assert!(html.contains("+ NEW"));
+        assert!(html.contains("+ New issue"));
         assert!(html.contains("openFullDetail(card.dataset.issue)"));
         assert!(!html.contains("loadDetail(card.dataset.issue);"));
         assert!(html.contains(r#"id="kpiTok">unavailable</b>"#));
@@ -6057,7 +7325,7 @@ mod tests {
         assert!(html.contains(r#"id="kpiShad">unavailable</b>"#));
         assert!(html.contains("app.board.totals.tokens ?? \"unavailable\""));
         assert!(!html.contains(concat!("app.board.totals.tokens ", "|| 0")));
-        assert!(html.contains("turns unavailable"));
+        assert!(!html.contains("turns unavailable"));
         assert!(!html.contains(concat!(": \\\"", "0", "t\\\"")));
         for fabricated in [
             concat!("TOK <b id=\"kpiTok\">", "0"),
@@ -6077,7 +7345,9 @@ mod tests {
         assert!(html.contains(r#"id="createAttachments""#));
         assert!(html.contains("createAttachmentPayload"));
         assert!(html.contains("attachments: createAttachmentPayload()"));
-        assert!(html.contains("Attachments upload after issue creation and are persisted as issue attachment comments."));
+        assert!(
+            html.contains("Add screenshots, logs, or other files that help explain the issue.")
+        );
         assert!(!html.contains("createDescriptionWithAttachments"));
         assert!(!html.contains(concat!("File", "Reader")));
         assert!(!html.contains(concat!("readAs", "DataURL")));
@@ -6096,7 +7366,7 @@ mod tests {
         assert!(html.contains("--ensemble-config"));
         assert!(html.contains("No Ensemble is configured"));
         assert!(!html.contains("http://127.0.0.1"));
-        assert!(html.contains(r#"class="active" href="/ensemble""#));
+        assert!(html.contains(r#"href="/ensemble" class="active" aria-current="page""#));
     }
 
     #[test]
@@ -6198,7 +7468,7 @@ mod tests {
 
     #[test]
     fn issue_detail_page_keeps_integrated_navigation_and_ims_controls() {
-        assert_banana_sorbet_contract(ISSUE_DETAIL_HTML);
+        assert_document_contract(ISSUE_DETAIL_HTML);
         assert!(ISSUE_DETAIL_HTML.contains("Meerkat Fugue · Issue sheet"));
         assert!(ISSUE_DETAIL_HTML.contains("banana-sorbet issue-subsystem"));
         assert!(ISSUE_DETAIL_HTML.contains("--font-display"));
@@ -6228,8 +7498,6 @@ mod tests {
             ISSUE_DETAIL_HTML
                 .contains("/api/v1/issues/${encodeURIComponent(issueIdentifier)}/comments")
         );
-        assert!(ISSUE_DETAIL_HTML.contains("method: \"POST\""));
-        assert!(ISSUE_DETAIL_HTML.contains("body_markdown: body"));
         assert!(ISSUE_DETAIL_HTML.contains(r#"id="commentAttachmentInput""#));
         assert!(ISSUE_DETAIL_HTML.contains("commentAttachmentState"));
         assert!(ISSUE_DETAIL_HTML.contains("FormData"));
@@ -6359,7 +7627,7 @@ mod tests {
         assert!(source.contains("Multipart"));
         assert!(source.contains("attachment_comment_markdown"));
         assert!(source.contains("/api/v1/issues/{issue_identifier}/attachments"));
-        assert!(source.contains("uploadIssueAttachments(createdIdentifier, createAttachmentState"));
+        assert!(source.contains("uploadIssueAttachments(createdIdentifier, pending"));
         assert!(!source.contains(concat!("issue_create_attachments", "_unsupported")));
         assert!(!source.contains(concat!("readAs", "DataURL")));
         assert!(!source.contains(concat!("File", "Reader")));
@@ -6384,7 +7652,13 @@ mod tests {
         let path = dir.join(&stored);
         std::fs::write(&path, bytes).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        assert!(path.starts_with(workspace.path().join(".fugue/issue-attachments/LUC-649")));
+        assert!(
+            path.starts_with(
+                config
+                    .attachment_storage_root()
+                    .join("issue-attachments/LUC-649")
+            )
+        );
 
         let url = format!(
             "/api/v1/issues/{}/attachments/{}",
@@ -6397,6 +7671,7 @@ mod tests {
             content_type: Some("text/plain".to_string()),
             url: url.clone(),
             path: None,
+            bytes: Vec::new(),
         }]);
         assert!(markdown.contains("Attached files:"));
         assert!(markdown.contains("[trace log.txt]"));
@@ -6411,6 +7686,7 @@ mod tests {
                 content_type: Some("text/plain".to_string()),
                 url,
                 path: None,
+                bytes: Vec::new(),
             }],
         );
         assert!(comment.starts_with("Please see the trace.\n\nAttached files:"));
@@ -6455,6 +7731,7 @@ mod tests {
             }],
             runtime: None,
             lanes: Vec::new(),
+            lane_actions: BTreeMap::new(),
         };
 
         let value = serde_json::to_value(snapshot).expect("snapshot serializes");
@@ -6591,6 +7868,81 @@ mod tests {
     }
 
     #[test]
+    fn managed_attachments_survive_configuration_generations_and_remain_repository_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = issue_board_config();
+        config.workflow_dir = root.path().join("generation-one");
+        config.meerkat.repository_runtime = Some(crate::config::RepositoryRuntimeBinding {
+            repository: crate::ensemble::config::RepoId::try_from("first".to_owned()).unwrap(),
+            state_path: root.path().join("teams/first"),
+        });
+        let path = issue_attachment_dir(&config, "TEST-1");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("trace.txt"), "first repository").unwrap();
+        config.workflow_dir = root.path().join("generation-two");
+        assert_eq!(
+            std::fs::read_to_string(issue_attachment_dir(&config, "TEST-1").join("trace.txt"))
+                .unwrap(),
+            "first repository"
+        );
+        config
+            .meerkat
+            .repository_runtime
+            .as_mut()
+            .unwrap()
+            .state_path = root.path().join("teams/second");
+        assert_ne!(issue_attachment_dir(&config, "TEST-1"), path);
+    }
+
+    #[test]
+    fn jira_board_preserves_actual_statuses_when_roles_overlap() {
+        let mut config = issue_board_config();
+        config.tracker.kind = "jira".into();
+        config.linear.lanes.parked = "Open".into();
+        config.linear.lanes.ready = "Open".into();
+        config.linear.lanes.success = "Closed".into();
+        config.linear.lanes.canceled = "Closed".into();
+        config.linear.lanes.duplicate = "Closed".into();
+        config.linear.lanes.blocked = None;
+        config.linear.lanes.review_ready = Some("Resolved".into());
+        config.linear.lanes.deploy = Some("Reopened".into());
+        config.tracker.intake_states = vec!["Open".into()];
+        config.tracker.in_flight_states = vec!["In Progress".into()];
+        config.tracker.active_states = vec!["Open".into(), "In Progress".into()];
+        config.tracker.terminal_states = vec!["Closed".into()];
+        config.deploy.enabled = true;
+        config.deploy.lane = "Reopened".into();
+        config.deploy.success_lane = "Closed".into();
+        config.deploy.procedure = "merge-only".into();
+        let board = issue_board_snapshot_from_rows(&config, vec![], &[], &[], 0, 0);
+        assert_eq!(
+            board
+                .lanes
+                .iter()
+                .map(|lane| lane.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Open", "In Progress", "Resolved", "Reopened", "Closed"]
+        );
+        assert_eq!(
+            board.lanes.last().unwrap().kind,
+            IssueBoardLaneKind::Terminal
+        );
+        assert_eq!(lane_action(&config, "Reopened"), Some(LaneAction::Merge));
+        assert_eq!(lane_action(&config, "Deploy"), None);
+        config.independent_review.enabled = true;
+        assert_eq!(lane_action(&config, "Resolved"), Some(LaneAction::Review));
+        assert_eq!(lane_action(&config, "Review"), None);
+        assert_eq!(canonical_lane_for_state(&config, "Closed"), "Closed");
+        assert_eq!(issue_creation_lanes(&config), ["Open"]);
+        // A real status that happens to match a canonical label stays literal.
+        config.tracker.in_flight_states.push("Active".into());
+        assert_eq!(
+            tracker_state_for_canonical_lane(&config, "Active"),
+            "Active"
+        );
+    }
+
+    #[test]
     fn configured_tracker_statuses_preserve_intake_and_success_roles() {
         let mut config = issue_board_config();
         config.linear.lanes.parked = "Open".into();
@@ -6604,6 +7956,62 @@ mod tests {
         assert_eq!(canonical_lane_for_state(&config, "Open"), "Queue");
         assert_eq!(canonical_lane_for_state(&config, "Resolved"), "Done");
         assert_eq!(canonical_lane_for_state(&config, "Closed"), "Done");
+    }
+
+    #[test]
+    fn merge_only_boards_name_the_action_without_rewriting_tracker_states() {
+        for tracker in ["local", "linear"] {
+            let mut config = issue_board_config();
+            config.tracker.kind = tracker.into();
+            config.deploy.enabled = true;
+            config.deploy.procedure = "merge-only".into();
+            config.deploy.lane = "Deploy".into();
+            config.linear.lanes.deploy = Some("Deploy".into());
+
+            assert!(issue_board_lanes(&config).contains(&"Merge".into()));
+            assert!(!issue_board_lanes(&config).contains(&"Deploy".into()));
+            assert_eq!(canonical_lane_for_state(&config, "Deploy"), "Merge");
+            assert_eq!(tracker_state_for_canonical_lane(&config, "Merge"), "Deploy");
+            assert_eq!(lane_action(&config, "Merge"), Some(LaneAction::Merge));
+            // Existing API clients can still use the former canonical name.
+            assert_eq!(lane_action(&config, "Deploy"), Some(LaneAction::Merge));
+            assert_eq!(
+                tracker_state_for_canonical_lane(&config, "Deploy"),
+                "Deploy"
+            );
+            assert_eq!(config.deploy.lane, "Deploy");
+            assert_eq!(canonical_lane_kind("Merge"), IssueBoardLaneKind::Attention);
+        }
+    }
+
+    #[test]
+    fn deployment_boards_do_not_acquire_a_merge_alias() {
+        let mut config = issue_board_config();
+        config.deploy.enabled = true;
+        config.deploy.procedure = "release".into();
+        config.linear.lanes.deploy = Some("Ship".into());
+        assert!(issue_board_lanes(&config).contains(&"Deploy".into()));
+        assert!(!issue_board_lanes(&config).contains(&"Merge".into()));
+        assert_eq!(canonical_lane_for_state(&config, "Ship"), "Deploy");
+        assert_eq!(lane_action(&config, "Deploy"), Some(LaneAction::Deploy));
+        assert_eq!(lane_action(&config, "Merge"), None);
+        assert_eq!(tracker_state_for_canonical_lane(&config, "Merge"), "Merge");
+    }
+
+    #[test]
+    fn jira_merge_actions_keep_their_configured_status_names() {
+        let mut config = issue_board_config();
+        config.tracker.kind = "jira".into();
+        config.deploy.enabled = true;
+        config.deploy.procedure = "merge-only".into();
+        config.deploy.lane = "Reopened".into();
+        config.linear.lanes.deploy = Some("Reopened".into());
+        assert!(issue_board_lanes(&config).contains(&"Reopened".into()));
+        assert!(!issue_board_lanes(&config).contains(&"Merge".into()));
+        assert_eq!(canonical_lane_for_state(&config, "Reopened"), "Reopened");
+        assert_eq!(lane_action(&config, "Reopened"), Some(LaneAction::Merge));
+        assert_eq!(lane_action(&config, "Merge"), None);
+        assert_eq!(tracker_state_for_canonical_lane(&config, "Merge"), "Merge");
     }
 
     #[test]
@@ -6920,22 +8328,58 @@ mod tests {
     }
 
     #[test]
+    fn app_navigation_keeps_primary_links_stable_before_async_data_loads() {
+        let html = "<html><head></head><body></body></html>";
+        for queue_enabled in [false, true] {
+            for active in [
+                AppPage::Home,
+                AppPage::Work,
+                AppPage::Ensemble,
+                AppPage::Console,
+            ] {
+                let page = inject_app_chrome(html, active, queue_enabled).unwrap();
+                let primary = page
+                    .split("aria-label=\"Primary app navigation\">")
+                    .nth(1)
+                    .unwrap()
+                    .split("</nav>")
+                    .next()
+                    .unwrap();
+                assert_eq!(primary.matches("<a ").count(), 3);
+                let home = primary.find(">Home</a>").unwrap();
+                let board = primary.find(">Board</a>").unwrap();
+                let agents = primary.find(">Agents</a>").unwrap();
+                assert!(home < board && board < agents);
+                assert!(!primary.contains("Sign out"));
+                assert!(!primary.contains("Overview"));
+                assert!(!primary.contains("Settings"));
+                assert!(!page.contains("nav.prepend"));
+                assert!(!page.contains("nav.append"));
+                assert!(page.contains("Meerkat Fugue home"));
+                assert_eq!(page.matches("id=\"fugueWelcome\"").count(), 1);
+                assert!(page.contains("meerkat-fugue.welcome.v1"));
+                assert!(!page.contains("{brand}"));
+            }
+        }
+    }
+
+    #[test]
     fn console_browser_compat_embeds_meta_in_fugue_shell_once() {
         let html = r#"<!doctype html><html><head><title>Meta</title></head><body class="meta"><main id="meta-root"></main></body></html>"#;
-        let patched = inject_console_browser_compat_html(html);
+        let patched = inject_console_browser_compat_html(html, true);
 
         assert!(patched.contains("data-fugue-random-uuid-polyfill"));
         assert!(patched.contains("data-fugue-console-chrome"));
         assert!(patched.contains("class=\"fugue-console-embedded meta\""));
-        assert!(patched.contains("MEERKAT FUGUE"));
-        assert!(patched.contains(r#"href="/overview""#));
-        assert!(patched.contains(r#"href="/issues""#));
-        assert!(patched.contains(r#"class="active" href="/console""#));
-        assert!(patched.contains("META CONSOLE"));
+        assert!(patched.contains("Fugue home"));
+        assert!(patched.contains(r#"href="/ensemble""#));
+        assert!(patched.contains(r#"href="/queues""#));
+        assert!(patched.contains(r#"href="/console" class="active" aria-current="page""#));
+        assert!(patched.contains(">Agents</a>"));
         assert!(patched.contains("meta-root"));
-        assert_banana_sorbet_contract(&patched);
+        assert!(patched.contains("--bs-accent:#a34924"));
 
-        let repatched = inject_console_browser_compat_html(&patched);
+        let repatched = inject_console_browser_compat_html(&patched, true);
         assert_eq!(
             repatched.matches("data-fugue-console-chrome").count(),
             patched.matches("data-fugue-console-chrome").count()
@@ -6944,6 +8388,18 @@ mod tests {
             repatched.matches("data-fugue-random-uuid-polyfill").count(),
             patched.matches("data-fugue-random-uuid-polyfill").count()
         );
+    }
+
+    #[test]
+    fn console_browser_compat_hub_links_only_to_shared_pages() {
+        let html = "<html><head></head><body><main id=\"meta-root\"></main></body></html>";
+        let patched = inject_console_browser_compat_html(html, false);
+        assert!(patched.contains(r#"href="/ensemble""#));
+        assert!(patched.contains(r#"href="/console" class="active""#));
+        assert!(patched.contains(r#"href="/queues""#));
+        assert!(patched.contains(">Board</a>"));
+        assert!(!patched.contains(r#"href="./issues""#));
+        assert!(!patched.contains(r#"href="./overview""#));
     }
 
     #[tokio::test]
@@ -7076,7 +8532,7 @@ mod tests {
                 "tracker": {
                     "kind": "fugue-ims",
                     "endpoint": ims_path.display().to_string(),
-                    "project_slug": "fugue-ims",
+                    "project_slug": "lukacf/meerkat-fugue",
                     "active_states": ["Todo", "Deploy", "Done"],
                     "terminal_states": ["Done"]
                 },
@@ -7092,8 +8548,18 @@ mod tests {
             .clone(),
             prompt_template: "hi".to_string(),
         };
-        let config =
-            ServiceConfig::from_definition(PathBuf::from("/tmp/fugue.yaml"), &definition).unwrap();
+        let mut config =
+            ServiceConfig::from_definition(temp.path().join("fugue.yaml"), &definition).unwrap();
+        config.meerkat =
+            crate::meta_runtime::tests::test_meerkat_config(temp.path().join("runtime"));
+        let gate = crate::workgraph_gate::WorkGraphTerminalGate::for_service(&config);
+        std::fs::create_dir_all(gate.state_path.parent().unwrap()).unwrap();
+        let store = meerkat::SqliteWorkGraphStore::open(&gate.state_path).unwrap();
+        let graph = meerkat::WorkGraphService::with_scope(
+            std::sync::Arc::new(store),
+            meerkat_core::mob_realm_id(&gate.mob_id).unwrap().as_str(),
+            meerkat::WorkNamespace::default(),
+        );
         crate::fugue_ims::create_issue_for_config(
             &config.tracker,
             CreateFugueIssue {
@@ -7129,6 +8595,7 @@ mod tests {
             ci_status: Some(crate::tools::CiStatus::Success),
             unresolved_workgraph_blockers: 0,
             idempotency_key: IdempotencyKey("deploy:LUC-631:abc123".to_string()),
+            retry_deployment: None,
         };
         let now = Utc::now();
         let outcome = DeployOutcome {
@@ -7172,6 +8639,29 @@ mod tests {
             })
             .await
             .expect("initial workpad");
+        let mut missing_graph_config = config.clone();
+        missing_graph_config.meerkat =
+            crate::meta_runtime::tests::test_meerkat_config(temp.path().join("missing-runtime"));
+        let missing_graph =
+            crate::workgraph_gate::WorkGraphTerminalGate::for_service(&missing_graph_config);
+        std::fs::create_dir_all(missing_graph.state_path.parent().unwrap()).unwrap();
+        for status in [DeployOutcomeStatus::Merged, DeployOutcomeStatus::Succeeded] {
+            let mut completed = outcome.clone();
+            completed.status = status;
+            if status == DeployOutcomeStatus::Merged {
+                completed.ota = None;
+            }
+            let error =
+                record_successful_deploy_projection(&missing_graph_config, &request, &completed)
+                    .await
+                    .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("WorkGraph database is unavailable")
+            );
+            assert!(!missing_graph.state_path.exists());
+        }
         record_successful_deploy_projection(&config, &request, &outcome)
             .await
             .expect("deploy projection");
@@ -7210,6 +8700,90 @@ mod tests {
                 .await
                 .expect("idempotency check")
         );
+        graph
+            .create(meerkat::CreateWorkItemRequest {
+                realm_id: None,
+                namespace: None,
+                title: "New post-merge finding".into(),
+                description: None,
+                priority: meerkat::WorkPriority::High,
+                completion_policy: meerkat::WorkCompletionPolicy::SelfAttest,
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                labels: std::collections::BTreeSet::from([
+                    "fugue".into(),
+                    "blocking".into(),
+                    "issue:LUC-631".into(),
+                ]),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: Some(meerkat::WorkStatus::Open),
+            })
+            .await
+            .unwrap();
+        adapter
+            .move_issue(MoveIssueInput {
+                issue: request.issue.clone(),
+                state: LinearStateRef::Name {
+                    name: "Deploy".into(),
+                },
+                expected_updated_at: None,
+                idempotency_key: IdempotencyKey("reopen-for-projection".into()),
+            })
+            .await
+            .unwrap();
+        // A custom success lane is terminal for this operation even if the
+        // tracker's generic terminal list does not include it.
+        config.deploy.success_lane = "Shipped".into();
+        let mut overlapping_config = config.clone();
+        overlapping_config.deploy.blocked_lane = "Shipped".into();
+        assert!(
+            record_successful_deploy_projection(&overlapping_config, &request, &outcome)
+                .await
+                .is_err(),
+            "success cannot use the failure-only blocked exemption"
+        );
+        let refused = record_successful_deploy_projection(&config, &request, &outcome)
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("unresolved Fugue WorkGraph obligation"),
+            "{refused}"
+        );
+        let blocked = adapter
+            .inspect_issue(InspectIssueInput {
+                issue: request.issue.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(blocked.issue.state.name, "Deploy");
+        assert!(
+            blocked.workpad.unwrap().body_markdown.contains("def456"),
+            "successful merge/deploy evidence remains available after projection refusal"
+        );
+        // A historical receipt is useful evidence, but cannot authorize a
+        // changed request with the same key or bypass current policy.
+        let mut retry = request.clone();
+        retry.issue = LinearIssueRef::Id {
+            id: inspected.issue.id.clone(),
+        };
+        retry.pull_request.repo.name = GitHubRepoName("unconfigured-repository".into());
+        let registry = MetaRuntimeRegistry::new(config.meerkat.clone());
+        let refused = execute_deploy_transaction(config, registry, retry).await;
+        assert!(
+            !refused.accepted,
+            "a Workpad receipt must not authorize a deploy"
+        );
+        assert!(refused.plan.is_some(), "retry must evaluate current policy");
+        assert_eq!(
+            refused.issue_identifier, "LUC-631",
+            "immutable IDs must resolve to the canonical issue key in deployment evidence"
+        );
     }
 
     #[tokio::test]
@@ -7221,7 +8795,7 @@ mod tests {
                 "tracker": {
                     "kind": "fugue-ims",
                     "endpoint": ims_path.display().to_string(),
-                    "project_slug": "fugue-ims",
+                    "project_slug": "lukacf/meerkat-fugue",
                     "active_states": ["Todo", "Deploy", "Rework", "Blocked", "Ready for review"],
                     "terminal_states": ["Done"]
                 },
@@ -7238,7 +8812,7 @@ mod tests {
             prompt_template: "hi".to_string(),
         };
         let config =
-            ServiceConfig::from_definition(PathBuf::from("/tmp/fugue.yaml"), &definition).unwrap();
+            ServiceConfig::from_definition(temp.path().join("fugue.yaml"), &definition).unwrap();
         crate::fugue_ims::create_issue_for_config(
             &config.tracker,
             CreateFugueIssue {
@@ -7274,6 +8848,7 @@ mod tests {
             ci_status: Some(crate::tools::CiStatus::Failure),
             unresolved_workgraph_blockers: 0,
             idempotency_key: IdempotencyKey("deploy:LUC-632:abc123".to_string()),
+            retry_deployment: None,
         };
         let plan = plan_deploy_gate(DeployGateInput {
             config: config.deploy.clone(),
@@ -7351,6 +8926,7 @@ mod tests {
             ci_status: Some(crate::tools::CiStatus::Success),
             unresolved_workgraph_blockers: 0,
             idempotency_key: IdempotencyKey("deploy:LUC-637:head123".to_string()),
+            retry_deployment: None,
         };
         let merge = MergePrOutput {
             pull_request: request.pull_request.clone(),
@@ -7358,6 +8934,7 @@ mod tests {
             merge_commit_sha: Some(GitSha("merge456".to_string())),
         };
         let ota = OtaUpdateReport {
+            deployment_attempt: None,
             status: OtaUpdateStatus::Failed,
             branch: "main".to_string(),
             remote: "origin".to_string(),
@@ -7411,6 +8988,7 @@ mod tests {
     fn deploy_success_requires_ota_target_to_match_merge_commit() {
         let now = Utc::now();
         let ota = OtaUpdateReport {
+            deployment_attempt: None,
             status: OtaUpdateStatus::Succeeded,
             branch: "main".to_string(),
             remote: "origin".to_string(),
@@ -7466,8 +9044,10 @@ mod tests {
             ci_status: Some(crate::tools::CiStatus::Success),
             unresolved_workgraph_blockers: 0,
             idempotency_key: IdempotencyKey("deploy:LUC-642:head123".to_string()),
+            retry_deployment: None,
         };
         let ota = OtaUpdateReport {
+            deployment_attempt: None,
             status: OtaUpdateStatus::Succeeded,
             branch: "main".to_string(),
             remote: "origin".to_string(),
@@ -7563,6 +9143,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn independent_review_http_rejects_caller_verdicts_before_projection() {
+        use tower::ServiceExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let (_, owner) = managed_test_router(root.path(), None).await;
+        let mut config = owner.config().effective().clone();
+        config.independent_review.enabled = true;
+        crate::fugue_ims::create_issue_for_config(
+            &config.tracker,
+            CreateFugueIssue {
+                key: ImsIssueKey("TEST-1".into()),
+                repo: "test/repository".into(),
+                title: "Review must use native results".into(),
+                description: None,
+                stage: ImsStageName("Todo".into()),
+                labels: Vec::new(),
+            },
+        )
+        .unwrap();
+        let adapter = IssueAdapter::from_config(&config.tracker).unwrap();
+        let issue = LinearIssueRef::Identifier {
+            identifier: LinearIssueIdentifier("TEST-1".into()),
+        };
+        let before = adapter
+            .inspect_issue(InspectIssueInput {
+                issue: issue.clone(),
+            })
+            .await
+            .unwrap();
+        let request = IndependentReviewCompletionRequest {
+            issue: issue.clone(),
+            pull_request: GitHubPullRequestSnapshot {
+                repo: GitHubRepoRef {
+                    host: None,
+                    owner: GitHubOwner("test".into()),
+                    name: GitHubRepoName("repository".into()),
+                },
+                number: GitHubPullRequestNumber(1),
+                title: "Review candidate".into(),
+                url: "https://github.com/test/repository/pull/1".into(),
+                state: PullRequestState::Open,
+                draft: false,
+                head_branch: BranchName("feature".into()),
+                base_branch: BranchName("main".into()),
+                head_sha: GitSha("a".repeat(40)),
+            },
+            head_sha: GitSha("a".repeat(40)),
+            workgraph_scope: crate::independent_review::IndependentReviewWorkGraphScope {
+                realm_id: meerkat_core::mob_realm_id(&config.meerkat.mob_id())
+                    .unwrap()
+                    .to_string(),
+                namespace: meerkat::WorkNamespace::default().as_str().into(),
+            },
+            native_review: crate::native_review::ReviewReference {
+                runs: vec![meerkat_mob::RunId::new()],
+            },
+            idempotency_key: IdempotencyKey("review:test-1:round-1".into()),
+        };
+        let (refresh, _receiver) = mpsc::channel(1);
+        let app = router(
+            owner.shared_state(),
+            config,
+            refresh,
+            owner.internal_sender(),
+            owner.meta_runtime_registry(),
+            None,
+        )
+        .await
+        .unwrap();
+        for endpoint in ["complete-independent-review", "complete-final-pr-gate"] {
+            for forged_field in ["verdicts", "timed_out", "missing_native_review"] {
+                let mut payload = serde_json::to_value(&request).unwrap();
+                match forged_field {
+                    "verdicts" => {
+                        payload["verdicts"] = json!([test_review_verdict(
+                            "claimed-reviewer",
+                            crate::independent_review::IndependentReviewVerdictStatus::Green,
+                        )])
+                    }
+                    "timed_out" => payload["timed_out"] = json!(true),
+                    _ => {
+                        payload.as_object_mut().unwrap().remove("native_review");
+                    }
+                }
+                let response = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::post(format!("/api/v1/kapellmeister/{endpoint}"))
+                            .header("host", "127.0.0.1:4719")
+                            .header("origin", "http://127.0.0.1:4719")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(payload.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "{forged_field}"
+                );
+            }
+        }
+        let admission = json!({
+            "issue":issue, "repo":request.pull_request.repo,
+            "pull_request":1, "head_sha":"a".repeat(40),
+            "reviewers":{"domain":["repo:a", "repo:b", "repo:c"]},
+            "task":"Review the candidate", "idempotency_key":"test-request"
+        });
+        for field in ["round", "verdicts", "accepted", "tracker_context"] {
+            let mut forged = admission.clone();
+            forged[field] = json!("caller-owned authority");
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::post("/api/v1/kapellmeister/admit-independent-review")
+                        .header("host", "127.0.0.1:4719")
+                        .header("origin", "http://127.0.0.1:4719")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(forged.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{field}"
+            );
+        }
+        let after = adapter
+            .inspect_issue(InspectIssueInput { issue })
+            .await
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "untrusted completion must not change issue, comments or workpad"
+        );
+    }
+
+    #[tokio::test]
     async fn independent_review_red_projection_records_comment_workgraph_and_rework_lane() {
         let temp = tempfile::tempdir().expect("tempdir");
         let ims_path = temp.path().join("ims.sqlite");
@@ -7572,7 +9293,7 @@ mod tests {
                 "tracker": {
                     "kind": "fugue-ims",
                     "endpoint": ims_path.display().to_string(),
-                    "project_slug": "fugue-ims",
+                    "project_slug": "lukacf/meerkat-fugue",
                     "active_states": ["Todo", "Do Review", "Ready for review", "Rework", "Blocked"],
                     "terminal_states": ["Done"]
                 },
@@ -7594,7 +9315,7 @@ mod tests {
             prompt_template: "hi".to_string(),
         };
         let config =
-            ServiceConfig::from_definition(PathBuf::from("/tmp/fugue.yaml"), &definition).unwrap();
+            ServiceConfig::from_definition(temp.path().join("fugue.yaml"), &definition).unwrap();
         crate::fugue_ims::create_issue_for_config(
             &config.tracker,
             CreateFugueIssue {
@@ -7607,6 +9328,20 @@ mod tests {
             },
         )
         .expect("create issue");
+        let verdicts = vec![
+            test_review_verdict(
+                "runtime-boundary",
+                crate::independent_review::IndependentReviewVerdictStatus::Red,
+            ),
+            test_review_verdict(
+                "operator-workflow",
+                crate::independent_review::IndependentReviewVerdictStatus::Green,
+            ),
+            test_review_verdict(
+                "test-coverage",
+                crate::independent_review::IndependentReviewVerdictStatus::Green,
+            ),
+        ];
         let request = IndependentReviewCompletionRequest {
             issue: LinearIssueRef::Identifier {
                 identifier: LinearIssueIdentifier("LUC-633".to_string()),
@@ -7628,45 +9363,83 @@ mod tests {
             },
             head_sha: GitSha("abc123".to_string()),
             workgraph_scope: crate::independent_review::IndependentReviewWorkGraphScope {
-                realm_id: "fugue-review-realm".to_string(),
-                namespace: "fugue".to_string(),
+                realm_id: meerkat_core::mob_realm_id(&config.meerkat.mob_id())
+                    .unwrap()
+                    .to_string(),
+                namespace: WorkNamespace::default().as_str().to_string(),
             },
-            verdicts: vec![
-                test_review_verdict(
-                    "runtime-boundary",
-                    crate::independent_review::IndependentReviewVerdictStatus::Red,
-                ),
-                test_review_verdict(
-                    "operator-workflow",
-                    crate::independent_review::IndependentReviewVerdictStatus::Green,
-                ),
-                test_review_verdict(
-                    "test-coverage",
-                    crate::independent_review::IndependentReviewVerdictStatus::Green,
-                ),
-            ],
-            timed_out: false,
+            native_review: crate::native_review::ReviewReference {
+                runs: vec![meerkat_mob::RunId::new()],
+            },
             idempotency_key: IdempotencyKey("review:LUC-633:abc123:1".to_string()),
         };
         let plan = aggregate_independent_review(IndependentReviewAggregationInput {
             config: config.independent_review.clone(),
             issue_identifier: "LUC-633".to_string(),
             head_sha: request.head_sha.clone(),
-            verdicts: request.verdicts.clone(),
+            verdicts: verdicts.clone(),
             timed_out: false,
         });
 
-        let projection = record_independent_review_projection(&config, &request, "LUC-633", &plan)
+        let mut mismatched = request.clone();
+        mismatched.pull_request.head_sha = GitSha("new-unreviewed-head".into());
+        assert!(
+            record_independent_review_projection(&config, &mismatched, "LUC-633", &plan, &verdicts)
+                .await
+                .is_err(),
+            "a PR snapshot and review must name the same head before any projection"
+        );
+
+        let mut foreign_scope = request.clone();
+        foreign_scope.workgraph_scope.realm_id = "another-repository".into();
+        assert!(
+            record_independent_review_projection(
+                &config,
+                &foreign_scope,
+                "LUC-633",
+                &plan,
+                &verdicts
+            )
             .await
-            .expect("review projection");
+            .is_err(),
+            "review obligations must not escape the repository's native realm"
+        );
+
+        let mut foreign_namespace = request.clone();
+        foreign_namespace.workgraph_scope.namespace = "hidden-review".into();
+        assert!(
+            record_independent_review_projection(
+                &config,
+                &foreign_namespace,
+                "LUC-633",
+                &plan,
+                &verdicts
+            )
+            .await
+            .is_err(),
+            "review blockers must use the namespace granted to repository agents and merge guards"
+        );
+
+        let projection =
+            record_independent_review_projection(&config, &request, "LUC-633", &plan, &verdicts)
+                .await
+                .expect("review projection");
 
         assert_eq!(projection.target_lane, "Rework");
         assert!(projection.findings_comment_id.is_some());
         assert_eq!(projection.workgraph_items.len(), 1);
-        assert_eq!(projection.workgraph_items[0].realm_id, "fugue-review-realm");
-        assert_eq!(projection.workgraph_items[0].namespace, "fugue");
+        assert_eq!(
+            projection.workgraph_items[0].realm_id,
+            meerkat_core::mob_realm_id(&config.meerkat.mob_id())
+                .unwrap()
+                .as_str()
+        );
+        assert_eq!(
+            projection.workgraph_items[0].namespace,
+            WorkNamespace::default().as_str()
+        );
         let repeated_projection =
-            record_independent_review_projection(&config, &request, "LUC-633", &plan)
+            record_independent_review_projection(&config, &request, "LUC-633", &plan, &verdicts)
                 .await
                 .expect("repeat review projection");
         assert_eq!(repeated_projection.target_lane, "Rework");
@@ -7697,13 +9470,19 @@ mod tests {
         .expect("workgraph store");
         let service = WorkGraphService::with_scope(
             Arc::new(store),
-            "fugue-review-realm",
-            WorkNamespace::new("fugue").expect("namespace"),
+            meerkat_core::mob_realm_id(&config.meerkat.mob_id())
+                .unwrap()
+                .as_str(),
+            WorkNamespace::default(),
         );
         let items = service
             .list(WorkItemFilter {
-                realm_id: Some("fugue-review-realm".to_string()),
-                namespace: Some(WorkNamespace::new("fugue").expect("namespace")),
+                realm_id: Some(
+                    meerkat_core::mob_realm_id(&config.meerkat.mob_id())
+                        .unwrap()
+                        .to_string(),
+                ),
+                namespace: Some(WorkNamespace::default()),
                 all_namespaces: false,
                 statuses: Vec::new(),
                 labels: vec![
@@ -7718,6 +9497,15 @@ mod tests {
             .await
             .expect("workgraph items");
         assert_eq!(items.len(), 1);
+        let gate = crate::workgraph_gate::WorkGraphTerminalGate::for_service(&config);
+        assert_eq!(
+            gate.unresolved_blocking_items("LUC-633")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "merge and terminal guards must see blockers created by independent review"
+        );
     }
 
     fn test_review_verdict(

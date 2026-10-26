@@ -1,11 +1,16 @@
+use crate::host_signal_journal::HostSignalBinding;
+#[cfg(test)]
+use crate::kapellmeister::repo_kapellmeister_signal_message_with_lanes;
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -28,10 +33,14 @@ use crate::domain::{
     is_todo_state, normalize_state, sanitize_workspace_key,
 };
 use crate::error::{FugueError, Result};
+#[cfg(test)]
 use crate::final_pr_gate::{
-    FinalPrGateCompletionInput, FinalPrGateCompletionPlan, FinalPrGateProjectionPlan,
-    FinalPrGateRuntimePlan, FinalPrGateRuntimeTriggerInput, FinalPrGateStartRequest,
-    final_pr_gate_completion_plan, final_pr_gate_start_request,
+    FinalPrGateCompletionInput, FinalPrGateCompletionPlan, FinalPrGateRuntimePlan,
+    final_pr_gate_completion_plan,
+};
+use crate::final_pr_gate::{
+    FinalPrGateProjectionPlan, FinalPrGateRuntimeTriggerInput, FinalPrGateStartRequest,
+    final_pr_gate_start_request,
 };
 use crate::github_tools::GitHubToolHost;
 use crate::independent_review::IndependentReviewStartRequest;
@@ -41,7 +50,7 @@ use crate::kapellmeister::{
     KapellmeisterHostDecision, KapellmeisterHostObservation, KapellmeisterRepoScope,
     KapellmeisterRunningMobObservation, KapellmeisterShadowHost, KapellmeisterShadowInspection,
     KapellmeisterShadowSignal, KapellmeisterToolAuthority, KapellmeisterWorkspaceEvidence,
-    PrHandoffMonitorDecision, RkatKapellmeisterShadowRuntime, ShadowDecisionId, ShadowSignalId,
+    PrHandoffMonitorDecision, RkatKapellmeisterShadowRuntime, ShadowDecisionId,
     ShadowWorkerFailure, ShadowWorkerFailureReason, ShadowWorkerOutcome, inspect_shadow_state,
 };
 use crate::kapellmeister_host::{
@@ -53,8 +62,7 @@ use crate::linear_adapter::{
     active_projection_phase_labels_for_template, classify_issue_lane, evaluate_issue_projection,
     issue_lane_state_path_for_workflow, lane_state_path_env_name,
     projected_terminal_lane_for_template_status, projection_lane_for_template_node,
-    reconcile_issue_lane_observation_state, record_internal_lane_for_workflow,
-    terminal_states_env_name,
+    reconcile_issue_lane_observation_state, terminal_states_env_name,
 };
 use crate::linear_tools::{LINEAR_ACTION_STATES_ENV, LINEAR_REVIEW_HANDOFF_STATES_ENV};
 use crate::meta_runtime::{
@@ -73,10 +81,10 @@ use crate::native_mob_contract::{NativeMobE2eEvidence, inspect_native_mob_e2e_co
 use crate::native_reviewer_gate::{ReviewerGateObservation, latest_reviewer_gate_observation};
 use crate::tool_layer::{FugueToolLayer, clean_workspace_for_issue_identifier_best_effort};
 use crate::tools::{
-    BranchName, CancelExecutionInput, CheckCiInput, CheckCiOutput, CiStatus, ClaimIssueInput,
-    CreatePrInput, Cursor, ExistingPrMatch, FugueToolError, FugueToolErrorCode, FugueToolOperation,
+    BranchName, CancelExecutionInput, CheckCiOutput, CiStatus, ClaimIssueInput, CreatePrInput,
+    Cursor, ExistingPrMatch, FugueToolError, FugueToolErrorCode, FugueToolOperation,
     FugueToolOutput, FugueToolResult, GitHubPullRequestNumber, GitHubPullRequestRef,
-    GitHubPullRequestSnapshot, GitHubRepoRef, GitRef, GitSha, IdempotencyKey, InspectRepoInput,
+    GitHubPullRequestSnapshot, GitHubRepoRef, GitSha, IdempotencyKey, InspectRepoInput,
     LinearIssueIdentifier, LinearIssueRef, LinearStateRef, ListRunsInput, MergePrInput,
     MobEventSnapshot, MobRunId, MobRunSnapshot, MobRunStatus, MoveIssueInput, MoveIssueOutput,
     PullRequestState, RetryAdvice, SpawnOrResumeExecutionInput, ToolExecutionMetadata,
@@ -90,9 +98,8 @@ use crate::workspace::WorkspaceManager;
 pub type SharedState = Arc<RwLock<OrchestratorState>>;
 
 const KAPELLMEISTER_SHADOW_RECONCILE_TIMEOUT_MS: u64 = 10_000;
-const KAPELLMEISTER_REPO_SIGNAL_PENDING_LOG_MS: u64 = 15_000;
+const HOST_SIGNAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_STALL_TIMEOUT_STEP_GRACE_MS: i64 = 60_000;
-const KAPELLMEISTER_SIGNAL_DEDUP_LIMIT: usize = 2048;
 
 pub struct Orchestrator {
     config: WorkflowConfigManager,
@@ -105,12 +112,18 @@ pub struct Orchestrator {
     native_event_observer: NativeMobEventObserver,
     native_worker_execution: bool,
     terminal_issue_refresh: bool,
-    kapellmeister_signal_deduper: Arc<Mutex<RecentSignalDeduper>>,
+    host_signal_binding: HostSignalBinding,
+    host_signal_wake: tokio::sync::Notify,
+    #[cfg(test)]
+    captured_native_signal_messages: Option<Mutex<Vec<String>>>,
     linear_backoff_until: Option<DateTime<Utc>>,
+    #[cfg(test)]
+    test_directory: Option<tempfile::TempDir>,
 }
 
 #[derive(Debug)]
 pub enum InternalMessage {
+    NativeReviewAdmission(Box<crate::review_admission::NativeReviewAdmission>),
     Worker(Box<WorkerMessage>),
     RetryDue {
         issue_id: String,
@@ -149,7 +162,6 @@ pub struct OrchestratorState {
     pub meerkat_rate_limits: Option<Value>,
     pub last_error: Option<String>,
     pub recent_events: HashMap<String, Vec<RecentEvent>>,
-    final_pr_gates: HashMap<String, FinalPrGateRunHandle>,
 }
 
 #[derive(Debug)]
@@ -169,48 +181,10 @@ struct RunningEntry {
 
 #[derive(Debug, Clone)]
 struct NativeRunHandle {
+    launch_failure: Option<crate::tools::NativeLaunchFailure>,
     run_id: MobRunId,
     observed_events: Vec<MobEventSnapshot>,
     recovery: NativeStatusRecovery,
-}
-
-#[derive(Debug, Clone)]
-struct FinalPrGateRunHandle {
-    run_id: MobRunId,
-    start_request: FinalPrGateStartRequest,
-    observed_events: Vec<MobEventSnapshot>,
-    completed: bool,
-}
-
-#[derive(Debug)]
-struct RecentSignalDeduper {
-    seen: HashSet<ShadowSignalId>,
-    order: VecDeque<ShadowSignalId>,
-    limit: usize,
-}
-
-impl RecentSignalDeduper {
-    fn new(limit: usize) -> Self {
-        Self {
-            seen: HashSet::new(),
-            order: VecDeque::new(),
-            limit,
-        }
-    }
-
-    fn accept(&mut self, id: &ShadowSignalId) -> bool {
-        if self.seen.contains(id) {
-            return false;
-        }
-        self.seen.insert(id.clone());
-        self.order.push_back(id.clone());
-        while self.order.len() > self.limit {
-            if let Some(evicted) = self.order.pop_front() {
-                self.seen.remove(&evicted);
-            }
-        }
-        true
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -284,8 +258,8 @@ struct NativeStatusReviewEvidence {
 
 trait NativeStatusGitHubInspector: Send + Sync {
     fn inspect_pr(&self, input: crate::tools::InspectPrInput) -> FugueToolResult;
-    fn check_ci(&self, input: CheckCiInput) -> FugueToolResult {
-        GitHubToolHost::new().check_ci(input)
+    fn check_pr_ci(&self, pull_request: &GitHubPullRequestSnapshot) -> FugueToolResult {
+        GitHubToolHost::new().check_pr_ci(pull_request)
     }
 }
 
@@ -294,8 +268,8 @@ impl NativeStatusGitHubInspector for GitHubToolHost {
         GitHubToolHost::inspect_pr(self, input)
     }
 
-    fn check_ci(&self, input: CheckCiInput) -> FugueToolResult {
-        GitHubToolHost::check_ci(self, input)
+    fn check_pr_ci(&self, pull_request: &GitHubPullRequestSnapshot) -> FugueToolResult {
+        GitHubToolHost::check_pr_ci(self, pull_request)
     }
 }
 
@@ -356,14 +330,12 @@ enum RunningTerminationTarget {
     NativeWorker {
         identifier: String,
         session_id: String,
-        run_id: MobRunId,
         cancel: CancellationToken,
         handle: JoinHandle<()>,
     },
     Native {
         identifier: String,
         session_id: String,
-        run_id: MobRunId,
     },
 }
 
@@ -436,25 +408,23 @@ impl KapellmeisterHostToolExecutor for OrchestratorFinalPrGateStartExecutor {
         request: FinalPrGateStartRequest,
     ) -> FugueToolResult {
         let mcp_tools = agent_visible_mcp_tool_names(&self.config.mob.mcp_servers);
-        let template = final_pr_gate_native_launch_template(&request, &mcp_tools);
+        let template = crate::kapellmeister_host::final_pr_gate_native_launch_template_with_profile(
+            &request,
+            &mcp_tools,
+            &self.config.independent_review.orchestrator_profile,
+        );
         let repository = Some(request.pr.repo.clone());
-        let plan = match NativeMobLaunchPlan::new(
-            request.spawn_input,
-            template.clone(),
-            native_member_mcp_servers_for_issue(
-                &self.config.mob.mcp_servers,
-                &self.config.workflow_dir,
-                &template,
-                &self.issue,
-                repository.as_ref(),
-                &self.config.tracker.terminal_states,
-                &native_issue_review_handoff_states(&self.config, &self.issue),
-                &native_action_lanes(&self.config),
-            ),
-            native_member_direct_tool_servers(&self.config.tracker, &template),
-            self.config.tracker.project_slug.clone(),
-            repository,
-        ) {
+        let plan = match (|| {
+            NativeMobLaunchPlan::new(
+                request.spawn_input,
+                template.clone(),
+                bound_member_mcp_servers(&self.config, &template, &self.issue, repository.as_ref())
+                    .map_err(host_signal_launch_error)?,
+                native_member_direct_tool_servers(&self.config.tracker, &template),
+                self.config.tracker.project_slug.clone(),
+                repository,
+            )
+        })() {
             Ok(plan) => plan,
             Err(error) => {
                 return FugueToolResult::Err {
@@ -488,23 +458,17 @@ impl KapellmeisterHostToolExecutor for OrchestratorFinalPrGateStartExecutor {
         let mcp_tools = agent_visible_mcp_tool_names(&self.config.mob.mcp_servers);
         let template = independent_review_native_launch_template(&request, &mcp_tools);
         let repository = Some(request.pull_request.repo.clone());
-        let plan = match NativeMobLaunchPlan::new(
-            request.spawn_input,
-            template.clone(),
-            native_member_mcp_servers_for_issue(
-                &self.config.mob.mcp_servers,
-                &self.config.workflow_dir,
-                &template,
-                &self.issue,
-                repository.as_ref(),
-                &self.config.tracker.terminal_states,
-                &native_issue_review_handoff_states(&self.config, &self.issue),
-                &native_action_lanes(&self.config),
-            ),
-            native_member_direct_tool_servers(&self.config.tracker, &template),
-            self.config.tracker.project_slug.clone(),
-            repository,
-        ) {
+        let plan = match (|| {
+            NativeMobLaunchPlan::new(
+                request.spawn_input,
+                template.clone(),
+                bound_member_mcp_servers(&self.config, &template, &self.issue, repository.as_ref())
+                    .map_err(host_signal_launch_error)?,
+                native_member_direct_tool_servers(&self.config.tracker, &template),
+                self.config.tracker.project_slug.clone(),
+                repository,
+            )
+        })() {
             Ok(plan) => plan,
             Err(error) => {
                 return FugueToolResult::Err {
@@ -554,6 +518,8 @@ fn unsupported_final_gate_operation(
 
 pub struct FinalPrGateProjectionExecutor {
     config: ServiceConfig,
+    issue: LinearIssueRef,
+    registry: MetaRuntimeRegistry,
 }
 
 #[async_trait]
@@ -571,8 +537,9 @@ impl KapellmeisterHostToolExecutor for FinalPrGateProjectionExecutor {
             meta_runtime_state_path(&self.config.meerkat).join("workgraph.sqlite3"),
             self.config.tracker.terminal_states.clone(),
             native_workgraph_blocked_states(&self.config),
-        );
-        if let Err(message) = gate.guard_terminal_move(&input).await {
+        )
+        .for_mob(self.config.meerkat.mob_id().into_owned());
+        if let Err(message) = gate.guard_terminal_move(&self.config.tracker, &input).await {
             return FugueToolResult::Err {
                 error: FugueToolError {
                     operation: FugueToolOperation::LinearMoveIssue,
@@ -584,30 +551,18 @@ impl KapellmeisterHostToolExecutor for FinalPrGateProjectionExecutor {
                 metadata: ToolExecutionMetadata::default(),
             };
         }
-        match IssueAdapter::from_config(&self.config.tracker) {
-            Ok(adapter) => match adapter.move_issue(input).await {
-                Ok(output) => FugueToolResult::Ok {
-                    output: FugueToolOutput::LinearMoveIssue(output),
-                    metadata: ToolExecutionMetadata::default(),
-                },
-                Err(error) => FugueToolResult::Err {
-                    error: FugueToolError {
-                        operation: FugueToolOperation::LinearMoveIssue,
-                        code: FugueToolErrorCode::ExecutionFailed,
-                        message: error.to_string(),
-                        retry: RetryAdvice::DoNotRetry,
-                        idempotency_key: Some(idempotency_key),
-                    },
-                    metadata: ToolExecutionMetadata::default(),
-                },
+        match crate::linear_adapter::move_issue_with_observation(&self.config, input).await {
+            Ok(output) => FugueToolResult::Ok {
+                output: FugueToolOutput::LinearMoveIssue(output),
+                metadata: ToolExecutionMetadata::default(),
             },
             Err(error) => FugueToolResult::Err {
                 error: FugueToolError {
                     operation: FugueToolOperation::LinearMoveIssue,
-                    code: FugueToolErrorCode::BackendUnavailable,
+                    code: FugueToolErrorCode::ExecutionFailed,
                     message: error.to_string(),
-                    retry: RetryAdvice::SafeToRetry,
-                    idempotency_key: Some(input.idempotency_key),
+                    retry: RetryAdvice::DoNotRetry,
+                    idempotency_key: Some(idempotency_key),
                 },
                 metadata: ToolExecutionMetadata::default(),
             },
@@ -661,7 +616,14 @@ impl KapellmeisterHostToolExecutor for FinalPrGateProjectionExecutor {
     }
 
     async fn merge_pr(&mut self, input: MergePrInput) -> FugueToolResult {
-        GitHubToolHost::new().merge_pr(input)
+        crate::merge_gate::merge(
+            &self.config,
+            &self.registry,
+            self.issue.clone(),
+            input,
+            crate::merge_gate::MergePurpose::FinalReview,
+        )
+        .await
     }
 }
 
@@ -723,44 +685,16 @@ pub async fn execute_final_pr_gate_projection_with_executor(
     Ok(())
 }
 
+#[cfg(test)]
 fn final_pr_gate_native_launch_template(
     request: &FinalPrGateStartRequest,
     mcp_tools: &[String],
 ) -> MaterializedMobTemplate {
-    let members = request
-        .reviewers
-        .iter()
-        .map(|reviewer| crate::config::MaterializedMobMember {
-            name: reviewer.id.clone(),
-            profile: reviewer.profile.clone(),
-            agent: crate::config::NativeAgentProfile {
-                model: None,
-                provider: None,
-                auth_binding: None,
-                max_tokens: None,
-                system_prompt: None,
-                output_schema: None,
-                structured_output_retries: None,
-                provider_params: None,
-                tools: review_agent_tools(
-                    ["mob", "shell", "comms", "workgraph"],
-                    mcp_tools,
-                ),
-                skills: Vec::new(),
-                additional_instructions: Some(vec![
-                    "You are a repo-level final PR reviewer. Emit typed final-review verdicts only. Do not merge. Inspect the PR diff against base and WorkGraph obligations yourself with shell/GitHub/workgraph tools; do not rely on precomputed summaries."
-                        .to_string(),
-                ]),
-            },
-        })
-        .collect::<Vec<_>>();
-    MaterializedMobTemplate {
-        backend: MobExecutionBackend::NativeExecution,
-        members,
-        flow: None,
-        linear_projection: None,
-        max_review_cycles: None,
-    }
+    crate::kapellmeister_host::final_pr_gate_native_launch_template_with_profile(
+        request,
+        mcp_tools,
+        &crate::config::IndependentReviewConfig::default().orchestrator_profile,
+    )
 }
 
 fn agent_visible_mcp_tool_names(
@@ -773,38 +707,22 @@ fn agent_visible_mcp_tool_names(
         .collect()
 }
 
-fn review_agent_tools<const N: usize>(base_tools: [&str; N], mcp_tools: &[String]) -> Vec<String> {
-    let mut tools = base_tools
-        .into_iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    for tool in mcp_tools {
-        if !tools.iter().any(|existing| existing == tool) {
-            tools.push(tool.clone());
-        }
-    }
-    tools
-}
-
 impl Orchestrator {
-    pub fn new(config: WorkflowConfigManager, refresh_rx: mpsc::Receiver<()>) -> Self {
+    pub fn new(config: WorkflowConfigManager, refresh_rx: mpsc::Receiver<()>) -> Result<Self> {
         let (internal_tx, internal_rx) = mpsc::channel(256);
         let effective = config.effective();
         let meerkat_config = effective.meerkat.clone();
+        let host_signal_binding = HostSignalBinding::from_config(effective)?;
+        let tracker_servers = host_signal_mcp_servers(effective)?;
         let fugue_host_api_url = fugue_host_api_url_from_config(effective);
         let fugue_host_api_auth = fugue_host_api_auth_from_config(effective);
-        let final_review_reviewers = if effective.final_review.enabled {
-            effective.final_review.reviewers.clone()
-        } else {
-            Vec::new()
-        };
         let meta_runtime_registry = MetaRuntimeRegistry::with_config(
             meerkat_config,
             effective.tracker.clone(),
             fugue_host_api_url.clone(),
             fugue_host_api_auth,
             native_repo_kapellmeister_mcp_servers(
-                &effective.mob.mcp_servers,
+                &tracker_servers,
                 &effective.workflow_dir,
                 repository_scope_from_config(effective).as_ref(),
                 effective.tracker.project_slug.as_deref(),
@@ -817,7 +735,9 @@ impl Orchestrator {
             ),
             effective.mob.templates.clone(),
         )
-        .with_final_review_reviewers(final_review_reviewers)
+        .with_review_admission(internal_tx.clone())
+        .with_host_signal_binding(host_signal_binding.clone())
+        .with_final_review_config(effective.final_review.clone())
         .with_independent_review_config(effective.independent_review.clone());
         let native_event_observer = NativeMobEventObserver::for_config(effective);
         let state = Arc::new(RwLock::new(OrchestratorState {
@@ -832,9 +752,8 @@ impl Orchestrator {
             meerkat_rate_limits: None,
             last_error: None,
             recent_events: HashMap::new(),
-            final_pr_gates: HashMap::new(),
         }));
-        Self {
+        Ok(Self {
             config,
             state,
             refresh_rx,
@@ -847,11 +766,14 @@ impl Orchestrator {
             native_event_observer,
             native_worker_execution: false,
             terminal_issue_refresh: true,
-            kapellmeister_signal_deduper: Arc::new(Mutex::new(RecentSignalDeduper::new(
-                KAPELLMEISTER_SIGNAL_DEDUP_LIMIT,
-            ))),
+            host_signal_binding,
+            host_signal_wake: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            captured_native_signal_messages: None,
             linear_backoff_until: None,
-        }
+            #[cfg(test)]
+            test_directory: None,
+        })
     }
 
     #[cfg(test)]
@@ -861,9 +783,12 @@ impl Orchestrator {
         refresh_rx: mpsc::Receiver<()>,
         native_execution_host: Arc<dyn NativeMobExecutionHost + Send + Sync>,
     ) -> Self {
-        let mut orchestrator = Self::new(config, refresh_rx);
+        let mut orchestrator = Self::new(config, refresh_rx).unwrap();
         orchestrator.native_execution_host = native_execution_host;
         orchestrator.native_worker_execution = false;
+        // A fake worker host must not bootstrap a real coordinator as a side
+        // effect. Real signal delivery is covered by the native runtime tests.
+        orchestrator.captured_native_signal_messages = Some(Mutex::new(Vec::new()));
         orchestrator
     }
 
@@ -922,6 +847,7 @@ impl Orchestrator {
 
     pub async fn run_until_shutdown(&mut self, shutdown: CancellationToken) -> anyhow::Result<()> {
         self.spawn_autonomous_host_bootstrap();
+        self.drain_host_signals().await;
         self.startup_terminal_workspace_cleanup().await;
         self.reconcile_kapellmeister_shadow_host().await;
         self.tick().await;
@@ -934,6 +860,9 @@ impl Orchestrator {
                 }
                 Some(_) = self.refresh_rx.recv() => {
                     self.tick().await;
+                }
+                _ = self.host_signal_wake.notified() => {
+                    self.drain_host_signals().await;
                 }
                 Some(message) = self.internal_rx.recv() => {
                     self.handle_internal(message).await;
@@ -1011,6 +940,8 @@ impl Orchestrator {
     }
 
     async fn tick(&mut self) {
+        // Saved intent is independent of tracker availability and dispatch policy.
+        self.drain_host_signals().await;
         if self.linear_backoff_is_active() {
             debug!("dispatch skipped while Linear rate-limit backoff is active");
             return;
@@ -1046,6 +977,19 @@ impl Orchestrator {
             warn!(error = %err, "Linear projection lane preflight failed");
             return;
         }
+        let observation_revision = match crate::host_signal_journal::HostSignalBinding::from_config(
+            self.config.effective(),
+        )
+        .and_then(|binding| binding.open())
+        .and_then(|journal| journal.revision())
+        {
+            Ok(revision) => revision,
+            Err(error) => {
+                self.state.write().await.last_error = Some(error.to_string());
+                warn!(%error, "cannot capture tracker observation revision");
+                return;
+            }
+        };
         let mut candidates = match adapter.fetch_candidate_issues().await {
             Ok(issues) => issues,
             Err(err) => {
@@ -1073,7 +1017,7 @@ impl Orchestrator {
             let mut state = self.state.write().await;
             state.last_error = None;
         }
-        self.reconcile_linear_lane_observations(&pr_handoff_candidates)
+        self.reconcile_linear_lane_observations(&pr_handoff_candidates, observation_revision)
             .await;
         if native_kapellmeister_prompt_control_enabled(self.config.effective()) {
             self.reconcile_native_deploy_lane(&adapter, &pr_handoff_candidates)
@@ -1145,7 +1089,9 @@ impl Orchestrator {
         adapter: &IssueAdapter,
         issues: &[Issue],
     ) -> NativePrHandoffReconcileResult {
-        let github_host = GitHubToolHost::new();
+        let github_host = GitHubToolHost::with_connections(
+            self.config.effective().meerkat.runtime_connections.clone(),
+        );
         let mut result = NativePrHandoffReconcileResult::default();
         for issue in issues {
             if matches!(
@@ -1195,7 +1141,8 @@ impl Orchestrator {
                     self.deliver_kapellmeister_shadow_signal(native_pr_handoff_missing_pr_signal(
                         &issue.identifier,
                         Utc::now(),
-                    ));
+                    ))
+                    .await;
                     let mut state = self.state.write().await;
                     state.last_error = Some(format!(
                         "native PR handoff monitor reported {} to Kapellmeister because Workpad/Linear claims PR handoff but durable GitHub PR evidence is missing; Linear lane was not moved by the host",
@@ -1342,7 +1289,9 @@ impl Orchestrator {
         if !self.config.effective().deploy.enabled {
             return false;
         }
-        let github_host = GitHubToolHost::new();
+        let github_host = GitHubToolHost::with_connections(
+            self.config.effective().meerkat.runtime_connections.clone(),
+        );
         let mut changed = false;
         for issue in issues {
             if !native_deploy_lane_candidate(self.config.effective(), issue) {
@@ -1355,6 +1304,7 @@ impl Orchestrator {
                 Ok(Some(request)) => {
                     let result = crate::http::execute_deploy_transaction(
                         self.config.effective().clone(),
+                        self.meta_runtime_registry(),
                         request,
                     )
                     .await;
@@ -1410,18 +1360,32 @@ impl Orchestrator {
             .await?
             .unwrap_or_else(|| "## Fugue Workpad".to_string());
         let linear = recover_native_linear_evidence(issue, Some(&workpad_body));
-        let Some(handoff) = recover_existing_native_pr_monitor_handoff_for_issue(
+        let recorded = recover_recorded_native_pr_handoff(
             self.config.effective(),
             issue,
             Some(&linear),
             github_host,
-        ) else {
+        )?;
+        let Some(handoff) = recorded.or_else(|| {
+            recover_existing_native_pr_monitor_handoff_for_issue(
+                self.config.effective(),
+                issue,
+                Some(&linear),
+                github_host,
+            )
+        }) else {
             warn!(
                 issue_identifier = %issue.identifier,
                 "mechanical deploy lane found no durable PR evidence"
             );
             return Ok(None);
         };
+        if !handoff.rejected_pull_requests.is_empty() {
+            return Err(FugueError::ResponseError(
+                "PR evidence conflicts with the current issue branch".into(),
+            ));
+        }
+        crate::pr_handoff::record(self.config.effective(), issue, &handoff.pull_request)?;
         let ci = if handoff.pull_request.state == PullRequestState::Open {
             inspect_native_pr_handoff_ci(github_host, &handoff.pull_request)
                 .map_err(|message| {
@@ -1451,6 +1415,7 @@ impl Orchestrator {
             ci_status: ci.map(|output| output.status),
             unresolved_workgraph_blockers,
             idempotency_key,
+            retry_deployment: None,
         }))
     }
 
@@ -1462,7 +1427,8 @@ impl Orchestrator {
             meta_runtime_state_path(&self.config.effective().meerkat).join("workgraph.sqlite3"),
             self.config.effective().tracker.terminal_states.clone(),
             native_workgraph_blocked_states(self.config.effective()),
-        );
+        )
+        .for_mob(self.config.effective().meerkat.mob_id().into_owned());
         gate.unresolved_blocking_items(issue_identifier)
             .await
             .map(|items| items.len())
@@ -1474,7 +1440,9 @@ impl Orchestrator {
         adapter: &IssueAdapter,
         issues: &[Issue],
     ) -> bool {
-        let github_host = GitHubToolHost::new();
+        let github_host = GitHubToolHost::with_connections(
+            self.config.effective().meerkat.runtime_connections.clone(),
+        );
         let mut changed = false;
         for issue in issues {
             if !matches!(
@@ -1571,7 +1539,8 @@ impl Orchestrator {
                 &handoff,
                 ci.as_ref(),
                 action,
-            );
+            )
+            .await;
             if let Some(final_gate_start) = final_gate_start.as_ref() {
                 match self
                     .deliver_native_final_pr_gate_request_to_kapellmeister(issue, final_gate_start)
@@ -1598,7 +1567,11 @@ impl Orchestrator {
             .await
     }
 
-    async fn reconcile_linear_lane_observations(&self, issues: &[Issue]) {
+    async fn reconcile_linear_lane_observations(
+        &self,
+        issues: &[Issue],
+        revision: crate::host_signal_journal::ObservationRevision,
+    ) {
         let mut observations = Vec::new();
         for issue in issues {
             observations.push(IssueLaneRuntimeObservation {
@@ -1607,8 +1580,8 @@ impl Orchestrator {
             });
         }
         let signals = match reconcile_issue_lane_observation_state(
-            &self.config.effective().workflow_dir,
             self.config.effective(),
+            revision,
             observations,
         ) {
             Ok(signals) => signals,
@@ -1624,7 +1597,7 @@ impl Orchestrator {
                 count = signals.len(),
                 "observed external issue lane changes"
             );
-            self.deliver_kapellmeister_shadow_signals(signals);
+            self.deliver_kapellmeister_shadow_signals(signals).await;
         }
         self.reconcile_linear_comment_observations(issues).await;
     }
@@ -1638,10 +1611,7 @@ impl Orchestrator {
             }
         };
         let signals = match adapter
-            .reconcile_issue_comment_observation_state(
-                &self.config.effective().workflow_dir,
-                issues,
-            )
+            .reconcile_issue_comment_observation_state(self.config.effective(), issues)
             .await
         {
             Ok(signals) => signals,
@@ -1657,7 +1627,7 @@ impl Orchestrator {
                 count = signals.len(),
                 "delivering issue comment control-plane observations to Kapellmeister"
             );
-            self.deliver_kapellmeister_shadow_signals(signals);
+            self.deliver_kapellmeister_shadow_signals(signals).await;
         }
     }
 
@@ -1719,103 +1689,141 @@ impl Orchestrator {
         }
     }
 
-    fn deliver_kapellmeister_shadow_signal(&self, signal: KapellmeisterShadowSignal) {
-        self.deliver_kapellmeister_shadow_signals(vec![signal]);
+    async fn deliver_kapellmeister_shadow_signal(&self, signal: KapellmeisterShadowSignal) {
+        self.deliver_kapellmeister_shadow_signals(vec![signal])
+            .await;
     }
 
-    fn deliver_kapellmeister_shadow_signals(&self, signals: Vec<KapellmeisterShadowSignal>) {
-        let original_count = signals.len();
-        if original_count == 0 {
-            return;
+    async fn deliver_kapellmeister_shadow_signals(&self, signals: Vec<KapellmeisterShadowSignal>) {
+        if let Err(error) = self.enqueue_host_signals(&signals) {
+            self.state.write().await.last_error = Some(error.to_string());
+            warn!(%error, "host notifications could not be saved; delivery is not acknowledged");
         }
-        let signals = match self.kapellmeister_signal_deduper.lock() {
-            Ok(mut deduper) => signals
-                .into_iter()
-                .filter(|signal| deduper.accept(&signal.id))
-                .collect::<Vec<_>>(),
-            Err(_) => {
-                warn!("kapellmeister signal deduper lock is poisoned; dropping signal batch");
-                Vec::new()
-            }
-        };
-        if signals.is_empty() {
-            debug!(
-                skipped_duplicate_count = original_count,
-                "suppressed duplicate Fugue host signal batch for repo Kapellmeister"
-            );
-            return;
-        }
-        let signal_ids = signals
-            .iter()
-            .map(|signal| signal.id.0.clone())
-            .collect::<Vec<_>>();
-        match repo_kapellmeister_signal_message_with_success_lane(
-            &signals,
-            &self.config.effective().linear.lanes.success,
-        ) {
-            Ok(message) => {
-                let registry = self.meta_runtime_registry.clone();
-                tokio::spawn(async move {
-                    for attempt in 1..=3 {
-                        let mut delivery = Box::pin(
-                            registry.deliver_repo_kapellmeister_signal_batch(message.clone()),
-                        );
-                        let mut pending_logs = 0_u64;
-                        loop {
-                            let pending_log = tokio::time::sleep(Duration::from_millis(
-                                KAPELLMEISTER_REPO_SIGNAL_PENDING_LOG_MS,
-                            ));
-                            tokio::pin!(pending_log);
-                            tokio::select! {
-                                result = &mut delivery => {
-                                    match result {
-                                        Ok(accepted) => {
-                                            info!(
-                                                interaction_id = %accepted.interaction_id,
-                                                identity = %accepted.identity,
-                                                attempt,
-                                                signal_ids = ?signal_ids,
-                                                "accepted Fugue host signal batch for repo Kapellmeister delivery"
-                                            );
-                                            return;
-                                        }
-                                        Err(error) => {
-                                            warn!(
-                                                error = %error,
-                                                attempt,
-                                                signal_ids = ?signal_ids,
-                                                "failed to deliver Fugue host signal batch to repo Kapellmeister"
-                                            );
-                                            break;
-                                        }
-                                    }
-                                }
-                                () = &mut pending_log => {
-                                    pending_logs = pending_logs.saturating_add(1);
-                                    warn!(
-                                        pending_for_ms = pending_logs.saturating_mul(KAPELLMEISTER_REPO_SIGNAL_PENDING_LOG_MS),
-                                        pending_log_interval_ms = KAPELLMEISTER_REPO_SIGNAL_PENDING_LOG_MS,
-                                        attempt,
-                                        signal_ids = ?signal_ids,
-                                        "delivery still pending for Fugue host signal batch to repo Kapellmeister"
-                                    );
-                                }
-                            }
-                        }
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                    }
-                });
-            }
-            Err(error) => warn!(
-                error = %error,
-                "failed to encode Fugue host signal batch for repo Kapellmeister"
-            ),
-        }
+    }
 
-        // Host signals have one canonical live path: the Meta repo Kapellmeister.
-        // The Kapellmeister shadow runtime is only reconciled at startup for persisted-state
-        // delivering every signal through both paths spawns duplicate
-        // rkat-rpc clients and can starve the service of file descriptors.
+    fn enqueue_host_signals(&self, signals: &[KapellmeisterShadowSignal]) -> Result<()> {
+        if signals.is_empty() {
+            return Ok(());
+        }
+        if HostSignalBinding::from_config(self.config.effective())? != self.host_signal_binding {
+            return Err(FugueError::Workspace(
+                "host signal routing changed; restart with the intended repository configuration"
+                    .into(),
+            ));
+        }
+        let mut journal = self.host_signal_binding.open()?;
+        let mut update = journal.begin()?;
+        #[cfg(test)]
+        let mut recorded = Vec::new();
+        for signal in signals {
+            update.enqueue_once(&signal.id.0, || {
+                let envelope = crate::host_signal_journal::SignalEnvelope::for_signals(
+                    self.config.effective(),
+                    std::slice::from_ref(signal),
+                )?;
+                #[cfg(test)]
+                recorded.push(envelope.content.clone());
+                Ok(envelope)
+            })?;
+        }
+        update.commit()?;
+        #[cfg(test)]
+        if let Some(messages) = &self.captured_native_signal_messages {
+            messages
+                .lock()
+                .expect("test signal recorder")
+                .extend(recorded);
+        }
+        // The run loop owns the drain. Signals arriving during a drain remain
+        // in SQLite; cancellation, shutdown or process loss cannot drop them.
+        self.host_signal_wake.notify_one();
+        Ok(())
+    }
+
+    async fn drain_host_signals(&self) {
+        #[cfg(test)]
+        if self.captured_native_signal_messages.is_some() {
+            return;
+        }
+        let limit = std::num::NonZeroU32::MIN.saturating_add(31);
+        let drain = self
+            .host_signal_binding
+            .drain_pending(limit, |scope, signal| async move {
+                self.meta_runtime_registry
+                    .deliver_repo_kapellmeister_signal(&scope, &signal)
+                    .await
+                    .map_err(FugueError::Workspace)
+            });
+        match tokio::time::timeout(HOST_SIGNAL_DRAIN_TIMEOUT, drain).await {
+            Ok(Ok(progress)) => {
+                if progress.acknowledged != 0 {
+                    info!(
+                        count = progress.acknowledged,
+                        "native admission acknowledged saved host notifications"
+                    );
+                }
+                if let Some(deferred) = progress.deferred {
+                    debug!(delivery_id = %deferred.receipt.delivery_id,
+                        status = ?deferred.receipt.status,
+                        "host notification retained for the next native admission check");
+                }
+            }
+            Ok(Err(error)) => {
+                self.state.write().await.last_error = Some(error.to_string());
+                warn!(%error, "host notification remains saved for retry");
+            }
+            Err(_) => {
+                let error = "native notification admission timed out; saved intent will be retried";
+                self.state.write().await.last_error = Some(error.to_owned());
+                warn!(error);
+            }
+        }
+        // Reconciliation is independent of admission. An unresolved receipt
+        // must not prevent newer completion or steering messages from arriving.
+        let reconcile =
+            self.host_signal_binding
+                .reconcile_admitted(limit, |scope, receipt| async move {
+                    self.meta_runtime_registry
+                        .observe_repo_kapellmeister_input(&scope, &receipt)
+                        .await
+                        .map_err(FugueError::Workspace)
+                });
+        match tokio::time::timeout(HOST_SIGNAL_DRAIN_TIMEOUT, reconcile).await {
+            Ok(Ok(progress)) => {
+                if progress.requeued != 0 {
+                    info!(
+                        count = progress.requeued,
+                        "saved host notifications stopped before execution are ready for readmission"
+                    );
+                    self.host_signal_wake.notify_one();
+                }
+                if let Some(unresolvable) = progress.unresolvable.first() {
+                    let error = format!(
+                        "host notification needs attention: {} (delivery {})",
+                        unresolvable.reason, unresolvable.admission.receipt.delivery_id
+                    );
+                    self.state.write().await.last_error = Some(error.clone());
+                    warn!(%error, "native input cannot be resolved; receipt retained without resend");
+                }
+                if let Some(attention) = progress.attention.first() {
+                    let error = format!(
+                        "host notification needs attention: native input {:?}, outcome {:?} (delivery {})",
+                        attention.phase, attention.outcome, attention.admission.receipt.delivery_id
+                    );
+                    self.state.write().await.last_error = Some(error.clone());
+                    warn!(%error, "native terminal input retained without automatic resend");
+                }
+            }
+            Ok(Err(error)) => {
+                self.state.write().await.last_error = Some(error.to_string());
+                warn!(%error, "native input reconciliation failed; admission receipts retained");
+            }
+            Err(_) => {
+                let error = "native input reconciliation timed out; admission receipts retained";
+                self.state.write().await.last_error = Some(error.to_owned());
+                warn!(error);
+            }
+        }
     }
 
     async fn reload_workflow_if_needed(&mut self) -> bool {
@@ -1852,6 +1860,12 @@ impl Orchestrator {
         {
             Ok(issues) => {
                 for issue in issues {
+                    if let Err(error) =
+                        self.cleanup_native_executions_for_issue(&issue, "startup-terminal-cleanup")
+                    {
+                        self.record_terminal_cleanup_error(&issue, &error).await;
+                        continue;
+                    }
                     clean_workspace_for_issue_identifier_best_effort(
                         self.config.effective(),
                         &issue.identifier,
@@ -1864,9 +1878,9 @@ impl Orchestrator {
     }
 
     async fn reconcile_running_issues(&mut self) {
+        self.reconcile_untracked_terminal_executions().await;
         self.recover_native_running_entries_after_restart().await;
         self.reconcile_native_mob_events().await;
-        self.reconcile_final_pr_gate_events_internal().await;
         self.reconcile_stalled_runs().await;
         let running_ids = {
             let state = self.state.read().await;
@@ -2220,52 +2234,72 @@ impl Orchestrator {
         let restore_capacity = self.config.effective().agent.max_concurrent_agents - existing;
         let restore_keys =
             native_runtime_restore_keys(self.config.effective(), &issues, restore_capacity);
-        if let Err(error) = self
+        let native_restored = match self
             .native_execution_host
             .restore_persisted_runtimes(restore_keys, restore_capacity)
         {
-            warn!(error = %error, "native mob persisted runtime restore skipped");
-            let mut state = self.state.write().await;
-            state.last_error = Some(format!(
-                "native mob persisted runtime restore skipped: {error}"
-            ));
-            return;
-        }
-        let result = self
-            .native_execution_host
-            .list_runs(crate::tools::ListRunsInput {
-                issue: None,
-                status: Some(MobRunStatus::Running),
-                cursor: None,
-                limit: 100,
-            });
-        let runs = match result {
-            FugueToolResult::Ok {
-                output: FugueToolOutput::MobListRuns(output),
-                ..
-            } => output.runs,
-            FugueToolResult::Ok { output, .. } => {
-                let mut state = self.state.write().await;
-                state.last_error = Some(format!(
-                    "native mob restart reconciliation returned unexpected output {output:?}"
+            Ok(()) => true,
+            Err(error) => {
+                warn!(error = %error, "native mob persisted runtime restore skipped");
+                self.state.write().await.last_error = Some(format!(
+                    "native mob persisted runtime restore skipped: {error}"
                 ));
-                return;
+                false
             }
-            FugueToolResult::Err { error, .. } => {
-                warn!(message = %error.message, "native mob restart reconciliation skipped");
+        };
+        // Admission receipts remain readable when native materialization is
+        // unavailable. Preserve that error and restore only failure reporting.
+        let runs = match list_native_runs_for_restart(self.native_execution_host.as_ref()) {
+            Ok(runs) => runs,
+            Err(error) => {
+                warn!(message = %error, "native mob restart reconciliation skipped");
+                self.state.write().await.last_error = Some(error);
                 return;
             }
         };
         if runs.is_empty() {
             return;
         }
-        let workspace = WorkspaceManager::new(
-            &self.config.effective().workspace,
-            &self.config.effective().hooks,
+        let workspace = WorkspaceManager::for_service(self.config.effective());
+        let github_host = GitHubToolHost::with_connections(
+            self.config.effective().meerkat.runtime_connections.clone(),
         );
-        let github_host = GitHubToolHost::new();
         let mut recovered = Vec::new();
         for run in newest_native_runs_by_issue(runs) {
+            if !native_restored && native_run_status_is_active(run.status) {
+                continue;
+            }
+            if !native_run_status_is_active(run.status) && run.status != MobRunStatus::Failed {
+                continue;
+            }
+            let launch_failure = if run.status == MobRunStatus::Failed {
+                match self
+                    .native_execution_host
+                    .status(crate::tools::InspectRunInput {
+                        run_id: run.run_id.clone(),
+                    }) {
+                    FugueToolResult::Ok {
+                        output: FugueToolOutput::MobInspectRun(output),
+                        ..
+                    } => output.launch_failure,
+                    FugueToolResult::Err { error, .. } => {
+                        warn!(run_id = %run.run_id.0, message = %error.message, "failed admission inspection could not be recovered");
+                        self.state.write().await.last_error = Some(error.message);
+                        return;
+                    }
+                    FugueToolResult::Ok { output, .. } => {
+                        self.state.write().await.last_error = Some(format!(
+                            "failed admission inspection returned unexpected output {output:?}"
+                        ));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            if run.status == MobRunStatus::Failed && launch_failure.is_none() {
+                continue;
+            }
             let workpad_body = match run.issue.as_ref() {
                 Some(issue_ref) => {
                     match adapter.workpad_body(issue_ref, "## Fugue Workpad").await {
@@ -2297,18 +2331,22 @@ impl Orchestrator {
             }
             if let Some((issue, mut entry)) = recover_native_running_entry(
                 &run,
+                launch_failure.as_ref(),
                 &issues,
                 self.config.effective(),
                 &workspace,
                 workpad_body.as_deref(),
             ) {
-                if matches!(entry.policy_mode, IssuePolicyMode::Kapellmeister) {
+                if launch_failure.is_none()
+                    && matches!(entry.policy_mode, IssuePolicyMode::Kapellmeister)
+                {
                     self.deliver_kapellmeister_shadow_signal(runtime_recovered_signal(
                         self.config.effective(),
                         &issue,
                         &run,
                         entry.native_run.as_ref(),
-                    ));
+                    ))
+                    .await;
                 }
                 if let Some(native_run) = entry.native_run.as_mut() {
                     native_run.recovery = refresh_native_status_recovery(
@@ -2336,7 +2374,9 @@ impl Orchestrator {
     }
 
     async fn reconcile_native_mob_events(&mut self) {
-        let github_host = GitHubToolHost::new();
+        let github_host = GitHubToolHost::with_connections(
+            self.config.effective().meerkat.runtime_connections.clone(),
+        );
         self.reconcile_native_mob_events_with_tools(None, Some(&github_host))
             .await;
     }
@@ -2376,238 +2416,6 @@ impl Orchestrator {
         }
     }
 
-    fn final_pr_gate_merge_authorized(
-        &self,
-        issue: &Issue,
-        pr: &GitHubPullRequestSnapshot,
-    ) -> bool {
-        let context = kapellmeister_context_for_issue(issue, Some(pr.repo.clone()));
-        crate::kapellmeister_host::guarded_mode_allows_mutation(
-            &self.config.effective().kapellmeister.shadow_mode.authority,
-            &context,
-            FugueToolOperation::GitHubMergePr,
-        )
-    }
-
-    fn final_pr_gate_mergeable_evidence(&self, pr: &GitHubPullRequestSnapshot) -> bool {
-        pr.state == PullRequestState::Open && !pr.draft
-    }
-
-    async fn reconcile_final_pr_gate_events_internal(&mut self) {
-        let github_host = GitHubToolHost::new();
-        self.reconcile_final_pr_gate_events_with_projector(
-            None::<&mut FinalPrGateProjectionExecutor>,
-            &github_host,
-        )
-        .await;
-    }
-
-    async fn reconcile_final_pr_gate_events_with_projector<E: KapellmeisterHostToolExecutor>(
-        &mut self,
-        projection_executor: Option<&mut E>,
-        github: &dyn NativeStatusGitHubInspector,
-    ) {
-        self.reconcile_final_pr_gate_events_with_projector_and_ci(
-            projection_executor,
-            github,
-            None,
-            None,
-            None,
-        )
-        .await;
-    }
-
-    async fn reconcile_final_pr_gate_events_with_projector_and_ci<
-        E: KapellmeisterHostToolExecutor,
-    >(
-        &mut self,
-        projection_executor: Option<&mut E>,
-        github: &dyn NativeStatusGitHubInspector,
-        ci_override: Option<CheckCiOutput>,
-        merge_authorized_override: Option<bool>,
-        mergeable_override: Option<bool>,
-    ) {
-        let mut projection_executor = projection_executor;
-        let gates = {
-            let state = self.state.read().await;
-            state
-                .final_pr_gates
-                .iter()
-                .filter(|(_, gate)| !gate.completed)
-                .map(|(id, gate)| (id.clone(), gate.clone()))
-                .collect::<Vec<_>>()
-        };
-        for (run_id_key, mut gate) in gates {
-            let observation = match self.native_event_observer.observe(
-                self.native_execution_host.as_ref(),
-                &gate.run_id,
-                100,
-            ) {
-                Ok(observation) => observation,
-                Err(err) => {
-                    let mut state = self.state.write().await;
-                    state.last_error = Some(err.to_string());
-                    continue;
-                }
-            };
-            if observation.events.is_empty() {
-                let _ = self
-                    .native_event_observer
-                    .commit(&gate.run_id, &observation);
-                continue;
-            }
-            merge_mob_event_snapshots(&mut gate.observed_events, &observation.events);
-            let mut extra_blockers = Vec::new();
-            let current_pr = match github.inspect_pr(crate::tools::InspectPrInput {
-                repo: gate.start_request.pr.repo.clone(),
-                pull_request: GitHubPullRequestRef::Number {
-                    number: gate.start_request.pr.number,
-                },
-            }) {
-                FugueToolResult::Ok {
-                    output: FugueToolOutput::GitHubInspectPr(output),
-                    ..
-                } => output.pull_request,
-                FugueToolResult::Err { error, .. } => {
-                    let blocker = format!(
-                        "current PR refresh failed for PR #{}: {}",
-                        gate.start_request.pr.number.0, error.message
-                    );
-                    let mut state = self.state.write().await;
-                    state.last_error = Some(format!("final PR gate {blocker}"));
-                    extra_blockers.push(blocker);
-                    let mut stale = gate.start_request.pr.clone();
-                    stale.head_sha = GitSha(format!(
-                        "unverified-current-pr-refresh-failed:{}",
-                        stale.head_sha.0
-                    ));
-                    stale
-                }
-                FugueToolResult::Ok { output, .. } => {
-                    let blocker =
-                        format!("current PR refresh returned unexpected output {output:?}");
-                    let mut state = self.state.write().await;
-                    state.last_error = Some(format!("final PR gate {blocker}"));
-                    extra_blockers.push(blocker);
-                    let mut stale = gate.start_request.pr.clone();
-                    stale.head_sha = GitSha(format!(
-                        "unverified-current-pr-refresh-unexpected:{}",
-                        stale.head_sha.0
-                    ));
-                    stale
-                }
-            };
-            let ci = if let Some(ci) = ci_override.clone() {
-                Some(ci)
-            } else {
-                match github.check_ci(native_pr_handoff_ci_input(&current_pr)) {
-                    FugueToolResult::Ok {
-                        output: FugueToolOutput::GitHubCheckCi(output),
-                        ..
-                    } => Some(output),
-                    FugueToolResult::Err { error, .. } => {
-                        let mut state = self.state.write().await;
-                        state.last_error = Some(format!(
-                            "final PR gate CI evidence unavailable for PR #{}: {}",
-                            current_pr.number.0, error.message
-                        ));
-                        None
-                    }
-                    FugueToolResult::Ok { output, .. } => {
-                        let mut state = self.state.write().await;
-                        state.last_error = Some(format!(
-                            "final PR gate CI check returned unexpected output {output:?}"
-                        ));
-                        None
-                    }
-                }
-            };
-            let issue_identifier = issue_identifier_from_ref(&gate.start_request.issue)
-                .unwrap_or_else(|| "unknown".to_string());
-            let issue = Issue {
-                id: issue_identifier.clone(),
-                identifier: issue_identifier,
-                title: format!("Final PR gate for PR #{}", current_pr.number.0),
-                description: None,
-                priority: None,
-                state: self.config.effective().final_review.lane.clone(),
-                branch_name: Some(current_pr.head_branch.0.clone()),
-                url: Some(current_pr.url.clone()),
-                labels: Vec::new(),
-                blocked_by: Vec::new(),
-                attachments: Vec::new(),
-                created_at: None,
-                updated_at: None,
-            };
-            let completion_ci = ci.clone();
-            let completion = final_pr_gate_completion_plan(
-                Utc::now(),
-                FinalPrGateCompletionInput {
-                    config: self.config.effective().final_review.clone(),
-                    start_request: gate.start_request.clone(),
-                    current_pr: current_pr.clone(),
-                    ci: completion_ci.clone(),
-                    merge_authorized_by_kapellmeister: merge_authorized_override.unwrap_or_else(
-                        || self.final_pr_gate_merge_authorized(&issue, &current_pr),
-                    ),
-                    mergeable: mergeable_override
-                        .unwrap_or_else(|| self.final_pr_gate_mergeable_evidence(&current_pr)),
-                    idempotency_key: IdempotencyKey(format!(
-                        "final-gate-complete:{}:{}",
-                        current_pr.number.0, gate.start_request.pr.head_sha.0
-                    )),
-                    extra_blockers,
-                    events: gate.observed_events.clone(),
-                },
-            );
-            match completion {
-                FinalPrGateCompletionPlan::Waiting { .. } => {
-                    let mut state = self.state.write().await;
-                    if let Some(stored) = state.final_pr_gates.get_mut(&run_id_key) {
-                        stored.observed_events = gate.observed_events;
-                    }
-                }
-                FinalPrGateCompletionPlan::Ready(plan) => {
-                    let projection_result = if let Some(executor) =
-                        projection_executor.as_deref_mut()
-                    {
-                        execute_final_pr_gate_projection_with_executor(
-                            &self.config.effective().kapellmeister.shadow_mode.authority,
-                            &kapellmeister_context_for_issue(&issue, Some(current_pr.repo.clone())),
-                            plan.projection.clone(),
-                            executor,
-                        )
-                        .await
-                    } else {
-                        let mut executor = FinalPrGateProjectionExecutor {
-                            config: self.config.effective().clone(),
-                        };
-                        execute_final_pr_gate_projection_with_executor(
-                            &self.config.effective().kapellmeister.shadow_mode.authority,
-                            &kapellmeister_context_for_issue(&issue, Some(current_pr.repo.clone())),
-                            plan.projection.clone(),
-                            &mut executor,
-                        )
-                        .await
-                    };
-                    if let Err(err) = projection_result {
-                        let mut state = self.state.write().await;
-                        state.last_error = Some(err.to_string());
-                        continue;
-                    }
-                    let mut state = self.state.write().await;
-                    if let Some(stored) = state.final_pr_gates.get_mut(&run_id_key) {
-                        stored.observed_events = gate.observed_events;
-                        stored.completed = true;
-                    }
-                }
-            }
-            let _ = self
-                .native_event_observer
-                .commit(&gate.run_id, &observation);
-        }
-    }
-
     async fn reconcile_native_mob_events_with_tools(
         &mut self,
         mut workpad_executor: Option<&mut (dyn KapellmeisterHostToolExecutor + Send)>,
@@ -2635,6 +2443,48 @@ impl Orchestrator {
                 classify_issue_policy_mode(&issue, self.config.effective()),
                 IssuePolicyMode::Kapellmeister
             );
+            let inspected_run =
+                match self
+                    .native_execution_host
+                    .status(crate::tools::InspectRunInput {
+                        run_id: run_id.clone(),
+                    }) {
+                    FugueToolResult::Ok {
+                        output: FugueToolOutput::MobInspectRun(inspected),
+                        ..
+                    } => {
+                        self.observe_native_launch_failure(&issue_id, &inspected)
+                            .await;
+                        Some(inspected.run)
+                    }
+                    FugueToolResult::Ok { output, .. } => {
+                        let mut state = self.state.write().await;
+                        state.last_error = Some(format!(
+                            "native mob status returned unexpected output {output:?}"
+                        ));
+                        None
+                    }
+                    FugueToolResult::Err { error, .. } => {
+                        if native_mechanism_failure_is_nonretryable(&error.message)
+                            && self
+                                .park_running_native_issue_for_liveness(
+                                    &issue_id,
+                                    NativeRunParkReason::HostMechanics,
+                                    Some(error.message.clone()),
+                                )
+                                .await
+                        {
+                            continue;
+                        }
+                        warn!(
+                            message = %error.message,
+                            issue_identifier = %identifier,
+                            run_id = %run_id.0,
+                            "native mob status inspection failed"
+                        );
+                        None
+                    }
+                };
             let observation = match self.native_event_observer.observe(
                 self.native_execution_host.as_ref(),
                 &run_id,
@@ -2665,44 +2515,6 @@ impl Orchestrator {
                     continue;
                 }
             };
-            let inspected_run =
-                match self
-                    .native_execution_host
-                    .status(crate::tools::InspectRunInput {
-                        run_id: run_id.clone(),
-                    }) {
-                    FugueToolResult::Ok {
-                        output: FugueToolOutput::MobInspectRun(inspected),
-                        ..
-                    } => Some(inspected.run),
-                    FugueToolResult::Ok { output, .. } => {
-                        let mut state = self.state.write().await;
-                        state.last_error = Some(format!(
-                            "native mob status returned unexpected output {output:?}"
-                        ));
-                        None
-                    }
-                    FugueToolResult::Err { error, .. } => {
-                        if native_mechanism_failure_is_nonretryable(&error.message)
-                            && self
-                                .park_running_native_issue_for_liveness(
-                                    &issue_id,
-                                    NativeRunParkReason::HostMechanics,
-                                    Some(error.message.clone()),
-                                )
-                                .await
-                        {
-                            continue;
-                        }
-                        warn!(
-                            message = %error.message,
-                            issue_identifier = %identifier,
-                            run_id = %run_id.0,
-                            "native mob status inspection failed"
-                        );
-                        None
-                    }
-                };
             if observation.events.is_empty() {
                 if let Err(err) = self.native_event_observer.commit(&run_id, &observation) {
                     let mut state = self.state.write().await;
@@ -2726,10 +2538,7 @@ impl Orchestrator {
                             "native mob status heartbeat",
                         )
                         .await;
-                    let workspace = WorkspaceManager::new(
-                        &self.config.effective().workspace,
-                        &self.config.effective().hooks,
-                    );
+                    let workspace = WorkspaceManager::for_service(self.config.effective());
                     let mut state = self.state.write().await;
                     if let Some(entry) = state.running.get_mut(&issue_id) {
                         let status_is_fresh = entry
@@ -2810,10 +2619,7 @@ impl Orchestrator {
                         );
                         cumulative_events = Some(native_run.observed_events.clone());
                         if let Some(run) = inspected_run.as_ref() {
-                            let workspace = WorkspaceManager::new(
-                                &self.config.effective().workspace,
-                                &self.config.effective().hooks,
-                            );
+                            let workspace = WorkspaceManager::for_service(self.config.effective());
                             native_run.recovery = refresh_native_status_recovery(
                                 run,
                                 &entry.issue,
@@ -2890,19 +2696,26 @@ impl Orchestrator {
                 }
             }
             let observed_at = Utc::now();
-            self.deliver_kapellmeister_shadow_signal(KapellmeisterShadowSignal::worker_started(
-                observed_at,
-                Some(worker_cursor(
-                    &identifier,
-                    "native_mob_structural_event",
-                    1,
+            if let Err(error) =
+                self.enqueue_host_signals(&[KapellmeisterShadowSignal::worker_started(
                     observed_at,
-                )),
-                issue_ref_for_identifier(&identifier),
-                workspace_key_for_identifier(&identifier),
-                1,
-                Some(run_id.0.clone()),
-            ));
+                    Some(worker_cursor(
+                        &identifier,
+                        "native_mob_structural_event",
+                        1,
+                        observed_at,
+                    )),
+                    issue_ref_for_identifier(&identifier),
+                    workspace_key_for_identifier(&identifier),
+                    1,
+                    Some(run_id.0.clone()),
+                )])
+            {
+                self.state.write().await.last_error = Some(error.to_string());
+                warn!(%error, "native observation cursor retained because its notification could not be saved");
+                continue;
+            }
+
             let Some(inspected_run) = inspected_run else {
                 let mut state = self.state.write().await;
                 state.last_error = Some(format!(
@@ -3016,10 +2829,7 @@ impl Orchestrator {
                 };
                 match workpad_result {
                     FugueToolResult::Ok { .. } => {
-                        let workspace = WorkspaceManager::new(
-                            &self.config.effective().workspace,
-                            &self.config.effective().hooks,
-                        );
+                        let workspace = WorkspaceManager::for_service(self.config.effective());
                         let mut state = self.state.write().await;
                         if let Some(entry) = state.running.get_mut(&issue_id)
                             && let Some(native_run) = entry.native_run.as_mut()
@@ -3074,6 +2884,50 @@ impl Orchestrator {
         }
     }
 
+    async fn observe_native_launch_failure(
+        &self,
+        issue_id: &str,
+        inspected: &crate::tools::InspectRunOutput,
+    ) {
+        let identifier = {
+            let mut state = self.state.write().await;
+            let Some(entry) = state.running.get_mut(issue_id) else {
+                return;
+            };
+            let Some(native_run) = entry.native_run.as_mut() else {
+                return;
+            };
+            if native_run.run_id != inspected.run.run_id {
+                return;
+            }
+            native_run.launch_failure = inspected.launch_failure.clone();
+            entry.identifier.clone()
+        };
+        if let Some(failure) = &inspected.launch_failure {
+            let source_cursor = worker_cursor(
+                &identifier,
+                &format!(
+                    "launch_failed:{}:{}",
+                    inspected.run.run_id.0, failure.occurred_at
+                ),
+                0,
+                failure.occurred_at,
+            );
+            self.deliver_kapellmeister_shadow_signal(KapellmeisterShadowSignal::worker_failed(
+                failure.occurred_at,
+                Some(source_cursor),
+                issue_ref_for_identifier(&identifier),
+                workspace_key_for_identifier(&identifier),
+                ShadowWorkerFailure {
+                    reason: ShadowWorkerFailureReason::InfrastructureUnavailable,
+                    message: Some(format!("Issue team startup failed: {}", failure.message)),
+                    retry_scheduled: false,
+                },
+            ))
+            .await;
+        }
+    }
+
     async fn handle_native_run_finished(
         &mut self,
         issue_id: String,
@@ -3113,9 +2967,13 @@ impl Orchestrator {
         else {
             let mut state = self.state.write().await;
             state.last_error = Some(format!(
-                "native mob terminal handling skipped {} because the Linear issue could not be refreshed",
+                "native mob terminal handling deferred {} because the issue could not be refreshed",
                 entry.identifier
             ));
+            state.claimed.insert(issue_id.clone());
+            state.ended_runtime_seconds =
+                (state.ended_runtime_seconds - ended_runtime_seconds).max(0.0);
+            state.running.insert(issue_id, entry);
             return;
         };
         let lane_action = if native_kapellmeister_prompt_control_enabled(self.config.effective()) {
@@ -3129,17 +2987,16 @@ impl Orchestrator {
             }
             HumanLaneAction::StopAndCleanup => {
                 if let Err(cleanup_error) =
-                    self.cleanup_native_execution_for_entry(&entry, "native-terminal-lane-cleanup")
+                    self.cleanup_native_executions_for_issue(&issue, "native-terminal-lane-cleanup")
                 {
-                    self.park_native_issue_for_liveness(
-                        issue_id,
-                        entry,
-                        NativeRunParkReason::HostMechanics,
-                        Some(format!(
-                            "native execution cleanup failed after terminal lane observation: {cleanup_error}"
-                        )),
-                    )
-                    .await;
+                    self.record_terminal_cleanup_error(&issue, &cleanup_error)
+                        .await;
+                    entry.issue = issue;
+                    let mut state = self.state.write().await;
+                    state.claimed.insert(issue_id.clone());
+                    state.ended_runtime_seconds =
+                        (state.ended_runtime_seconds - ended_runtime_seconds).max(0.0);
+                    state.running.insert(issue_id, entry);
                     return;
                 }
                 clean_workspace_for_issue_identifier_best_effort(
@@ -3442,10 +3299,7 @@ impl Orchestrator {
                 "native PR handoff requires a configured GitHub repository scope".to_string(),
             ));
         };
-        let workspace = WorkspaceManager::new(
-            &self.config.effective().workspace,
-            &self.config.effective().hooks,
-        );
+        let workspace = WorkspaceManager::for_service(self.config.effective());
         let workspace_key = workspace_key_for_identifier(&entry.identifier);
         let inspection = workspace
             .inspect_workspace_key(&workspace_key.0)?
@@ -3476,9 +3330,19 @@ impl Orchestrator {
         if !git_staged_changes_empty(&inspection.path)? {
             git_run(&inspection.path, &["commit", "-m", &commit_message])?;
         }
-        git_run(&inspection.path, &["push", "-u", "origin", &head_branch.0])?;
+        git_output_with_connections(
+            &inspection.path,
+            &["push", "-u", "origin", &head_branch.0],
+            self.config
+                .effective()
+                .meerkat
+                .runtime_connections
+                .as_deref(),
+        )?;
 
-        let github = GitHubToolHost::new();
+        let github = GitHubToolHost::with_connections(
+            self.config.effective().meerkat.runtime_connections.clone(),
+        );
         let base_branch = match github.inspect_repo(InspectRepoInput { repo: repo.clone() }) {
             FugueToolResult::Ok {
                 output: FugueToolOutput::GitHubInspectRepo(output),
@@ -3527,6 +3391,7 @@ impl Orchestrator {
         entry: &RunningEntry,
         pull_request: &GitHubPullRequestSnapshot,
     ) -> Result<()> {
+        crate::pr_handoff::record(self.config.effective(), issue, pull_request)?;
         let adapter = IssueAdapter::from_config(&self.config.effective().tracker)?;
         let issue_ref = issue_ref_for_identifier(&issue.identifier);
         let body = adapter
@@ -3550,6 +3415,14 @@ impl Orchestrator {
     }
 
     async fn record_detected_native_pr_handoff(&self, handoff: DetectedNativePrHandoff) {
+        if let Err(error) = crate::pr_handoff::record(
+            self.config.effective(),
+            &handoff.issue,
+            &handoff.pull_request,
+        ) {
+            self.state.write().await.last_error = Some(error.to_string());
+            return;
+        }
         let adapter = match IssueAdapter::from_config(&self.config.effective().tracker) {
             Ok(adapter) => adapter,
             Err(err) => {
@@ -3621,6 +3494,9 @@ impl Orchestrator {
         action: &NativePrHandoffMonitorAction,
         final_gate_start: Option<&FinalPrGateStartRequest>,
     ) -> Result<bool> {
+        if github.rejected_pull_requests.is_empty() {
+            crate::pr_handoff::record(self.config.effective(), issue, &github.pull_request)?;
+        }
         let body = append_native_pr_handoff_monitor_evidence(
             workpad_body,
             github,
@@ -3651,32 +3527,24 @@ impl Orchestrator {
         issue: &Issue,
         final_gate_start: &FinalPrGateStartRequest,
     ) -> Result<bool> {
-        if self
-            .matching_final_pr_gate_is_running(issue, final_gate_start)
-            .await
-        {
-            return Ok(false);
-        }
-        self.deliver_kapellmeister_shadow_signal(
-            KapellmeisterShadowSignal::final_pr_gate_requested(
-                Utc::now(),
-                None,
-                issue_ref_for_identifier(&issue.identifier),
-                final_gate_start.pr.clone(),
-                final_gate_start.clone(),
-            ),
-        );
+        self.enqueue_host_signals(&[KapellmeisterShadowSignal::final_pr_gate_requested(
+            Utc::now(),
+            None,
+            issue_ref_for_identifier(&issue.identifier),
+            final_gate_start.pr.clone(),
+            final_gate_start.clone(),
+        )])?;
         info!(
             issue_identifier = %issue.identifier,
             pull_request = final_gate_start.pr.number.0,
             head_sha = %final_gate_start.pr.head_sha.0,
             trigger_mode = ?final_gate_start.trigger_mode,
-            "delivered final PR gate request observation to repo Kapellmeister"
+            "saved final PR gate request observation to repo Kapellmeister"
         );
         Ok(true)
     }
 
-    fn deliver_native_pr_handoff_monitor_signal_to_kapellmeister(
+    async fn deliver_native_pr_handoff_monitor_signal_to_kapellmeister(
         &self,
         issue: &Issue,
         handoff: &RecoveredGitHubEvidence,
@@ -3694,30 +3562,16 @@ impl Orchestrator {
                 decision,
                 detail.to_string(),
             ),
-        );
+        )
+        .await;
         info!(
             issue_identifier = %issue.identifier,
             pull_request = handoff.pull_request.number.0,
             head_sha = %handoff.pull_request.head_sha.0,
             ci_status = ?ci.map(|output| output.status),
             decision = ?decision,
-            "delivered PR handoff monitor observation to repo Kapellmeister"
+            "processed PR handoff monitor observation for repo Kapellmeister"
         );
-    }
-
-    async fn matching_final_pr_gate_is_running(
-        &self,
-        issue: &Issue,
-        final_gate_start: &FinalPrGateStartRequest,
-    ) -> bool {
-        let state = self.state.read().await;
-        state.final_pr_gates.values().any(|gate| {
-            !gate.completed
-                && issue_identifier_from_ref(&gate.start_request.issue)
-                    .is_some_and(|identifier| identifier == issue.identifier)
-                && gate.start_request.pr.number == final_gate_start.pr.number
-                && gate.start_request.pr.head_sha == final_gate_start.pr.head_sha
-        })
     }
 
     #[cfg(test)]
@@ -3900,7 +3754,8 @@ impl Orchestrator {
             detail.as_deref(),
             entry.retry_attempt.unwrap_or(0),
             observed_at,
-        ));
+        ))
+        .await;
         warn!(
             issue_identifier = %entry.identifier,
             reason = ?reason,
@@ -3939,6 +3794,93 @@ impl Orchestrator {
         let mut state = self.state.write().await;
         state.completed.insert(issue_id);
         state.last_error = Some(message);
+    }
+
+    fn cleanup_native_executions_for_issue(
+        &self,
+        issue: &Issue,
+        reason: &str,
+    ) -> std::result::Result<usize, String> {
+        let mut retired = 0;
+        for run in list_native_runs_for_restart(self.native_execution_host.as_ref())? {
+            if native_run_belongs_to_issue(&run, issue) {
+                retired += self
+                    .native_execution_host
+                    .cleanup_execution(&run.run_id, reason)?;
+            }
+        }
+        Ok(retired)
+    }
+
+    async fn record_terminal_cleanup_error(&self, issue: &Issue, error: &str) {
+        warn!(issue_identifier = %issue.identifier, %error, "terminal native cleanup deferred; retaining workspace for retry");
+        self.state.write().await.last_error = Some(format!(
+            "native cleanup deferred for {}: {error}",
+            issue.identifier
+        ));
+    }
+
+    async fn reconcile_untracked_terminal_executions(&self) {
+        let runs = match list_native_runs_for_restart(self.native_execution_host.as_ref()) {
+            Ok(runs) => runs,
+            Err(error) => {
+                self.state.write().await.last_error =
+                    Some(format!("native cleanup listing failed: {error}"));
+                return;
+            }
+        };
+        let untracked = {
+            let state = self.state.read().await;
+            runs.into_iter()
+                .filter(|run| {
+                    !state
+                        .running
+                        .values()
+                        .any(|entry| native_run_belongs_to_issue(run, &entry.issue))
+                })
+                .collect::<Vec<_>>()
+        };
+        if untracked.is_empty() {
+            return;
+        }
+        let adapter = match IssueAdapter::from_config(&self.config.effective().tracker) {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                self.state.write().await.last_error =
+                    Some(format!("native cleanup issue adapter failed: {error}"));
+                return;
+            }
+        };
+        let terminal = match adapter
+            .fetch_issues_by_states(&self.config.effective().tracker.terminal_states)
+            .await
+        {
+            Ok(issues) => issues,
+            Err(error) => {
+                self.state.write().await.last_error = Some(format!(
+                    "native cleanup terminal issue refresh failed: {error}"
+                ));
+                return;
+            }
+        };
+        for issue in terminal {
+            if !untracked
+                .iter()
+                .any(|run| native_run_belongs_to_issue(run, &issue))
+            {
+                continue;
+            }
+            match self.cleanup_native_executions_for_issue(&issue, "untracked-terminal-cleanup") {
+                Ok(_) => {
+                    clean_workspace_for_issue_identifier_best_effort(
+                        self.config.effective(),
+                        &issue.identifier,
+                    )
+                    .await
+                }
+                Err(error) => self.record_terminal_cleanup_error(&issue, &error).await,
+            }
+        }
     }
 
     fn cleanup_native_execution_for_entry(
@@ -4117,20 +4059,9 @@ impl Orchestrator {
         lane: &str,
         idempotency_suffix: &str,
     ) -> bool {
-        let adapter = match IssueAdapter::from_config(&self.config.effective().tracker) {
-            Ok(adapter) => adapter,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    issue_identifier = %identifier,
-                    target_lane = %lane,
-                    "native compact lane transition skipped because issue adapter is unavailable"
-                );
-                return false;
-            }
-        };
-        let result = adapter
-            .move_issue(MoveIssueInput {
+        let result = crate::linear_adapter::move_issue_with_observation(
+            self.config.effective(),
+            MoveIssueInput {
                 issue: issue_ref_for_identifier(identifier),
                 state: LinearStateRef::Name {
                     name: lane.to_string(),
@@ -4139,18 +4070,11 @@ impl Orchestrator {
                 idempotency_key: IdempotencyKey(format!(
                     "{idempotency_suffix}:{identifier}:{lane}"
                 )),
-            })
-            .await;
+            },
+        )
+        .await;
         match result {
-            Ok(output) => {
-                if native_lane_move_satisfied(&output) {
-                    self.record_internal_linear_lane(identifier, &output.issue.state.name)
-                        .await;
-                    true
-                } else {
-                    false
-                }
-            }
+            Ok(output) => native_lane_move_satisfied(&output),
             Err(err) => {
                 warn!(
                     error = %err,
@@ -4160,24 +4084,6 @@ impl Orchestrator {
                 );
                 false
             }
-        }
-    }
-
-    async fn record_internal_linear_lane(&self, identifier: &str, lane: &str) {
-        let result = record_internal_lane_for_workflow(
-            &self.config.effective().workflow_dir,
-            identifier,
-            lane,
-        );
-        if let Err(err) = result {
-            let mut state = self.state.write().await;
-            state.last_error = Some(err.to_string());
-            warn!(
-                error = %err,
-                issue_identifier = %identifier,
-                lane = %lane,
-                "failed to record internal Linear lane"
-            );
         }
     }
 
@@ -4207,6 +4113,45 @@ impl Orchestrator {
                 return;
             }
         }
+        let native = {
+            let state = self.state.read().await;
+            state.running.get(issue_id).and_then(|entry| {
+                entry
+                    .native_run
+                    .as_ref()
+                    .map(|run| (entry.issue.clone(), run.run_id.clone()))
+            })
+        };
+        let Some((issue, run_id)) = native else {
+            return;
+        };
+        let retirement = if matches!(authority, TerminationAuthority::LinearTerminalLane) {
+            self.cleanup_native_executions_for_issue(&issue, reason)
+                .map(|_| ())
+        } else {
+            match self
+                .native_execution_host
+                .cancel_execution(CancelExecutionInput {
+                    run_id,
+                    reason: reason.to_owned(),
+                    idempotency_key: IdempotencyKey(format!(
+                        "native-execution-cancel:{issue_id}:{reason}"
+                    )),
+                }) {
+                FugueToolResult::Ok {
+                    output: FugueToolOutput::MobCancelExecution(output),
+                    ..
+                } if output.cancelled => Ok(()),
+                FugueToolResult::Err { error, .. } => Err(error.message),
+                FugueToolResult::Ok { .. } => {
+                    Err("native cancellation did not confirm retirement".to_owned())
+                }
+            }
+        };
+        if let Err(error) = retirement {
+            self.record_terminal_cleanup_error(&issue, &error).await;
+            return;
+        }
         let target = {
             let mut state = self.state.write().await;
             state.claimed.remove(issue_id);
@@ -4216,12 +4161,11 @@ impl Orchestrator {
                     retry,
                     reason: reason.to_string(),
                 });
-                if let Some(native_run) = entry.native_run.clone() {
+                if entry.native_run.is_some() {
                     if let Some(handle) = entry.handle.take() {
                         Some(RunningTerminationTarget::NativeWorker {
                             identifier: entry.identifier.clone(),
                             session_id: entry.session.session_id.clone().unwrap_or_default(),
-                            run_id: native_run.run_id,
                             cancel: entry.cancel.clone(),
                             handle,
                         })
@@ -4229,7 +4173,6 @@ impl Orchestrator {
                         Some(RunningTerminationTarget::Native {
                             identifier: entry.identifier.clone(),
                             session_id: entry.session.session_id.clone().unwrap_or_default(),
-                            run_id: native_run.run_id,
                         })
                     }
                 } else {
@@ -4246,19 +4189,9 @@ impl Orchestrator {
             RunningTerminationTarget::NativeWorker {
                 identifier,
                 session_id,
-                run_id,
                 cancel,
                 mut handle,
             } => {
-                let _ = self
-                    .native_execution_host
-                    .cancel_execution(CancelExecutionInput {
-                        run_id,
-                        reason: reason.to_string(),
-                        idempotency_key: IdempotencyKey(format!(
-                            "native-execution-cancel:{issue_id}:{reason}"
-                        )),
-                    });
                 cancel.cancel();
                 let shutdown_timeout = self.worker_shutdown_timeout();
                 match tokio::time::timeout(shutdown_timeout, &mut handle).await {
@@ -4299,19 +4232,7 @@ impl Orchestrator {
             RunningTerminationTarget::Native {
                 identifier,
                 session_id,
-                run_id,
-            } => {
-                let _ = self
-                    .native_execution_host
-                    .cancel_execution(CancelExecutionInput {
-                        run_id,
-                        reason: reason.to_string(),
-                        idempotency_key: IdempotencyKey(format!(
-                            "native-execution-cancel:{issue_id}:{reason}"
-                        )),
-                    });
-                (identifier, session_id)
-            }
+            } => (identifier, session_id),
         };
         self.drain_internal_messages().await;
         let orphaned_entry = {
@@ -4345,6 +4266,11 @@ impl Orchestrator {
 
     async fn handle_internal(&mut self, message: InternalMessage) {
         match message {
+            InternalMessage::NativeReviewAdmission(command) => {
+                command
+                    .execute(self.config.effective(), &self.meta_runtime_registry)
+                    .await;
+            }
             InternalMessage::Worker(message) => match *message {
                 WorkerMessage::AgentUpdate { issue_id, update } => {
                     self.apply_agent_update(&issue_id, *update).await;
@@ -4356,7 +4282,7 @@ impl Orchestrator {
                     issue_id: _,
                     signals,
                 } => {
-                    self.deliver_kapellmeister_shadow_signals(signals);
+                    self.deliver_kapellmeister_shadow_signals(signals).await;
                 }
             },
             InternalMessage::RetryDue { issue_id } => self.handle_retry_due(issue_id).await,
@@ -4384,10 +4310,27 @@ impl Orchestrator {
 
     async fn handle_kapellmeister_start_final_pr_gate(
         &self,
-        request: FinalPrGateStartRequest,
+        mut request: FinalPrGateStartRequest,
     ) -> KapellmeisterStartIssueResult {
         let issue_identifier =
             issue_identifier_from_ref(&request.issue).unwrap_or_else(|| "unknown".to_string());
+        let config = self.config.effective();
+        if !config.final_review.enabled {
+            return KapellmeisterStartIssueResult {
+                issue_identifier,
+                accepted: false,
+                message: "Final review is disabled for this repository.".into(),
+            };
+        }
+        request.reviewers = crate::final_pr_gate::final_reviewer_member_specs(&config.final_review);
+        request.trigger_mode = config.final_review.mode;
+        request.spawn_input.instructions =
+            Some(crate::final_pr_gate::final_pr_gate_reviewer_instructions(
+                &config.final_review,
+                &request.issue,
+                &request.pr,
+                request.trigger_mode,
+            ));
         let issue = Issue {
             id: issue_identifier.clone(),
             identifier: issue_identifier.clone(),
@@ -4434,26 +4377,14 @@ impl Orchestrator {
                 Some(FugueToolResult::Ok {
                     output: FugueToolOutput::MobSpawnOrResumeExecution(output),
                     ..
-                }) => {
-                    let mut state = self.state.write().await;
-                    state.final_pr_gates.insert(
-                        output.run.run_id.0.clone(),
-                        FinalPrGateRunHandle {
-                            run_id: output.run.run_id.clone(),
-                            start_request: request.clone(),
-                            observed_events: Vec::new(),
-                            completed: false,
-                        },
-                    );
-                    KapellmeisterStartIssueResult {
-                        issue_identifier,
-                        accepted: true,
-                        message: format!(
-                            "Kapellmeister-authorized final PR gate start/resume accepted: run_id={}, spawned={}, resumed={}",
-                            output.run.run_id.0, output.spawned, output.resumed
-                        ),
-                    }
-                }
+                }) => KapellmeisterStartIssueResult {
+                    issue_identifier,
+                    accepted: true,
+                    message: format!(
+                        "Kapellmeister-authorized final PR gate start/resume accepted: run_id={}, spawned={}, resumed={}",
+                        output.run.run_id.0, output.spawned, output.resumed
+                    ),
+                },
                 Some(FugueToolResult::Err { error, .. }) => KapellmeisterStartIssueResult {
                     issue_identifier,
                     accepted: false,
@@ -4483,25 +4414,29 @@ impl Orchestrator {
         &self,
         mut request: IndependentReviewStartRequest,
     ) -> KapellmeisterStartIssueResult {
+        let issue_identifier =
+            issue_identifier_from_ref(&request.issue).unwrap_or_else(|| "unknown".to_string());
+        if !self.config.effective().independent_review.enabled {
+            return KapellmeisterStartIssueResult {
+                issue_identifier,
+                accepted: false,
+                message: "independent review lane is disabled by configuration".to_string(),
+            };
+        }
         request.orchestrator_profile = self
             .config
             .effective()
             .independent_review
             .orchestrator_profile
             .clone();
-        let issue_identifier =
-            issue_identifier_from_ref(&request.issue).unwrap_or_else(|| "unknown".to_string());
         if request
             .spawn_input
             .worktree_path
             .as_deref()
             .is_none_or(str::is_empty)
         {
-            match WorkspaceManager::new(
-                &self.config.effective().workspace,
-                &self.config.effective().hooks,
-            )
-            .path_for_issue(&issue_identifier)
+            match WorkspaceManager::for_service(self.config.effective())
+                .path_for_issue(&issue_identifier)
             {
                 Ok(path) => {
                     request.spawn_input.worktree_path = Some(path.display().to_string());
@@ -4589,74 +4524,6 @@ impl Orchestrator {
                 accepted: false,
                 message: error.to_string(),
             },
-        }
-    }
-
-    pub async fn handle_final_pr_gate_completion_events(
-        &self,
-        start_request: FinalPrGateStartRequest,
-        current_pr: GitHubPullRequestSnapshot,
-        ci: Option<CheckCiOutput>,
-        merge_authorized_by_kapellmeister: bool,
-        mergeable: bool,
-        events: Vec<MobEventSnapshot>,
-    ) -> Result<Option<FinalPrGateRuntimePlan>> {
-        let completion = final_pr_gate_completion_plan(
-            Utc::now(),
-            FinalPrGateCompletionInput {
-                config: self.config.effective().final_review.clone(),
-                start_request: start_request.clone(),
-                current_pr: current_pr.clone(),
-                ci,
-                merge_authorized_by_kapellmeister,
-                mergeable,
-                idempotency_key: IdempotencyKey(format!(
-                    "final-gate-complete:{}:{}",
-                    current_pr.number.0, start_request.pr.head_sha.0
-                )),
-                extra_blockers: Vec::new(),
-                events,
-            },
-        );
-        match completion {
-            FinalPrGateCompletionPlan::Waiting { reason } => {
-                debug!(
-                    pull_request = current_pr.number.0,
-                    reason = %reason,
-                    "final PR gate completion aggregation is waiting for typed verdict evidence"
-                );
-                Ok(None)
-            }
-            FinalPrGateCompletionPlan::Ready(plan) => {
-                let issue_identifier = issue_identifier_from_ref(&start_request.issue)
-                    .unwrap_or_else(|| "unknown".to_string());
-                let issue = Issue {
-                    id: issue_identifier.clone(),
-                    identifier: issue_identifier,
-                    title: format!("Final PR gate for PR #{}", current_pr.number.0),
-                    description: None,
-                    priority: None,
-                    state: self.config.effective().final_review.lane.clone(),
-                    branch_name: Some(current_pr.head_branch.0.clone()),
-                    url: Some(current_pr.url.clone()),
-                    labels: Vec::new(),
-                    blocked_by: Vec::new(),
-                    attachments: Vec::new(),
-                    created_at: None,
-                    updated_at: None,
-                };
-                let mut executor = FinalPrGateProjectionExecutor {
-                    config: self.config.effective().clone(),
-                };
-                execute_final_pr_gate_projection_with_executor(
-                    &self.config.effective().kapellmeister.shadow_mode.authority,
-                    &kapellmeister_context_for_issue(&issue, Some(current_pr.repo.clone())),
-                    plan.projection.clone(),
-                    &mut executor,
-                )
-                .await?;
-                Ok(Some(plan))
-            }
         }
     }
 
@@ -4888,7 +4755,8 @@ impl Orchestrator {
                 .tracker
                 .is_terminal_state(&outcome.final_issue.state),
             observed_at,
-        ));
+        ))
+        .await;
         match outcome.exit {
             WorkerExit::Normal => {
                 if let Some(plan) = entry.termination.clone() {
@@ -5307,7 +5175,8 @@ impl Orchestrator {
             workspace_key_for_identifier(&identifier),
             attempt.unwrap_or(0).saturating_add(1),
             None,
-        ));
+        ))
+        .await;
         info!(issue_id = %issue_id, issue_identifier = %identifier, "dispatch started");
     }
 
@@ -5428,30 +5297,32 @@ impl Orchestrator {
             }
         };
         let idempotency_key = native_execution_idempotency_key(&identifier, native_run_generation);
-        let plan = match NativeMobLaunchPlan::new(
-            SpawnOrResumeExecutionInput {
-                issue: issue_ref_for_identifier(&identifier),
-                workspace_key: workspace_key_for_identifier(&identifier),
-                template_id: selected.template_id.clone(),
-                worktree_path: Some(workspace_path.clone()),
-                instructions: Some(instructions),
-                idempotency_key,
-            },
-            selected.template.clone(),
-            native_member_mcp_servers_for_issue(
-                &self.config.effective().mob.mcp_servers,
-                &self.config.effective().workflow_dir,
-                selected.template,
-                &issue,
-                repository_scope_from_config(self.config.effective()).as_ref(),
-                &self.config.effective().tracker.terminal_states,
-                &native_issue_review_handoff_states(self.config.effective(), &issue),
-                &native_action_lanes(self.config.effective()),
-            ),
-            native_member_direct_tool_servers(&self.config.effective().tracker, selected.template),
-            self.config.effective().tracker.project_slug.clone(),
-            repository_scope_from_config(self.config.effective()),
-        ) {
+        let plan = match (|| {
+            NativeMobLaunchPlan::new(
+                SpawnOrResumeExecutionInput {
+                    issue: issue_ref_for_identifier(&identifier),
+                    workspace_key: workspace_key_for_identifier(&identifier),
+                    template_id: selected.template_id.clone(),
+                    worktree_path: Some(workspace_path.clone()),
+                    instructions: Some(instructions),
+                    idempotency_key,
+                },
+                selected.template.clone(),
+                bound_member_mcp_servers(
+                    self.config.effective(),
+                    selected.template,
+                    &issue,
+                    repository_scope_from_config(self.config.effective()).as_ref(),
+                )
+                .map_err(host_signal_launch_error)?,
+                native_member_direct_tool_servers(
+                    &self.config.effective().tracker,
+                    selected.template,
+                ),
+                self.config.effective().tracker.project_slug.clone(),
+                repository_scope_from_config(self.config.effective()),
+            )
+        })() {
             Ok(plan) => plan,
             Err(error) => {
                 self.block_native_issue_for_host_failure(
@@ -5573,8 +5444,9 @@ impl Orchestrator {
             )
             .await
         };
-        let workspace_manager = WorkspaceManager::new(&config.workspace, &config.hooks);
-        let github_host = GitHubToolHost::new();
+        let workspace_manager = WorkspaceManager::for_service(&config);
+        let github_host =
+            GitHubToolHost::with_connections(config.meerkat.runtime_connections.clone());
         let recovery = refresh_native_status_recovery(
             &run,
             &issue,
@@ -5604,6 +5476,7 @@ impl Orchestrator {
                 handle,
                 termination: None,
                 native_run: Some(NativeRunHandle {
+                    launch_failure: None,
                     run_id: run.run_id.clone(),
                     observed_events: Vec::new(),
                     recovery,
@@ -5625,7 +5498,8 @@ impl Orchestrator {
             workspace_key_for_identifier(&identifier),
             attempt.unwrap_or(0).saturating_add(1),
             None,
-        ));
+        ))
+        .await;
         info!(
             issue_id = %issue_id,
             issue_identifier = %identifier,
@@ -5839,7 +5713,8 @@ impl Orchestrator {
             self.deliver_kapellmeister_shadow_signal(native_pr_handoff_missing_pr_signal(
                 &issue.identifier,
                 Utc::now(),
-            ));
+            ))
+            .await;
             let mut state = self.state.write().await;
             state.last_error = Some(format!(
                 "native dispatch reported {} to Kapellmeister because durable Workpad/Linear evidence points to a PR handoff but no matching GitHub PR exists; Linear lane was not moved by the host",
@@ -6134,7 +6009,7 @@ fn native_pr_handoff_monitor_action(
                     NativePrHandoffWaitingReason::CiPending,
                 );
             }
-            CiStatus::Pending | CiStatus::Success | CiStatus::Skipped => {}
+            CiStatus::NoChecks | CiStatus::Pending | CiStatus::Success | CiStatus::Skipped => {}
         }
     }
     if github.pull_request.draft {
@@ -6155,7 +6030,7 @@ fn native_final_pr_gate_start_request_from_handoff(
 ) -> Result<Option<FinalPrGateStartRequest>> {
     let final_review = config.final_review.clone();
     let issue_ref = issue_ref_for_identifier(&issue.identifier);
-    let worktree_path = WorkspaceManager::new(&config.workspace, &config.hooks)
+    let worktree_path = WorkspaceManager::for_service(config)
         .path_for_issue(&issue.identifier)?
         .display()
         .to_string();
@@ -6194,7 +6069,7 @@ fn native_pr_handoff_monitor_signal_decision(
             NativePrHandoffWaitingReason::AwaitingReviewOrMerge,
         ) => (
             PrHandoffMonitorDecision::ReadyForDone,
-            "CI is green or no checks are configured, and the PR handoff is acceptable; if reviewer and WorkGraph obligations are satisfied, move the issue to Done. Merge/OTA is a separate Deploy action.",
+            "PR is mechanically eligible for handoff: CI is acceptable or no checks were reported. Ask the issue lead to verify issue-team review and current implementation findings before the configured development handoff. A shared review holding status requests subsequent repository independent review, so that review and future merge obligations remain open until performed; they do not block their own admission. Follow the configured completion policy. This signal does not authorize a merge, obligation closure, or a claim that checks ran.",
         ),
         NativePrHandoffMonitorAction::Replan(_) => (
             PrHandoffMonitorDecision::Replan,
@@ -6202,7 +6077,7 @@ fn native_pr_handoff_monitor_signal_decision(
         ),
         NativePrHandoffMonitorAction::Complete => (
             PrHandoffMonitorDecision::Merged,
-            "Merged PR observed; move the issue to Done if it is not already terminal.",
+            "Merged PR observed; project to the configured terminal success lane after verifying remaining completion obligations.",
         ),
     }
 }
@@ -6214,21 +6089,11 @@ fn kapellmeister_host_projection_repair_allowed(idempotency_suffix: &str) -> boo
     )
 }
 
-fn native_pr_handoff_ci_input(pull_request: &GitHubPullRequestSnapshot) -> CheckCiInput {
-    // `gh pr checks` accepts a PR number/branch selector, not an arbitrary commit SHA.
-    // The monitored PR snapshot still carries the exact head SHA used as final-gate
-    // evidence; CI is queried through the PR branch that resolves to that snapshot.
-    CheckCiInput {
-        repo: pull_request.repo.clone(),
-        git_ref: GitRef(pull_request.head_branch.0.clone()),
-    }
-}
-
 fn inspect_native_pr_handoff_ci(
     github: &dyn NativeStatusGitHubInspector,
     pull_request: &GitHubPullRequestSnapshot,
 ) -> std::result::Result<CheckCiOutput, String> {
-    match github.check_ci(native_pr_handoff_ci_input(pull_request)) {
+    match github.check_pr_ci(pull_request) {
         FugueToolResult::Ok {
             output: FugueToolOutput::GitHubCheckCi(output),
             ..
@@ -6412,7 +6277,7 @@ fn native_pr_handoff_waiting_reason(reason: NativePrHandoffWaitingReason) -> &'s
             "CI is still pending; keep the issue Active and continue polling"
         }
         NativePrHandoffWaitingReason::AwaitingReviewOrMerge => {
-            "PR is open, CI is green or no checks are configured, and the handoff is acceptable; close to Done once reviewer/WorkGraph obligations are satisfied"
+            "PR is open and eligible for handoff; follow the configured holding lane after reviewer and WorkGraph obligations are satisfied; no merge is implied"
         }
     }
 }
@@ -6539,7 +6404,19 @@ fn ensure_workspace_runtime_git_excludes(workspace: &Path) -> Result<()> {
 }
 
 fn git_output(workspace: &Path, args: &[&str]) -> Result<String> {
-    let output = StdCommand::new("git")
+    git_output_with_connections(workspace, args, None)
+}
+
+fn git_output_with_connections(
+    workspace: &Path,
+    args: &[&str],
+    connections: Option<&crate::setup::connections::Connections>,
+) -> Result<String> {
+    let mut command = StdCommand::new("git");
+    if let Some(connections) = connections {
+        command.envs(connections.github_environment());
+    }
+    let output = command
         .args(args)
         .current_dir(workspace)
         .output()
@@ -6992,6 +6869,50 @@ fn native_runtime_restore_keys(
     candidates.into_iter().map(|(_, _, key)| key).collect()
 }
 
+fn host_signal_mcp_servers(
+    config: &ServiceConfig,
+) -> Result<BTreeMap<String, NativeMcpServerConfig>> {
+    let binding = HostSignalBinding::from_config(config)?.encode()?;
+    let mut servers = config.mob.mcp_servers.clone();
+    for (name, server) in &mut servers {
+        if is_native_linear_mcp_server(name, server) {
+            server.env.insert(
+                crate::host_signal_journal::HOST_SIGNAL_BINDING_ENV.to_owned(),
+                binding.clone(),
+            );
+        }
+    }
+    Ok(servers)
+}
+
+fn bound_member_mcp_servers(
+    config: &ServiceConfig,
+    template: &MaterializedMobTemplate,
+    issue: &Issue,
+    repository: Option<&GitHubRepoRef>,
+) -> Result<BTreeMap<String, NativeMcpServerConfig>> {
+    Ok(native_member_mcp_servers_for_issue(
+        &host_signal_mcp_servers(config)?,
+        &config.workflow_dir,
+        template,
+        issue,
+        repository,
+        &config.tracker.terminal_states,
+        &native_issue_review_handoff_states(config, issue),
+        &native_action_lanes(config),
+    ))
+}
+
+fn host_signal_launch_error(error: FugueError) -> FugueToolError {
+    FugueToolError {
+        operation: FugueToolOperation::MobSpawnOrResumeExecution,
+        code: FugueToolErrorCode::PreconditionFailed,
+        message: error.to_string(),
+        retry: RetryAdvice::DoNotRetry,
+        idempotency_key: None,
+    }
+}
+
 fn native_runtime_key_for_issue(config: &ServiceConfig, issue: &Issue) -> Option<String> {
     let selected = config.select_template_for_issue(issue).ok()?;
     let workspace_key = workspace_key_for_identifier(&issue.identifier);
@@ -7273,7 +7194,7 @@ fn native_repo_review_handoff_states(config: &ServiceConfig) -> Vec<String> {
         .collect()
 }
 
-fn native_action_lanes(config: &ServiceConfig) -> Vec<String> {
+pub(crate) fn native_action_lanes(config: &ServiceConfig) -> Vec<String> {
     let mut states = Vec::new();
     if let Some(do_review) = &config.linear.lanes.do_review {
         add_unique_lane(&mut states, do_review);
@@ -7281,7 +7202,7 @@ fn native_action_lanes(config: &ServiceConfig) -> Vec<String> {
     if let Some(deploy) = &config.linear.lanes.deploy {
         add_unique_lane(&mut states, deploy);
     }
-    if config.independent_review.enabled {
+    if config.independent_review.enabled && config.independent_review_handoff_lane().is_none() {
         add_unique_lane(&mut states, &config.independent_review.lane);
     }
     if config.deploy.enabled {
@@ -7343,15 +7264,10 @@ fn native_issue_review_handoff_states(config: &ServiceConfig, issue: &Issue) -> 
 }
 
 fn linear_error_is_rate_limited(error: &FugueError) -> bool {
-    match error {
-        FugueError::LinearGraphqlErrors(body) => {
-            let lower = body.to_ascii_lowercase();
-            lower.contains("ratelimited")
-                || lower.contains("rate limit")
-                || lower.contains("too many requests")
-        }
-        _ => false,
-    }
+    matches!(
+        error,
+        FugueError::LinearGraphqlErrors(crate::error::LinearGraphqlFailure::RateLimited)
+    )
 }
 
 fn native_host_mcp_command(base: &BTreeMap<String, NativeMcpServerConfig>) -> Vec<String> {
@@ -7417,6 +7333,51 @@ fn next_native_run_generation_from_workpad(
                 .max(workpad_generation.saturating_add(1)),
         ),
         None => requested_generation,
+    }
+}
+
+fn native_run_belongs_to_issue(run: &MobRunSnapshot, issue: &Issue) -> bool {
+    match run.issue.as_ref() {
+        Some(LinearIssueRef::Id { id }) => id.0 == issue.id,
+        Some(LinearIssueRef::Identifier { identifier }) => identifier.0 == issue.identifier,
+        None => false,
+    }
+}
+
+pub(crate) fn list_native_runs_for_restart(
+    host: &dyn NativeMobExecutionHost,
+) -> std::result::Result<Vec<MobRunSnapshot>, String> {
+    let mut runs = Vec::new();
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    loop {
+        let output = match host.list_runs(crate::tools::ListRunsInput {
+            issue: None,
+            status: None,
+            cursor,
+            limit: 100,
+        }) {
+            FugueToolResult::Ok {
+                output: FugueToolOutput::MobListRuns(output),
+                ..
+            } => output,
+            FugueToolResult::Err { error, .. } => return Err(error.message),
+            FugueToolResult::Ok { output, .. } => {
+                return Err(format!(
+                    "native mob restart listing returned unexpected output {output:?}"
+                ));
+            }
+        };
+        if let Some(next) = &output.next_cursor
+            && !seen_cursors.insert(next.0.clone())
+        {
+            return Err("native mob restart listing repeated its cursor".to_owned());
+        }
+        runs.extend(output.runs);
+        cursor = output.next_cursor;
+        if cursor.is_none() {
+            return Ok(runs);
+        }
     }
 }
 
@@ -7489,7 +7450,7 @@ fn recover_existing_native_pr_handoff_for_issue(
     linear: Option<&RecoveredLinearEvidence>,
 ) -> Option<RecoveredGitHubEvidence> {
     let repo = repository_scope_from_config(config)?;
-    let workspace = WorkspaceManager::new(&config.workspace, &config.hooks);
+    let workspace = WorkspaceManager::for_service(config);
     let workspace_key = workspace_key_for_identifier(&issue.identifier);
     let workspace_evidence = workspace
         .inspect_workspace_key(&workspace_key.0)
@@ -7504,7 +7465,7 @@ fn recover_existing_native_pr_handoff_for_issue(
         .ok()
         .flatten()
         .map(|inspection| recover_native_workspace_evidence(&inspection));
-    let github_host = GitHubToolHost::new();
+    let github_host = GitHubToolHost::with_connections(config.meerkat.runtime_connections.clone());
     recover_native_github_evidence_from_durable_sources(
         &repo,
         linear,
@@ -7514,6 +7475,76 @@ fn recover_existing_native_pr_handoff_for_issue(
     )
 }
 
+fn recover_recorded_native_pr_handoff(
+    config: &ServiceConfig,
+    issue: &Issue,
+    linear: Option<&RecoveredLinearEvidence>,
+    github: &dyn NativeStatusGitHubInspector,
+) -> Result<Option<RecoveredGitHubEvidence>> {
+    let Some(repo) = repository_scope_from_config(config) else {
+        return Ok(None);
+    };
+    let Some(record) = crate::pr_handoff::load(config, issue, &repo)? else {
+        return Ok(None);
+    };
+    if issue
+        .branch_name
+        .as_deref()
+        .is_some_and(|branch| branch != record.head_branch.0)
+    {
+        return Err(FugueError::ResponseError(
+            "Recorded PR association conflicts with the current issue branch".into(),
+        ));
+    }
+    if linear
+        .and_then(|evidence| evidence.workpad_pr_number)
+        .is_some_and(|number| number != record.number)
+    {
+        return Err(FugueError::ResponseError(
+            "Recorded PR association conflicts with current issue PR evidence".into(),
+        ));
+    }
+    let workspace = WorkspaceManager::for_service(config)
+        .inspect_workspace_key(&workspace_key_for_identifier(&issue.identifier).0)?
+        .map(|inspection| recover_native_workspace_evidence(&inspection));
+    if native_pr_lookup_branch(linear, workspace.as_ref())
+        .is_some_and(|branch| *branch != record.head_branch)
+    {
+        return Err(FugueError::ResponseError(
+            "Recorded PR association conflicts with the current workspace branch".into(),
+        ));
+    }
+    let result = github.inspect_pr(crate::tools::InspectPrInput {
+        repo: repo.clone(),
+        pull_request: GitHubPullRequestRef::Number {
+            number: record.number,
+        },
+    });
+    match result {
+        FugueToolResult::Ok {
+            output: FugueToolOutput::GitHubInspectPr(output),
+            ..
+        } => {
+            let pr = output.pull_request;
+            if pr.repo != repo || pr.number != record.number || pr.head_branch != record.head_branch
+            {
+                return Err(FugueError::ResponseError(
+                    "GitHub PR identity differs from the recorded issue association".into(),
+                ));
+            }
+            // Never use a cached merge state, check result, or approval.
+            Ok(Some(RecoveredGitHubEvidence {
+                pull_request: pr,
+                rejected_pull_requests: Vec::new(),
+            }))
+        }
+        FugueToolResult::Err { error, .. } => Err(FugueError::ResponseError(error.message)),
+        FugueToolResult::Ok { .. } => Err(FugueError::ResponseError(
+            "GitHub PR inspection returned an unexpected result".into(),
+        )),
+    }
+}
+
 fn recover_existing_native_pr_monitor_handoff_for_issue(
     config: &ServiceConfig,
     issue: &Issue,
@@ -7521,7 +7552,7 @@ fn recover_existing_native_pr_monitor_handoff_for_issue(
     github: &dyn NativeStatusGitHubInspector,
 ) -> Option<RecoveredGitHubEvidence> {
     let repo = repository_scope_from_config(config)?;
-    let workspace = WorkspaceManager::new(&config.workspace, &config.hooks);
+    let workspace = WorkspaceManager::for_service(config);
     let workspace_key = workspace_key_for_identifier(&issue.identifier);
     let workspace_evidence = workspace
         .inspect_workspace_key(&workspace_key.0)
@@ -7707,7 +7738,10 @@ fn workpad_pr_handoff_section_lines(body: &str) -> impl Iterator<Item = &str> {
             let heading = trimmed.trim_start_matches('#').trim().to_ascii_lowercase();
             in_handoff_section = matches!(
                 heading.as_str(),
-                "pull request or handoff" | "pull request" | "pr handoff"
+                "pull request or handoff"
+                    | "pull request"
+                    | "pr handoff"
+                    | "review / pr handoff evidence"
             );
             return false;
         }
@@ -8347,12 +8381,15 @@ fn dispatch_backend_for_issue(issue: &Issue, config: &ServiceConfig) -> Dispatch
 
 fn recover_native_running_entry(
     run: &MobRunSnapshot,
+    launch_failure: Option<&crate::tools::NativeLaunchFailure>,
     issues: &[Issue],
     config: &ServiceConfig,
     workspace: &WorkspaceManager,
     workpad_body: Option<&str>,
 ) -> Option<(Issue, RunningEntry)> {
-    if !native_run_status_is_active(run.status) {
+    if !native_run_status_is_active(run.status)
+        && !(run.status == MobRunStatus::Failed && launch_failure.is_some())
+    {
         return None;
     }
     let issue_ref = run.issue.as_ref()?;
@@ -8409,6 +8446,7 @@ fn recover_native_running_entry(
             handle: None,
             termination: None,
             native_run: Some(NativeRunHandle {
+                launch_failure: launch_failure.cloned(),
                 run_id: run.run_id.clone(),
                 observed_events: Vec::new(),
                 recovery: native_status_recovery(
@@ -8749,6 +8787,7 @@ pub struct RunningLifecycleRow {
 #[serde(rename_all = "snake_case")]
 pub enum RunningLifecycleStatus {
     Running,
+    LaunchFailed,
     Terminating,
 }
 
@@ -8760,6 +8799,7 @@ pub enum StatusBackend {
 
 #[derive(Debug, Serialize)]
 pub struct NativeRecoveryStatusRow {
+    pub launch_failure: Option<crate::tools::NativeLaunchFailure>,
     pub run_id: String,
     pub workspace_path: Option<String>,
     pub workspace_branch: Option<String>,
@@ -8976,6 +9016,12 @@ fn running_row(issue_id: &str, entry: &RunningEntry) -> RunningRow {
             lane: entry.issue.state.clone(),
             status: if entry.termination.is_some() {
                 RunningLifecycleStatus::Terminating
+            } else if entry
+                .native_run
+                .as_ref()
+                .is_some_and(|run| run.launch_failure.is_some())
+            {
+                RunningLifecycleStatus::LaunchFailed
             } else {
                 RunningLifecycleStatus::Running
             },
@@ -8997,6 +9043,13 @@ fn running_row(issue_id: &str, entry: &RunningEntry) -> RunningRow {
 }
 
 fn running_row_last_message(entry: &RunningEntry) -> Option<String> {
+    if let Some(failure) = entry
+        .native_run
+        .as_ref()
+        .and_then(|run| run.launch_failure.as_ref())
+    {
+        return Some(format!("Issue team startup failed: {}", failure.message));
+    }
     match entry.session.last_meerkat_message.as_deref() {
         Some(message) if !is_stale_native_startup_delivery_message(message) => {
             Some(message.to_string())
@@ -9061,6 +9114,7 @@ fn workspace_cleanliness_label(dirty: bool) -> &'static str {
 fn native_recovery_status_row(native_run: &NativeRunHandle) -> NativeRecoveryStatusRow {
     let recovery = &native_run.recovery;
     NativeRecoveryStatusRow {
+        launch_failure: native_run.launch_failure.clone(),
         run_id: native_run.run_id.0.clone(),
         workspace_path: recovery
             .workspace
@@ -9159,66 +9213,7 @@ fn sort_retry_rows(rows: &mut [RetryRow]) {
 fn repo_kapellmeister_signal_message(
     signals: &[KapellmeisterShadowSignal],
 ) -> std::result::Result<String, serde_json::Error> {
-    repo_kapellmeister_signal_message_with_success_lane(signals, "Done")
-}
-
-fn repo_kapellmeister_signal_message_with_success_lane(
-    signals: &[KapellmeisterShadowSignal],
-    success: &str,
-) -> std::result::Result<String, serde_json::Error> {
-    let payload = serde_json::to_string_pretty(signals)?;
-    Ok(format!(
-        "Fugue host signal batch for the repo-scoped Kapellmeister.\n\
-         Treat this JSON as authoritative host-observed lifecycle input. \
-         Use it to coordinate issue mobs, PR handoff, and operator guidance. \
-         Do not depend on Linear lanes as lifecycle authority; Linear remains a projection. \
-         Use one tool call at a time; do not issue parallel or batched tool calls in this signal turn. \
-         If a linear_issue_first_seen or open_issue_without_runtime observation reports an intake, \
-         control_active, or unexpected_nonterminal lane with no running_mob, call \
-         fugue_start_issue_mob for that issue immediately unless the payload is a configured \
-         Review action lane, Deploy lane, terminal, blocked, duplicate, or explicit pause reason. \
-         If a lane observation is classified as attention_or_terminal, do not start an issue mob \
-         from that observation alone. For a configured final-review/merge lane, wait for or act on \
-         a final_pr_gate_requested signal and use fugue_start_final_pr_gate with its exact typed \
-         request; do not substitute fugue_start_issue_mob. \
-         For a configured Review action lane, inspect the issue/PR evidence and use \
-         fugue_start_independent_review with a typed IndependentReviewStartRequest; the review \
-         orchestrator must choose exactly three reviewers and spawn them through Meta. \
-         For a configured Deploy lane, do not start the implementation mob and do not try to \
-         orchestrate merge/OTA yourself; Fugue host handles Deploy as a guarded mechanical \
-         transaction after verifying durable PR evidence, CI, WorkGraph blockers, and deploy \
-         policy. \
-         If a pr_handoff_monitor_changed signal reports ready_for_done, CI is green or no checks are configured and the PR handoff is acceptable; inspect reviewer/WorkGraph evidence and move the issue to {success} when those obligations are satisfied. {success} means accepted development work, not merged PR. Merge/OTA only happens through the Deploy action lane. \
-         Do not wait for an external flow-step feeder. If an active issue reports missing concrete handoff, stale worker_started signals, or offline issue peers, actively inspect/ask the issue mob for status or decide resume/replan through Kapellmeister-owned coordination. \
-         A linear_issue_moved signal means Fugue observed external projection drift from the \
-         issue lane map. It is not proof that lifecycle work completed, but it is an \
-         operator-visible intent/change that must be reconciled through Kapellmeister and \
-         the issue lead rather than ignored as mere projection noise. \
-         If a linear_issue_commented or linear_issue_comment_changed signal includes \
-         operator_review_finding, treat that field as concrete issue rework input from an \
-         operator/repo reviewer. Tell the issue lead to replan and drive worker changes from \
-         that finding; do not classify it as a passive final-gate wait, acceptance hold, or \
-         standby condition. \
-         When writing Linear Workpad/status evidence from repo scope, pass the explicit issue \
-         identifier from the signal payload to the Linear tool call. \
-         You do not have shell/worktree authority. If reviewer-green evidence has no pushed \
-         branch/head SHA yet, ask the issue lead to have the coder commit and push the reviewed \
-         scoped changes before you call github_create_pr. If a runtime_recovered signal carries \
-         workspace.branch, workspace.head_sha, workspace.upstream_branch, matching \
-         workspace.upstream_head_sha, and dirty=false, treat that as durable pushed-branch \
-         evidence. When that pushed-branch evidence is present and no PR exists for the branch, \
-         create or update the PR yourself with github_create_pr; do not ask the issue lead for an \
-         extra PR creation request. If github_create_pr returns an open PR, newly created or \
-         already existing, tell the issue lead the PR number/URL/head branch and ask it to record \
-         PR handoff evidence while keeping ordinary issue-mob work on the active projection lane. \
-         Do not ask issue agents to move issues into configured Review, Deploy, or \
-         final-review action lanes; those lanes are operator or host-observed control inputs. \
-         Merge is not implicit repo authority: green review/CI evidence can close the issue to Done, \
-         but it is not merge authorization. Do not merge a PR unless Deploy policy or an operator \
-         explicitly approves that specific PR merge in the current session. \
-         If a Meerkat mob operator tool such as list_members returns access_denied, treat that as a scope boundary and continue from these signals and comms peers.\n\n\
-         ```json\n{payload}\n```"
-    ))
+    repo_kapellmeister_signal_message_with_lanes(signals, "Done", None, Some("Review"))
 }
 
 #[cfg(test)]
@@ -9227,10 +9222,72 @@ mod tests {
 
     #[test]
     fn repo_signal_prompt_uses_configured_success_lane() {
-        let body = super::repo_kapellmeister_signal_message_with_success_lane(&[], "Accepted")
-            .expect("prompt");
+        let body = super::repo_kapellmeister_signal_message_with_lanes(
+            &[],
+            "Accepted",
+            None,
+            Some("Review"),
+        )
+        .expect("prompt");
         assert!(body.contains("move the issue to Accepted"));
         assert!(!body.contains("move the issue to Done"));
+    }
+
+    #[test]
+    fn repo_signal_prompt_holds_review_before_configured_completion() {
+        let body = super::repo_kapellmeister_signal_message_with_lanes(
+            &[],
+            "Closed",
+            Some("Resolved"),
+            None,
+        )
+        .expect("prompt");
+        assert!(body.contains("move the issue to Resolved to await operator review"));
+        assert!(body.contains("only verified merge completion projects to Closed"));
+        assert!(!body.contains("move the issue to Closed"));
+        assert!(!body.contains("means accepted development work, not merged PR"));
+    }
+
+    #[test]
+    fn shared_review_handoff_requests_native_review_without_claiming_approval() {
+        let body = super::repo_kapellmeister_signal_message_with_lanes(
+            &[],
+            "Closed",
+            Some("Resolved"),
+            Some("Resolved"),
+        )
+        .unwrap();
+        assert!(body.contains("move the issue to Resolved for independent specialist review"));
+        assert!(body.contains("first-seen, recovered or changed observations"));
+        assert!(body.contains("retain an already completed current review"));
+        assert!(body.contains("never proof of approval"));
+        assert!(body.contains("never create substitute reviewers"));
+        assert!(!body.contains("holding lane, not a review action trigger"));
+        assert!(!body.contains("spawn them"));
+    }
+
+    #[test]
+    fn repo_signal_prompt_does_not_request_disabled_review_action() {
+        let body = super::repo_kapellmeister_signal_message_with_lanes(&[], "Done", None, None)
+            .expect("prompt");
+        assert!(body.contains("Review is a holding lane only"));
+        assert!(!body.contains("fugue_start_independent_review"));
+    }
+
+    #[test]
+    fn hosted_acceptance_shared_review_handoff_has_one_projection_writer() {
+        let body = super::repo_kapellmeister_signal_message_with_lanes(
+            &[],
+            "Closed",
+            Some("Awaiting review"),
+            Some("Awaiting review"),
+        )
+        .unwrap();
+        assert!(body.contains("The issue lead owns the development handoff projection"));
+        assert!(body.contains("do not perform this transition yourself"));
+        assert!(body.contains("The shared review holding status is the sole exception"));
+        assert!(body.contains("never proof of approval"));
+        assert!(body.contains("Only an explicit merge action"));
     }
 
     use super::*;
@@ -9682,6 +9739,11 @@ mod tests {
             mob_definition: json!({}),
         };
         let final_template = final_pr_gate_native_launch_template(&final_request, &mcp_tools);
+        assert_eq!(final_template.members.len(), 1);
+        assert_eq!(
+            final_template.members[0].name, "review_orchestrator",
+            "final review must select existing specialists through one coordinator"
+        );
         let final_tools = &final_template.members[0].agent.tools;
         assert!(final_tools.contains(&"mcp:github".to_string()));
         assert!(final_tools.contains(&"mcp:linear".to_string()));
@@ -9711,6 +9773,7 @@ mod tests {
                     intake_states: Vec::new(),
                     in_flight_states: Vec::new(),
                     active_states: Vec::new(),
+                    attachment_root: None,
                     max_attachment_files: 0,
                     max_attachment_bytes: 0,
                     max_attachment_total_bytes: 0,
@@ -10254,6 +10317,102 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn recorded_pr_handoff_survives_workpad_rewrite_and_workspace_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let (orchestrator, _) =
+            native_orchestrator_for_definition(native_kapellmeister_workflow_definition());
+        let mut config = orchestrator.config.effective().clone();
+        config.meerkat.state_root = Some(directory.path().join("runtime"));
+        config.workspace.root = directory.path().join("removed-workspaces");
+        config
+            .kapellmeister
+            .shadow_mode
+            .authority
+            .safe_selectors
+            .repositories = vec![repo_ref()];
+        let issue = issue("immutable-issue-1", "TEST-1", None, 10);
+        let pr = pr_snapshot(42, "feature/test-1", "reviewed-head");
+        crate::pr_handoff::record(&config, &issue, &pr).unwrap();
+        let notes = recover_native_linear_evidence(
+            &issue,
+            Some("## Fugue Workpad\n\nRewritten notes without a PR reference."),
+        );
+        assert_eq!(
+            parse_first_pr_number(
+                "## Fugue Workpad\n\n### Review / PR Handoff Evidence\nPR: https://github.com/example/application/pull/42"
+            ),
+            Some(GitHubPullRequestNumber(42))
+        );
+        assert!(
+            recover_existing_native_pr_monitor_handoff_for_issue(
+                &config,
+                &issue,
+                Some(&notes),
+                &StaticGitHubInspector::ok(pr.clone())
+            )
+            .is_none()
+        );
+
+        // A fresh process reads the durable association, then obtains current
+        // state and head from GitHub rather than replaying a stored snapshot.
+        let mut current = pr.clone();
+        current.state = PullRequestState::Merged;
+        current.head_sha = GitSha("current-head".into());
+        let recovered = recover_recorded_native_pr_handoff(
+            &config,
+            &issue,
+            None,
+            &StaticGitHubInspector::ok(current.clone()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered.pull_request, current);
+        assert!(
+            recover_recorded_native_pr_handoff(
+                &config,
+                &issue,
+                None,
+                &StaticGitHubInspector::err("GitHub unavailable")
+            )
+            .is_err()
+        );
+        let mut wrong = current;
+        wrong.head_branch = BranchName("unrelated-branch".into());
+        assert!(
+            recover_recorded_native_pr_handoff(
+                &config,
+                &issue,
+                None,
+                &StaticGitHubInspector::ok(wrong)
+            )
+            .is_err()
+        );
+        let mut reworked = issue.clone();
+        reworked.branch_name = Some("feature/replacement".into());
+        assert!(
+            recover_recorded_native_pr_handoff(
+                &config,
+                &reworked,
+                None,
+                &StaticGitHubInspector::ok(pr.clone())
+            )
+            .is_err(),
+            "a durable association must not override the current issue branch"
+        );
+        config.tracker.project_slug = Some("another-project".into());
+        assert!(
+            recover_recorded_native_pr_handoff(
+                &config,
+                &issue,
+                None,
+                &StaticGitHubInspector::ok(pr)
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
     #[derive(Clone)]
     struct StaticGitHubInspector {
         result: FugueToolResult,
@@ -10295,7 +10454,7 @@ mod tests {
             self.result.clone()
         }
 
-        fn check_ci(&self, _input: CheckCiInput) -> FugueToolResult {
+        fn check_pr_ci(&self, _pull_request: &GitHubPullRequestSnapshot) -> FugueToolResult {
             match self.ci.clone() {
                 Some(output) => FugueToolResult::Ok {
                     output: FugueToolOutput::GitHubCheckCi(output),
@@ -10328,7 +10487,11 @@ mod tests {
         spawned_inputs: std::sync::Mutex<Vec<SpawnOrResumeExecutionInput>>,
         plan_inputs: std::sync::Mutex<Vec<SpawnOrResumeExecutionInput>>,
         status_override: std::sync::Mutex<Option<MobRunSnapshot>>,
+        list_override: std::sync::Mutex<Option<Vec<MobRunSnapshot>>>,
+        restore_error: std::sync::Mutex<Option<String>>,
+        launch_failure_override: std::sync::Mutex<Option<crate::tools::NativeLaunchFailure>>,
         cleanup_calls: std::sync::Mutex<Vec<(MobRunId, String)>>,
+        retirement_error: std::sync::Mutex<Option<String>>,
     }
 
     impl RecordingNativeMobExecutionHost {
@@ -10404,7 +10567,31 @@ mod tests {
     }
 
     impl NativeMobExecutionHost for RecordingNativeMobExecutionHost {
+        fn restore_persisted_runtimes(
+            &self,
+            _runtime_keys: Vec<String>,
+            _max_successes: usize,
+        ) -> std::result::Result<(), String> {
+            match self.restore_error.lock().expect("restore error").clone() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
         fn list_runs(&self, input: crate::tools::ListRunsInput) -> FugueToolResult {
+            if let Some(runs) = self.list_override.lock().expect("list override").as_ref() {
+                return FugueToolResult::Ok {
+                    output: FugueToolOutput::MobListRuns(crate::tools::ListRunsOutput {
+                        runs: runs
+                            .iter()
+                            .filter(|run| input.status.is_none_or(|status| run.status == status))
+                            .cloned()
+                            .collect(),
+                        next_cursor: None,
+                    }),
+                    metadata: ToolExecutionMetadata::default(),
+                };
+            }
             self.inner.list_runs(input)
         }
 
@@ -10416,6 +10603,11 @@ mod tests {
                 return FugueToolResult::Ok {
                     output: FugueToolOutput::MobInspectRun(crate::tools::InspectRunOutput {
                         run: run.clone(),
+                        launch_failure: self
+                            .launch_failure_override
+                            .lock()
+                            .expect("failure override")
+                            .clone(),
                     }),
                     metadata: ToolExecutionMetadata::default(),
                 };
@@ -10438,6 +10630,23 @@ mod tests {
             self.inner.spawn_or_resume_execution(input)
         }
         fn cancel_execution(&self, input: crate::tools::CancelExecutionInput) -> FugueToolResult {
+            if let Some(message) = self
+                .retirement_error
+                .lock()
+                .expect("retirement error")
+                .clone()
+            {
+                return FugueToolResult::Err {
+                    error: FugueToolError {
+                        operation: FugueToolOperation::MobCancelExecution,
+                        code: crate::tools::FugueToolErrorCode::BackendUnavailable,
+                        message,
+                        retry: crate::tools::RetryAdvice::SafeToRetry,
+                        idempotency_key: Some(input.idempotency_key),
+                    },
+                    metadata: ToolExecutionMetadata::default(),
+                };
+            }
             self.inner.cancel_execution(input)
         }
 
@@ -10448,6 +10657,14 @@ mod tests {
         ) -> std::result::Result<usize, String> {
             if let Ok(mut calls) = self.cleanup_calls.lock() {
                 calls.push((run_id.clone(), reason.to_string()));
+            }
+            if let Some(message) = self
+                .retirement_error
+                .lock()
+                .expect("retirement error")
+                .clone()
+            {
+                return Err(message);
             }
             Ok(1)
         }
@@ -10948,7 +11165,9 @@ mod tests {
             )
             .without_native_worker_execution()
         } else {
-            Orchestrator::new(manager, refresh_rx).without_native_worker_execution()
+            Orchestrator::new(manager, refresh_rx)
+                .unwrap()
+                .without_native_worker_execution()
         }
     }
 
@@ -10964,6 +11183,43 @@ mod tests {
             }),
         );
         definition
+    }
+
+    #[test]
+    fn tracker_modules_share_the_resolved_host_signal_binding() {
+        let mut config = native_control_plane_config();
+        config.meerkat.state_root = Some(PathBuf::from("/tmp/example-repository-runtime"));
+        config.mob.mcp_servers = BTreeMap::from([
+            (
+                "linear".to_owned(),
+                NativeMcpServerConfig {
+                    command: vec!["fugue-linear-mcp".to_owned()],
+                    url: None,
+                    env: BTreeMap::new(),
+                },
+            ),
+            (
+                "linear_projection".to_owned(),
+                NativeMcpServerConfig {
+                    command: vec!["fugue-linear-mcp".to_owned()],
+                    url: None,
+                    env: BTreeMap::new(),
+                },
+            ),
+        ]);
+        let expected = HostSignalBinding::from_config(&config).unwrap();
+        let servers = host_signal_mcp_servers(&config).unwrap();
+        for name in ["linear", "linear_projection"] {
+            let encoded = &servers[name].env[crate::host_signal_journal::HOST_SIGNAL_BINDING_ENV];
+            assert_eq!(HostSignalBinding::decode(encoded).unwrap(), expected);
+            assert!(!encoded.contains("token"));
+        }
+        assert!(
+            expected
+                .scope
+                .runtime_path
+                .starts_with("/tmp/example-repository-runtime")
+        );
     }
 
     fn native_control_plane_config() -> ServiceConfig {
@@ -11018,16 +11274,166 @@ mod tests {
     ) -> (Orchestrator, Arc<RecordingNativeMobExecutionHost>) {
         let (refresh_tx, refresh_rx) = mpsc::channel(1);
         drop(refresh_tx);
+        let directory = tempfile::tempdir().unwrap();
         let manager = WorkflowConfigManager::from_definition_for_test(
-            PathBuf::from("/tmp/fugue.yaml"),
+            directory.path().join("fugue.yaml"),
             definition,
         )
         .unwrap();
         let native_host = Arc::new(RecordingNativeMobExecutionHost::default());
-        (
-            Orchestrator::new_with_native_execution_host(manager, refresh_rx, native_host.clone()),
-            native_host,
-        )
+        let mut orchestrator =
+            Orchestrator::new_with_native_execution_host(manager, refresh_rx, native_host.clone());
+        orchestrator.test_directory = Some(directory);
+        (orchestrator, native_host)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_signal_tick_drains_saved_work_before_tracker_backoff_and_missing_auth() {
+        const TEST: &str = "orchestrator::tests::host_signal_tick_drains_saved_work_before_tracker_backoff_and_missing_auth";
+        const MARKER: &str = "FUGUE_SIGNAL_TICK_FIXTURE";
+        if std::env::var(MARKER).ok().as_deref() != Some(TEST) {
+            let output = StdCommand::new(std::env::current_exe().unwrap())
+                .env(MARKER, TEST)
+                .args([TEST, "--exact", "--nocapture"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut definition = native_kapellmeister_workflow_definition();
+        definition.config.insert(
+            "meerkat".to_owned(),
+            json!({
+                "command": "true", "state_root": directory.path().join("native"),
+            }),
+        );
+        definition.config.insert(
+            "tracker".to_owned(),
+            json!({
+                "kind": "linear", "endpoint": "http://127.0.0.1:1/graphql",
+                "project_slug": "fixture", "api_key": "",
+            }),
+        );
+        let make = || {
+            let manager = WorkflowConfigManager::from_definition_for_test(
+                directory.path().join("fugue.yaml"),
+                definition.clone(),
+            )
+            .unwrap();
+            let (_, receiver) = mpsc::channel(1);
+            let mut orchestrator = Orchestrator::new(manager, receiver).unwrap();
+            // Keep the real native runtime and sender; omit irrelevant network tools.
+            orchestrator.meta_runtime_registry = MetaRuntimeRegistry::with_templates(
+                orchestrator.config.effective().meerkat.clone(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .with_host_signal_binding(orchestrator.host_signal_binding.clone());
+            orchestrator
+        };
+        let first = make();
+        let signal =
+            worker_finished_signal("TEST-1", WorkerExit::Normal, None, 1, false, Utc::now());
+        first
+            .enqueue_host_signals(std::slice::from_ref(&signal))
+            .unwrap();
+        let saved = first
+            .host_signal_binding
+            .open()
+            .unwrap()
+            .pending(10)
+            .unwrap();
+        assert_eq!(saved.len(), 1);
+        drop(first);
+        let mut restored = make();
+        restored.enqueue_host_signals(&[signal]).unwrap();
+        assert_eq!(
+            restored
+                .host_signal_binding
+                .open()
+                .unwrap()
+                .pending(10)
+                .unwrap(),
+            saved
+        );
+        restored.linear_backoff_until = Some(Utc::now() + chrono::Duration::hours(1));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                restored.tick().await;
+                if restored
+                    .host_signal_binding
+                    .open()
+                    .unwrap()
+                    .pending(10)
+                    .unwrap()
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("backoff must not strand saved work");
+        let second =
+            worker_finished_signal("TEST-2", WorkerExit::Normal, None, 1, false, Utc::now());
+        restored.enqueue_host_signals(&[second]).unwrap();
+        restored.linear_backoff_until = None;
+        assert!(
+            restored.config.validate_dispatch().is_err(),
+            "tracker authentication remains missing"
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                restored.tick().await;
+                if restored
+                    .host_signal_binding
+                    .open()
+                    .unwrap()
+                    .pending(10)
+                    .unwrap()
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("missing tracker auth must not strand saved work");
+        restored.meta_runtime_registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_independent_review_cannot_start_or_create_runtime_work() {
+        let (orchestrator, native_host) =
+            native_orchestrator_for_definition(native_workflow_definition());
+        let request = IndependentReviewStartRequest {
+            issue: issue_ref_for_identifier("LUC-631"),
+            spawn_input: SpawnOrResumeExecutionInput {
+                issue: issue_ref_for_identifier("LUC-631"),
+                workspace_key: workspace_key_for_identifier("LUC-631"),
+                template_id: crate::tools::MobTemplateId("independent_review".to_string()),
+                worktree_path: None,
+                instructions: None,
+                idempotency_key: IdempotencyKey("disabled-review".to_string()),
+            },
+            pull_request: pr_snapshot(206, "luka/luc-631", "head-a"),
+            orchestrator_profile: "review_orchestrator".to_string(),
+        };
+        let result = orchestrator
+            .handle_kapellmeister_start_independent_review(request)
+            .await;
+        assert!(!result.accepted);
+        assert!(result.message.contains("disabled by configuration"));
+        assert_eq!(native_host.raw_spawn_call_count(), 0);
+        assert_eq!(native_host.plan_call_count(), 0);
     }
 
     #[tokio::test]
@@ -11084,7 +11490,8 @@ mod tests {
     async fn fugue_ims_kapellmeister_start_issue_uses_sqlite_issue_source() {
         let temp = tempfile::tempdir().unwrap();
         let ims_path = temp.path().join("fugue-ims.sqlite");
-        let tracker = crate::fugue_ims::fugue_ims_tracker_config(&ims_path);
+        let mut tracker = crate::fugue_ims::fugue_ims_tracker_config(&ims_path);
+        tracker.project_slug = Some("lukacf/meerkat-fugue".into());
         crate::fugue_ims::create_issue_for_config(
             &tracker,
             crate::fugue_ims::CreateFugueIssue {
@@ -11104,7 +11511,7 @@ mod tests {
             json!({
                 "kind": "fugue-ims",
                 "endpoint": ims_path.display().to_string(),
-                "project_slug": "fugue-ims",
+                "project_slug": "lukacf/meerkat-fugue",
                 "intake_states": ["Todo"],
                 "active_states": ["Todo", "Rework", "Planning", "Implementing", "Reviewing"],
                 "terminal_states": ["Done", "Canceled", "Duplicate"]
@@ -11128,7 +11535,8 @@ mod tests {
     async fn kapellmeister_start_issue_allows_configured_review_ready_rework_resume() {
         let temp = tempfile::tempdir().unwrap();
         let ims_path = temp.path().join("fugue-ims.sqlite");
-        let tracker = crate::fugue_ims::fugue_ims_tracker_config(&ims_path);
+        let mut tracker = crate::fugue_ims::fugue_ims_tracker_config(&ims_path);
+        tracker.project_slug = Some("lukacf/meerkat-fugue".into());
         crate::fugue_ims::create_issue_for_config(
             &tracker,
             crate::fugue_ims::CreateFugueIssue {
@@ -11164,7 +11572,7 @@ mod tests {
             json!({
                 "kind": "fugue-ims",
                 "endpoint": ims_path.display().to_string(),
-                "project_slug": "fugue-ims",
+                "project_slug": "lukacf/meerkat-fugue",
                 "intake_states": ["Todo"],
                 "active_states": ["Todo", "Rework", "Planning", "Implementing", "Reviewing"],
                 "terminal_states": ["Ready for review", "Blocked", "Done", "Canceled", "Duplicate"]
@@ -11269,20 +11677,6 @@ mod tests {
             classify_issue_lane(&config, "In Progress"),
             IssueLaneClassification::UnexpectedNonterminal
         );
-    }
-
-    #[test]
-    fn recent_signal_deduper_accepts_once_per_signal_id() {
-        let mut deduper = RecentSignalDeduper::new(2);
-        let first = ShadowSignalId("sig-first".to_string());
-        let second = ShadowSignalId("sig-second".to_string());
-        let third = ShadowSignalId("sig-third".to_string());
-
-        assert!(deduper.accept(&first));
-        assert!(!deduper.accept(&first));
-        assert!(deduper.accept(&second));
-        assert!(deduper.accept(&third));
-        assert!(deduper.accept(&first));
     }
 
     #[test]
@@ -11464,7 +11858,7 @@ mod tests {
 
         let message = repo_kapellmeister_signal_message(&signals).expect("signal message");
 
-        assert!(message.contains("For a configured Review action lane"));
+        assert!(message.contains("For a configured Review action or shared review holding status"));
         assert!(message.contains("fugue_start_independent_review"));
         assert!(message.contains("For a configured Deploy lane"));
         assert!(message.contains("do not start the implementation mob"));
@@ -11488,6 +11882,7 @@ mod tests {
             completed_at: None,
         };
         let native_run = NativeRunHandle {
+            launch_failure: None,
             run_id: run.run_id.clone(),
             observed_events: vec![MobEventSnapshot {
                 sequence: 1,
@@ -11928,7 +12323,6 @@ worker:
             meerkat_rate_limits: None,
             last_error: None,
             recent_events: HashMap::new(),
-            final_pr_gates: HashMap::new(),
         };
         let mut issue = active_issue_with_labels(&["native"]);
         issue.state = "In Progress".to_string();
@@ -12027,10 +12421,11 @@ worker:
             updated_at: Utc.timestamp_opt(20, 0).unwrap(),
             completed_at: None,
         };
-        let workspace = WorkspaceManager::new(&config.workspace, &config.hooks);
+        let workspace = WorkspaceManager::for_service(&config);
 
         let (recovered_issue, entry) = recover_native_running_entry(
             &run,
+            None,
             std::slice::from_ref(&issue),
             &config,
             &workspace,
@@ -12131,10 +12526,11 @@ worker:
             updated_at: Utc.timestamp_opt(20, 0).unwrap(),
             completed_at: None,
         };
-        let workspace = WorkspaceManager::new(&config.workspace, &config.hooks);
+        let workspace = WorkspaceManager::for_service(&config);
 
         let (recovered_issue, entry) = recover_native_running_entry(
             &run,
+            None,
             std::slice::from_ref(&issue),
             &config,
             &workspace,
@@ -12213,6 +12609,7 @@ worker:
 
         assert!(recovery.review.is_none());
         let row = native_recovery_status_row(&NativeRunHandle {
+            launch_failure: None,
             run_id,
             observed_events: events,
             recovery,
@@ -12274,6 +12671,7 @@ worker:
             Some(2),
         );
         let row = native_recovery_status_row(&NativeRunHandle {
+            launch_failure: None,
             run_id,
             observed_events: Vec::new(),
             recovery,
@@ -12338,6 +12736,7 @@ worker:
             Some(2),
         );
         let row = native_recovery_status_row(&NativeRunHandle {
+            launch_failure: None,
             run_id,
             observed_events: events,
             recovery,
@@ -12410,6 +12809,7 @@ worker:
 
         assert!(recovery.review.is_some());
         let row = native_recovery_status_row(&NativeRunHandle {
+            launch_failure: None,
             run_id,
             observed_events: events,
             recovery,
@@ -12461,6 +12861,7 @@ worker:
             Some(3),
         );
         let native_run = NativeRunHandle {
+            launch_failure: None,
             run_id,
             observed_events: Vec::new(),
             recovery,
@@ -12494,6 +12895,7 @@ worker:
             handle: None,
             termination: None,
             native_run: Some(NativeRunHandle {
+                launch_failure: None,
                 run_id: MobRunId("native-execution:native-execution:LUC-277:attempt-5".to_string()),
                 observed_events: Vec::new(),
                 recovery: NativeStatusRecovery::default(),
@@ -12586,7 +12988,8 @@ worker:
             native_pr_handoff_monitor_action(&github, Some(&ci)),
         );
         assert_eq!(decision, PrHandoffMonitorDecision::ReadyForDone);
-        assert!(detail.contains("no checks are configured"));
+        assert!(detail.contains("no checks were reported"));
+        assert!(!detail.contains("move the issue to Done"));
     }
 
     #[test]
@@ -12635,29 +13038,29 @@ worker:
     }
 
     #[test]
-    fn native_pr_handoff_ci_uses_pr_branch_ref_not_bare_head_sha() {
-        let pull_request = pr_snapshot(
-            187,
-            "luka/luc-623",
-            "df54ff6bba8830904fb69815e95b454b94b2fbfe",
-        );
-        assert_eq!(
-            native_pr_handoff_ci_input(&pull_request),
-            CheckCiInput {
-                repo: pull_request.repo.clone(),
-                git_ref: GitRef("luka/luc-623".to_string()),
+    fn native_pr_handoff_ci_passes_exact_candidate_to_inspector() {
+        struct Inspector(std::sync::Mutex<Option<GitHubPullRequestSnapshot>>);
+        impl NativeStatusGitHubInspector for Inspector {
+            fn inspect_pr(&self, _: crate::tools::InspectPrInput) -> FugueToolResult {
+                panic!("the CI read already has a candidate");
             }
-        );
-        assert_ne!(
-            native_pr_handoff_ci_input(&pull_request).git_ref,
-            GitRef(pull_request.head_sha.0.clone()),
-            "gh pr checks treats a bare commit SHA as a branch/PR selector, so the native monitor must not pass the reviewed head SHA as the check ref"
-        );
+            fn check_pr_ci(&self, candidate: &GitHubPullRequestSnapshot) -> FugueToolResult {
+                *self.0.lock().unwrap() = Some(candidate.clone());
+                FugueToolResult::Ok {
+                    output: FugueToolOutput::GitHubCheckCi(ci_output(CiStatus::Success)),
+                    metadata: ToolExecutionMetadata::default(),
+                }
+            }
+        }
+        let candidate = pr_snapshot(187, "feature", "df54ff6bba8830904fb69815e95b454b94b2fbfe");
+        let inspector = Inspector(std::sync::Mutex::new(None));
         assert_eq!(
-            pull_request.head_sha,
-            GitSha("df54ff6bba8830904fb69815e95b454b94b2fbfe".to_string()),
-            "CI lookup uses the branch selector, but final-gate evidence remains tied to the exact monitored PR head SHA"
+            inspect_native_pr_handoff_ci(&inspector, &candidate)
+                .unwrap()
+                .status,
+            CiStatus::Success
         );
+        assert_eq!(inspector.0.into_inner().unwrap(), Some(candidate));
     }
 
     #[test]
@@ -12676,6 +13079,7 @@ worker:
     fn native_pr_handoff_monitor_materializes_final_gate_trigger_evidence() {
         let mut config = service_config(json!({}));
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Auto,
             lane: "Repo Gate".to_string(),
@@ -12755,6 +13159,7 @@ worker:
         let (orchestrator, _native_host) = native_orchestrator_for_definition(definition);
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Auto,
             lane: "Custom Final Gate".to_string(),
@@ -12848,306 +13253,6 @@ worker:
         assert_eq!(executor.operations, vec!["workpad", "move"]);
     }
 
-    async fn live_reconcile_completion_for_test(
-        status: FinalReviewVerdictStatus,
-        current_sha_override: Option<&str>,
-        merge_authorized_override: Option<bool>,
-        mergeable_override: Option<bool>,
-        require_fresh_head: bool,
-    ) -> (
-        Orchestrator,
-        Arc<RecordingNativeMobExecutionHost>,
-        RecordingFinalGateProjectionExecutor,
-    ) {
-        let current_sha = current_sha_override.unwrap_or("sha-a").to_string();
-        live_reconcile_completion_for_test_with_inspector(
-            status,
-            StaticGitHubInspector::ok(pr_snapshot(187, "luka/luc-623", &current_sha)),
-            merge_authorized_override,
-            mergeable_override,
-            require_fresh_head,
-        )
-        .await
-    }
-
-    async fn live_reconcile_completion_for_test_with_inspector(
-        status: FinalReviewVerdictStatus,
-        inspector: StaticGitHubInspector,
-        merge_authorized_override: Option<bool>,
-        mergeable_override: Option<bool>,
-        require_fresh_head: bool,
-    ) -> (
-        Orchestrator,
-        Arc<RecordingNativeMobExecutionHost>,
-        RecordingFinalGateProjectionExecutor,
-    ) {
-        let mut definition = native_kapellmeister_workflow_definition();
-        definition.config.insert(
-            "kapellmeister".to_string(),
-            json!({
-                "authority_mode": "guarded_labeled",
-                "safe_selectors": {
-                    "repositories": [{"owner": "lukacf", "name": "meerkat-fugue"}]
-                }
-            }),
-        );
-        definition.config.insert(
-            "final_review".to_string(),
-            json!({
-                "enabled": true,
-                "mode": "manual",
-                "lane": "Custom Final Gate",
-                "rework_lane": "Custom Rework",
-                "blocked_lane": "Custom Blocked",
-                "success_lane": "Custom Done",
-                "merge": {"strategy": "squash", "delete_branch": true, "require_ci_success": true, "require_fresh_head": true},
-                "reviewers": [
-                    {"id": "architecture", "profile": "final_architecture_reviewer", "required": true},
-                    {"id": "tests", "profile": "final_test_reviewer", "required": true}
-                ]
-            }),
-        );
-        definition.config.insert(
-            "final_review".to_string(),
-            json!({
-                "enabled": true,
-                "mode": "manual",
-                "lane": "Custom Final Gate",
-                "rework_lane": "Custom Rework",
-                "blocked_lane": "Custom Blocked",
-                "success_lane": "Custom Done",
-                "merge": {"strategy": "squash", "delete_branch": true, "require_ci_success": true, "require_fresh_head": require_fresh_head},
-                "reviewers": [
-                    {"id": "architecture", "profile": "final_architecture_reviewer", "required": true},
-                    {"id": "tests", "profile": "final_test_reviewer", "required": true}
-                ]
-            }),
-        );
-        let (mut orchestrator, native_host) = native_orchestrator_for_definition(definition);
-        let cursor_dir = tempfile::tempdir().expect("cursor tempdir");
-        orchestrator.native_event_observer =
-            NativeMobEventObserver::new(crate::mob_event_observer::MobEventCursorStore::new(
-                cursor_dir.path().join("meta-cursors.json"),
-            ));
-        let mut config = orchestrator.config.effective().clone();
-        config.final_review = crate::config::FinalReviewConfig {
-            enabled: true,
-            mode: crate::config::FinalReviewMode::Manual,
-            lane: "Custom Final Gate".to_string(),
-            rework_lane: "Custom Rework".to_string(),
-            blocked_lane: "Custom Blocked".to_string(),
-            success_lane: "Custom Done".to_string(),
-            merge: crate::config::FinalReviewMergeConfig::default(),
-            reviewers: vec![
-                crate::config::FinalReviewReviewerConfig {
-                    id: "architecture".to_string(),
-                    profile: "final_architecture_reviewer".to_string(),
-                    required: true,
-                },
-                crate::config::FinalReviewReviewerConfig {
-                    id: "tests".to_string(),
-                    profile: "final_test_reviewer".to_string(),
-                    required: true,
-                },
-            ],
-        };
-        let sha = "sha-a";
-        let mut issue = issue("issue-623", "LUC-623", Some(1), 10);
-        issue.state = "Custom Final Gate".to_string();
-        let github = recover_native_github_evidence(pr_snapshot(187, "luka/luc-623", sha));
-        let request = native_final_pr_gate_start_request_from_handoff(&config, &issue, &github)
-            .expect("start request construction")
-            .expect("manual mode should produce request");
-        let result = orchestrator
-            .handle_kapellmeister_start_final_pr_gate(request.clone())
-            .await;
-        assert!(result.accepted, "{}", result.message);
-        let run_id = {
-            let state = orchestrator.state.read().await;
-            state
-                .final_pr_gates
-                .values()
-                .next()
-                .map(|gate| gate.run_id.clone())
-                .expect("tracked final gate run")
-        };
-        let test_status = if status == FinalReviewVerdictStatus::RequestChanges {
-            FinalReviewVerdictStatus::RequestChanges
-        } else {
-            FinalReviewVerdictStatus::Approve
-        };
-        let mut verdicts = vec![crate::final_pr_gate::FinalReviewVerdict {
-            reviewer: "architecture".to_string(),
-            status: FinalReviewVerdictStatus::Approve,
-            pr: pr_snapshot(187, "luka/luc-623", sha),
-            head_sha: GitSha(sha.to_string()),
-            findings: Vec::new(),
-            required_checks: Vec::new(),
-        }];
-        if status != FinalReviewVerdictStatus::Blocked {
-            verdicts.push(crate::final_pr_gate::FinalReviewVerdict {
-                reviewer: "tests".to_string(),
-                status: test_status,
-                pr: pr_snapshot(187, "luka/luc-623", sha),
-                head_sha: GitSha(sha.to_string()),
-                findings: Vec::new(),
-                required_checks: Vec::new(),
-            });
-        }
-        native_host
-            .append_structural_event(
-                &run_id,
-                crate::tools::MobEventKind::RunCompleted {
-                    status: MobRunStatus::Succeeded,
-                    structured_output: Some(json!({ "verdicts": verdicts })),
-                },
-                None,
-            )
-            .expect("append final gate event");
-        let mut executor = RecordingFinalGateProjectionExecutor::default();
-        orchestrator
-            .reconcile_final_pr_gate_events_with_projector_and_ci(
-                Some(&mut executor),
-                &inspector,
-                None,
-                merge_authorized_override,
-                mergeable_override,
-            )
-            .await;
-        (orchestrator, native_host, executor)
-    }
-
-    #[tokio::test]
-    async fn live_reconcile_final_gate_completion_events_drive_rework_projection() {
-        let (_orchestrator, _native_host, executor) = live_reconcile_completion_for_test(
-            FinalReviewVerdictStatus::RequestChanges,
-            None,
-            None,
-            None,
-            true,
-        )
-        .await;
-        assert_eq!(executor.workpads.len(), 1);
-        assert_eq!(executor.moves.len(), 1);
-        assert!(executor.merges.is_empty());
-    }
-
-    #[tokio::test]
-    async fn live_reconcile_final_gate_completion_blocks_stale_refreshed_head() {
-        let (_orchestrator, _native_host, executor) = live_reconcile_completion_for_test(
-            FinalReviewVerdictStatus::Approve,
-            Some("sha-drift"),
-            None,
-            None,
-            true,
-        )
-        .await;
-        assert_eq!(executor.workpads.len(), 1);
-        assert_eq!(executor.moves.len(), 1);
-        assert!(executor.merges.is_empty());
-    }
-
-    #[tokio::test]
-    async fn live_reconcile_final_gate_completion_blocks_pr_refresh_failure() {
-        let (_orchestrator, _native_host, executor) =
-            live_reconcile_completion_for_test_with_inspector(
-                FinalReviewVerdictStatus::Approve,
-                StaticGitHubInspector::err("boom refresh failed"),
-                None,
-                None,
-                true,
-            )
-            .await;
-        assert_eq!(executor.workpads.len(), 1);
-        assert_eq!(executor.moves.len(), 1);
-        assert!(executor.merges.is_empty());
-        assert!(
-            executor.workpads[0]
-                .body_markdown
-                .contains("current PR refresh failed")
-        );
-    }
-
-    #[tokio::test]
-    async fn live_reconcile_final_gate_completion_blocks_pr_refresh_failure_without_fresh_head_requirement()
-     {
-        let (_orchestrator, _native_host, executor) =
-            live_reconcile_completion_for_test_with_inspector(
-                FinalReviewVerdictStatus::Approve,
-                StaticGitHubInspector::err("boom refresh failed"),
-                None,
-                None,
-                false,
-            )
-            .await;
-        assert_eq!(executor.workpads.len(), 1);
-        assert_eq!(executor.moves.len(), 1);
-        assert!(executor.merges.is_empty());
-        assert!(
-            executor.workpads[0]
-                .body_markdown
-                .contains("current PR refresh failed")
-        );
-    }
-
-    #[tokio::test]
-    async fn live_reconcile_final_gate_completion_blocks_false_authority_or_mergeability() {
-        let (_orchestrator, _native_host, no_authority) = live_reconcile_completion_for_test(
-            FinalReviewVerdictStatus::Approve,
-            None,
-            Some(false),
-            None,
-            true,
-        )
-        .await;
-        assert_eq!(no_authority.workpads.len(), 1);
-        assert_eq!(no_authority.moves.len(), 1);
-        assert!(no_authority.merges.is_empty());
-
-        let (_orchestrator, _native_host, not_mergeable) = live_reconcile_completion_for_test(
-            FinalReviewVerdictStatus::Approve,
-            None,
-            None,
-            Some(false),
-            true,
-        )
-        .await;
-        assert_eq!(not_mergeable.workpads.len(), 1);
-        assert_eq!(not_mergeable.moves.len(), 1);
-        assert!(not_mergeable.merges.is_empty());
-    }
-
-    #[tokio::test]
-    async fn live_reconcile_final_gate_completion_events_drive_merge_projection() {
-        let (_orchestrator, _native_host, executor) = live_reconcile_completion_for_test(
-            FinalReviewVerdictStatus::Approve,
-            None,
-            None,
-            None,
-            true,
-        )
-        .await;
-        assert_eq!(executor.workpads.len(), 1);
-        assert_eq!(executor.moves.len(), 1);
-        assert_eq!(executor.merges.len(), 1);
-        assert!(executor.merges[0].expected_head_sha.is_some());
-    }
-
-    #[tokio::test]
-    async fn live_reconcile_final_gate_completion_events_drive_blocked_projection() {
-        let (_orchestrator, _native_host, executor) = live_reconcile_completion_for_test(
-            FinalReviewVerdictStatus::Blocked,
-            None,
-            None,
-            None,
-            true,
-        )
-        .await;
-        assert_eq!(executor.workpads.len(), 1);
-        assert_eq!(executor.moves.len(), 1);
-        assert!(executor.merges.is_empty());
-    }
-
     #[tokio::test]
     async fn production_final_gate_completion_events_drive_blocked_projection() {
         let mut definition = native_kapellmeister_workflow_definition();
@@ -13163,6 +13268,7 @@ worker:
         let (orchestrator, _native_host) = native_orchestrator_for_definition(definition);
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Auto,
             lane: "Custom Final Gate".to_string(),
@@ -13293,9 +13399,10 @@ worker:
                 }
             }),
         );
-        let (orchestrator, native_host) = native_orchestrator_for_definition(definition);
+        let (mut orchestrator, native_host) = native_orchestrator_for_definition(definition);
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Auto,
             lane: "Custom Final Gate".to_string(),
@@ -13310,6 +13417,16 @@ worker:
             }],
         };
         config.linear.lanes.review_ready = Some("Repo Ready".to_string());
+        let mut enabled_definition = orchestrator.config.definition().clone();
+        enabled_definition.config.insert(
+            "final_review".into(),
+            serde_json::to_value(&config.final_review).unwrap(),
+        );
+        orchestrator.config = WorkflowConfigManager::from_definition_for_test(
+            PathBuf::from("/tmp/fugue.yaml"),
+            enabled_definition,
+        )
+        .unwrap();
         let mut issue = issue("issue-623", "LUC-623", Some(1), 10);
         issue.state = "Repo Ready".to_string();
         let github = recover_native_github_evidence(pr_snapshot(187, "luka/luc-623", "api-head"));
@@ -13343,9 +13460,10 @@ worker:
                 }
             }),
         );
-        let (orchestrator, _native_host) = native_orchestrator_for_definition(definition);
+        let (mut orchestrator, _native_host) = native_orchestrator_for_definition(definition);
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Auto,
             lane: "Custom Final Gate".to_string(),
@@ -13360,6 +13478,16 @@ worker:
             }],
         };
         config.linear.lanes.review_ready = Some("Repo Ready".to_string());
+        let mut enabled_definition = orchestrator.config.definition().clone();
+        enabled_definition.config.insert(
+            "final_review".into(),
+            serde_json::to_value(&config.final_review).unwrap(),
+        );
+        orchestrator.config = WorkflowConfigManager::from_definition_for_test(
+            PathBuf::from("/tmp/fugue.yaml"),
+            enabled_definition,
+        )
+        .unwrap();
         let mut issue = issue("issue-623", "LUC-623", Some(1), 10);
         issue.state = "Repo Ready".to_string();
         let github = recover_native_github_evidence(pr_snapshot(187, "luka/luc-623", "api-head"));
@@ -13379,10 +13507,11 @@ worker:
 
     #[tokio::test]
     async fn production_final_pr_gate_does_not_self_authorize_label_only_selector() {
-        let (orchestrator, native_host) =
+        let (mut orchestrator, native_host) =
             native_orchestrator_for_definition(native_kapellmeister_workflow_definition());
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Auto,
             lane: "Custom Final Gate".to_string(),
@@ -13397,6 +13526,16 @@ worker:
             }],
         };
         config.linear.lanes.review_ready = Some("Repo Ready".to_string());
+        let mut enabled_definition = orchestrator.config.definition().clone();
+        enabled_definition.config.insert(
+            "final_review".into(),
+            serde_json::to_value(&config.final_review).unwrap(),
+        );
+        orchestrator.config = WorkflowConfigManager::from_definition_for_test(
+            PathBuf::from("/tmp/fugue.yaml"),
+            enabled_definition,
+        )
+        .unwrap();
         let mut issue = issue("issue-623", "LUC-623", Some(1), 10);
         issue.state = "Repo Ready".to_string();
         let github = recover_native_github_evidence(pr_snapshot(187, "luka/luc-623", "api-head"));
@@ -13419,6 +13558,7 @@ worker:
             native_orchestrator_for_definition(native_kapellmeister_workflow_definition());
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Auto,
             lane: "Custom Final Gate".to_string(),
@@ -13476,8 +13616,8 @@ worker:
         );
         let instructions = input.instructions.as_deref().unwrap();
         assert!(instructions.contains("via Auto"));
-        assert!(instructions.contains("Review exact head SHA `new-head`"));
-        assert!(instructions.contains("success=`Custom Done`"));
+        assert!(instructions.contains("Review exact head new-head"));
+        assert!(instructions.contains("success=Custom Done"));
         assert_eq!(start.reviewers.len(), 2);
         assert!(
             start
@@ -13493,6 +13633,7 @@ worker:
             native_orchestrator_for_definition(native_kapellmeister_workflow_definition());
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Auto,
             lane: "Custom Final Gate".to_string(),
@@ -13556,6 +13697,7 @@ worker:
             native_orchestrator_for_definition(native_kapellmeister_workflow_definition());
         let mut config = orchestrator.config.effective().clone();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Manual,
             lane: "Custom Final Gate".to_string(),
@@ -13604,53 +13746,6 @@ worker:
                 .unwrap()
                 .contains("via Manual")
         );
-    }
-
-    #[tokio::test]
-    async fn final_gate_observation_is_suppressed_while_matching_gate_runs() {
-        let (orchestrator, _) =
-            native_orchestrator_for_definition(native_kapellmeister_workflow_definition());
-        let mut config = orchestrator.config.effective().clone();
-        config.final_review = crate::config::FinalReviewConfig {
-            enabled: true,
-            mode: crate::config::FinalReviewMode::Manual,
-            lane: "Custom Final Gate".to_string(),
-            rework_lane: "Custom Rework".to_string(),
-            blocked_lane: "Custom Blocked".to_string(),
-            success_lane: "Custom Done".to_string(),
-            merge: crate::config::FinalReviewMergeConfig::default(),
-            reviewers: vec![crate::config::FinalReviewReviewerConfig {
-                id: "tests".to_string(),
-                profile: "final_test_reviewer".to_string(),
-                required: true,
-            }],
-        };
-        let mut issue = issue("issue-624", "LUC-624", Some(1), 10);
-        issue.state = "Custom Final Gate".to_string();
-        let github =
-            recover_native_github_evidence(pr_snapshot(188, "luka/luc-624", "manual-head"));
-        let start = native_final_pr_gate_start_request_from_handoff(&config, &issue, &github)
-            .expect("start request construction")
-            .expect("manual mode should start from final gate lane");
-        {
-            let mut state = orchestrator.state.write().await;
-            state.final_pr_gates.insert(
-                start.spawn_input.idempotency_key.0.clone(),
-                FinalPrGateRunHandle {
-                    run_id: crate::tools::MobRunId(start.spawn_input.idempotency_key.0.clone()),
-                    start_request: start.clone(),
-                    observed_events: Vec::new(),
-                    completed: false,
-                },
-            );
-        }
-
-        let delivered = orchestrator
-            .deliver_native_final_pr_gate_request_to_kapellmeister(&issue, &start)
-            .await
-            .expect("suppression check succeeds");
-
-        assert!(!delivered);
     }
 
     #[test]
@@ -13727,6 +13822,7 @@ worker:
         )
         .unwrap();
         config.final_review = crate::config::FinalReviewConfig {
+            minimum_reviewers: 3,
             enabled: true,
             mode: crate::config::FinalReviewMode::Manual,
             lane: "Custom Final Gate".to_string(),
@@ -14461,6 +14557,7 @@ worker:
             Some(2),
         );
         let row = native_recovery_status_row(&NativeRunHandle {
+            launch_failure: None,
             run_id,
             observed_events: Vec::new(),
             recovery,
@@ -14521,7 +14618,7 @@ worker:
         .unwrap()
         .effective()
         .clone();
-        let workspace_manager = WorkspaceManager::new(&config.workspace, &config.hooks);
+        let workspace_manager = WorkspaceManager::for_service(&config);
         let mut issue = active_issue_with_labels(&["native"]);
         issue.identifier = "LUC-338".to_string();
         issue.state = "Reviewing".to_string();
@@ -14601,7 +14698,7 @@ worker:
         .unwrap()
         .effective()
         .clone();
-        let workspace_manager = WorkspaceManager::new(&config.workspace, &config.hooks);
+        let workspace_manager = WorkspaceManager::for_service(&config);
         let mut issue = active_issue_with_labels(&["native"]);
         issue.identifier = "LUC-620".to_string();
         issue.state = "Reviewing".to_string();
@@ -14693,6 +14790,7 @@ worker:
         issue.state = "Reviewing".to_string();
         let workpad = "## Fugue Workpad\n\n#### Reviewer gate\n- [x] Reviewer decision: red / return to Planning.\n\n#### Reviewer findings requiring focused rework\n- [ ] Source: focused finding.\n";
         let native_run = NativeRunHandle {
+            launch_failure: None,
             run_id: run_id.clone(),
             observed_events: Vec::new(),
             recovery: native_status_recovery(
@@ -14729,6 +14827,7 @@ worker:
     #[test]
     fn structured_reviewer_red_gate_requests_replan_without_workpad_magic() {
         let native_run = NativeRunHandle {
+            launch_failure: None,
             run_id: MobRunId("native-execution:native-execution:LUC-401".to_string()),
             observed_events: vec![native_event(
                 1,
@@ -14800,6 +14899,7 @@ worker:
         issue.state = "Reviewing".to_string();
         let red_workpad = "## Fugue Workpad\n\nReviewer decision: red / return to Planning.";
         let native_run = NativeRunHandle {
+            launch_failure: None,
             run_id: MobRunId("native-execution:native-execution:LUC-401".to_string()),
             observed_events: vec![native_event(
                 1,
@@ -14841,6 +14941,7 @@ worker:
         let mut issue = active_issue_with_labels(&["native"]);
         issue.state = "In Progress".to_string();
         let native_run = NativeRunHandle {
+            launch_failure: None,
             run_id: MobRunId("native-execution:native-execution:LUC-264".to_string()),
             observed_events: vec![MobEventSnapshot {
                 sequence: 1,
@@ -14979,6 +15080,7 @@ worker:
         let mut issue = active_issue_with_labels(&["native"]);
         issue.state = "Reviewing".to_string();
         let mut native_run = NativeRunHandle {
+            launch_failure: None,
             run_id,
             observed_events: Vec::new(),
             recovery: native_status_recovery(
@@ -15065,6 +15167,7 @@ worker:
             handle: None,
             termination: None,
             native_run: Some(NativeRunHandle {
+                launch_failure: None,
                 run_id,
                 observed_events: Vec::new(),
                 recovery: NativeStatusRecovery::default(),
@@ -15206,7 +15309,7 @@ worker:
         .unwrap()
         .effective()
         .clone();
-        let workspace_manager = WorkspaceManager::new(&config.workspace, &config.hooks);
+        let workspace_manager = WorkspaceManager::for_service(&config);
         let run_id = MobRunId("native-execution:native-execution:LUC-168".to_string());
         let run = MobRunSnapshot {
             run_id: run_id.clone(),
@@ -15275,6 +15378,7 @@ worker:
             None,
         );
         let row = native_recovery_status_row(&NativeRunHandle {
+            launch_failure: None,
             run_id,
             observed_events: events,
             recovery: refreshed,
@@ -15375,7 +15479,6 @@ worker:
             meerkat_rate_limits: None,
             last_error: None,
             recent_events: HashMap::new(),
-            final_pr_gates: HashMap::new(),
         };
         state.running.insert(
             issue.id.clone(),
@@ -15394,6 +15497,7 @@ worker:
                 handle: None,
                 termination: None,
                 native_run: Some(NativeRunHandle {
+                    launch_failure: None,
                     run_id,
                     observed_events: events,
                     recovery,
@@ -15552,7 +15656,8 @@ worker:
     async fn kapellmeister_native_reconcile_refreshes_recovery_without_host_projection() {
         let temp = tempfile::tempdir().unwrap();
         let ims_path = temp.path().join("fugue-ims.sqlite");
-        let tracker = crate::fugue_ims::fugue_ims_tracker_config(&ims_path);
+        let mut tracker = crate::fugue_ims::fugue_ims_tracker_config(&ims_path);
+        tracker.project_slug = Some("lukacf/meerkat-fugue".into());
         crate::fugue_ims::create_issue_for_config(
             &tracker,
             crate::fugue_ims::CreateFugueIssue {
@@ -15573,7 +15678,7 @@ worker:
             json!({
                 "kind": "fugue-ims",
                 "endpoint": ims_path.display().to_string(),
-                "project_slug": "fugue-ims",
+                "project_slug": "lukacf/meerkat-fugue",
                 "intake_states": ["Todo"],
                 "active_states": ["Todo", "Rework", "Planning", "Implementing", "Reviewing"],
                 "terminal_states": ["Ready for review", "Done", "Canceled", "Duplicate"]
@@ -15660,19 +15765,58 @@ worker:
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn kapellmeister_native_terminal_event_keeps_nonterminal_issue_running() {
+    // Exercise terminal handling against a real local tracker, including its
+    // fresh lane read. The worker and coordinator transports are recorded so
+    // these policy tests do not start competing process-global Meta runtimes.
+    async fn dispatched_terminal_fixture(
+        lane: &str,
+    ) -> (
+        tempfile::TempDir,
+        Orchestrator,
+        Arc<RecordingNativeMobExecutionHost>,
+        Issue,
+    ) {
         let workspace = tempfile::tempdir().expect("isolated workspace");
         let mut definition = native_kapellmeister_workflow_definition();
-        definition
-            .config
-            .insert("workspace".to_owned(), json!({"root": workspace.path()}));
-        let (mut orchestrator, native_host) = native_orchestrator_for_definition(definition);
-        orchestrator.terminal_issue_refresh = false;
+        definition.config.insert(
+            "tracker".to_owned(),
+            json!({
+                "kind": "fugue-ims",
+                "endpoint": workspace.path().join("issues.sqlite"),
+                "project_slug": "fixture/repository",
+                "active_states": ["Todo", "In Progress"],
+                "terminal_states": ["Done", "Canceled"]
+            }),
+        );
+        definition.config.insert(
+            "workspace".to_owned(),
+            json!({"root": workspace.path().join("workspaces")}),
+        );
+        definition.config.insert(
+            "meerkat".to_owned(),
+            json!({"state_root": workspace.path().join("runtime")}),
+        );
+        let (orchestrator, native_host) = native_orchestrator_for_definition(definition);
         let config = orchestrator.config.effective().clone();
-        let mut issue = active_issue_with_labels(&["kapellmeister-safe"]);
-        issue.state = "Planning".to_string();
-
+        let created = crate::fugue_ims::create_issue_for_config(
+            &config.tracker,
+            crate::fugue_ims::CreateFugueIssue {
+                key: crate::ims::ImsIssueKey("LUC-168".to_owned()),
+                repo: "fixture/repository".to_owned(),
+                title: "Terminal event fixture".to_owned(),
+                description: None,
+                stage: crate::ims::ImsStageName("Todo".to_owned()),
+                labels: vec!["kapellmeister-safe".to_owned()],
+            },
+        )
+        .expect("create local issue");
+        let adapter = IssueAdapter::from_config(&config.tracker).expect("local tracker");
+        let issue = adapter
+            .fetch_issue_states_by_ids(&[created.id.0])
+            .await
+            .expect("read local issue")
+            .pop()
+            .expect("fixture issue");
         orchestrator
             .dispatch_native_execution_mob(
                 issue.clone(),
@@ -15682,7 +15826,6 @@ worker:
                 config,
             )
             .await;
-
         {
             let state = orchestrator.shared_state();
             let state = state.read().await;
@@ -15692,6 +15835,201 @@ worker:
                 state.last_error
             );
         }
+        adapter
+            .move_issue_as_operator(MoveIssueInput {
+                issue: issue_ref_for_identifier(&issue.identifier),
+                state: LinearStateRef::Name {
+                    name: lane.to_owned(),
+                },
+                expected_updated_at: None,
+                idempotency_key: IdempotencyKey(format!("fixture-lane:{lane}")),
+            })
+            .await
+            .expect("update tracker lane");
+        let messages = orchestrator
+            .captured_native_signal_messages
+            .as_ref()
+            .expect("recorded coordinator transport")
+            .lock()
+            .expect("signal messages");
+        assert_eq!(messages.len(), 1, "dispatch must notify the coordinator");
+        assert!(messages[0].contains("worker_started"));
+        assert!(messages[0].contains(&issue.identifier));
+        drop(messages);
+        assert!(
+            !workspace.path().join("runtime").exists(),
+            "recording worker tests must not start a real Meta runtime"
+        );
+        (workspace, orchestrator, native_host, issue)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn launch_failure_restart_reporting_survives_native_restore_error() {
+        let (_workspace, mut orchestrator, native_host, issue) =
+            dispatched_terminal_fixture("Planning").await;
+        let run_id = orchestrator.state.read().await.running[&issue.id]
+            .native_run
+            .as_ref()
+            .expect("run")
+            .run_id
+            .clone();
+        let FugueToolResult::Ok {
+            output: FugueToolOutput::MobInspectRun(mut inspected),
+            ..
+        } = native_host.status(crate::tools::InspectRunInput { run_id })
+        else {
+            panic!("run")
+        };
+        inspected.run.status = MobRunStatus::Failed;
+        *native_host.list_override.lock().expect("list") = Some(vec![inspected.run.clone()]);
+        native_host.set_status_override(inspected.run);
+        *native_host.launch_failure_override.lock().expect("failure") =
+            Some(crate::tools::NativeLaunchFailure {
+                occurred_at: Utc::now(),
+                message: "planner wiring failed".to_owned(),
+            });
+        *native_host.restore_error.lock().expect("restore") =
+            Some("shared native runtime is unavailable".to_owned());
+        {
+            let mut state = orchestrator.state.write().await;
+            state.running.clear();
+            state.claimed.clear();
+        }
+        orchestrator
+            .recover_native_running_entries_after_restart()
+            .await;
+        let state = orchestrator.state.read().await;
+        let entry = state
+            .running
+            .get(&issue.id)
+            .expect("failed admission must stay visible even when native restoration fails");
+        assert_eq!(
+            serde_json::to_value(running_row(&issue.id, entry)).expect("row")["lifecycle"]["status"],
+            "launch_failed"
+        );
+        assert!(
+            state
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("shared native runtime is unavailable"))
+        );
+        assert_eq!(entry.issue.state, "Planning");
+        assert_eq!(native_host.spawn_call_count(), 1);
+        assert!(native_host.cleanup_calls().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn launch_failure_notifies_coordinator_and_surfaces_without_lane_mutation() {
+        let (_workspace, mut orchestrator, native_host, issue) =
+            dispatched_terminal_fixture("Planning").await;
+        let run_id = {
+            let state = orchestrator.state.read().await;
+            state.running[&issue.id]
+                .native_run
+                .as_ref()
+                .expect("native run")
+                .run_id
+                .clone()
+        };
+        let FugueToolResult::Ok {
+            output: FugueToolOutput::MobInspectRun(mut inspected),
+            ..
+        } = native_host.status(crate::tools::InspectRunInput { run_id })
+        else {
+            panic!("run")
+        };
+        inspected.run.status = MobRunStatus::Failed;
+        inspected.run.completed_at = Some(Utc::now());
+        let failed_run = inspected.run.clone();
+        native_host.set_status_override(inspected.run);
+        *native_host.launch_failure_override.lock().expect("failure") =
+            Some(crate::tools::NativeLaunchFailure {
+                occurred_at: Utc::now(),
+                message: "wire planner -> specialist: wire requires comms runtime".to_owned(),
+            });
+        for _ in 0..2 {
+            orchestrator
+                .reconcile_native_mob_events_with_tools(None, None)
+                .await;
+        }
+        let state = orchestrator.state.read().await;
+        let entry = &state.running[&issue.id];
+        let row = running_row(&issue.id, entry);
+        let value = serde_json::to_value(&row).expect("serialize projection");
+        assert_eq!(value["lifecycle"]["status"], "launch_failed");
+        assert!(
+            row.last_message
+                .as_deref()
+                .is_some_and(|text| text.contains("requires comms runtime"))
+        );
+        assert_eq!(entry.issue.state, "Planning");
+        assert!(state.retry_attempts.is_empty());
+        assert!(native_host.cleanup_calls().is_empty());
+        assert_eq!(native_host.spawn_call_count(), 1);
+        let manager = WorkspaceManager::for_service(orchestrator.config.effective());
+        let failure = native_host
+            .launch_failure_override
+            .lock()
+            .expect("failure")
+            .clone();
+        let (_, recovered) = recover_native_running_entry(
+            &failed_run,
+            failure.as_ref(),
+            std::slice::from_ref(&issue),
+            orchestrator.config.effective(),
+            &manager,
+            None,
+        )
+        .expect("preserve failed admission after restart");
+        assert_eq!(
+            serde_json::to_value(running_row(&issue.id, &recovered)).expect("recovered row")["lifecycle"]
+                ["status"],
+            "launch_failed"
+        );
+        let mut newer = failed_run.clone();
+        newer.run_id.0.push_str(":attempt-2");
+        newer.status = MobRunStatus::Succeeded;
+        let newest = newest_native_runs_by_issue(vec![failed_run.clone(), newer.clone()]);
+        assert_eq!(
+            newest,
+            vec![newer],
+            "a newer completed attempt supersedes old admission failure"
+        );
+        assert!(
+            recover_native_running_entry(
+                &failed_run,
+                None,
+                std::slice::from_ref(&issue),
+                orchestrator.config.effective(),
+                &manager,
+                None
+            )
+            .is_none(),
+            "ordinary terminal native runs are not admission failures"
+        );
+        let messages = orchestrator
+            .captured_native_signal_messages
+            .as_ref()
+            .expect("capture")
+            .lock()
+            .expect("messages");
+        let failures = messages
+            .iter()
+            .filter(|message| message.contains("requires comms runtime"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            failures.len(),
+            1,
+            "one failure signal across repeated observations"
+        );
+        assert!(failures[0].contains("infrastructure_unavailable"));
+        assert!(failures[0].contains("\"retry_scheduled\": false"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kapellmeister_native_terminal_event_keeps_nonterminal_issue_running() {
+        let (_workspace, mut orchestrator, native_host, issue) =
+            dispatched_terminal_fixture("Planning").await;
 
         orchestrator
             .handle_native_run_finished(issue.id.clone(), issue.clone(), MobRunStatus::Succeeded)
@@ -15703,6 +16041,7 @@ worker:
             state.running.contains_key(&issue.id),
             "Meta terminal status alone must not retire prompt-controlled nonterminal issues"
         );
+        assert_eq!(state.running[&issue.id].issue.state, "Planning");
         assert!(
             native_host.cleanup_calls().is_empty(),
             "cleanup must wait until the issue agent moves the IMS lane to a terminal state"
@@ -15711,36 +16050,8 @@ worker:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn kapellmeister_native_terminal_event_keeps_review_ready_issue_running() {
-        let workspace = tempfile::tempdir().expect("isolated workspace");
-        let mut definition = native_kapellmeister_workflow_definition();
-        definition
-            .config
-            .insert("workspace".to_owned(), json!({"root": workspace.path()}));
-        let (mut orchestrator, native_host) = native_orchestrator_for_definition(definition);
-        orchestrator.terminal_issue_refresh = false;
-        let config = orchestrator.config.effective().clone();
-        let mut issue = active_issue_with_labels(&["kapellmeister-safe"]);
-        issue.state = "Ready for review".to_string();
-
-        orchestrator
-            .dispatch_native_execution_mob(
-                issue.clone(),
-                None,
-                None,
-                IssuePolicyMode::Kapellmeister,
-                config,
-            )
-            .await;
-
-        {
-            let state = orchestrator.shared_state();
-            let state = state.read().await;
-            assert!(
-                state.running.contains_key(&issue.id),
-                "native dispatch must succeed before terminal handling: {:?}",
-                state.last_error
-            );
-        }
+        let (_workspace, mut orchestrator, native_host, issue) =
+            dispatched_terminal_fixture("Ready for review").await;
 
         orchestrator
             .handle_native_run_finished(issue.id.clone(), issue.clone(), MobRunStatus::Succeeded)
@@ -15752,6 +16063,7 @@ worker:
             state.running.contains_key(&issue.id),
             "Ready for review is an attention lane and must keep the issue mob visible"
         );
+        assert_eq!(state.running[&issue.id].issue.state, "Ready for review");
         assert!(
             native_host.cleanup_calls().is_empty(),
             "Ready for review must not retire visible Meta members"
@@ -15760,36 +16072,8 @@ worker:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn kapellmeister_native_terminal_event_retires_terminal_issue_members() {
-        let workspace = tempfile::tempdir().expect("isolated workspace");
-        let mut definition = native_kapellmeister_workflow_definition();
-        definition
-            .config
-            .insert("workspace".to_owned(), json!({"root": workspace.path()}));
-        let (mut orchestrator, native_host) = native_orchestrator_for_definition(definition);
-        orchestrator.terminal_issue_refresh = false;
-        let config = orchestrator.config.effective().clone();
-        let mut issue = active_issue_with_labels(&["kapellmeister-safe"]);
-        issue.state = "Done".to_string();
-
-        orchestrator
-            .dispatch_native_execution_mob(
-                issue.clone(),
-                None,
-                None,
-                IssuePolicyMode::Kapellmeister,
-                config,
-            )
-            .await;
-
-        {
-            let state = orchestrator.shared_state();
-            let state = state.read().await;
-            assert!(
-                state.running.contains_key(&issue.id),
-                "native dispatch must succeed before terminal handling: {:?}",
-                state.last_error
-            );
-        }
+        let (_workspace, mut orchestrator, native_host, issue) =
+            dispatched_terminal_fixture("Done").await;
 
         orchestrator
             .handle_native_run_finished(issue.id.clone(), issue.clone(), MobRunStatus::Succeeded)
@@ -15864,6 +16148,213 @@ worker:
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_cleanup_includes_independent_review_jobs() {
+        let (_workspace, mut orchestrator, native_host, issue) =
+            dispatched_terminal_fixture("Done").await;
+        let development = list_native_runs_for_restart(native_host.as_ref())
+            .expect("persisted jobs")
+            .remove(0);
+        let mut review = development.clone();
+        review.run_id = MobRunId("independent-review:fixture:round-one".to_owned());
+        review.issue = Some(LinearIssueRef::Id {
+            id: crate::tools::LinearIssueId(issue.id.clone()),
+        });
+        let mut other = development.clone();
+        other.run_id = MobRunId("independent-review:other-issue".to_owned());
+        other.issue = Some(issue_ref_for_identifier("LUC-169"));
+        *native_host.list_override.lock().expect("jobs") =
+            Some(vec![development.clone(), review.clone(), other]);
+        orchestrator
+            .handle_native_run_finished(issue.id.clone(), issue, MobRunStatus::Succeeded)
+            .await;
+        let retired: BTreeSet<_> = native_host
+            .cleanup_calls()
+            .into_iter()
+            .map(|(id, _)| id.0)
+            .collect();
+        assert_eq!(
+            retired,
+            BTreeSet::from([development.run_id.0, review.run_id.0]),
+            "terminal cleanup must cover every issue phase without touching another issue"
+        );
+    }
+
+    async fn refused_retirement_keeps_ownership(
+        with_worker: bool,
+        authority: TerminationAuthority,
+    ) {
+        let (_workspace, mut orchestrator, native_host, issue) =
+            dispatched_terminal_fixture("Done").await;
+        let cleanup_workspace = matches!(authority, TerminationAuthority::LinearTerminalLane);
+        let state = orchestrator.shared_state();
+        let workspace_path = state.read().await.running[&issue.id].workspace_path.clone();
+        let sentinel = PathBuf::from(&workspace_path).join("uncommitted-evidence.txt");
+        std::fs::write(&sentinel, "retain until native retirement succeeds").expect("sentinel");
+        if with_worker {
+            let mut state = state.write().await;
+            let entry = state.running.get_mut(&issue.id).expect("entry");
+            let cancel = entry.cancel.clone();
+            entry.handle = Some(tokio::spawn(async move { cancel.cancelled().await }));
+        }
+        *native_host.retirement_error.lock().expect("error") =
+            Some("native retirement refused".to_owned());
+        orchestrator
+            .terminate_running_issue(
+                &issue.id,
+                cleanup_workspace,
+                false,
+                "retirement-test",
+                authority,
+            )
+            .await;
+        {
+            let state = state.read().await;
+            assert!(
+                state.running.contains_key(&issue.id),
+                "retirement failure must keep cleanup ownership"
+            );
+            assert!(
+                state
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("native retirement refused"))
+            );
+            assert_eq!(state.running[&issue.id].handle.is_some(), with_worker);
+            assert!(sentinel.exists(), "live members still own their workspace");
+        }
+        *native_host.retirement_error.lock().expect("error") = None;
+        orchestrator
+            .terminate_running_issue(
+                &issue.id,
+                cleanup_workspace,
+                false,
+                "retirement-test",
+                authority,
+            )
+            .await;
+        assert!(!state.read().await.running.contains_key(&issue.id));
+        assert_eq!(
+            sentinel.exists(),
+            !cleanup_workspace,
+            "successful retry obeys workspace cleanup policy"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_cleanup_refusal_keeps_native_entry_for_retry() {
+        refused_retirement_keeps_ownership(false, TerminationAuthority::LinearTerminalLane).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_cleanup_refusal_keeps_native_worker_for_retry() {
+        refused_retirement_keeps_ownership(true, TerminationAuthority::LinearTerminalLane).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_refusal_keeps_native_entry_for_retry() {
+        refused_retirement_keeps_ownership(false, TerminationAuthority::HostRuntime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_refusal_keeps_native_worker_for_retry() {
+        refused_retirement_keeps_ownership(true, TerminationAuthority::HostRuntime).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_cleanup_retries_after_terminal_event_without_changing_done() {
+        let (_workspace, mut orchestrator, host, issue) = dispatched_terminal_fixture("Done").await;
+        *host.retirement_error.lock().expect("error") = Some("retirement unavailable".into());
+        orchestrator
+            .handle_native_run_finished(issue.id.clone(), issue.clone(), MobRunStatus::Succeeded)
+            .await;
+        assert!(
+            orchestrator
+                .state
+                .read()
+                .await
+                .running
+                .contains_key(&issue.id)
+        );
+        let adapter =
+            IssueAdapter::from_config(&orchestrator.config.effective().tracker).expect("tracker");
+        let current = adapter
+            .fetch_issue_states_by_ids(std::slice::from_ref(&issue.id))
+            .await
+            .expect("issue");
+        assert_eq!(current[0].state, "Done");
+        *host.retirement_error.lock().expect("error") = None;
+        orchestrator
+            .handle_native_run_finished(issue.id.clone(), issue.clone(), MobRunStatus::Succeeded)
+            .await;
+        assert!(
+            !orchestrator
+                .state
+                .read()
+                .await
+                .running
+                .contains_key(&issue.id)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_cleanup_retries_persisted_review_without_running_entry() {
+        let (_workspace, orchestrator, host, issue) = dispatched_terminal_fixture("Done").await;
+        let mut review = list_native_runs_for_restart(host.as_ref())
+            .expect("jobs")
+            .remove(0);
+        review.run_id = MobRunId("independent-review:restart".into());
+        review.issue = Some(LinearIssueRef::Id {
+            id: crate::tools::LinearIssueId(issue.id.clone()),
+        });
+        *host.list_override.lock().expect("jobs") = Some(vec![review.clone()]);
+        let state = orchestrator.shared_state();
+        let entry = state
+            .write()
+            .await
+            .running
+            .remove(&issue.id)
+            .expect("entry");
+        state.write().await.claimed.clear();
+        let sentinel = PathBuf::from(&entry.workspace_path).join("preserved-until-retirement.txt");
+        std::fs::write(&sentinel, "recovery evidence").expect("sentinel");
+        *host.retirement_error.lock().expect("error") = Some("refused after restart".into());
+        orchestrator.startup_terminal_workspace_cleanup().await;
+        assert!(sentinel.exists());
+        assert!(
+            state
+                .read()
+                .await
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("refused after restart"))
+        );
+        *host.retirement_error.lock().expect("error") = None;
+        orchestrator.reconcile_untracked_terminal_executions().await;
+        assert!(!sentinel.exists());
+        assert_eq!(
+            host.cleanup_calls().last().expect("cleanup").0,
+            review.run_id
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_cleanup_keeps_untracked_nonterminal_review() {
+        let (_workspace, orchestrator, host, issue) =
+            dispatched_terminal_fixture("Ready for review").await;
+        let state = orchestrator.shared_state();
+        let entry = state
+            .write()
+            .await
+            .running
+            .remove(&issue.id)
+            .expect("entry");
+        state.write().await.claimed.clear();
+        orchestrator.reconcile_untracked_terminal_executions().await;
+        assert!(host.cleanup_calls().is_empty());
+        assert!(PathBuf::from(entry.workspace_path).exists());
+    }
+
     #[tokio::test]
     async fn kapellmeister_retry_scheduling_is_suppressed() {
         let definition = workflow_definition(json!({
@@ -15879,7 +16370,7 @@ worker:
             definition,
         )
         .unwrap();
-        let orchestrator = Orchestrator::new(manager, refresh_rx);
+        let orchestrator = Orchestrator::new(manager, refresh_rx).unwrap();
 
         orchestrator
             .schedule_retry(
@@ -15923,7 +16414,6 @@ worker:
             meerkat_rate_limits: None,
             last_error: None,
             recent_events: HashMap::new(),
-            final_pr_gates: HashMap::new(),
         };
         let cancel = CancellationToken::new();
         let running_handle = tokio::spawn(async {});
@@ -16005,7 +16495,6 @@ worker:
             meerkat_rate_limits: None,
             last_error: None,
             recent_events: HashMap::new(),
-            final_pr_gates: HashMap::new(),
         };
         let mut issue = issue("running-1", "LUC-624", Some(1), 10);
         issue.state = "Final Review & Merge".to_string();
@@ -16030,6 +16519,7 @@ worker:
                 handle: None,
                 termination: None,
                 native_run: Some(NativeRunHandle {
+                    launch_failure: None,
                     run_id: MobRunId("final-pr-gate:meerkat-fugue:191:6bb24de3".to_string()),
                     observed_events: Vec::new(),
                     recovery: NativeStatusRecovery {

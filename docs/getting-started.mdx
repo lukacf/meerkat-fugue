@@ -1,118 +1,168 @@
-# Quick start
+---
+title: "Your first repository"
+description: "Connect a repository, prepare its specialists, and take an issue through review."
+---
 
-This guide gets a new Fugue instance from a checkout to a native execution
-configuration that can be validated safely.
+# Your first repository
 
-## 1. Install prerequisites
+Start with one repository and a small, verifiable issue. Fugue gives each
+repository its own tracker project, board, credentials and persistent agent team.
+You can add more repositories later without reconfiguring the first.
 
-You need:
+## Install and open Fugue
 
-- Rust stable with edition 2024 support.
-- A Linear API key that can read and update the target project.
-- Git and repository credentials for the repositories workers will modify.
-- Meerkat/Meta native execution tooling installed on the host.
-- Optional GitHub credentials if workers create pull requests or inspect CI.
+For a local source installation, install Git, GitHub CLI, Node.js and Rust using
+rustup. The checkout's `rust-toolchain.toml` selects the required Rust version.
+Install the native `rkat` CLI if you want to create or select model accounts
+through setup. A [release bundle](../scripts/distribution/README.md) includes it
+alongside all five Fugue executables.
 
-Fugue does not sandbox worker commands. Run it only on hosts where those tools
-and credentials are allowed.
-
-## 2. Create a native config
-
-```bash
-meerkat-fugue configure backend gcp-systemd \
-  --name live-gcp \
-  --gcp-project example-gcp-project \
-  --zone europe-west1-b \
-  --instance example-fugue-host \
-  --remote-user fugue \
-  --fugue-root /srv/fugue \
-  --bin-dir /srv/fugue/bin \
-  --flow-team implementation_mob=LUC \
-  --default
-
-meerkat-fugue /path/to/repo
+```sh
+git clone https://github.com/lukacf/meerkat-fugue.git
+cd meerkat-fugue
+cargo install --locked --path .
+meerkat-fugue serve --port 8788
 ```
 
-The backend profile records how Fugue deploys queues to the remote host. Passing
-a repository directory then infers `remote.origin.url`, creates or reuses the
-Linear project for the selected mob flow, generates native config and prompts,
-deploys them to the backend, installs/updates systemd, and starts the queue.
+Open [Fugue on this machine](http://127.0.0.1:8788/). For a hosted installation,
+use its authenticated HTTPS address instead. The service user's machine needs
+the repository's build tools and network access to GitHub/GHE, the tracker and
+the model provider. A credential alone does not establish that network access.
 
-For local-only config generation, use `meerkat-fugue stage`.
+Keep the service user's home directory and Fugue state on durable storage.
+Use `--state-dir /absolute/private/path` to choose another private state location.
+Fugue refuses to store managed credentials inside a Git checkout.
 
-Review:
+## 1. Connect the repository
 
-- `linear.project_slug`, `linear.team`, `linear.lanes`, and
-  `linear_projections` for your Linear workflow.
-- `selection.default_template` and any label-to-template routing.
-- `agents` and `mob_templates` for the mob shape you want.
-- `mcp_servers` for scoped Linear and GitHub access.
-- `workspace.root` for durable issue workspaces.
-- `hooks.after_create` and `hooks.before_run` to clone and sync the target
-  repository.
+Choose **Repositories > Add repository** and paste its HTTPS GitHub or GitHub
+Enterprise address, such as `https://github.com/example/service`.
+Fugue derives the host, owner and repository. Each added repository opens its own
+configuration screen.
 
-Keep secrets in environment variables:
+Choose how the service accesses GitHub:
 
-```yaml
-linear:
-  api_key: $LINEAR_API_KEY
-```
+- **GitHub CLI** uses `gh` authentication on the machine running Fugue. For GHE,
+  authenticate that exact hostname with `gh auth login --hostname git.example.com`.
+- **Token** stores the token privately for this repository connection.
 
-## 3. Use native defaults
+Save the connection, then **Check account access**. The authenticated account must
+be able to clone the repository and, for delivery, push a branch and open a PR.
+An existing checkout is an advanced option; its origin must match the selected
+repository. Fugue normally clones it for you.
 
-For `fugue.yaml`, omitting `backend` means native execution. Most new configs
-should not set either top-level `backend` or `mob.backend`.
+Expand **Commit author** to choose the name and email recorded on Fugue's
+commits. The default is `Meerkat Fugue <fugue@localhost>`, which identifies the
+automated author without borrowing a personal identity. To attribute commits to
+an account, enter its chosen commit email. Fugue configures each managed issue
+checkout; it does not change the machine's global Git identity.
 
-Use this only for migration or incident rollback:
+## 2. Choose the issue tracker
 
-```yaml
-```
+Use built-in tickets to try Fugue without a tracker account, or connect an
+existing Jira or Linear project.
 
-Do not disable native runtime while keeping native execution selected; Fugue
-rejects ambiguous backend mixtures before dispatch.
+### Fugue tickets
 
-## 4. Validate safely
+Choose **Fugue tickets**, then **Save tracker access**. There is no tracker token
+or external project to enter. Each repository gets its own queue. Repository
+access and an AI account are still needed to develop code.
 
-Run the non-destructive validation set:
+The default **Backlog** lane holds drafts; **Queue** starts work. **Review**
+requests review and **Merge** requests a guarded PR merge. Merging does not deploy
+your application. Existing saved status mappings are preserved; a merge-only
+board displays its action as Merge even if its underlying tracker status was
+previously named Deploy. Read the action shown in the issue editor before
+confirming it.
 
-```bash
-cargo fmt --check
-cargo test
-cargo run -- --help
-```
+After preparation, choose **New issue** on that repository's Board. Write the
+ticket in Backlog and move it to Queue when its acceptance criteria are ready.
+At completion, verify the merged PR and the ticket's Done state. These tickets
+stay in Fugue and are not synchronized to Jira or Linear; include them in the
+installation's [complete state backup](./operations.mdx).
 
-These commands are safe for routine development. They do not create live Linear
-issues, GitHub pull requests, or Meta sessions.
+### Jira
 
-## 5. Start Fugue
+For Jira, supply the site, account email and API token, then select the project
+key and issue type. Load its available statuses and map intake, active, review,
+merge and terminal work to the project's existing workflow. Fugue validates
+transitions; it does not alter a shared Jira workflow. A selective JQL filter
+isolates Fugue issues inside a larger project and is required in browser setup.
+For a filter such as `labels = "fugue-app"`, enter `fugue-app` in **Labels for new
+issues**. The Board applies these labels when creating Jira tickets, so they
+appear in this repository's queue. Separate multiple labels with commas.
+See [Jira and GitHub Enterprise](./jira-and-github-enterprise.mdx) for project
+scope, transition requirements and advanced configuration.
 
-```bash
-export LINEAR_API_KEY=lin_api_...
-RUST_LOG=meerkat_fugue=info cargo run -- ./fugue.yaml --port 0
-```
+### Linear
 
-Notes:
+For Linear, supply the API key and project/team selection. Ensure the selected
+account can read and update issues, comments and the configured workflow states.
+See the [configuration reference](./configuration.mdx) for exact fields.
 
-- Fugue starts queues from `./fugue.yaml` by default.
-- `--port 0` enables the loopback status server on a free port.
-- The default status bind address is `127.0.0.1`.
+### Merge policy
 
-## 6. Confirm the first run
+Keep **Allow merge when GitHub reports no CI checks** off unless you have made
+that decision for this repository. Missing checks are distinct from successful
+checks. Pending or failing checks still block a merge when the exception is on.
 
-After a native issue starts:
+## 3. Select model access
 
-1. Open `GET /api/v1/state` on the status server.
-2. Confirm the running row reports `backend: native_mob`.
-3. Confirm `native_recovery` is populated with Meta run, workspace, branch,
-   and handoff evidence as it becomes available.
-4. In Linear, confirm there is one `## Fugue Workpad` comment.
-5. If the issue requires code changes, confirm there is one PR for the issue
-   branch/head.
+AI authentication belongs to Meerkat. Select an existing rkat account, connect
+an API key, or use credentials already provided to the service environment.
+The default model follows the Meerkat recommendation used by this Fugue release.
 
-If evidence is missing or inconsistent, leave the issue in a review lane and
-follow [Troubleshooting](./troubleshooting.mdx).
+Connecting an API key sends it to native rkat authentication through stdin;
+Fugue stores the resulting binding reference. This updates rkat's default API-key
+account for that provider. Review the selected account before saving.
 
-## Related docs
+Browser OAuth support depends on the provider and native rkat. For Copilot or
+remote-host sign-in, complete `rkat auth login` in a terminal on the execution
+host, then refresh the account list. Your Fugue browser login grants operator
+access; it is separate from the model account used by agents.
 
-- [Configuration](./configuration.mdx)
-- [Operations](./operations.mdx)
+## 4. Prepare and start
+
+Save all three connections, check the workspace, then start Fugue. Preparation
+checks access and creates the checkout. Repository mapping then designs and
+reviews the specialist team and has its members study their domains. This uses
+model tokens and can take several minutes.
+
+Saving access stores that connection. Project selection, status mappings and
+other workflow edits are saved by **Check and prepare repository**. Keep setup
+open until you have submitted those edits for preparation.
+
+If a save finishes while you are still editing that connection, review and save
+the newer changes too. Preparation stays disabled until all connection edits
+are saved and the existing settings have loaded successfully. See
+[setup recovery](./troubleshooting.mdx#setup-will-not-prepare-or-start) if it
+remains unavailable.
+
+Watch preparation under **Repositories**. A ready team includes specialists for
+this repository, not only generic planner/coder/reviewer roles. Execution agents
+join the same native mob as those specialists. If preparation fails, read its
+reported cause, repair the connection or configuration and use the retry action.
+
+## 5. Run a small issue
+
+Open the repository's **Board** and create an issue with:
+
+1. A concrete result, such as adding a missing regression test and its fix.
+2. Acceptance criteria that can be checked locally.
+3. The relevant test command and any external resources the team may use.
+
+Put it in the configured intake lane. Follow its workpad and inspect the real
+agent conversations under **Agents**. Specialists keep domain knowledge and
+receive notifications when subscribed paths on the remote default branch change.
+
+Review the diff, test evidence and independent review before requesting the
+final PR gate. Use the configured merge action only when the gates are satisfied.
+Fugue rechecks the PR and policy at merge time. Verify the resulting merged PR
+and terminal issue state; a finished agent message alone is not delivery proof.
+
+## Continue from here
+
+- [Daily work](./daily-work.mdx): Home, Board, Agents, review and recovery.
+- [Repository teams](./ensemble.mdx): mapping, specialists, memory and subscriptions.
+- [Operations](./operations.mdx): durable state, upgrades and rollback.
+- [Configuration](./configuration.mdx): advanced YAML workflows and permissions.

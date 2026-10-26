@@ -1,7 +1,11 @@
 use std::process::Command;
 
 fn git(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
+    let output = Command::new("git")
+        .args(["-c", "core.fsmonitor=false"])
+        .args(args)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }

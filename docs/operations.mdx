@@ -1,191 +1,305 @@
-# Operator guide
+---
+title: "Operate and upgrade Fugue"
+description: "Host requirements, durable state, release verification, monitoring and recovery."
+---
 
-This guide is for people running Fugue against a real Linear queue. It focuses
-on safe setup, daily operation, monitoring, handoff evidence, incidents, and
-rollback.
+# Operate and upgrade Fugue
 
-## Operating model
+Use [daily work](./daily-work.mdx) for the operator UI. This guide is for the
+person responsible for the service host, access, data and release lifecycle.
 
-On each poll Fugue:
+## Prepare the host
 
-1. reads eligible Linear issues from configured project lanes;
-2. skips blocked, terminal, already running, claimed, or backing-off work;
-3. creates or reuses the issue workspace;
-4. runs configured setup/sync hooks;
-5. launches the selected native Meerkat mob template;
-6. reconciles Meta, workspace, Linear, and GitHub evidence.
+Run Fugue as a dedicated unprivileged user on a trusted host. Install Git,
+GitHub CLI, Node.js/npx and the repositories' required build tools. Make these
+available in the service PATH rather than relying on an interactive shell.
+The service user's home must persist because native rkat owns its account store.
 
-The service is intended for trusted automation hosts. It does not provide an OS
-sandbox.
+Install the five Fugue binaries together: `meerkat-fugue`, `fugue-linear-mcp`,
+`fugue-jira-mcp`, `fugue-github-mcp` and `fugue-host-mcp`. Mixed versions can expose
+incompatible tool schemas to agents. The [release bundle](../scripts/distribution/README.md)
+also pins rkat and records checksums and build identity.
 
-## Production setup checklist
+Before accepting a hosted installation, verify:
 
-- [ ] Create a dedicated Linear API key.
-- [ ] Confirm the Linear workflow has every state required by `linear.lanes`
-      and the selected `linear_projections`, or set
-      `linear.provisioning.mode: create_missing` with an explicit team.
-- [ ] Confirm workers have GitHub credentials for target repositories.
-- [ ] Install and smoke-test Meerkat/Meta native execution tooling.
-- [ ] Deploy `meerkat-fugue`, `fugue-linear-mcp`, `fugue-jira-mcp`, `fugue-github-mcp`,
-      and `fugue-host-mcp` together so the service and companion MCP tool
-      contracts stay in sync.
-      Install or restart all five binaries atomically; issue mob members use
-      the helper MCP binaries for Linear Workpad updates and GitHub PR/check/
-      merge evidence, so deploying only the service can leave stale member tool
-      behavior behind.
-- [ ] For GCP/systemd hosts with a persistent source checkout, use
-      `scripts/gcp-systemd/ota-update.sh` for one-command pull/build/replace/
-      restart updates from the host.
-- [ ] Record binary hash evidence for every Fugue binary in the issue-mob path:
-      `meerkat-fugue`, `fugue-linear-mcp`, `fugue-jira-mcp`, `fugue-github-mcp`, and
-      `fugue-host-mcp`.
-- [ ] Run `scripts/gcp-systemd/setup-host.sh` once on the remote host to create
-      the Fugue root, binary directory, shared secrets file, queue/workspace/log/
-      state roots, and auth hook.
-- [ ] Run `meerkat-fugue configure backend gcp-systemd ...` once locally to
-      record the reusable GCP/systemd deploy profile and flow-to-team mappings.
-- [ ] Run `meerkat-fugue /path/to/repo` to create/reuse the Linear queue,
-      generate native config and prompts, deploy them to the backend, install or
-      update systemd, start the queue, and print tunnel/status details.
-- [ ] Keep secrets in environment variables, not committed YAML.
-- [ ] Set `workspace.root` to durable storage with enough disk space.
-- [ ] Make `hooks.after_create` clone the intended repository.
-- [ ] Make `hooks.before_run` safely sync the checkout.
-- [ ] Review `prompts/fugue-worker.md` and your Linear handoff policy.
-- [ ] Run safe validation: `cargo fmt --check`, `cargo test`, and
-      `cargo run -- --help`.
+- Authenticated access to the exact repository and tracker from the execution
+  host. Laptop access does not prove host networking or credentials.
+- A private operator gateway with HTTPS, an explicit allowlist and live-stream
+  support. Keep Fugue's listener on loopback.
+- Persistent application state and service-user home, sufficient disk capacity,
+  and private backups stored away from the VM/disk being protected.
+- A small, authorized issue journey that reaches reviewed code, PR and merge.
+- Native conversations, topology, Memory and Work Graph, including after restart.
 
-## Starting Fugue
+Every admitted browser user is a full operator. Fugue does not provide per-user
+repository isolation or an OS sandbox for agent commands and repository hooks.
 
-```bash
-export LINEAR_API_KEY=lin_api_...
-RUST_LOG=meerkat_fugue=info cargo run -- ./fugue.yaml --port 0
+## Start the managed host
+
+```sh
+meerkat-fugue serve --state-dir /absolute/private/fugue-state --port 8788
 ```
 
-Use `--port 0` or `server.port: 0` to bind the status server to a free loopback
-port. Expose the status surface beyond loopback only with access controls. For a
-simple raw-IP setup, configure `server.meta_console.basic_auth` and protect
-the transport with HTTPS, an SSH/IAP tunnel, or a source-IP firewall rule.
+Configure a service manager to restart this process after failure and reboot.
+Use its dedicated account, persistent HOME and explicit PATH. Add repositories
+through the browser. Existing configured repositories resume when the host starts.
 
-## Monitoring
+Advanced workflow installations can instead run:
 
-Enable the status surface with `--port` or `server.port`.
-
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /` | Human dashboard. |
-| `GET /console` | Authenticated Meta console served by the Meta console router and embedded under Meerkat Fugue app chrome. |
-| `POST /console/rpc` | Authenticated Meta console JSON-RPC through the Meta console router. |
-| `GET /api/v1/state` | Full orchestrator snapshot as JSON. |
-| `GET /api/v1/{issue_identifier}` | Issue-scoped running row, events, and errors. |
-| `POST /api/v1/refresh` | Request an immediate poll. |
-| `POST /api/v1/ota-update` | Trigger configured authorized OTA fetch/staging-build/deploy flow. |
-
-Inspect these fields first:
-
-- `running[]` for executing issues, backend, policy owner, and workspace.
-- `retrying[]` for attempts waiting on retry backoff.
-- `last_errors` for hook, worker, timeout, or reconciliation failures.
-- `kapellmeister_shadow` when shadow recommendations are enabled.
-- `native_recovery.review_required` for evidence mismatches.
-
-Use `/console` only behind configured browser auth. Fugue serves configured
-Meta console assets unchanged and forwards console JSON-RPC to the configured
-Meta console service; it does not provide host-projected timeline, session
-history, roster, or send acknowledgement semantics. Those surfaces belong in
-Meta.
-
-## Native Meta stall heartbeat
-
-Native rows use a Meta status heartbeat at the stall boundary. If no new
-structural event appears before `meerkat.stall_timeout_ms`, Fugue asks Meta
-for run status before canceling. `pending`, `running`, or `waiting_for_input`
-records a `native_mob_status_heartbeat` event instead of canceling the run.
-
-
-## Handoff evidence
-
-Treat a run as green only when the Workpad and status evidence show:
-
-- Exactly one issue-specific Workpad exists for the current issue, with no
-  duplicate generic Fugue Workpad comment created during recovery or handoff.
-- Exactly one PR exists for the issue branch; duplicate PRs must be closed or
-  explicitly ruled out before completion.
-- CI/check evidence is branch-scoped to the issue branch or PR head instead of
-  copied from a stale SHA-only check result.
-- Final evidence records the PR URL, check conclusion, merge SHA, and Linear
-  `Done` handoff.
-- MCP servers expose protocol-compatible `inputSchema` descriptors.
-- Planner, coder, and reviewer profiles have the required `mcp:linear` and
-  `mcp:github` tools.
-- The planner publishes a specific checkbox plan.
-- Planner, coder, and reviewer members report lifecycle facts to the issue
-  lead. The issue lead owns per-issue `linear_move_issue` movement; Fugue
-  observes Linear and reports external lane drift to Kapellmeister/issue mobs.
-- The coder checks off implementation and validation items with concrete
-  evidence.
-- The reviewer records green or red findings and PR/no-PR evidence.
-- Member-facing MCP tools provide Workpad, PR, check, and merge evidence after
-  the deploy; do not treat service health alone as a production smoke pass.
-- Logs and the Meta console include native member launch, wiring, and review evidence.
-- Logs do not show repeated transport errors, empty MCP catalogs, missing state
-  arguments, stale active rows, retry loops, or recovery mismatches.
-
-## Common incidents
-
-### Hook failure
-
-1. Inspect the issue workspace under `workspace.root`.
-2. Re-run the failing hook manually from that directory.
-3. Fix `fugue.yaml`, repository access, or host credentials.
-4. Trigger `POST /api/v1/refresh` or wait for the next poll.
-
-### Worker or Meta failure
-
-1. Open the Linear Workpad and PR if one exists.
-2. Inspect `GET /api/v1/{issue_identifier}`.
-3. If durable evidence disagrees, leave the issue in the reviewer node's
-   projected lane, record the operator finding, and resolve manually.
-4. If transient, allow retry backoff to retry.
-
-During restart, a terminal Meta `Cancelled` event is only a recovery signal.
-Do not move the Linear issue to a canceled lane until Workpad, workspace,
-branch, PR, check, and merge evidence prove the work was intentionally
-abandoned. If an issue-specific Workpad heading such as `## LUC-123 Workpad`
-contains richer handoff evidence than `## Fugue Workpad`, preserve the richer
-comment and continue retry, review, or completion from that evidence. Verify
-recovery changes with a fresh issue that records PR, check, merge, and final
-handoff evidence.
-
-### Duplicate or missing PR evidence
-
-Choose the correct PR, update the Workpad, close duplicates if appropriate, and
-return the issue to the planner node's projected lane for focused rework or
-keep it in the reviewer node's projected lane until evidence is coherent.
-
-## Pause Or Park
-
-For production incidents, pause the systemd service or move affected issues into
-the configured non-active operator lane, then inspect `/api/v1/state`,
-Kapellmeister history, and Meta member timelines. Do not route production
-queues through another execution backend.
-
-Restart the service only after the incident is understood and the queue is safe to resume.
-
-## Real E2E warning
-
-The ignored real E2E suite creates live Linear projects/issues, GitHub
-repositories/PRs, and real Meerkat sessions. Run it only in an
-operator-approved disposable environment:
-
-```bash
-MEERKAT_FUGUE_REAL_E2E=1 \
-MEERKAT_FUGUE_E2E_POLICY_MODE=native_only \
-MEERKAT_FUGUE_E2E_KEEP_RESOURCES=1 \
-cargo test --test real_e2e -- --ignored --nocapture
+```sh
+meerkat-fugue /absolute/private/fugue.yaml --port 8788
 ```
 
-## Related docs
+Use a fixed port behind a gateway. A local diagnostic instance may use `--port 0`
+to select an available port. See the bundle guide for `FUGUE_PUBLIC_ORIGIN`, the
+private proxy capability and the optional same-origin logout path. Do not put
+those deployment-specific values or credentials in public configuration.
 
-- [Status Api](./status-api.mdx)
-- [Troubleshooting](./troubleshooting.mdx)
+## Preserve the right state
+
+Back up the application state, the service user's native rkat account store,
+workflow/connection configuration and issue workspaces. Keep release identity and
+service definitions with the backup so rollback can restore a matching pair.
+Stop the service or use an explicitly supported consistent snapshot mechanism;
+a copy of live SQLite files alone is not a proven consistent backup.
+
+Include `fugue-tracker-context.json` with each repository's native databases.
+It records the original tracker scope as a credential-free hash. Restore it with
+the matching workflow and state; do not generate a replacement binding from new
+tracker settings. A running workflow also refuses tracker identity changes
+through hot reload. See [tracker setup recovery](./troubleshooting.mdx#setup-will-not-prepare-or-start)
+for the supported options when changing configuration.
+
+Include `.fugue/host-signals.sqlite3` beside each repository workflow. It stores
+observed changes and saved notifications to the repository coordinator. Preserve
+it with the matching workflow and native runtime state, including when moving
+or restoring the service. It can contain private issue and repository content.
+
+Managed repositories keep uploaded files under their own state directory's
+`files/tracker-files/<scope-hash>` folder. Explicit workflow installations use
+`.fugue/tracker-files/<scope-hash>` beside the workflow. The scope includes the
+tracker kind, endpoint and project, so identical issue keys from separate
+trackers do not share files. Include these directories in your backup.
+Jira environment references use the same resolver for access and file scoping.
+Browser mutations require the scope embedded in the current page; after changing
+a repository's tracker, reload any already-open issue forms. Non-browser API
+clients can send `X-Fugue-Tracker-Scope` for the same stale-context protection.
+
+Older explicit workflows may have files under `.fugue/issue-attachments`, and
+older managed repositories may have unscoped files under `files`. Preserve those
+directories when upgrading. Fugue does not automatically read these locations:
+an administrator must verify each file's tracker, repository and issue ownership
+before restoring it into the corresponding scoped directory. Changing a
+repository's tracker must never expose the previous tracker's files.
+
+Treat backups as secrets. They may contain tokens, private repository code,
+transcripts, native memory and pending work. Restrict access and retention, then
+test restoring to an isolated host that cannot accidentally dispatch the same
+live queue.
+
+Keep the historical `mobkit-runtime` state-directory name when upgrading older
+installations. Renaming a package must not create an empty runtime state root.
+Legacy state from before the native storage layout needs a separate migration
+rehearsal; see [the stopped-state migration guide](./upgrading-0.9.4.mdx).
+Fresh installations do not need that migration. Older configuration changes are
+in [the 0.9.3 guide](./upgrading-0.9.3.mdx).
+
+## Upgrade and roll back
+
+1. Record the running build identity and save the exact release archive,
+   manifest/checksum and matching installer version.
+2. Finish or deliberately park sensitive work, especially a pending merge. Stop
+   Fugue and take a consistent state snapshot.
+3. Verify the candidate archive before executing its binaries. Install the full
+   bundle atomically; do not replace only the main service executable.
+4. Start the candidate and check the actual build served by the process, service
+   health, repository queues and native state.
+5. Verify login, streaming and restart behavior through the intended gateway.
+   Use a fresh issue in an authorized test scope for behavior that changed.
+6. If activation fails, stop the candidate and restore both the prior executable
+   release and its matching state snapshot and service definition. Then verify
+   the prior service has actually recovered.
+
+The public bundle installer recovers unfinished upgrades and atomically switches
+the active executable release. It does not stop your service or roll back
+application-state migrations for you. Deployment integrations may automate these
+steps; follow their verified recovery procedure.
+
+If the installer process is interrupted, rerun the same verified installation
+command before using the rollback selection. If activation did not finish, the
+installer restores the earlier rollback selection. If activation finished, it
+keeps the newly selected release and the release it replaced. Recovery happens
+before validating or executing the next candidate. See the
+[bundle recovery guide](../scripts/distribution/README.md#if-installation-stops)
+if recovery reports an error.
+
+If the installer rejects a candidate's manifest or checksum, obtain the verified
+archive and its matching checksum again, then retry. After any interrupted switch
+has been recovered, validation refusal preserves those release selections. If it reports invalid **existing**
+release files, inspect the current release and any retained copy of the bundle
+you are trying to install. Restore the damaged release from your verified backup,
+including regular files and executable permissions, before retrying the same
+archive. Downloading the archive again does not repair a damaged retained
+directory. Do not edit manifest fields or delete release links
+to bypass validation.
+
+Do not change a shared dependency pin merely because upstream merged a fix.
+Qualify the exact replacement source against the same persistence and E2E checks.
+An upstream release tag is not required to qualify an exact backport. Record the
+resolved dependencies from that candidate's lockfile, as described in the
+[bundle guide](../scripts/distribution/README.md#temporary-dependency-follow-up).
+
+## Monitor the right signals
+
+**Home** identifies attention lanes, retries and unavailable repositories.
+**Board** shows the actual tracker workflow. **Agents** uses the native Meta
+runtime for timelines, roster, sends, topology, Memory and Work Graph.
+
+The JSON APIs are described in [Status API](./status-api.mdx). On a managed host,
+queue APIs live under that repository's `/repositories/<id>/` prefix. They are
+not a single instance-wide issue namespace.
+
+Inspect `running`, `retrying`, errors and native recovery evidence. If a run
+appears quiet, inspect the native status before treating it as stopped. At the
+configured stall boundary, a native status heartbeat can establish that a run is
+still pending, running or waiting for input. A UI observation timeout does not
+establish that the process terminated.
+
+## Recover saved notifications
+
+Fugue saves coordinator notifications before sending them to Meerkat. It retries
+pending notifications at startup and during the service loop, including while
+new tracker reads are backing off. This applies to saved work; changes that have
+not yet been observed still require a successful tracker or repository poll.
+
+An admission timeout can mean that Meerkat accepted the input but Fugue did not
+receive the result. The retry keeps the same delivery key, so native admission
+can return the original receipt instead of adding a second input. Fugue marks
+the saved notification acknowledged only when the native receipt is `Admitted`.
+That means Meerkat has queued an input for the coordinator. It does not prove
+that the coordinator has processed it, finished the work or merged a PR. Fugue
+retains the full admission receipt and checks the native input separately, so
+an in-flight turn does not block newer notifications. Check the conversation,
+Work Graph and delivery evidence for the task outcome.
+
+If a graceful stop abandons a queued notification before any execution, Fugue
+can submit a replacement after native state proves it never ran. The replacement
+key and proof are saved together, so another restart cannot create another copy.
+Notifications already consumed, associated with a run, canceled, or affected by
+held-tail repair are not automatically resubmitted.
+
+**Host notification needs attention** means Fugue cannot safely establish a
+retry. For example, the admitted native input may be missing or its runtime may
+have been destroyed. Its receipt stays saved, and later notifications can still
+arrive. Preserve the workflow's `.fugue/host-signals.sqlite3`, the matching native
+runtime state and the service log for diagnosis. A missing input is not proof
+that its earlier work had no effect. Do not clear the journal or repeat the
+tracker action to manufacture progress.
+
+If logs report **host notification remains saved for retry**, inspect the
+associated runtime or storage error and restore that dependency. Leave the
+journal intact and allow the service to retry. A failure to save a notification
+is a different error: preserve the logs and verify the affected tracker action
+before repeating it, because an external mutation may already have succeeded.
+
+The journal belongs to one repository workflow, native runtime, coordinator and
+tracker scope. Editing the tracker site, project or Jira query must not redirect
+old pending work to another queue. A live routing-change error requires a managed
+restart with the intended configuration; an existing journal scope mismatch
+also requires restoring its matching configuration and state or using a separate
+repository workspace. Restart alone cannot make another queue's journal valid.
+Do not delete or edit the journal to bypass a scope or format error.
+
+## Validate delivery
+
+Use evidence for the exact issue and PR head:
+
+- One authoritative issue workpad with plan, progress, validation and handoff.
+- Exactly one PR exists for the issue branch. Verify its repository, base and current head.
+- Actual test outputs and independent review, including explicit failures or skips.
+- Required branch-scoped checks for the current PR head, with `no_checks` kept distinct
+  from successful checks. Record the actual merge SHA after merging.
+- A verified merge result and the configured terminal tracker projection.
+- Native member wiring, specialist consultation and matching change notifications.
+
+A tracker status or an agent's final message does not replace merge evidence.
+A green health endpoint does not prove that member tools can update Jira, create
+PRs or consult specialists.
+
+Run merges through the repository's configured Fugue host action. The standalone
+GitHub tool server cannot check repository review authority and does not offer
+merge. If a merge response is lost, inspect the PR and preserve its head and merge
+commit before retrying the same action. A deployment receipt in the Workpad is
+historical evidence; it does not bypass current review, CI or WorkGraph checks.
+
+If a new blocking obligation appears after the merge, Fugue keeps the confirmed
+merge/deployment evidence and refuses successful completion. A later rejected
+retry is recorded under **Deployment attempt** in the same Workpad, preserving
+the earlier **Deployment** result. Resolve the native obligation and retry the
+intended action. A missing native WorkGraph database is an error, including for
+merge-only repositories; restoring complete state is required before completion.
+The configured success and blocked statuses must differ.
+
+Each GitHub CLI command has a 60-second deadline and runs without interactive
+prompts. On Linux and macOS, Fugue terminates the command's process group and
+reaps the direct child before releasing review authority. A timeout is an
+uncertain result: the server may already have accepted a PR creation or merge.
+Inspect the remote PR before retrying; do not assume that timeout means failure.
+Output beyond the 16 MiB capture limit is also rejected as incomplete evidence.
+If the operating system reports that another waiter has already consumed the
+child, Fugue refuses cleanup using its old process ID. OTA commands use the same
+owned-process cleanup for deadlines and cancellation. Start persistent services
+through their service manager; shell helpers left in the command's process group
+are terminated when the command finishes.
+
+For repositories with OTA deployment configured, an unchanged retry returns the
+durable attempt result instead of running the deploy command again. The report
+includes `deployment_attempt`. If Fugue reports an uncertain attempt, inspect the
+service's installed revision and the command's effects before deciding to retry.
+Do not infer failure from a lost browser response.
+
+After inspection, an operator can ask the repository coordinator in **Agents**
+to retry the recorded attempt. Include the attempt ID, what you verified and
+explicit permission to run the deployment again. The coordinator must use a new
+request key and `retry_deployment` with `attempt_id` and `reason`. Repeating an
+ordinary Merge/Deploy action does not authorize another uncertain execution.
+The new request still has to pass review, PR, CI and WorkGraph checks.
+
+Back up `deployment-receipts.sqlite3` with the complete repository state. Do not
+delete a receipt or lock file to force recovery. Lock ownership belongs to the
+running process, and removing its pathname does not stop that process. A lock
+file left behind by a stopped process can be reused normally.
+
+## Recover from an incident
+
+First preserve the error, affected issue, runtime identity, workspace, PR and
+release. Stop the service if continuing could mutate the wrong work. Park issues
+in the configured non-active lane where appropriate.
+
+For a hook failure, inspect the failing command and repository workspace before
+rerunning it. Hooks may have side effects. Repair credentials, tools or the script
+and retry only the intended operation.
+
+For a native failure or `review_required` recovery state, compare runtime, branch,
+workpad and PR evidence. Resolve contradictions before requesting completion.
+A terminal Meta `Cancelled` event during restart is a recovery signal. It does not by itself prove the human
+abandoned the issue. Preserve the most evidence-rich issue-specific workpad
+(such as `## LUC-123 Workpad`) when duplicate or legacy comments exist. Never
+replace durable PR, check, merge and handoff evidence with a new placeholder.
+See [the native Workpad contract](./native-mobs.mdx#workpad-handoff-contract).
+
+Do not run a second service against the same state directory or live queue as a
+recovery shortcut. Do not force a tracker lane to manufacture successful runtime
+completion. Use [troubleshooting](./troubleshooting.mdx) for focused checks.
+
+## Live acceptance and cleanup
+
+The default test suite uses fixtures. Ignored live E2E tests create real external
+resources and use model tokens. Select an explicitly authorized disposable
+repository and tracker scope, record every created resource and clean up only
+those resources after retaining the acceptance evidence.
+
+A complete release record includes the public commit/tree, bundle checksums,
+installer revision, execution-host identity, issue/PR/check/merge evidence and
+recovery results. Keep private organization-specific records with the deployment
+integration, outside the public Fugue repository.

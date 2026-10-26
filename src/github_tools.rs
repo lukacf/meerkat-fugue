@@ -1,5 +1,10 @@
+use crate::process;
+
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+
+#[cfg(test)]
+pub(crate) use tests::scripted_host;
 
 use crate::tools::{
     BranchName, CheckCiInput, CheckCiOutput, CiStatus, CreatePrInput, CreatePrOutput,
@@ -18,6 +23,14 @@ pub struct GitHubToolHost {
 impl GitHubToolHost {
     pub fn new() -> Self {
         Self { gh: GhCli::new() }
+    }
+
+    pub fn with_connections(
+        connections: Option<std::sync::Arc<crate::setup::connections::Connections>>,
+    ) -> Self {
+        Self {
+            gh: GhCli::with_runner(Box::new(ProcessCommandRunner { connections })),
+        }
     }
 
     #[cfg(test)]
@@ -77,41 +90,98 @@ impl GitHubToolHost {
         })
     }
 
+    /// Read all CI pages, requiring the same PR head and commit on each page. A
+    /// later branch lookup must not substitute checks for a newer candidate.
+    pub fn check_pr_ci(&self, pull_request: &GitHubPullRequestSnapshot) -> FugueToolResult {
+        run_tool(FugueToolOperation::GitHubCheckCi, None, || {
+            let checks = self.gh.check_pr_ci(pull_request)?;
+            Ok(FugueToolOutput::GitHubCheckCi(CheckCiOutput {
+                status: aggregate_ci_status(&checks),
+                checks,
+            }))
+        })
+    }
+
     pub fn merge_pr(&self, input: MergePrInput) -> FugueToolResult {
+        crate::merge_gate::missing_context(input)
+    }
+
+    pub(crate) fn merge_authorized(
+        &self,
+        authorization: crate::merge_gate::AuthorizedMerge,
+    ) -> FugueToolResult {
+        let (mut input, expected_base) = authorization.into_parts();
         let operation = FugueToolOperation::GitHubMergePr;
         let idempotency_key = input.idempotency_key.clone();
         run_tool(operation, Some(idempotency_key), || {
+            let expected = input
+                .expected_head_sha
+                .as_ref()
+                .filter(|sha| !sha.0.trim().is_empty())
+                .ok_or_else(|| {
+                    GitHubToolFailure::new(
+                        FugueToolErrorCode::PreconditionFailed,
+                        "merge requires an explicit expected_head_sha",
+                        RetryAdvice::RefreshStateThenRetry,
+                    )
+                })?;
             let current = self.gh.resolve_pr(&input.repo, &input.pull_request)?;
-            if current.state == PullRequestState::Merged {
-                let merge_commit_sha = self.gh.merge_commit_sha(&input.repo, current.number)?;
-                return Ok(FugueToolOutput::GitHubMergePr(MergePrOutput {
-                    pull_request: current,
-                    merged: false,
-                    merge_commit_sha,
-                }));
-            }
-            if current.state != PullRequestState::Open {
-                return Err(GitHubToolFailure::new(
-                    FugueToolErrorCode::PreconditionFailed,
-                    format!("pull request is not open: {:?}", current.state),
-                    RetryAdvice::RefreshStateThenRetry,
-                ));
-            }
-            if let Some(expected) = &input.expected_head_sha
-                && current.head_sha != *expected
-            {
+            if current.head_sha != *expected {
                 return Err(GitHubToolFailure::new(
                     FugueToolErrorCode::PreconditionFailed,
                     "pull request head sha did not match expected_head_sha",
                     RetryAdvice::RefreshStateThenRetry,
                 ));
             }
-            self.gh.merge_pr(&input)?;
-            let pull_request = self.gh.resolve_pr(&input.repo, &input.pull_request)?;
+            if current.base_branch != expected_base {
+                return Err(GitHubToolFailure::new(
+                    FugueToolErrorCode::PreconditionFailed,
+                    "pull request base branch no longer matches the reviewed candidate",
+                    RetryAdvice::RefreshStateThenRetry,
+                ));
+            }
+            // Bind branch selectors to the PR number observed before mutation.
+            input.pull_request = GitHubPullRequestRef::Number {
+                number: current.number,
+            };
+            let newly_merged = current.state != PullRequestState::Merged;
+            let pull_request = if newly_merged {
+                if current.state != PullRequestState::Open || current.draft {
+                    return Err(GitHubToolFailure::new(
+                        FugueToolErrorCode::PreconditionFailed,
+                        "pull request must be open and ready for review",
+                        RetryAdvice::RefreshStateThenRetry,
+                    ));
+                }
+                self.gh.merge_pr(&input)?;
+                self.gh.resolve_pr(&input.repo, &input.pull_request)?
+            } else {
+                current
+            };
+            if pull_request.state != PullRequestState::Merged
+                || pull_request.head_sha != *expected
+                || pull_request.base_branch != expected_base
+            {
+                return Err(GitHubToolFailure::new(
+                    FugueToolErrorCode::PreconditionFailed,
+                    "GitHub has not confirmed a merge of the expected PR head; refresh before retrying",
+                    RetryAdvice::RefreshStateThenRetry,
+                ));
+            }
             let merge_commit_sha = self.gh.merge_commit_sha(&input.repo, pull_request.number)?;
+            if merge_commit_sha
+                .as_ref()
+                .is_none_or(|sha| sha.0.trim().is_empty())
+            {
+                return Err(GitHubToolFailure::new(
+                    FugueToolErrorCode::PreconditionFailed,
+                    "GitHub has not returned the merge commit; refresh before retrying",
+                    RetryAdvice::RefreshStateThenRetry,
+                ));
+            }
             Ok(FugueToolOutput::GitHubMergePr(MergePrOutput {
                 pull_request,
-                merged: true,
+                merged: newly_merged,
                 merge_commit_sha,
             }))
         })
@@ -210,7 +280,9 @@ impl GitHubToolFailure {
 }
 
 fn aggregate_ci_status(checks: &[GitHubCheckSnapshot]) -> CiStatus {
-    if checks.is_empty() || checks.iter().any(|check| check.status == CiStatus::Pending) {
+    if checks.is_empty() {
+        CiStatus::NoChecks
+    } else if checks.iter().any(|check| check.status == CiStatus::Pending) {
         CiStatus::Pending
     } else if checks
         .iter()
@@ -221,7 +293,7 @@ fn aggregate_ci_status(checks: &[GitHubCheckSnapshot]) -> CiStatus {
         CiStatus::Skipped
     } else if checks
         .iter()
-        .all(|check| check.status == CiStatus::Cancelled)
+        .any(|check| check.status == CiStatus::Cancelled)
     {
         CiStatus::Cancelled
     } else {
@@ -236,7 +308,7 @@ struct GhCli {
 
 impl GhCli {
     fn new() -> Self {
-        Self::with_runner(Box::new(ProcessCommandRunner))
+        Self::with_runner(Box::new(ProcessCommandRunner::default()))
     }
 
     fn with_runner(runner: Box<dyn CommandRunner>) -> Self {
@@ -411,6 +483,95 @@ impl GhCli {
             .collect())
     }
 
+    fn check_pr_ci(
+        &self,
+        pull_request: &GitHubPullRequestSnapshot,
+    ) -> GitHubToolResult<Vec<GitHubCheckSnapshot>> {
+        if pull_request.number.0 == 0 || pull_request.head_sha.0.trim().is_empty() {
+            return Err(GitHubToolFailure::new(
+                FugueToolErrorCode::InvalidInput,
+                "PR checks require a pull request number and expected head SHA",
+                RetryAdvice::DoNotRetry,
+            ));
+        }
+        let mut cursor = None;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut checks = Vec::new();
+        // The CLI's pr-view export drops pagination metadata. Read the native
+        // connection so a failing check after the first page cannot be omitted.
+        for _ in 0..100 {
+            let mut args = vec![
+                "api".to_owned(),
+                "graphql".to_owned(),
+                "--hostname".to_owned(),
+                pull_request.repo.hostname().to_owned(),
+                "-f".to_owned(),
+                format!("query={PR_CI_QUERY}"),
+                "-f".to_owned(),
+                format!("owner={}", pull_request.repo.owner.0),
+                "-f".to_owned(),
+                format!("name={}", pull_request.repo.name.0),
+                "-F".to_owned(),
+                format!("number={}", pull_request.number.0),
+            ];
+            if let Some(cursor) = &cursor {
+                args.extend(["-f".to_owned(), format!("cursor={cursor}")]);
+            }
+            let output = self
+                .runner
+                .run(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+            let response: PrCiResponse = decode(&output.stdout)?;
+            if !response.errors.is_empty() {
+                return Err(ci_read_refusal("GitHub returned incomplete CI data"));
+            }
+            let pr = response.data.repository.pull_request;
+            if pr.head_ref_oid != pull_request.head_sha.0 || pr.commits.nodes.len() != 1 {
+                return Err(ci_read_refusal(
+                    "pull request head changed or its latest commit is unavailable; refresh the candidate before retrying",
+                ));
+            }
+            let Some(node) = pr.commits.nodes.into_iter().next() else {
+                return Err(ci_read_refusal("the latest PR commit is unavailable"));
+            };
+            if node.commit.oid != pull_request.head_sha.0 {
+                return Err(ci_read_refusal(
+                    "CI belongs to a different PR commit; refresh before retrying",
+                ));
+            }
+            let Some(rollup) = node.commit.status_check_rollup else {
+                if cursor.is_some() {
+                    return Err(ci_read_refusal(
+                        "CI disappeared during pagination; refresh before retrying",
+                    ));
+                }
+                return Ok(checks);
+            };
+            checks.extend(
+                rollup
+                    .contexts
+                    .nodes
+                    .into_iter()
+                    .map(fallback_check_snapshot),
+            );
+            if !rollup.contexts.page_info.has_next_page {
+                return Ok(checks);
+            }
+            let next = rollup
+                .contexts
+                .page_info
+                .end_cursor
+                .filter(|cursor| !cursor.trim().is_empty())
+                .ok_or_else(|| ci_read_refusal("GitHub omitted the next CI page cursor"))?;
+            if !seen.insert(next.clone()) {
+                return Err(ci_read_refusal("GitHub repeated a CI page cursor"));
+            }
+            cursor = Some(next);
+        }
+        Err(ci_read_refusal(
+            "CI pagination exceeded its bounded read limit",
+        ))
+    }
+
     fn merge_pr(&self, input: &MergePrInput) -> GitHubToolResult<()> {
         let number = match &input.pull_request {
             GitHubPullRequestRef::Number { number } => *number,
@@ -489,26 +650,45 @@ pub struct CommandOutput {
     pub stderr: String,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ProcessCommandRunner;
+#[derive(Debug, Clone, Default)]
+struct ProcessCommandRunner {
+    connections: Option<std::sync::Arc<crate::setup::connections::Connections>>,
+}
 
 impl CommandRunner for ProcessCommandRunner {
     fn run(&self, args: &[&str]) -> GitHubToolResult<CommandOutput> {
-        let output = std::process::Command::new("gh")
-            .env("GH_HOST", "github.com")
-            .args(args)
-            .output()
-            .map_err(|err| {
-                GitHubToolFailure::new(
-                    FugueToolErrorCode::BackendUnavailable,
-                    format!("failed to execute gh: {err}"),
-                    RetryAdvice::SafeToRetry,
-                )
-            })?;
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        command_output(args, output.status.code(), stdout, stderr)
+        let mut command = std::process::Command::new("gh");
+        if let Some(connections) = &self.connections {
+            command.envs(connections.github_environment());
+        }
+        command.env("GH_HOST", "github.com").args(args);
+        execute_gh_command(command, args, std::time::Duration::from_secs(60))
     }
+}
+
+fn execute_gh_command(
+    command: std::process::Command,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> GitHubToolResult<CommandOutput> {
+    let output = process::run(command, timeout).map_err(|error| {
+        let retry = if error.may_have_executed() {
+            RetryAdvice::RefreshStateThenRetry
+        } else {
+            RetryAdvice::SafeToRetry
+        };
+        GitHubToolFailure::new(
+            FugueToolErrorCode::BackendUnavailable,
+            format!("gh command failed: {error}"),
+            retry,
+        )
+    })?;
+    command_output(
+        args,
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
 }
 
 fn command_output(
@@ -666,42 +846,179 @@ fn check_snapshot(payload: CheckView) -> GitHubCheckSnapshot {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PrChecksView {
-    #[serde(default)]
+    // Explicit null is an empty rollup. An absent field or invalid element is
+    // not evidence of NoChecks and must not activate the no-CI exception.
+    #[serde(deserialize_with = "deserialize_check_rollup")]
     status_check_rollup: Vec<StatusCheckRollupView>,
 }
 
-#[derive(Debug, Deserialize)]
+// Every page repeats both the PR head and latest commit identity. These are
+// compared with the reviewed candidate before any check can be accepted.
+const PR_CI_QUERY: &str = r#"query($owner:String!, $name:String!, $number:Int!, $cursor:String) {
+  repository(owner:$owner, name:$name) {
+    pullRequest(number:$number) {
+      headRefOid
+      commits(last:1) { nodes { commit {
+        oid
+        statusCheckRollup { contexts(first:100, after:$cursor) {
+          nodes {
+            __typename
+            ... on CheckRun { name status conclusion detailsUrl completedAt }
+            ... on StatusContext { context state targetUrl }
+          }
+          pageInfo { hasNextPage endCursor }
+        } }
+      } } }
+    }
+  }
+}"#;
+
+#[derive(Deserialize)]
+struct PrCiResponse {
+    data: PrCiData,
+    #[serde(default)]
+    errors: Vec<PrCiError>,
+}
+
+#[derive(Deserialize)]
+struct PrCiError {
+    // Decode the boundary but never echo arbitrary provider diagnostics.
+    #[serde(rename = "message")]
+    _message: String,
+}
+
+#[derive(Deserialize)]
+struct PrCiData {
+    repository: PrCiRepository,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StatusCheckRollupView {
-    name: Option<String>,
-    workflow_name: Option<String>,
-    status: Option<String>,
-    conclusion: Option<String>,
-    details_url: Option<String>,
-    completed_at: Option<DateTime<Utc>>,
+struct PrCiRepository {
+    pull_request: PrCiPullRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrCiPullRequest {
+    head_ref_oid: String,
+    commits: PrCiCommits,
+}
+
+#[derive(Deserialize)]
+struct PrCiCommits {
+    nodes: Vec<PrCiCommitNode>,
+}
+
+#[derive(Deserialize)]
+struct PrCiCommitNode {
+    commit: PrCiCommit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrCiCommit {
+    oid: String,
+    #[serde(deserialize_with = "required_nullable")]
+    status_check_rollup: Option<PrCiRollup>,
+}
+
+#[derive(Deserialize)]
+struct PrCiRollup {
+    contexts: PrCiContexts,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrCiContexts {
+    nodes: Vec<StatusCheckRollupView>,
+    page_info: PrCiPageInfo,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrCiPageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+fn required_nullable<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    Option::<T>::deserialize(deserializer)
+}
+
+fn ci_read_refusal(message: &str) -> GitHubToolFailure {
+    GitHubToolFailure::new(
+        FugueToolErrorCode::PreconditionFailed,
+        message,
+        RetryAdvice::RefreshStateThenRetry,
+    )
+}
+
+fn deserialize_check_rollup<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<StatusCheckRollupView>, D::Error> {
+    Option::<Vec<StatusCheckRollupView>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "__typename")]
+enum StatusCheckRollupView {
+    #[serde(rename_all = "camelCase")]
+    CheckRun {
+        name: String,
+        status: String,
+        conclusion: Option<String>,
+        details_url: Option<String>,
+        completed_at: Option<DateTime<Utc>>,
+    },
+    #[serde(rename_all = "camelCase")]
+    StatusContext {
+        context: String,
+        state: String,
+        target_url: Option<String>,
+    },
 }
 
 fn fallback_check_snapshot(payload: StatusCheckRollupView) -> GitHubCheckSnapshot {
-    let state = payload
-        .conclusion
-        .as_deref()
-        .or(payload.status.as_deref())
-        .unwrap_or("PENDING");
-    GitHubCheckSnapshot {
-        name: payload
-            .name
-            .or(payload.workflow_name)
-            .unwrap_or_else(|| "status check".to_string()),
-        status: check_status(state),
-        details_url: payload.details_url,
-        completed_at: payload.completed_at,
+    match payload {
+        StatusCheckRollupView::CheckRun {
+            name,
+            status,
+            conclusion,
+            details_url,
+            completed_at,
+        } => {
+            let state = if status == "COMPLETED" {
+                conclusion.as_deref().unwrap_or("PENDING")
+            } else {
+                "PENDING"
+            };
+            GitHubCheckSnapshot {
+                name,
+                status: check_status(state),
+                details_url,
+                completed_at,
+            }
+        }
+        StatusCheckRollupView::StatusContext {
+            context,
+            state,
+            target_url,
+        } => GitHubCheckSnapshot {
+            name: context,
+            status: check_status(&state),
+            details_url: target_url,
+            completed_at: None,
+        },
     }
 }
 
 fn check_status(state: &str) -> CiStatus {
     match state.to_ascii_uppercase().as_str() {
         "SUCCESS" | "PASSED" | "NEUTRAL" => CiStatus::Success,
-        "FAILURE" | "FAILED" | "TIMED_OUT" => CiStatus::Failure,
+        "FAILURE" | "FAILED" | "TIMED_OUT" | "STARTUP_FAILURE" | "STALE" => CiStatus::Failure,
         "ERROR" | "ACTION_REQUIRED" => CiStatus::Error,
         "SKIPPED" => CiStatus::Skipped,
         "CANCELLED" | "CANCELED" => CiStatus::Cancelled,
@@ -737,6 +1054,23 @@ mod tests {
     use super::*;
     use crate::tools::{GitHubOwner, GitHubRepoName, IdempotencyKey};
     use std::sync::{Arc, Mutex};
+
+    #[cfg(unix)]
+    #[test]
+    fn process_command_timeout_requires_refresh_after_uncertain_effect() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 1; printf '{}'"]);
+        let started = std::time::Instant::now();
+        let result = execute_gh_command(
+            command,
+            &["pr", "merge"],
+            std::time::Duration::from_millis(150),
+        );
+        let error = result.expect_err("a stalled merge must not hold current review forever");
+        assert_eq!(error.retry, RetryAdvice::RefreshStateThenRetry);
+        assert!(error.message.contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_millis(850));
+    }
 
     #[derive(Clone, Default)]
     struct FakeRunner {
@@ -788,6 +1122,24 @@ mod tests {
                 })?
                 .remove(0)
         }
+    }
+
+    pub(crate) fn scripted_host(
+        responses: Vec<String>,
+    ) -> (GitHubToolHost, impl Fn() -> Vec<Vec<String>>) {
+        let runner = FakeRunner::with_outputs(
+            responses
+                .into_iter()
+                .map(|stdout| CommandOutput {
+                    stdout,
+                    stderr: String::new(),
+                })
+                .collect(),
+        );
+        (
+            GitHubToolHost::with_runner(Box::new(runner.clone())),
+            move || runner.calls(),
+        )
     }
 
     fn repo() -> GitHubRepoRef {
@@ -973,6 +1325,184 @@ mod tests {
         assert!(calls[1].contains(&"--draft".to_string()));
     }
 
+    fn merge_adapter_fixture(host: &GitHubToolHost, input: MergePrInput) -> FugueToolResult {
+        host.merge_authorized(crate::merge_gate::AuthorizedMerge::for_adapter_fixture(
+            input,
+        ))
+    }
+
+    #[test]
+    fn unscoped_merge_refuses_before_any_forge_operation() {
+        let runner = FakeRunner::with_outputs(vec![output("{}")]);
+        let host = GitHubToolHost::with_runner(Box::new(runner.clone()));
+        let result = host.merge_pr(MergePrInput {
+            repo: repo(),
+            pull_request: GitHubPullRequestRef::Number {
+                number: GitHubPullRequestNumber(11),
+            },
+            method: MergeMethod::Squash,
+            expected_head_sha: Some(GitSha("a".repeat(40))),
+            idempotency_key: IdempotencyKey("unscoped-merge".into()),
+        });
+        assert!(matches!(result, FugueToolResult::Err { .. }));
+        assert!(
+            runner.calls().is_empty(),
+            "unscoped merge must use the Fugue runtime gate"
+        );
+    }
+
+    #[test]
+    fn merge_pr_refuses_missing_head_changed_head_and_draft_before_mutation() {
+        for (expected, draft) in [
+            (None, false),
+            (Some("other"), false),
+            (Some("abc123"), true),
+        ] {
+            let pr = serde_json::json!({"number":11, "title":"Change", "url":"https://github.com/example/app/pull/11",
+                "state":"OPEN", "isDraft":draft, "headRefName":"feature", "baseRefName":"main", "headRefOid":"abc123"}).to_string();
+            let runner = FakeRunner::with_outputs(vec![output(&pr)]);
+            let host = GitHubToolHost::with_runner(Box::new(runner.clone()));
+            let result = merge_adapter_fixture(
+                &host,
+                MergePrInput {
+                    repo: repo(),
+                    pull_request: GitHubPullRequestRef::Number {
+                        number: GitHubPullRequestNumber(11),
+                    },
+                    method: MergeMethod::Squash,
+                    expected_head_sha: expected.map(|sha| GitSha(sha.into())),
+                    idempotency_key: IdempotencyKey("merge:11".into()),
+                },
+            );
+            assert!(matches!(result, FugueToolResult::Err { .. }), "{result:?}");
+            assert!(
+                !runner
+                    .calls()
+                    .iter()
+                    .any(|args| args.get(1).is_some_and(|arg| arg == "merge"))
+            );
+        }
+    }
+
+    #[test]
+    fn merge_pr_refuses_newly_observed_base_drift() {
+        let pr = serde_json::json!({"number":11, "title":"Change", "url":"https://github.com/example/app/pull/11",
+            "state":"OPEN", "isDraft":false, "headRefName":"feature", "baseRefName":"release", "headRefOid":"abc123"});
+        let runner = FakeRunner::with_outputs(vec![output(&pr.to_string())]);
+        let host = GitHubToolHost::with_runner(Box::new(runner.clone()));
+        let result = merge_adapter_fixture(
+            &host,
+            MergePrInput {
+                repo: repo(),
+                pull_request: GitHubPullRequestRef::Number {
+                    number: GitHubPullRequestNumber(11),
+                },
+                method: MergeMethod::Squash,
+                expected_head_sha: Some(GitSha("abc123".into())),
+                idempotency_key: IdempotencyKey("base-drift".into()),
+            },
+        );
+        assert!(matches!(result, FugueToolResult::Err { .. }));
+        assert!(
+            !runner
+                .calls()
+                .iter()
+                .any(|args| args.get(1).is_some_and(|arg| arg == "merge")),
+            "a retargeted PR must not reach the forge merge command"
+        );
+    }
+
+    #[test]
+    fn merge_pr_zero_exit_requires_confirmed_merged_state_head_and_commit() {
+        let open = serde_json::json!({"number":11, "title":"Change", "url":"https://github.com/example/app/pull/11",
+            "state":"OPEN", "isDraft":false, "headRefName":"feature", "baseRefName":"main", "headRefOid":"abc123"});
+        for scenario in ["queued", "changed_head", "missing_commit"] {
+            let mut observed = open.clone();
+            if scenario != "queued" {
+                observed["state"] = "MERGED".into();
+            }
+            if scenario == "changed_head" {
+                observed["headRefOid"] = "other".into();
+            }
+            let runner = FakeRunner::with_outputs(vec![
+                output(&open.to_string()),
+                output(""),
+                output(&observed.to_string()),
+                output(r#"{"mergeCommit":null}"#),
+            ]);
+            let host = GitHubToolHost::with_runner(Box::new(runner.clone()));
+            let result = merge_adapter_fixture(
+                &host,
+                MergePrInput {
+                    repo: repo(),
+                    pull_request: GitHubPullRequestRef::Number {
+                        number: GitHubPullRequestNumber(11),
+                    },
+                    method: MergeMethod::Squash,
+                    expected_head_sha: Some(GitSha("abc123".into())),
+                    idempotency_key: IdempotencyKey("merge:11".into()),
+                },
+            );
+            assert!(
+                matches!(result, FugueToolResult::Err { .. }),
+                "must not report {scenario} as merged: {result:?}"
+            );
+            assert_eq!(
+                runner
+                    .calls()
+                    .iter()
+                    .filter(|args| args.get(1).is_some_and(|arg| arg == "merge"))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn merge_pr_retry_confirms_commit_without_repeating_mutation() {
+        let merged = r#"{"number":11,"title":"Change","url":"https://github.com/example/app/pull/11","state":"MERGED","isDraft":false,"headRefName":"feature","baseRefName":"main","headRefOid":"abc123"}"#;
+        for commit in [
+            r#"{"mergeCommit":{"oid":"merge456"}}"#,
+            r#"{"mergeCommit":null}"#,
+        ] {
+            let runner = FakeRunner::with_outputs(vec![output(merged), output(commit)]);
+            let host = GitHubToolHost::with_runner(Box::new(runner.clone()));
+            let result = merge_adapter_fixture(
+                &host,
+                MergePrInput {
+                    repo: repo(),
+                    pull_request: GitHubPullRequestRef::Number {
+                        number: GitHubPullRequestNumber(11),
+                    },
+                    method: MergeMethod::Squash,
+                    expected_head_sha: Some(GitSha("abc123".into())),
+                    idempotency_key: IdempotencyKey("merge:11".into()),
+                },
+            );
+            if commit.contains("merge456") {
+                assert!(matches!(
+                    result,
+                    FugueToolResult::Ok {
+                        output: FugueToolOutput::GitHubMergePr(MergePrOutput {
+                            merged: false,
+                            merge_commit_sha: Some(_),
+                            ..
+                        }),
+                        ..
+                    }
+                ));
+            } else {
+                assert!(matches!(result, FugueToolResult::Err { .. }));
+            }
+            assert!(
+                !runner
+                    .calls()
+                    .iter()
+                    .any(|args| args.get(1).is_some_and(|arg| arg == "merge"))
+            );
+        }
+    }
+
     #[test]
     fn merge_pr_checks_head_sha_before_merge_command() {
         let open_pr = r#"{"number":11,"title":"Stage 2D","url":"https://github.com/lukacf/meerkat-fugue/pull/11","state":"OPEN","isDraft":false,"headRefName":"branch","baseRefName":"main","headRefOid":"abc123"}"#;
@@ -986,15 +1516,18 @@ mod tests {
         ]);
         let host = GitHubToolHost::with_runner(Box::new(runner.clone()));
 
-        let result = host.merge_pr(MergePrInput {
-            repo: repo(),
-            pull_request: GitHubPullRequestRef::Number {
-                number: GitHubPullRequestNumber(11),
+        let result = merge_adapter_fixture(
+            &host,
+            MergePrInput {
+                repo: repo(),
+                pull_request: GitHubPullRequestRef::Number {
+                    number: GitHubPullRequestNumber(11),
+                },
+                method: MergeMethod::Squash,
+                expected_head_sha: Some(GitSha("abc123".to_string())),
+                idempotency_key: IdempotencyKey("merge:11".to_string()),
             },
-            method: MergeMethod::Squash,
-            expected_head_sha: Some(GitSha("abc123".to_string())),
-            idempotency_key: IdempotencyKey("merge:11".to_string()),
-        });
+        );
 
         match result {
             FugueToolResult::Ok {
@@ -1021,6 +1554,324 @@ mod tests {
                 "abc123".to_string(),
             ]
         );
+    }
+
+    fn ci_candidate() -> GitHubPullRequestSnapshot {
+        GitHubPullRequestSnapshot {
+            repo: serde_json::from_value(
+                serde_json::json!({"host":"github.example.test","owner":"example","name":"app"}),
+            )
+            .unwrap(),
+            number: GitHubPullRequestNumber(11),
+            title: "Change".into(),
+            url: "https://github.example.test/example/app/pull/11".into(),
+            state: PullRequestState::Open,
+            draft: false,
+            head_branch: BranchName("reused-branch".into()),
+            base_branch: BranchName("main".into()),
+            head_sha: GitSha("a".repeat(40)),
+        }
+    }
+
+    fn ci_graph_page(
+        head: &str,
+        checks: serde_json::Value,
+        more: bool,
+        cursor: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({"data":{"repository":{"pullRequest":{
+            "headRefOid":head, "commits":{"nodes":[{"commit":{
+                "oid":head,"statusCheckRollup":{"contexts":{
+                    "nodes":checks,"pageInfo":{"hasNextPage":more,"endCursor":cursor}
+                }}
+            }}]}
+        }}}})
+    }
+
+    #[test]
+    fn check_pr_ci_binds_every_page_to_exact_head_and_numeric_pr() {
+        let candidate = ci_candidate();
+        let first = ci_graph_page(
+            &candidate.head_sha.0,
+            serde_json::json!([{
+                "__typename":"CheckRun", "name":"unit", "status":"COMPLETED", "conclusion":"SUCCESS"
+            }]),
+            true,
+            Some("next-page"),
+        );
+        for head in ["a".repeat(40), "b".repeat(40)] {
+            let second = ci_graph_page(
+                &head,
+                serde_json::json!([{
+                    "__typename":"StatusContext", "context":"external-build", "state":"FAILURE", "targetUrl":"https://ci.example.test/build/11"
+                }]),
+                false,
+                None,
+            );
+            let runner = FakeRunner::with_outputs(vec![
+                output(&first.to_string()),
+                output(&second.to_string()),
+            ]);
+            let host = GitHubToolHost::with_runner(Box::new(runner.clone()));
+            let result = host.check_pr_ci(&candidate);
+            if head == candidate.head_sha.0 {
+                match result {
+                    FugueToolResult::Ok {
+                        output: FugueToolOutput::GitHubCheckCi(result),
+                        ..
+                    } => {
+                        assert_eq!(result.status, CiStatus::Failure);
+                        assert_eq!(result.checks.len(), 2);
+                        assert_eq!(result.checks[1].name, "external-build");
+                    }
+                    other => panic!("unexpected result: {other:?}"),
+                }
+            } else {
+                assert!(matches!(
+                    result,
+                    FugueToolResult::Err {
+                        error: FugueToolError {
+                            code: FugueToolErrorCode::PreconditionFailed,
+                            retry: RetryAdvice::RefreshStateThenRetry,
+                            ..
+                        },
+                        ..
+                    }
+                ));
+            }
+            let calls = runner.calls();
+            for call in &calls {
+                assert_eq!(
+                    call[0..4],
+                    ["api", "graphql", "--hostname", "github.example.test"]
+                );
+                assert!(call.contains(&"number=11".to_owned()));
+                assert!(call.contains(&"owner=example".to_owned()));
+                assert!(call.contains(&"name=app".to_owned()));
+                assert!(!call.iter().any(|arg| arg.contains("reused-branch")));
+            }
+            assert!(!calls[0].contains(&"cursor=next-page".to_owned()));
+            assert!(calls[1].contains(&"cursor=next-page".to_owned()));
+        }
+    }
+
+    #[test]
+    fn check_pr_ci_refuses_incomplete_ambiguous_and_stale_responses() {
+        let candidate = ci_candidate();
+        for defect in [
+            "missing_rollup",
+            "missing_head",
+            "missing_commit",
+            "wrong_commit",
+            "unknown_check",
+            "missing_status",
+            "missing_page",
+            "missing_cursor",
+            "partial_error",
+        ] {
+            let mut payload =
+                ci_graph_page(&candidate.head_sha.0, serde_json::json!([]), false, None);
+            match defect {
+                "missing_rollup" => {
+                    payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("statusCheckRollup");
+                }
+                "missing_head" => {
+                    payload["data"]["repository"]["pullRequest"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("headRefOid");
+                }
+                "missing_commit" => {
+                    payload["data"]["repository"]["pullRequest"]["commits"]["nodes"] =
+                        serde_json::json!([])
+                }
+                "wrong_commit" => {
+                    payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
+                        ["oid"] = "b".repeat(40).into()
+                }
+                "partial_error" => {
+                    payload["errors"] =
+                        serde_json::json!([{"message":"private provider diagnostic"}])
+                }
+                _ => {
+                    let contexts = &mut payload["data"]["repository"]["pullRequest"]["commits"]["nodes"]
+                        [0]["commit"]["statusCheckRollup"]["contexts"];
+                    match defect {
+                        "unknown_check" => {
+                            contexts["nodes"] = serde_json::json!([{"__typename":"UnknownCheck"}])
+                        }
+                        "missing_status" => {
+                            contexts["nodes"] =
+                                serde_json::json!([{"__typename":"CheckRun","name":"unit"}])
+                        }
+                        "missing_page" => {
+                            contexts.as_object_mut().unwrap().remove("pageInfo");
+                        }
+                        "missing_cursor" => contexts["pageInfo"]["hasNextPage"] = true.into(),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            let host =
+                GitHubToolHost::with_runner(Box::new(FakeRunner::with_outputs(vec![output(
+                    &payload.to_string(),
+                )])));
+            let result = host.check_pr_ci(&candidate);
+            assert!(
+                matches!(result, FugueToolResult::Err { .. }),
+                "{defect}: {result:?}"
+            );
+            assert!(!format!("{result:?}").contains("private provider diagnostic"));
+        }
+    }
+
+    #[test]
+    fn check_pr_ci_requires_explicit_empty_rollup_and_terminating_pagination() {
+        let candidate = ci_candidate();
+        let empty = ci_graph_page(&candidate.head_sha.0, serde_json::json!([]), false, None);
+        let mut no_rollup = empty.clone();
+        no_rollup["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"] =
+            serde_json::Value::Null;
+        for payload in [empty, no_rollup.clone()] {
+            let host =
+                GitHubToolHost::with_runner(Box::new(FakeRunner::with_outputs(vec![output(
+                    &payload.to_string(),
+                )])));
+            assert!(matches!(
+                host.check_pr_ci(&candidate),
+                FugueToolResult::Ok {
+                    output: FugueToolOutput::GitHubCheckCi(CheckCiOutput {
+                        status: CiStatus::NoChecks,
+                        ..
+                    }),
+                    ..
+                }
+            ));
+        }
+        let page = ci_graph_page(
+            &candidate.head_sha.0,
+            serde_json::json!([]),
+            true,
+            Some("same-cursor"),
+        );
+        for second in [page.clone(), no_rollup] {
+            let runner = FakeRunner::with_outputs(vec![
+                output(&page.to_string()),
+                output(&second.to_string()),
+            ]);
+            let host = GitHubToolHost::with_runner(Box::new(runner.clone()));
+            assert!(matches!(
+                host.check_pr_ci(&candidate),
+                FugueToolResult::Err { .. }
+            ));
+            assert_eq!(runner.calls().len(), 2);
+        }
+    }
+
+    #[test]
+    fn check_pr_ci_requires_completed_check_runs_before_using_conclusion() {
+        let candidate = ci_candidate();
+        for (status, conclusion, expected) in [
+            ("IN_PROGRESS", "SUCCESS", CiStatus::Pending),
+            ("UNKNOWN", "SUCCESS", CiStatus::Pending),
+            ("COMPLETED", "", CiStatus::Pending),
+            ("COMPLETED", "STARTUP_FAILURE", CiStatus::Failure),
+            ("COMPLETED", "STALE", CiStatus::Failure),
+            ("COMPLETED", "SUCCESS", CiStatus::Success),
+        ] {
+            let page = ci_graph_page(
+                &candidate.head_sha.0,
+                serde_json::json!([{
+                    "__typename":"CheckRun", "name":"unit", "status":status, "conclusion":conclusion
+                }]),
+                false,
+                None,
+            );
+            let host =
+                GitHubToolHost::with_runner(Box::new(FakeRunner::with_outputs(vec![output(
+                    &page.to_string(),
+                )])));
+            assert!(
+                matches!(host.check_pr_ci(&candidate), FugueToolResult::Ok { output: FugueToolOutput::GitHubCheckCi(CheckCiOutput { status, .. }), .. } if status == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn check_ci_never_hides_cancellation_among_successful_checks() {
+        let checks = r#"[{"name":"unit","state":"SUCCESS","link":null,"completedAt":null},{"name":"integration","state":"CANCELLED","link":null,"completedAt":null}]"#;
+        let host =
+            GitHubToolHost::with_runner(Box::new(FakeRunner::with_outputs(vec![output(checks)])));
+        assert!(matches!(
+            host.check_ci(CheckCiInput {
+                repo: repo(),
+                git_ref: crate::tools::GitRef("11".into())
+            }),
+            FugueToolResult::Ok {
+                output: FugueToolOutput::GitHubCheckCi(CheckCiOutput {
+                    status: CiStatus::Cancelled,
+                    ..
+                }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn check_ci_fallback_preserves_commit_status_evidence() {
+        for (state, expected) in [
+            ("SUCCESS", CiStatus::Success),
+            ("FAILURE", CiStatus::Failure),
+            ("PENDING", CiStatus::Pending),
+            ("ERROR", CiStatus::Failure),
+        ] {
+            let rollup = serde_json::json!({"statusCheckRollup":[{
+                "__typename":"StatusContext", "context":"external-build", "state":state,
+                "targetUrl":"https://ci.example.test/build/11", "createdAt":"2026-04-29T12:00:00Z"
+            }]})
+            .to_string();
+            let runner = FakeRunner::with_results(vec![
+                Err(classify_gh_failure(Some(1), "unknown flag: --json".into())),
+                Ok(output(&rollup)),
+            ]);
+            let host = GitHubToolHost::with_runner(Box::new(runner));
+            match host.check_ci(CheckCiInput {
+                repo: repo(),
+                git_ref: crate::tools::GitRef("11".into()),
+            }) {
+                FugueToolResult::Ok {
+                    output: FugueToolOutput::GitHubCheckCi(result),
+                    ..
+                } => {
+                    assert_eq!(result.status, expected, "{state}");
+                    assert_eq!(result.checks[0].name, "external-build");
+                    assert_eq!(
+                        result.checks[0].details_url.as_deref(),
+                        Some("https://ci.example.test/build/11")
+                    );
+                }
+                other => panic!("unexpected CI result: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn check_ci_missing_rollup_is_not_evidence_of_no_checks() {
+        let runner = FakeRunner::with_results(vec![
+            Err(classify_gh_failure(Some(1), "no checks reported".into())),
+            Ok(output(r#"{"unexpected":"response"}"#)),
+        ]);
+        let host = GitHubToolHost::with_runner(Box::new(runner));
+        assert!(matches!(
+            host.check_ci(CheckCiInput {
+                repo: repo(),
+                git_ref: crate::tools::GitRef("11".into())
+            }),
+            FugueToolResult::Err { .. }
+        ));
     }
 
     #[test]
@@ -1091,7 +1942,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_checks_are_confirmed_by_rollup_and_remain_pending() {
+    fn missing_checks_are_confirmed_by_rollup_without_claiming_success() {
         let runner = FakeRunner::with_results(vec![
             Err(classify_gh_failure(
                 Some(1),
@@ -1108,7 +1959,7 @@ mod tests {
             result,
             FugueToolResult::Ok {
                 output: FugueToolOutput::GitHubCheckCi(CheckCiOutput {
-                    status: CiStatus::Pending,
+                    status: CiStatus::NoChecks,
                     ..
                 }),
                 ..
@@ -1117,7 +1968,7 @@ mod tests {
     }
 
     #[test]
-    fn check_ci_treats_empty_check_list_as_pending_not_success() {
+    fn check_ci_reports_empty_check_list_without_claiming_success() {
         let runner = FakeRunner::with_outputs(vec![output("[]")]);
         let host = GitHubToolHost::with_runner(Box::new(runner));
 
@@ -1131,7 +1982,7 @@ mod tests {
                 output: FugueToolOutput::GitHubCheckCi(output),
                 ..
             } => {
-                assert_eq!(output.status, CiStatus::Pending);
+                assert_eq!(output.status, CiStatus::NoChecks);
                 assert!(output.checks.is_empty());
             }
             other => panic!("unexpected result: {other:?}"),
@@ -1205,7 +2056,7 @@ mod tests {
             "gh exited with Some(1): unknown flag: --json",
             RetryAdvice::SafeToRetry,
         );
-        let rollup = r#"{"statusCheckRollup":[{"name":"test","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://example.test","completedAt":"2026-04-29T12:00:00Z"},{"workflowName":"lint","status":"IN_PROGRESS","conclusion":null,"detailsUrl":null,"completedAt":null}]}"#;
+        let rollup = r#"{"statusCheckRollup":[{"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://example.test","completedAt":"2026-04-29T12:00:00Z"},{"__typename":"CheckRun","name":"lint","status":"IN_PROGRESS","conclusion":null,"detailsUrl":null,"completedAt":null}]}"#;
         let runner = FakeRunner::with_results(vec![Err(unsupported_json), Ok(output(rollup))]);
         let host = GitHubToolHost::with_runner(Box::new(runner.clone()));
 

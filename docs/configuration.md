@@ -4,7 +4,8 @@ Fugue's native configuration file is `fugue.yaml` or `fugue.yml`. Native configs
 are parsed into typed Rust structs at startup and fail fast on unknown fields or
 invalid combinations.
 
-new queues should use `fugue.yaml`.
+Use [repository setup](./getting-started.mdx) for browser onboarding. This
+reference is for advanced, manually maintained workflow files.
 
 ## Native defaults
 
@@ -35,7 +36,7 @@ If `linear.api_key` is omitted, Fugue also checks `LINEAR_API_KEY`.
 version: 1
 backend: native-execution # optional; omitted is native-execution
 tracker_lanes: { ... }
-linear: { ... }
+tracker: { ... }
 linear_projections: { ... }
 selection: { ... }
 agents: { ... }
@@ -50,11 +51,40 @@ kapellmeister: { ... }
 server: { ... }
 ```
 
+## `tracker`
+
+Choose one issue backend per repository. `tracker` is the preferred name for
+this section; the historical `linear` name accepts the same settings. Specify
+only one. `linear_projections` and the `linear_*` tool names are retained for
+compatibility across trackers and do not select Linear by themselves.
+
+| `kind` | Connection and scope |
+| --- | --- |
+| `jira` | Jira site in `endpoint`, project key in `project_slug`, and private authentication/JQL settings under `jira`. |
+| `fugue-ims` | Persistent SQLite file in `endpoint` and a repository scope in `project_slug`; no external tracker account. |
+| `linear` | Linear API endpoint, API key, project and optional team. This is the default when `kind` is omitted. |
+
+For example, a manually configured built-in queue can use:
+
+```yaml
+tracker:
+  kind: fugue-ims
+  endpoint: sqlite:///absolute/private/fugue-issues.sqlite3
+  project_slug: example-app
+```
+
+Use a writable private path and keep the database in complete state backups.
+Different repositories need distinct tracker scopes. Browser setup manages this
+configuration for you. For Jira, use the complete
+[Jira example](../fugue.jira.example.yaml) and
+[Jira/GitHub Enterprise guide](./jira-and-github-enterprise.mdx); map the project's
+existing statuses and use `provisioning.mode: validate`.
+
 ## `linear`
 
-Configures issue intake, universal lane anchors, and optional workflow-state
-provisioning. Linear is a projection surface owned per issue by the issue lead;
-Fugue observes Linear for external lane drift.
+This historical section name is an alias for `tracker`. The example below
+shows a Linear connection. Lane roles and projections also apply to Jira and
+built-in tickets, using the selected tracker's actual status names.
 
 Fugue's canonical tracker lane roles are intentionally coarse:
 
@@ -111,7 +141,7 @@ The lane anchors are semantic defaults used across templates:
 - `success`: terminal success.
 - `canceled` and `duplicate`: terminal canceled states.
 
-`linear.team` is required for projection preflight because Linear workflow
+For Linear, `linear.team` is required for projection preflight because workflow
 states are team-scoped. When `provisioning.mode` is `validate`, Fugue fails
 preflight if required states are missing. When it is `create_missing`, Fugue
 creates missing team-scoped workflow states. Fugue never deletes or renames
@@ -122,7 +152,7 @@ existing Linear states automatically.
 
 ## `linear_projections`
 
-Maps mob flow node ids to Linear lanes. Member ids are used as a fallback only
+Maps mob flow node ids to configured tracker lanes. Member ids are used as a fallback only
 when Meta does not expose node ids.
 
 ```yaml
@@ -168,17 +198,21 @@ selection:
     native: implementation_mob
 ```
 
-`by_label` maps Linear label names to template ids. Issues without a matching
+`by_label` maps issue label names to template ids. Issues without a matching
 label use `default_template`.
 
 ## `agents`
 
 Defines reusable Meerkat agent profiles referenced by mob members.
 
+Omit `model` to use the recommendation in Fugue's pinned Meerkat catalog. An
+explicit model is an override and remains selected when that recommendation
+changes. The current default is `gpt-6-astra`.
+
 ```yaml
 agents:
   coder:
-    model: gpt-5.5
+    model: gpt-6-astra
     provider: openai
     max_tokens: 8000
     tools: [mob, shell, git, mcp:linear, mcp:github]
@@ -193,14 +227,18 @@ output retries, provider params, tool/skill lists, and extra instructions. Repo
 tools such as Linear and GitHub must be packaged as MCP servers and referenced
 with `mcp:<server-name>`; bare `linear`/`github` tool strings are rejected so a
 member cannot silently start with an empty tool catalog. The helper MCP binaries
-are part of the issue-mob runtime contract: `fugue-linear-mcp` owns Linear
-Workpad updates, `fugue-github-mcp` owns GitHub PR/check handoff evidence,
-and `fugue-host-mcp` owns host-level Fugue control-plane actions. It hides
-`github_merge_pr` by default; expose merge only for an explicit repo-level merge
-authority by setting `FUGUE_GITHUB_ALLOW_MERGE=true` on that MCP server. Deploy
-or restart them with `meerkat-fugue`, and include all four binary hashes in
-post-deploy evidence. The special `mob` tool means
+are part of the runtime contract: `fugue-linear-mcp` and `fugue-jira-mcp` provide
+their tracker tools, `fugue-github-mcp` provides GitHub PR/check evidence,
+and `fugue-host-mcp` provides repository control-plane actions. Merge goes
+through the Fugue host action, which checks current review and delivery
+authority; the standalone GitHub tool server does not offer merge. Deploy all
+five Fugue binaries together with the bundle's pinned rkat, and retain their
+checksums in post-deploy evidence. The special `mob` tool means
 Meerkat-provided mob tooling (`tools.mob=true`), not a Fugue-defined pseudo-tool.
+
+For Jira, configure `mcp:jira` with `fugue-jira-mcp`. Built-in tickets use
+host-provided tracker tools through the compatible `mcp:linear` declaration
+and do not need a Linear server or token.
 
 Fugue provides Playwright MCP to native agents by default. The default server is:
 
@@ -239,12 +277,14 @@ mob_templates:
 ```
 
 Members may be plain profile names or `{name, profile}` pairs. Template backend
-inherits the top-level backend unless explicitly set. Native issue mobs are
-prompt-driven by default: Fugue launches the issue lead plus worker members and
-the issue lead coordinates planner, coder, and reviewer through comms. Leave
-`flow:` unset unless the template intentionally uses Meta `mob/flow_run`.
-Native planner/coder/reviewer mobs must keep review cycles bounded with
-`max_review_cycles`.
+inherits the top-level backend unless explicitly set. Issue execution is
+prompt-driven: the issue lead coordinates its worker members through native
+communication. In managed repositories they join the existing repository mob
+alongside its specialists. Keep review cycles bounded with `max_review_cycles`.
+
+Optional `flow` selects a supported role/review contract. Native members still
+coordinate in-process through Meta; this does not start a separate `rkat-rpc`
+process or invoke an external `mob/flow_run` endpoint.
 
 ## `worker`
 
@@ -269,7 +309,7 @@ polling:
   interval_ms: 30000
 ```
 
-Controls the regular Linear poll cadence. Operators can also request an
+Controls the regular tracker poll cadence. Operators can also request an
 immediate poll with `POST /api/v1/refresh` when the status API is enabled.
 
 ## `workspace`
@@ -327,7 +367,7 @@ Low-level Meerkat/Meta session settings.
 meerkat:
   command: rkat-rpc
   realm_backend: sqlite
-  model: gpt-5.5
+  model: gpt-6-astra
   max_sessions: 4096
   enable_shell: true
   enable_builtins: true
@@ -381,9 +421,67 @@ Review and Deploy are action lanes: an operator or meta-agent moves an issue to
 one of these lanes to request the configured procedure. They are not passive
 phase projections from planner/coder/reviewer execution.
 
+For the built-in tracker, `tracker.project_slug` is the repository scope and is
+required even when the SQLite database contains only one repository. A shared
+database does not share queues: issue, comment and attachment reads and writes
+stay within the configured scope. Issue keys cannot be moved to another
+repository by creating or updating an issue with the same key.
+
+For Linear, direct issue lookup verifies project membership before returning
+issue details or changing assignments, states or comments. Bulk status lookup
+and comment feeds carry the configured project filter. An issue moved outside
+the configured project is no longer available through that repository's tools.
+
+Review obligations use the repository mob's native WorkGraph realm and default
+namespace. Independent-review completion rejects other scopes so blockers remain
+visible to terminal and merge checks. Tracker IDs are resolved to canonical issue
+keys before those checks. Lifecycle tool calls must use tracker state names so
+the configured terminal policy can be evaluated.
+
+Independent review uses existing repository specialists outside the issue's
+execution team. The review orchestrator selects their focus areas and requests
+admission with `fugue_admit_independent_review`. Fugue reserves the current request
+before native flows start; it does not create replacement reviewers. Native
+records supply each verdict. Completion submits run references and must match
+the current request and exact PR head. Replacing a request requires its current
+ID in `supersedes` and a new idempotency key. See the
+[review request contract](./development.mdx#current-review-request) for recovery
+and qualification requirements.
+
+New repository setup explicitly selects one independent specialist by default.
+The **Independent specialists required** setting accepts 1-255 and is saved per
+repository. Increase it when additional independent perspectives are needed.
+Existing saved setups and YAML configurations that omit the count retain three;
+changing another setting does not reduce their review requirement. The quorum
+never shrinks to match the available team. An implementer cannot approve their
+own work, and insufficient independent capacity keeps review blocked.
+
+`independent_review.reviewer_count` is the exact required count.
+`final_review.minimum_reviewers` is a minimum (default three), in addition to
+every required `final_review.reviewers` profile entry. A lower minimum does not
+remove profile coverage. Final completion and merge verify the same requirements
+against native evidence for the current PR head.
+
+To request configured review, `fugue_start_independent_review` takes the issue,
+repository, PR number, expected head SHA and a stable idempotency key. Fugue
+resolves the candidate and supplies the review coordinator's runtime settings
+and instructions. Callers do not choose workspace paths, templates or profiles.
+
+`linear_claim_issue` can also request a lane change through `target_state`.
+That change receives the terminal-obligation check before either assignment or
+transition. Claiming is restricted to issue leads and repository coordinators;
+workers report ownership and lifecycle needs to their lead. An assignment-only
+claim does not complete the issue or clear review obligations.
+Both direct tools and MCP calls apply the same public-lane and action-lane
+policy, including accepted dotted tool names. MCP state changes also require
+Fugue's WorkGraph configuration; a standalone server without that configuration
+refuses the change before contacting the tracker. Read-only calls and
+assignment-only claims remain available to authorized callers.
+
 ```yaml
 independent_review:
   enabled: true
+  reviewer_count: 3
   lane: Review
   success_lane: Active
   rework_lane: Queue
@@ -457,6 +555,7 @@ ota_update:
   deploy_command: >-
     install -m 0755 target/release/meerkat-fugue /usr/local/bin/meerkat-fugue &&
     install -m 0755 target/release/fugue-linear-mcp /usr/local/bin/fugue-linear-mcp &&
+    install -m 0755 target/release/fugue-jira-mcp /usr/local/bin/fugue-jira-mcp &&
     install -m 0755 target/release/fugue-github-mcp /usr/local/bin/fugue-github-mcp &&
     install -m 0755 target/release/fugue-host-mcp /usr/local/bin/fugue-host-mcp &&
     systemctl restart meerkat-fugue

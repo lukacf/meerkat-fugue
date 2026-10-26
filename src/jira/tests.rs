@@ -47,14 +47,21 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-struct MockResponse {
+pub(crate) struct MockResponse {
     method: &'static str,
     path: &'static str,
     status: StatusCode,
     body: Value,
 }
 
-fn reply(method: &'static str, path: &'static str, body: Value) -> MockResponse {
+impl MockResponse {
+    pub(crate) fn with_status(mut self, status: StatusCode) -> Self {
+        self.status = status;
+        self
+    }
+}
+
+pub(crate) fn reply(method: &'static str, path: &'static str, body: Value) -> MockResponse {
     MockResponse {
         method,
         path,
@@ -63,10 +70,10 @@ fn reply(method: &'static str, path: &'static str, body: Value) -> MockResponse 
     }
 }
 
-struct MockJira {
-    endpoint: String,
-    requests: Arc<Mutex<Vec<(String, Value)>>>,
-    responses: Arc<Mutex<VecDeque<MockResponse>>>,
+pub(crate) struct MockJira {
+    pub(crate) endpoint: String,
+    pub(crate) requests: Arc<Mutex<Vec<(String, Value)>>>,
+    pub(crate) responses: Arc<Mutex<VecDeque<MockResponse>>>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for MockJira {
@@ -75,7 +82,7 @@ impl Drop for MockJira {
     }
 }
 
-async fn mock_jira(responses: Vec<MockResponse>) -> MockJira {
+pub(crate) async fn mock_jira(responses: Vec<MockResponse>) -> MockJira {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -97,11 +104,36 @@ async fn mock_jira(responses: Vec<MockResponse>) -> MockJira {
             assert_eq!(parts.method.as_str(), response.method);
             assert_eq!(parts.uri.path(), response.path);
             assert!(parts.headers.contains_key("authorization"));
-            let body = to_bytes(body, 1024 * 1024).await.expect("request body");
-            let body = if body.is_empty() {
-                Value::Null
+            let body = if parts
+                .headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("multipart/form-data"))
+            {
+                use axum::extract::FromRequest;
+                assert_eq!(parts.headers["x-atlassian-token"], "no-check");
+                let request = Request::from_parts(parts.clone(), body);
+                let mut multipart = axum::extract::Multipart::from_request(request, &())
+                    .await
+                    .unwrap();
+                let mut files = Vec::new();
+                while let Some(field) = multipart.next_field().await.unwrap() {
+                    assert_eq!(field.name(), Some("file"));
+                    let name = field.file_name().unwrap().to_owned();
+                    let content_type = field.content_type().map(str::to_owned);
+                    let bytes = field.bytes().await.unwrap();
+                    files.push(
+                        json!({"name":name,"content_type":content_type,"bytes":bytes.to_vec()}),
+                    );
+                }
+                json!({"files":files})
             } else {
-                serde_json::from_slice(&body).expect("JSON")
+                let body = to_bytes(body, 1024 * 1024).await.expect("request body");
+                if body.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&body).expect("JSON")
+                }
             };
             observed
                 .lock()
@@ -114,6 +146,7 @@ async fn mock_jira(responses: Vec<MockResponse>) -> MockJira {
                 .expect("response")
         }
     }));
+    let app = app.layer(axum::extract::DefaultBodyLimit::max(101 * 1024 * 1024));
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve");
     });
@@ -125,7 +158,7 @@ async fn mock_jira(responses: Vec<MockResponse>) -> MockJira {
     }
 }
 
-fn tracker(endpoint: &str) -> TrackerConfig {
+pub(crate) fn tracker(endpoint: &str) -> TrackerConfig {
     TrackerConfig {
         kind: "jira".to_string(),
         endpoint: endpoint.to_string(),
@@ -139,14 +172,279 @@ fn tracker(endpoint: &str) -> TrackerConfig {
         in_flight_states: vec!["In Progress".to_string()],
         active_states: vec!["To Do".to_string(), "In Progress".to_string()],
         terminal_states: vec!["Done".to_string()],
+        attachment_root: None,
         max_attachment_files: 2,
         max_attachment_bytes: 1024,
         max_attachment_total_bytes: 2048,
     }
 }
 
-fn issue(status: &str) -> Value {
+pub(crate) fn issue(status: &str) -> Value {
     json!({"id":"10001","key":"TEST-1","fields":{"summary":"Integration fixture","description":null,"project":{"id":"10","key":"TEST"},"updated":"2026-01-01T00:00:00.000+0000","status":{"id":if status == "Done" { "3" } else { "2" },"name":status,"statusCategory":{"key":if status == "Done" { "done" } else { "indeterminate" }}}}})
+}
+
+#[tokio::test]
+async fn inspect_issue_downloads_current_jira_attachments() {
+    let mock = mock_jira(Vec::new()).await;
+    let storage = tempfile::tempdir().unwrap();
+    let mut config = tracker(&mock.endpoint);
+    config.attachment_root = Some(storage.path().to_path_buf());
+    let url = format!("{}/rest/api/3/attachment/content/42", mock.endpoint);
+    let mut current = issue("In Progress");
+    current["fields"]["attachment"] = json!([{
+        "id":"42", "filename":"probe.json", "content":url, "mimeType":"application/json"
+    }]);
+    mock.responses.lock().unwrap().extend([
+        reply("GET", "/rest/api/3/issue/TEST-1", current),
+        reply(
+            "GET",
+            "/rest/api/3/issue/TEST-1/comment",
+            json!({"comments":[], "total":0}),
+        ),
+        reply(
+            "GET",
+            "/rest/api/3/attachment/content/42",
+            json!({"probe":"HEAD"}),
+        ),
+    ]);
+    let result = JiraClient::from_config(&config)
+        .unwrap()
+        .inspect_issue(InspectIssueInput {
+            issue: LinearIssueRef::Identifier {
+                identifier: LinearIssueIdentifier("TEST-1".into()),
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.attachments.len(), 1);
+    let file = &result.attachments[0];
+    assert_eq!(
+        file.source,
+        LinearFileAttachmentSource::IssueAttachment {
+            attachment_id: LinearAttachmentId("42".into())
+        }
+    );
+    assert_eq!(file.title.as_deref(), Some("probe.json"));
+    assert_eq!(file.url, url);
+    assert_eq!(file.content_type.as_deref(), Some("application/json"));
+    assert!(Path::new(&file.path).starts_with(storage.path()));
+    let bytes = tokio::fs::read(&file.path).await.unwrap();
+    assert_eq!(bytes, serde_json::to_vec(&json!({"probe":"HEAD"})).unwrap());
+    assert_eq!(file.byte_len, bytes.len() as u64);
+    assert!(
+        mock.requests.lock().unwrap()[2]
+            .0
+            .contains("redirect=false")
+    );
+    assert!(mock.responses.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn inspect_issue_rejects_untrusted_attachment_origin_before_download() {
+    let mock = mock_jira(Vec::new()).await;
+    let storage = tempfile::tempdir().unwrap();
+    let mut config = tracker(&mock.endpoint);
+    config.attachment_root = Some(storage.path().to_path_buf());
+    let mut current = issue("In Progress");
+    current["fields"]["attachment"] = json!([{
+        "id":"42", "filename":"probe.txt", "content":"https://untrusted.invalid/private"
+    }]);
+    mock.responses.lock().unwrap().extend([
+        reply("GET", "/rest/api/3/issue/TEST-1", current),
+        reply(
+            "GET",
+            "/rest/api/3/issue/TEST-1/comment",
+            json!({"comments":[], "total":0}),
+        ),
+    ]);
+    let error = JiraClient::from_config(&config)
+        .unwrap()
+        .inspect_issue(InspectIssueInput {
+            issue: LinearIssueRef::Identifier {
+                identifier: LinearIssueIdentifier("TEST-1".into()),
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("outside the configured site"));
+    assert_eq!(mock.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn inspect_issue_preserves_attachment_download_limits() {
+    for (files, per_file, total) in [(0, 1024, 2048), (2, 4, 2048), (2, 1024, 4)] {
+        let mock = mock_jira(Vec::new()).await;
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = tracker(&mock.endpoint);
+        config.attachment_root = Some(storage.path().to_path_buf());
+        config.max_attachment_files = files;
+        config.max_attachment_bytes = per_file;
+        config.max_attachment_total_bytes = total;
+        let mut current = issue("In Progress");
+        current["fields"]["attachment"] = json!([{
+            "id":"42", "filename":"probe.json",
+            "content":format!("{}/rest/api/3/attachment/content/42", mock.endpoint)
+        }]);
+        mock.responses.lock().unwrap().extend([
+            reply("GET", "/rest/api/3/issue/TEST-1", current),
+            reply(
+                "GET",
+                "/rest/api/3/issue/TEST-1/comment",
+                json!({"comments":[], "total":0}),
+            ),
+            reply(
+                "GET",
+                "/rest/api/3/attachment/content/42",
+                json!({"probe":"HEAD"}),
+            ),
+        ]);
+        let error = JiraClient::from_config(&config)
+            .unwrap()
+            .inspect_issue(InspectIssueInput {
+                issue: LinearIssueRef::Identifier {
+                    identifier: LinearIssueIdentifier("TEST-1".into()),
+                },
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, FugueError::ResponseError(ref message) if message.contains("attachment download blocked"))
+        );
+        assert_eq!(
+            mock.requests.lock().unwrap().len(),
+            if files == 0 { 2 } else { 3 }
+        );
+        let mut directory = tokio::fs::read_dir(storage.path().join("attachments/TEST-1"))
+            .await
+            .unwrap();
+        assert!(directory.next_entry().await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn jira_attachment_download_keeps_paths_local_and_supports_concurrent_readers() {
+    let mock = mock_jira(vec![
+        reply(
+            "GET",
+            "/rest/api/3/attachment/content/42",
+            json!({"probe":"HEAD"}),
+        ),
+        reply(
+            "GET",
+            "/rest/api/3/attachment/content/42",
+            json!({"probe":"HEAD"}),
+        ),
+    ])
+    .await;
+    let client = JiraClient::from_config(&tracker(&mock.endpoint)).unwrap();
+    let mut current = issue("In Progress");
+    current["fields"]["attachment"] = json!([{
+        "id":"42", "filename":"../../probe.json",
+        "content":format!("{}/rest/api/3/attachment/content/42", mock.endpoint)
+    }]);
+    let normalized = client.normalize(serde_json::from_value(current).unwrap());
+    let storage = tempfile::tempdir().unwrap();
+    let (first, second) = tokio::join!(
+        client.materialize_issue_attachments(&normalized, storage.path()),
+        client.materialize_issue_attachments(&normalized, storage.path()),
+    );
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(&json!({"probe":"HEAD"})).unwrap();
+    let expected = storage
+        .path()
+        .join(".fugue/attachments/TEST-1")
+        .join(format!("{:x}", Sha256::digest(&bytes)))
+        .join("probe.json");
+    for result in [first.unwrap(), second.unwrap()] {
+        assert_eq!(result.attachments[0].local_path.as_ref(), Some(&expected));
+    }
+    assert_eq!(
+        tokio::fs::read(&expected).await.unwrap(),
+        serde_json::to_vec(&json!({"probe":"HEAD"})).unwrap()
+    );
+    let mut directory = tokio::fs::read_dir(expected.parent().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        directory.next_entry().await.unwrap().unwrap().path(),
+        expected
+    );
+    assert!(directory.next_entry().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn jira_attachment_receipts_survive_catalog_replacement_with_same_filename() {
+    let mock = mock_jira(vec![
+        reply(
+            "GET",
+            "/rest/api/3/attachment/content/42",
+            json!({"version":1}),
+        ),
+        reply(
+            "GET",
+            "/rest/api/3/attachment/content/43",
+            json!({"version":2}),
+        ),
+    ])
+    .await;
+    let client = JiraClient::from_config(&tracker(&mock.endpoint)).unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let mut paths = Vec::new();
+    for id in ["42", "43"] {
+        let mut current = issue("In Progress");
+        current["fields"]["attachment"] = json!([{
+            "id":id, "filename":"plan.json",
+            "content":format!("{}/rest/api/3/attachment/content/{id}",mock.endpoint)
+        }]);
+        let normalized = client.normalize(serde_json::from_value(current).unwrap());
+        let materialized = client
+            .materialize_issue_attachments(&normalized, storage.path())
+            .await
+            .unwrap();
+        paths.push(materialized.attachments[0].local_path.clone().unwrap());
+    }
+    assert_ne!(paths[0], paths[1]);
+    for (index, path) in paths.iter().enumerate() {
+        assert_eq!(
+            tokio::fs::read(path).await.unwrap(),
+            serde_json::to_vec(&json!({"version":index+1})).unwrap()
+        );
+    }
+}
+
+#[test]
+fn opaque_jira_priority_ids_are_not_numeric_ranks() {
+    let mut config = tracker("https://jira.example.com");
+    let client = JiraClient::from_config(&config).unwrap();
+    let mut value = issue("In Progress");
+    value["fields"]["priority"] = json!({"id":"10002", "name":"Normal"});
+    assert_eq!(
+        client
+            .normalize(serde_json::from_value(value.clone()).unwrap())
+            .priority,
+        None
+    );
+    config
+        .jira
+        .as_mut()
+        .unwrap()
+        .priority_ranks
+        .insert("Normal".into(), std::num::NonZeroU32::new(3).unwrap());
+    let client = JiraClient::from_config(&config).unwrap();
+    assert_eq!(
+        client
+            .normalize(serde_json::from_value(value.clone()).unwrap())
+            .priority,
+        Some(3)
+    );
+    value["fields"]["priority"]["id"] = json!("opaque-priority-id");
+    assert_eq!(
+        client
+            .normalize(serde_json::from_value(value).unwrap())
+            .priority,
+        Some(3)
+    );
+    assert!(serde_json::from_value::<JiraConfig>(json!({"priority_ranks":{"Normal":0}})).is_err());
 }
 fn reference() -> LinearIssueRef {
     LinearIssueRef::Identifier {
@@ -587,4 +885,85 @@ async fn creation_passes_required_custom_fields_without_changing_project() {
         json!({"id":"7"})
     );
     assert_eq!(requests[0].1["fields"]["labels"], json!(["fugue"]));
+}
+
+#[tokio::test]
+async fn creation_receipt_survives_initial_status_and_refresh_failures() {
+    for failure in ["initial_read", "transition", "refresh", "missing_key"] {
+        let failed_read = MockResponse {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            ..reply(
+                "GET",
+                "/rest/api/3/issue/10001",
+                json!({"errorMessages":["temporarily unavailable"]}),
+            )
+        };
+        let mut responses = vec![reply(
+            "POST",
+            "/rest/api/3/issue",
+            if failure == "missing_key" {
+                json!({"id":"10001"})
+            } else {
+                json!({"id":"10001", "key":"TEST-1"})
+            },
+        )];
+        match failure {
+            "initial_read" | "missing_key" => responses.push(failed_read),
+            "transition" => {
+                responses.push(reply(
+                    "GET",
+                    "/rest/api/3/issue/10001",
+                    issue("In Progress"),
+                ));
+                responses.push(reply(
+                    "GET",
+                    "/rest/api/3/issue/TEST-1/transitions",
+                    json!({"transitions":[]}),
+                ));
+            }
+            _ => {
+                responses.push(reply("GET", "/rest/api/3/issue/10001", issue("To Do")));
+                responses.push(failed_read);
+            }
+        }
+        let mock = mock_jira(responses).await;
+        let error = JiraClient::from_config(&tracker(&mock.endpoint))
+            .expect("client")
+            .create_issue("Only one issue", Some("Creation recovery fixture"), "To Do")
+            .await
+            .expect_err("follow-up operation fails");
+        let FugueError::IssueCreatedNeedsAttention { created, source } = error else {
+            panic!("{failure} lost the creation receipt: {error}");
+        };
+        assert_eq!(created.id, "10001");
+        if failure == "missing_key" {
+            assert_eq!(created.identifier, "10001");
+            assert_eq!(created.url, None);
+        } else {
+            assert_eq!(created.identifier, "TEST-1");
+            assert_eq!(
+                created.url,
+                Some(format!("{}/browse/TEST-1", mock.endpoint))
+            );
+        }
+        if failure != "transition" {
+            assert!(matches!(*source, FugueError::JiraApiStatus { status: 503 }));
+        } else {
+            assert!(
+                source
+                    .to_string()
+                    .contains("no currently available transition")
+            );
+        }
+        assert_eq!(
+            mock.requests
+                .lock()
+                .expect("requests")
+                .iter()
+                .filter(|(uri, _)| uri == "/rest/api/3/issue")
+                .count(),
+            1
+        );
+        assert!(mock.responses.lock().expect("responses").is_empty());
+    }
 }

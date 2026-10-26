@@ -10,7 +10,8 @@ use crate::domain::{BlockerRef, Issue};
 use crate::error::{FugueError, Result};
 use crate::ims::{
     ImsCommentAttachmentSnapshot, ImsCommentId, ImsCommentSnapshot, ImsIssueId, ImsIssueKey,
-    ImsIssueRef, ImsIssueSnapshot, ImsRepoIssueQuery, ImsStageName, IssueManagementSystem,
+    ImsIssueRef, ImsIssueSnapshot, ImsRepoIssueQuery, ImsRepoScope, ImsStageName,
+    IssueManagementSystem,
 };
 use crate::tools::IdempotencyKey;
 use crate::tools::{
@@ -27,6 +28,7 @@ use crate::tracker::IssueTracker;
 #[derive(Debug, Clone)]
 pub struct FugueImsStore {
     path: PathBuf,
+    repo: ImsRepoScope,
     active_stages: Vec<String>,
 }
 
@@ -52,9 +54,16 @@ impl FugueImsStore {
         if config.kind != "fugue-ims" {
             return Err(FugueError::UnsupportedTrackerKind(config.kind.clone()));
         }
+        let repo = config
+            .project_slug
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or(FugueError::MissingTrackerProjectSlug)?;
         let path = fugue_ims_path(&config.endpoint)?;
         let store = Self {
             path,
+            repo: ImsRepoScope(repo.to_owned()),
             active_stages: config.active_states.clone(),
         };
         store.initialize()?;
@@ -63,6 +72,18 @@ impl FugueImsStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn repository_scope(&self) -> &str {
+        &self.repo.0
+    }
+
+    pub(crate) fn resolve_issue_identifier(
+        &self,
+        issue: &LinearIssueRef,
+    ) -> Result<LinearIssueIdentifier> {
+        self.resolve_linear_issue_ref(issue)
+            .map(|issue| LinearIssueIdentifier(issue.identifier))
     }
 
     pub fn allocate_issue_key(&self, prefix: &str) -> Result<ImsIssueKey> {
@@ -79,18 +100,23 @@ impl FugueImsStore {
     }
 
     pub fn create_issue(&self, issue: CreateFugueIssue) -> Result<ImsIssueSnapshot> {
+        if issue.repo != self.repo.0 {
+            return Err(FugueError::ResponseError(
+                "issue repository does not match the configured tracker project".into(),
+            ));
+        }
         let now = Utc::now();
         let id = format!("fugue-ims:{}", issue.key.0);
         let conn = self.connection()?;
         let labels_json = serde_json::to_string(&issue.labels)
             .map_err(|err| FugueError::InvalidConfig(format!("encode fugue-ims labels: {err}")))?;
-        conn.execute(
+        let changed = conn.execute(
             "insert into issues \
              (id, key, repo, title, description, stage, branch_name, url, labels_json, created_at, updated_at) \
              values (?1, ?2, ?3, ?4, ?5, ?6, null, ?7, ?8, ?9, ?9) \
              on conflict(key) do update set \
-             repo = excluded.repo, title = excluded.title, description = excluded.description, \
-             stage = excluded.stage, updated_at = excluded.updated_at",
+             title = excluded.title, description = excluded.description, \
+             stage = excluded.stage, updated_at = excluded.updated_at where issues.repo = excluded.repo",
             params![
                 id,
                 issue.key.0,
@@ -104,6 +130,11 @@ impl FugueImsStore {
             ],
         )
         .map_err(sqlite_error)?;
+        if changed == 0 {
+            return Err(FugueError::ResponseError(
+                "issue key is unavailable in the configured repository".into(),
+            ));
+        }
         self.snapshot_for_key(&issue.key)
     }
 
@@ -116,8 +147,8 @@ impl FugueImsStore {
         let conn = self.connection()?;
         let changed = conn
             .execute(
-                "update comments set body_mark = ?1, updated_at = ?2 where id = ?3 and deleted_at is null",
-                params![body, now, comment_id.0],
+                "update comments set body_mark = ?1, updated_at = ?2 where id = ?3 and deleted_at is null and issue_key in (select key from issues where repo = ?4)",
+                params![body, now, comment_id.0, self.repo.0],
             )
             .map_err(sqlite_error)?;
         if changed == 0 {
@@ -138,8 +169,8 @@ impl FugueImsStore {
         let conn = self.connection()?;
         let changed = conn
             .execute(
-                "update comments set deleted_at = ?1, updated_at = ?1 where id = ?2 and deleted_at is null",
-                params![now, comment_id.0],
+                "update comments set deleted_at = ?1, updated_at = ?1 where id = ?2 and deleted_at is null and issue_key in (select key from issues where repo = ?3)",
+                params![now, comment_id.0, self.repo.0],
             )
             .map_err(sqlite_error)?;
         if changed == 0 {
@@ -365,6 +396,7 @@ impl FugueImsStore {
              create index if not exists comments_issue_key_idx on comments(issue_key);
              create index if not exists comment_attachments_comment_idx on comment_attachments(comment_id, position);
              create index if not exists issues_repo_stage_idx on issues(repo, stage);
+             create index if not exists issues_repo_stage_ci_created_key_idx on issues(repo, lower(stage), created_at, key);
              create index if not exists issues_stage_ci_created_key_idx on issues(lower(stage), created_at, key);
              create table if not exists issue_key_allocations (
                id integer primary key autoincrement,
@@ -384,8 +416,8 @@ impl FugueImsStore {
         let conn = self.connection()?;
         conn.query_row(
             "select id, key, title, description, stage, branch_name, url, labels_json, created_at, updated_at \
-             from issues where key = ?1",
-            params![key.0],
+             from issues where key = ?1 and repo = ?2",
+            params![key.0, self.repo.0],
             issue_from_row,
         )
         .optional()
@@ -406,8 +438,8 @@ impl FugueImsStore {
                 let conn = self.connection()?;
                 conn.query_row(
                     "select id, key, title, description, stage, branch_name, url, labels_json, created_at, updated_at \
-                     from issues where id = ?1",
-                    params![id.0],
+                     from issues where id = ?1 and repo = ?2",
+                    params![id.0, self.repo.0],
                     issue_from_row,
                 )
                 .optional()
@@ -476,14 +508,15 @@ impl FugueImsStore {
     }
 
     fn comments_for_key(&self, key: &ImsIssueKey) -> Result<Vec<ImsCommentSnapshot>> {
+        self.snapshot_for_key(key)?;
         let conn = self.connection()?;
         let mut stmt = conn
             .prepare(
                 "select id, body_mark from comments \
-                 where issue_key = ?1 and deleted_at is null order by created_at asc, id asc",
+                 where issue_key = ?1 and deleted_at is null and issue_key in (select key from issues where repo = ?2) order by created_at asc, id asc",
             )
             .map_err(sqlite_error)?;
-        stmt.query_map(params![key.0], |row| {
+        stmt.query_map(params![key.0, self.repo.0], |row| {
             Ok(ImsCommentSnapshot {
                 id: ImsCommentId(row.get(0)?),
                 body_mark: row.get(1)?,
@@ -514,10 +547,10 @@ impl FugueImsStore {
         let mut stmt = conn
             .prepare(
                 "select title, url, path, content_type, byte_len from comment_attachments \
-                 where comment_id = ?1 order by position asc",
+                 where comment_id = ?1 and comment_id in (select comments.id from comments join issues on issues.key = comments.issue_key where issues.repo = ?2 and comments.deleted_at is null) order by position asc",
             )
             .map_err(sqlite_error)?;
-        stmt.query_map(params![comment_id.0], |row| {
+        stmt.query_map(params![comment_id.0, self.repo.0], |row| {
             Ok(ImsCommentAttachmentSnapshot {
                 title: row.get(0)?,
                 url: row.get(1)?,
@@ -542,17 +575,20 @@ impl FugueImsStore {
             if normalized_stages.is_empty() {
                 return Ok(Vec::new());
             }
-            let placeholders = (1..=normalized_stages.len())
+            let placeholders = (2..=normalized_stages.len() + 1)
                 .map(|index| format!("?{index}"))
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
                 "select id, key, title, description, stage, branch_name, url, labels_json, created_at, updated_at \
-                 from issues where lower(stage) in ({placeholders}) order by created_at asc, key asc",
+                 from issues where repo = ?1 and lower(stage) in ({placeholders}) order by created_at asc, key asc",
             );
             let mut stmt = conn.prepare(&sql).map_err(sqlite_error)?;
             return stmt
-                .query_map(params_from_iter(normalized_stages.iter()), issue_from_row)
+                .query_map(
+                    params_from_iter(std::iter::once(&self.repo.0).chain(normalized_stages.iter())),
+                    issue_from_row,
+                )
                 .map_err(sqlite_error)?
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(sqlite_error);
@@ -560,28 +596,16 @@ impl FugueImsStore {
         let mut stmt = conn
             .prepare(
                 "select id, key, title, description, stage, branch_name, url, labels_json, created_at, updated_at \
-                 from issues order by created_at asc, key asc",
+                 from issues where repo = ?1 order by created_at asc, key asc",
             )
             .map_err(sqlite_error)?;
         let issues = stmt
-            .query_map([], issue_from_row)
+            .query_map(params![self.repo.0], issue_from_row)
             .map_err(sqlite_error)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(sqlite_error)?;
-        if stages.is_empty() {
-            return Ok(issues
-                .into_iter()
-                .filter(|issue| !issue_stage_is_terminal(issue, stages))
-                .collect());
-        }
-        Ok(issues
-            .into_iter()
-            .filter(|issue| {
-                stages
-                    .iter()
-                    .any(|stage| issue.state.eq_ignore_ascii_case(stage))
-            })
-            .collect())
+        // An empty stage filter includes terminal history for repository views.
+        Ok(issues)
     }
 }
 
@@ -596,11 +620,25 @@ impl IssueTracker for FugueImsStore {
     }
 
     async fn fetch_issue_states_by_ids(&self, issue_ids: &[String]) -> Result<Vec<Issue>> {
-        let issues = self.all_open_issues()?;
-        Ok(issues
-            .into_iter()
-            .filter(|issue| issue_ids.iter().any(|id| id == &issue.id))
-            .collect())
+        if issue_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.connection()?;
+        let placeholders = (2..=issue_ids.len() + 1)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "select id, key, title, description, stage, branch_name, url, labels_json, created_at, updated_at from issues where repo = ?1 and id in ({placeholders}) order by created_at asc, key asc"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(sqlite_error)?;
+        stmt.query_map(
+            params_from_iter(std::iter::once(&self.repo.0).chain(issue_ids.iter())),
+            issue_from_row,
+        )
+        .map_err(sqlite_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(sqlite_error)
     }
 
     async fn graphql(&self, _query: &str, _variables: Value) -> Result<Value> {
@@ -613,6 +651,11 @@ impl IssueTracker for FugueImsStore {
 #[async_trait]
 impl IssueManagementSystem for FugueImsStore {
     async fn list_repo_issues(&self, query: &ImsRepoIssueQuery) -> Result<Vec<ImsIssueSnapshot>> {
+        if query.repo != self.repo {
+            return Err(FugueError::ResponseError(
+                "repository query does not match the configured tracker project".into(),
+            ));
+        }
         let conn = self.connection()?;
         let mut stmt = conn
             .prepare(
@@ -646,8 +689,8 @@ impl IssueManagementSystem for FugueImsStore {
         let conn = self.connection()?;
         let changed = conn
             .execute(
-                "update issues set stage = ?1, updated_at = ?2 where key = ?3",
-                params![stage.0, now, issue.key.0],
+                "update issues set stage = ?1, updated_at = ?2 where key = ?3 and repo = ?4",
+                params![stage.0, now, issue.key.0, self.repo.0],
             )
             .map_err(sqlite_error)?;
         if changed == 0 {
@@ -681,12 +724,17 @@ impl IssueManagementSystem for FugueImsStore {
             )));
         }
         let tx = conn.transaction().map_err(sqlite_error)?;
-        tx.execute(
+        let changed = tx.execute(
             "insert into comments (id, issue_key, body_mark, created_at, updated_at, deleted_at) \
-             values (?1, ?2, ?3, ?4, ?4, null)",
-            params![id, issue.key.0, body, now],
+             select ?1, ?2, ?3, ?4, ?4, null where exists (select 1 from issues where key = ?2 and repo = ?5)",
+            params![id, issue.key.0, body, now, self.repo.0],
         )
         .map_err(sqlite_error)?;
+        if changed == 0 {
+            return Err(FugueError::ResponseError(
+                "issue is unavailable in the configured repository".into(),
+            ));
+        }
         for (position, attachment) in attachments.iter().enumerate() {
             tx.execute(
                 "insert into comment_attachments \
@@ -723,7 +771,7 @@ impl FugueImsStore {
     }
 }
 
-fn fugue_ims_path(endpoint: &str) -> Result<PathBuf> {
+pub(crate) fn fugue_ims_path(endpoint: &str) -> Result<PathBuf> {
     endpoint
         .strip_prefix("sqlite://")
         .map(PathBuf::from)
@@ -969,10 +1017,6 @@ fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
         .map(|datetime| datetime.with_timezone(&Utc))
 }
 
-fn issue_stage_is_terminal(_issue: &Issue, _stages: &[String]) -> bool {
-    false
-}
-
 fn configured_state_snapshots(config: &TrackerConfig) -> Vec<LinearStateSnapshot> {
     let mut names = Vec::<String>::new();
     for name in config
@@ -1075,6 +1119,7 @@ pub fn fugue_ims_tracker_config(path: &Path) -> TrackerConfig {
             "Reviewing".to_string(),
             "Rework".to_string(),
         ],
+        attachment_root: None,
         max_attachment_files: 20,
         max_attachment_bytes: 25 * 1024 * 1024,
         max_attachment_total_bytes: 100 * 1024 * 1024,
@@ -1139,7 +1184,8 @@ mod tests {
     #[tokio::test]
     async fn sqlite_ims_persists_issue_stage_and_comments() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config = fugue_ims_tracker_config(&temp.path().join("ims.sqlite"));
+        let mut config = fugue_ims_tracker_config(&temp.path().join("ims.sqlite"));
+        config.project_slug = Some("owner/repo".into());
         let store = FugueImsStore::from_config(&config).expect("store");
         store
             .create_issue(CreateFugueIssue {
@@ -1198,7 +1244,8 @@ mod tests {
     #[tokio::test]
     async fn sqlite_ims_add_comment_accepts_and_inspects_comment_attachments() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config = fugue_ims_tracker_config(&temp.path().join("ims.sqlite"));
+        let mut config = fugue_ims_tracker_config(&temp.path().join("ims.sqlite"));
+        config.project_slug = Some("owner/repo".into());
         let store = FugueImsStore::from_config(&config).expect("store");
         store
             .create_issue(CreateFugueIssue {
@@ -1267,24 +1314,27 @@ mod tests {
     #[test]
     fn sqlite_ims_stage_filter_uses_case_insensitive_stage_index() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config = fugue_ims_tracker_config(&temp.path().join("ims.sqlite"));
+        let mut config = fugue_ims_tracker_config(&temp.path().join("ims.sqlite"));
+        config.project_slug = Some("owner/repo".into());
         let store = FugueImsStore::from_config(&config).expect("store");
         let conn = store.connection().expect("connection");
         let mut stmt = conn
             .prepare(
                 "explain query plan \
                  select id, key, title, description, stage, branch_name, url, labels_json, created_at, updated_at \
-                 from issues where lower(stage) in (?1, ?2) order by created_at asc, key asc",
+                 from issues where repo = ?1 and lower(stage) in (?2, ?3) order by created_at asc, key asc",
             )
             .expect("plan");
         let details = stmt
-            .query_map(params!["todo", "active"], |row| row.get::<_, String>(3))
+            .query_map(params!["owner/repo", "todo", "active"], |row| {
+                row.get::<_, String>(3)
+            })
             .expect("plan rows")
             .collect::<std::result::Result<Vec<_>, _>>()
             .expect("details")
             .join("\n");
         assert!(
-            details.contains("issues_stage_ci_created_key_idx"),
+            details.contains("issues_repo_stage_ci_created_key_idx"),
             "stage filter should use the case-insensitive stage index; plan was {details}"
         );
     }
@@ -1292,7 +1342,8 @@ mod tests {
     #[test]
     fn sqlite_ims_stage_filter_does_not_materialize_off_lane_history() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config = fugue_ims_tracker_config(&temp.path().join("ims.sqlite"));
+        let mut config = fugue_ims_tracker_config(&temp.path().join("ims.sqlite"));
+        config.project_slug = Some("owner/repo".into());
         let store = FugueImsStore::from_config(&config).expect("store");
         for index in 0..1_500 {
             store
@@ -1344,7 +1395,8 @@ mod tests {
     #[tokio::test]
     async fn sqlite_ims_backs_linear_shaped_tool_surface() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config = fugue_ims_tracker_config(&temp.path().join("ims.sqlite"));
+        let mut config = fugue_ims_tracker_config(&temp.path().join("ims.sqlite"));
+        config.project_slug = Some("owner/repo".into());
         let store = FugueImsStore::from_config(&config).expect("store");
         store
             .create_issue(CreateFugueIssue {
@@ -1400,5 +1452,147 @@ mod tests {
                 .as_ref()
                 .is_some_and(|workpad| workpad.body_markdown.contains("Tool-backed workpad"))
         );
+    }
+    #[tokio::test]
+    async fn shared_database_preserves_repository_scope_for_reads_and_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config_a = fugue_ims_tracker_config(&root.path().join("shared.sqlite3"));
+        config_a.project_slug = Some("owner/one".into());
+        let mut config_b = config_a.clone();
+        config_b.project_slug = Some("owner/two".into());
+        let one = FugueImsStore::from_config(&config_a).unwrap();
+        let two = FugueImsStore::from_config(&config_b).unwrap();
+        let create = |key: &str, repo: &str| CreateFugueIssue {
+            key: ImsIssueKey(key.into()),
+            repo: repo.into(),
+            title: key.into(),
+            description: None,
+            stage: ImsStageName("Todo".into()),
+            labels: Vec::new(),
+        };
+        one.create_issue(create("ONE-1", "owner/one")).unwrap();
+        let foreign = two.create_issue(create("TWO-1", "owner/two")).unwrap();
+        let foreign_ref = ImsIssueRef {
+            key: foreign.key.clone(),
+        };
+        let comment = two.add_comment(&foreign_ref, "private note").await.unwrap();
+
+        assert_eq!(
+            one.all_open_issues().unwrap().len(),
+            1,
+            "board must be scoped"
+        );
+        assert_eq!(one.fetch_candidate_issues().await.unwrap().len(), 1);
+        assert!(
+            one.fetch_issue_states_by_ids(std::slice::from_ref(&foreign.id.0))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            one.list_repo_issues(&ImsRepoIssueQuery {
+                repo: ImsRepoScope("owner/two".into())
+            })
+            .await
+            .is_err()
+        );
+        for issue in [
+            LinearIssueRef::Id {
+                id: LinearIssueId(foreign.id.0.clone()),
+            },
+            LinearIssueRef::Identifier {
+                identifier: LinearIssueIdentifier(foreign.key.0.clone()),
+            },
+        ] {
+            assert!(
+                one.inspect_issue_tool(InspectIssueInput {
+                    issue: issue.clone()
+                })
+                .await
+                .is_err()
+            );
+            assert!(
+                crate::workgraph_gate::canonical_issue_identifier(&config_a, &issue)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(one.issue(&foreign_ref).await.is_err());
+        assert!(one.comments(&foreign_ref).await.is_err());
+        assert!(
+            one.add_comment(&foreign_ref, "must not write")
+                .await
+                .is_err()
+        );
+        assert!(one.update_comment(&comment.id, "must not update").is_err());
+        assert!(one.delete_comment(&comment.id).is_err());
+        assert!(
+            one.move_issue(
+                &foreign_ref,
+                &ImsStageName("Done".into()),
+                IdempotencyKey("foreign".into())
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            one.create_issue(create("TWO-1", "owner/one")).is_err(),
+            "upsert cannot transfer ownership"
+        );
+        assert!(
+            one.create_issue(create("TWO-2", "owner/two")).is_err(),
+            "create cannot choose another scope"
+        );
+
+        assert_eq!(two.issue(&foreign_ref).await.unwrap(), foreign);
+        assert_eq!(two.comments(&foreign_ref).await.unwrap(), vec![comment]);
+        assert_eq!(two.all_open_issues().unwrap().len(), 1);
+        let local = ImsIssueRef {
+            key: ImsIssueKey("ONE-1".into()),
+        };
+        one.move_issue(
+            &local,
+            &ImsStageName("Active".into()),
+            IdempotencyKey("local".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(one.issue(&local).await.unwrap().stage.0, "Active");
+        let own_id = one.issue(&local).await.unwrap().id.0;
+        one.move_issue(
+            &local,
+            &ImsStageName("Done".into()),
+            IdempotencyKey("done".into()),
+        )
+        .await
+        .unwrap();
+        let observed = one
+            .fetch_issue_states_by_ids(&[own_id, foreign.id.0])
+            .await
+            .unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(
+            observed[0].state, "Done",
+            "reconciliation must observe local terminal states"
+        );
+        assert_eq!(
+            one.all_open_issues().unwrap().len(),
+            1,
+            "terminal history remains repository-scoped"
+        );
+    }
+    #[test]
+    fn repository_scope_is_required_before_creating_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("not-created.sqlite3");
+        let mut config = fugue_ims_tracker_config(&path);
+        for scope in [None, Some("  ".to_owned())] {
+            config.project_slug = scope;
+            assert!(matches!(
+                FugueImsStore::from_config(&config),
+                Err(FugueError::MissingTrackerProjectSlug)
+            ));
+            assert!(!path.exists());
+        }
     }
 }

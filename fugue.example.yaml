@@ -66,7 +66,7 @@ mcp_servers:
 
 agents:
   planner:
-    model: gpt-5.5
+    model: gpt-6-astra
     # `mob` is Meerkat's native mob tool surface (delegate/mob_create/etc).
     tools: [mob, workgraph, mcp:linear, mcp:github]
     system_prompt: >-
@@ -74,14 +74,14 @@ agents:
       PR, comment, and check feedback into blocking WorkGraph items before
       implementation resumes.
   coder:
-    model: gpt-5.5
+    model: gpt-6-astra
     tools: [mob, shell, git, workgraph, mcp:linear, mcp:github]
     system_prompt: >-
       Implement only the current Workpad plan and open WorkGraph obligations,
       keep validation evidence current, and hand back to the reviewer when
       local checks are ready.
   reviewer:
-    model: gpt-5.5
+    model: gpt-6-astra
     tools: [mob, shell, git, workgraph, mcp:linear, mcp:github]
     system_prompt: >-
       Gate the local implementation and PR/check evidence. Inspect diff and
@@ -150,9 +150,10 @@ kapellmeister:
   #     - kapellmeister-safe
 
 # Optional repo-level final PR review gate. Disabled by default; when enabled,
-# Kapellmeister owns final reviewer orchestration, typed verdict aggregation,
-# configured lane projection, and any explicitly authorized merge. Host/issue
-# mobs observe and hand off only.
+# Kapellmeister starts a review coordinator in the repository mob. It selects
+# at least three independent existing specialists. Replace the profile selectors
+# below with names from your mapped repository roster before enabling this gate.
+# The host verifies native results, CI and WorkGraph before merge and projection.
 final_review:
   enabled: false
   mode: manual # manual | auto
@@ -167,17 +168,17 @@ final_review:
     require_fresh_head: true
   reviewers:
     - id: architecture
-      profile: final_architecture_reviewer
+      profile: repository_architecture
       required: true
     - id: tests
-      profile: final_test_reviewer
+      profile: repository_tests
       required: true
     - id: security
-      profile: final_security_reviewer
+      profile: repository_security
       required: false
 
 # Optional independent PR Review action lane. When enabled, Kapellmeister starts a
-# review orchestrator mob for the configured action lane; the orchestrator chooses
+# review coordinator in the repository mob for the action lane; it chooses
 # exactly three independent reviewers, each reviewer inspects the diff itself,
 # and red findings become blocking WorkGraph obligations before focused
 # replanning in the canonical active lane.

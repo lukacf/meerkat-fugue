@@ -4,7 +4,7 @@
 //! Jira is translated at this boundary; no GraphQL or Linear service is involved.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -12,9 +12,22 @@ use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::config::TrackerConfig;
-use crate::domain::{BlockerRef, Issue, IssueAttachment};
+use crate::domain::{BlockerRef, CreatedIssueReceipt, Issue, IssueAttachment};
 use crate::error::{FugueError, Result};
 use crate::tools::*;
+
+/// Bytes received from a validated browser multipart request. This is deliberately
+/// not deserializable: tool/JSON callers cannot use it to read host-local paths.
+pub(crate) struct JiraUploadFile {
+    pub name: String,
+    pub content_type: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+pub(crate) struct JiraUploadReceipt {
+    pub attachments: Vec<LinearCommentAttachmentInput>,
+    pub complete: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -33,6 +46,9 @@ pub struct JiraConfig {
     pub transition_fields_file: Option<String>,
     /// Jira issue-link type names whose inward side blocks this issue.
     pub blocking_link_types: Vec<String>,
+    /// Exact Jira priority names mapped to dispatch ranks (lower runs first).
+    /// Jira IDs are opaque; unmapped names have no numeric priority.
+    pub priority_ranks: BTreeMap<String, std::num::NonZeroU32>,
 }
 
 impl Default for JiraConfig {
@@ -46,6 +62,7 @@ impl Default for JiraConfig {
             create_fields_file: None,
             transition_fields_file: None,
             blocking_link_types: vec!["Blocks".to_string()],
+            priority_ranks: BTreeMap::new(),
         }
     }
 }
@@ -87,6 +104,13 @@ pub struct JiraClient {
     active_states: Vec<String>,
     terminal_states: Vec<String>,
     attachment_limits: crate::tracker::AttachmentDownloadLimits,
+    attachment_root: Option<PathBuf>,
+}
+
+struct JiraDownloadedFile {
+    path: PathBuf,
+    content_type: Option<String>,
+    byte_len: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -104,7 +128,7 @@ fn request_error(error: reqwest::Error) -> FugueError {
     FugueError::JiraRequest(error.without_url().to_string())
 }
 
-fn env_value(value: &str) -> Option<String> {
+pub(crate) fn env_value(value: &str) -> Option<String> {
     match value.strip_prefix('$') {
         Some(name) => std::env::var(name).ok(),
         None => Some(value.to_string()),
@@ -146,41 +170,68 @@ impl std::fmt::Display for JqlValues<'_> {
     }
 }
 
+pub(crate) struct JiraRoutingScope {
+    pub base: Url,
+    pub project: String,
+    pub query: Option<String>,
+}
+
+/// Resolve exactly the same routing coordinates for the client and durable
+/// notification scope without requiring credentials or contacting the server.
+pub(crate) fn routing_scope(tracker: &TrackerConfig) -> Result<JiraRoutingScope> {
+    let endpoint = env_value(&tracker.endpoint)
+        .ok_or_else(|| invalid("Jira requires tracker.endpoint or JIRA_BASE_URL"))?;
+    let mut base =
+        Url::parse(&endpoint).map_err(|_| invalid("tracker.endpoint must be a Jira site URL"))?;
+    if !matches!(base.scheme(), "http" | "https")
+        || base.host_str().is_none()
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.query().is_some()
+        || base.fragment().is_some()
+    {
+        return Err(invalid(
+            "Jira site URL must be HTTP(S) without credentials, query, or fragment",
+        ));
+    }
+    base.set_path(&format!("{}/", base.path().trim_end_matches('/')));
+    let project = tracker
+        .project_slug
+        .as_deref()
+        .and_then(env_value)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(FugueError::MissingTrackerProjectSlug)?;
+    let query = tracker
+        .jira
+        .as_ref()
+        .and_then(|config| config.jql.as_deref())
+        .map(|jql| {
+            env_value(jql).ok_or_else(|| {
+                invalid("tracker.jira.jql references a missing or empty environment variable")
+            })
+        })
+        .transpose()?;
+    Ok(JiraRoutingScope {
+        base,
+        project,
+        query,
+    })
+}
+
 impl JiraClient {
     pub fn from_config(tracker: &TrackerConfig) -> Result<Self> {
-        let endpoint = env_value(&tracker.endpoint)
-            .ok_or_else(|| invalid("Jira requires tracker.endpoint or JIRA_BASE_URL"))?;
-        let mut base = Url::parse(&endpoint)
-            .map_err(|_| invalid("tracker.endpoint must be a Jira site URL"))?;
-        if !matches!(base.scheme(), "http" | "https")
-            || base.host_str().is_none()
-            || !base.username().is_empty()
-            || base.password().is_some()
-            || base.query().is_some()
-            || base.fragment().is_some()
-        {
-            return Err(invalid(
-                "Jira site URL must be HTTP(S) without credentials, query, or fragment",
-            ));
-        }
-        base.set_path(&format!("{}/", base.path().trim_end_matches('/')));
-        let project = tracker
-            .project_slug
-            .as_deref()
-            .and_then(env_value)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(FugueError::MissingTrackerProjectSlug)?;
+        let JiraRoutingScope {
+            base,
+            project,
+            query,
+        } = routing_scope(tracker)?;
         let token = tracker
             .api_key
             .as_deref()
             .and_then(env_value)
             .ok_or(FugueError::MissingTrackerApiKey)?;
         let mut config = tracker.jira.clone().unwrap_or_default();
-        if let Some(jql) = &config.jql {
-            config.jql = Some(env_value(jql).ok_or_else(|| {
-                invalid("tracker.jira.jql references a missing or empty environment variable")
-            })?);
-        }
+        config.jql = query;
         if let Some(issue_type) = &config.issue_type {
             config.issue_type = Some(env_value(issue_type).ok_or_else(|| {
                 invalid(
@@ -271,6 +322,7 @@ impl JiraClient {
             active_states: tracker.active_states.clone(),
             terminal_states: tracker.terminal_states.clone(),
             attachment_limits: crate::tracker::AttachmentDownloadLimits::from_config(tracker),
+            attachment_root: tracker.attachment_root.clone(),
         })
     }
 
@@ -427,7 +479,13 @@ impl JiraClient {
             identifier: issue.key,
             title: issue.fields.summary,
             description: issue.fields.description.map(|body| body.markdown()),
-            priority: issue.fields.priority.map(|priority| priority.id),
+            priority: issue.fields.priority.and_then(|priority| {
+                self.config
+                    .priority_ranks
+                    .get(&priority.name)
+                    .copied()
+                    .map(|rank| i64::from(rank.get()))
+            }),
             state: issue.fields.status.name,
             branch_name: None,
             labels: issue.fields.labels,
@@ -532,6 +590,15 @@ impl JiraClient {
             .collect())
     }
 
+    pub(crate) async fn resolve_issue_identifier(
+        &self,
+        issue: &LinearIssueRef,
+    ) -> Result<LinearIssueIdentifier> {
+        self.fetch_issue(issue)
+            .await
+            .map(|issue| LinearIssueIdentifier(issue.key))
+    }
+
     pub async fn inspect_issue(&self, input: InspectIssueInput) -> Result<InspectIssueOutput> {
         let issue = self.fetch_issue(&input.issue).await?;
         let comments = self.comments_for_key(&issue.key).await?;
@@ -543,10 +610,46 @@ impl JiraClient {
                 url: Some(self.comment_url(&issue.key, &comment.id)),
             }
         });
+        let snapshot = self.snapshot(&issue);
+        let normalized = self.normalize(issue);
+        let mut attachments = Vec::with_capacity(normalized.attachments.len());
+        if !normalized.attachments.is_empty() {
+            let root = match &self.attachment_root {
+                Some(root) => root.join("attachments"),
+                None => std::env::current_dir()
+                    .map_err(|error| FugueError::Workspace(error.to_string()))?
+                    .join(".fugue/attachments"),
+            }
+            .join(crate::domain::sanitize_workspace_key(
+                &normalized.identifier,
+            ));
+            tokio::fs::create_dir_all(&root)
+                .await
+                .map_err(|error| FugueError::Workspace(error.to_string()))?;
+            let mut budget = self.attachment_limits.budget();
+            for (index, attachment) in normalized.attachments.into_iter().enumerate() {
+                let downloaded = self
+                    .download_attachment(&attachment, &root, index, &mut budget)
+                    .await?;
+                let attachment_id = attachment
+                    .id
+                    .ok_or_else(|| invalid("Jira attachment is missing its identifier"))?;
+                attachments.push(LinearFileAttachmentSnapshot {
+                    source: LinearFileAttachmentSource::IssueAttachment {
+                        attachment_id: LinearAttachmentId(attachment_id),
+                    },
+                    title: attachment.title,
+                    url: attachment.url,
+                    path: downloaded.path.display().to_string(),
+                    content_type: downloaded.content_type,
+                    byte_len: downloaded.byte_len,
+                });
+            }
+        }
         Ok(InspectIssueOutput {
-            issue: self.snapshot(&issue),
+            issue: snapshot,
             workpad,
-            attachments: Vec::new(),
+            attachments,
         })
     }
 
@@ -627,6 +730,80 @@ impl JiraClient {
             comment_id: LinearCommentId(comment.id),
             created: true,
             updated: false,
+        })
+    }
+
+    /// Uses Jira's native multipart attachment contract, not links to host files:
+    /// <https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-attachments/#api-rest-api-3-issue-issueidorkey-attachments-post>
+    pub(crate) async fn upload_browser_files(
+        &self,
+        issue: &LinearIssueRef,
+        files: Vec<JiraUploadFile>,
+    ) -> Result<JiraUploadReceipt> {
+        let issue = self.fetch_issue(issue).await?;
+        let expected = files.len();
+        let mut form = reqwest::multipart::Form::new();
+        for file in files {
+            let mut part = reqwest::multipart::Part::bytes(file.bytes).file_name(file.name);
+            if let Some(content_type) = file.content_type {
+                part = part.mime_str(&content_type).map_err(request_error)?;
+            }
+            form = form.part("file", part);
+        }
+        let response = self
+            .client
+            .post(self.url(&["issue", &issue.key, "attachments"])?)
+            .header("X-Atlassian-Token", "no-check")
+            .multipart(form)
+            .send()
+            .await;
+        // A lost response or server failure cannot prove that Jira rejected the
+        // upload. The caller must retain the issue and ask for reconciliation.
+        let uncertain = || JiraUploadReceipt {
+            attachments: Vec::new(),
+            complete: false,
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(_) => return Ok(uncertain()),
+        };
+        if response.status().is_client_error() {
+            return Err(FugueError::JiraApiStatus {
+                status: response.status().as_u16(),
+            });
+        }
+        if !response.status().is_success() {
+            return Ok(uncertain());
+        }
+        let uploaded: Vec<JiraUploadedFile> = match response.json().await {
+            Ok(uploaded) => uploaded,
+            Err(_) => return Ok(uncertain()),
+        };
+        let mut seen = BTreeSet::new();
+        let mut attachments = Vec::with_capacity(uploaded.len());
+        for file in uploaded {
+            let Ok(url) = Url::parse(&file.content) else {
+                continue;
+            };
+            if file.filename.is_empty()
+                || url.origin() != self.base.origin()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || !seen.insert(url.to_string())
+            {
+                continue;
+            }
+            attachments.push(LinearCommentAttachmentInput {
+                title: Some(file.filename),
+                url: url.to_string(),
+                path: None,
+                content_type: file.mime_type,
+                byte_len: file.size,
+            });
+        }
+        Ok(JiraUploadReceipt {
+            complete: attachments.len() == expected,
+            attachments,
         })
     }
 
@@ -739,10 +916,6 @@ impl JiraClient {
                 "Jira accepted the transition but the requested status was not observed",
             ));
         }
-        crate::linear_lane_state::record_internal_lane_change_from_env(
-            &issue.key,
-            &updated.fields.status.name,
-        )?;
         Ok(MoveIssueOutput {
             issue: self.snapshot(&updated),
             changed: true,
@@ -824,25 +997,39 @@ impl JiraClient {
                 },
             },
         };
-        let created: JiraId = self
+        let created: JiraCreatedIssue = self
             .send(Method::POST, &["issue"], Some(&payload))
             .await?
             .json()
             .await
             .map_err(request_error)?;
-        let reference = LinearIssueRef::Id {
-            id: LinearIssueId(created.id),
+        let receipt = CreatedIssueReceipt {
+            url: created.key.as_deref().map(|key| self.browse_url(key)),
+            identifier: created.key.unwrap_or_else(|| created.id.clone()),
+            id: created.id,
         };
-        self.move_issue(MoveIssueInput {
-            issue: reference.clone(),
-            state: LinearStateRef::Name {
-                name: lane.to_string(),
-            },
-            expected_updated_at: None,
-            idempotency_key: IdempotencyKey("jira-create-initial-status".to_string()),
+        let reference = LinearIssueRef::Id {
+            id: LinearIssueId(receipt.id.clone()),
+        };
+        // Creation has committed upstream. Every subsequent failure must retain
+        // that acknowledgement so the caller recovers this issue, not a new one.
+        let follow_up = async {
+            self.move_issue(MoveIssueInput {
+                issue: reference.clone(),
+                state: LinearStateRef::Name {
+                    name: lane.to_string(),
+                },
+                expected_updated_at: None,
+                idempotency_key: IdempotencyKey("jira-create-initial-status".to_string()),
+            })
+            .await?;
+            Ok(self.normalize(self.fetch_issue(&reference).await?))
+        }
+        .await;
+        follow_up.map_err(|source| FugueError::IssueCreatedNeedsAttention {
+            created: receipt,
+            source: Box::new(source),
         })
-        .await?;
-        Ok(self.normalize(self.fetch_issue(&reference).await?))
     }
 
     pub async fn materialize_issue_attachments(
@@ -850,7 +1037,6 @@ impl JiraClient {
         issue: &Issue,
         workspace: &Path,
     ) -> Result<Issue> {
-        use tokio::io::AsyncWriteExt;
         let mut materialized = issue.clone();
         let mut budget = self.attachment_limits.budget();
         let root = workspace
@@ -862,75 +1048,107 @@ impl JiraClient {
                 .map_err(|err| FugueError::Workspace(err.to_string()))?;
         }
         for (index, attachment) in materialized.attachments.iter_mut().enumerate() {
-            let url = Url::parse(&attachment.url)
-                .map_err(|_| invalid("Jira attachment URL is invalid"))?;
-            // Only the configured Jira origin receives credentials. Redirects must be
-            // handled by the operator until a trusted download origin is configured.
-            if url.origin() != self.base.origin()
-                || !url.username().is_empty()
-                || url.password().is_some()
-            {
-                return Err(invalid(
-                    "Jira attachment URL is outside the configured site",
-                ));
-            }
-            budget.reserve_file(&attachment.url)?;
-            // Jira serves the bytes directly when redirect=false, avoiding CDN auth leakage.
-            let mut response = self
-                .client
-                .get(url)
-                .query(&[("redirect", "false")])
-                .send()
-                .await
-                .map_err(request_error)?;
-            if !response.status().is_success() {
-                return Err(FugueError::JiraApiStatus {
-                    status: response.status().as_u16(),
-                });
-            }
-            budget.check_content_length(&attachment.url, response.content_length())?;
-            let filename = attachment
-                .title
-                .as_deref()
-                .and_then(|title| Path::new(title).file_name())
-                .and_then(|name| name.to_str())
-                .unwrap_or("attachment");
-            let path = root.join(format!("{index}-{filename}"));
-            let temporary = root.join(format!(".{index}.download"));
-            let result = async {
-                let mut file = tokio::fs::File::create(&temporary)
-                    .await
-                    .map_err(|err| FugueError::Workspace(err.to_string()))?;
-                let mut bytes = 0u64;
-                while let Some(chunk) = response.chunk().await.map_err(request_error)? {
-                    bytes = bytes.saturating_add(chunk.len() as u64);
-                    budget.check_streamed_len(&attachment.url, bytes)?;
-                    file.write_all(&chunk)
-                        .await
-                        .map_err(|err| FugueError::Workspace(err.to_string()))?;
-                }
-                file.flush()
-                    .await
-                    .map_err(|err| FugueError::Workspace(err.to_string()))?;
-                tokio::fs::rename(&temporary, &path)
-                    .await
-                    .map_err(|err| FugueError::Workspace(err.to_string()))?;
-                budget.record_success(bytes);
-                Ok::<_, FugueError>(())
-            }
-            .await;
-            if result.is_err()
-                && let Err(error) = tokio::fs::remove_file(&temporary).await
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(FugueError::Workspace(format!(
-                    "Jira download failed and temporary file cleanup failed: {error}"
-                )));
-            }
-            result?;
-            attachment.local_path = Some(path);
+            let downloaded = self
+                .download_attachment(attachment, &root, index, &mut budget)
+                .await?;
+            attachment.local_path = Some(downloaded.path);
         }
         Ok(materialized)
+    }
+
+    async fn download_attachment(
+        &self,
+        attachment: &IssueAttachment,
+        root: &Path,
+        index: usize,
+        budget: &mut crate::tracker::AttachmentDownloadBudget,
+    ) -> Result<JiraDownloadedFile> {
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncWriteExt;
+        let url =
+            Url::parse(&attachment.url).map_err(|_| invalid("Jira attachment URL is invalid"))?;
+        // Only the configured Jira origin receives credentials. Redirects must be
+        // handled by the operator until a trusted download origin is configured.
+        if url.origin() != self.base.origin()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(invalid(
+                "Jira attachment URL is outside the configured site",
+            ));
+        }
+        budget.reserve_file(&attachment.url)?;
+        // Jira serves the bytes directly when redirect=false, avoiding CDN auth leakage.
+        let mut response = self
+            .client
+            .get(url)
+            .query(&[("redirect", "false")])
+            .send()
+            .await
+            .map_err(request_error)?;
+        if !response.status().is_success() {
+            return Err(FugueError::JiraApiStatus {
+                status: response.status().as_u16(),
+            });
+        }
+        budget.check_content_length(&attachment.url, response.content_length())?;
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let filename = attachment
+            .title
+            .as_deref()
+            .and_then(|title| Path::new(title).file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment");
+        let temporary = root.join(format!(".{index}-{}.download", uuid::Uuid::now_v7()));
+        let result = async {
+            let mut file = tokio::fs::File::create(&temporary)
+                .await
+                .map_err(|err| FugueError::Workspace(err.to_string()))?;
+            let mut bytes = 0u64;
+            let mut digest = Sha256::new();
+            while let Some(chunk) = response.chunk().await.map_err(request_error)? {
+                bytes = bytes.saturating_add(chunk.len() as u64);
+                budget.check_streamed_len(&attachment.url, bytes)?;
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|err| FugueError::Workspace(err.to_string()))?;
+                digest.update(&chunk);
+            }
+            file.flush()
+                .await
+                .map_err(|err| FugueError::Workspace(err.to_string()))?;
+            // A later catalog replacement must not change the bytes behind an
+            // earlier receipt, even when filenames or positions are reused.
+            let content_root = root.join(format!("{:x}", digest.finalize()));
+            tokio::fs::create_dir_all(&content_root)
+                .await
+                .map_err(|err| FugueError::Workspace(err.to_string()))?;
+            let path = content_root.join(filename);
+            tokio::fs::rename(&temporary, &path)
+                .await
+                .map_err(|err| FugueError::Workspace(err.to_string()))?;
+            budget.record_success(bytes);
+            Ok::<_, FugueError>((path, bytes))
+        }
+        .await;
+        if result.is_err()
+            && let Err(error) = tokio::fs::remove_file(&temporary).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(FugueError::Workspace(format!(
+                "Jira download failed and temporary file cleanup failed: {error}"
+            )));
+        }
+        let (path, byte_len) = result?;
+        Ok(JiraDownloadedFile {
+            path,
+            content_type,
+            byte_len,
+        })
     }
 
     pub async fn recent_issue_changes(
@@ -1007,12 +1225,21 @@ pub async fn execute_tool(
     operation: FugueToolOperation,
     arguments: &serde_json::Value,
 ) -> (bool, String) {
+    let result = execute_tool_result(config, operation, arguments).await;
+    crate::linear_tools::tool_result_to_callback(result)
+}
+
+pub(crate) async fn execute_tool_result(
+    config: &TrackerConfig,
+    operation: FugueToolOperation,
+    arguments: &serde_json::Value,
+) -> FugueToolResult {
     let result = execute_typed_tool(config, operation, arguments).await;
     let key = arguments
         .get("idempotency_key")
         .and_then(serde_json::Value::as_str)
         .map(|value| IdempotencyKey(value.to_string()));
-    let result = match result {
+    match result {
         Ok(output) => FugueToolResult::Ok {
             output,
             metadata: ToolExecutionMetadata::default(),
@@ -1062,11 +1289,6 @@ pub async fn execute_tool(
                 metadata: ToolExecutionMetadata::default(),
             }
         }
-    };
-    let is_error = matches!(result, FugueToolResult::Err { .. });
-    match serde_json::to_string(&result) {
-        Ok(content) => (is_error, content),
-        Err(error) => (true, error.to_string()),
     }
 }
 
@@ -1316,20 +1538,19 @@ struct JiraFields {
     attachment: Vec<JiraAttachment>,
 }
 
+#[derive(Deserialize)]
+struct JiraCreatedIssue {
+    id: String,
+    // Retain an acknowledged ID even if a compatible server omits its key.
+    key: Option<String>,
+}
 #[derive(Serialize, Deserialize)]
 struct JiraId {
     id: String,
 }
 #[derive(Deserialize)]
 struct JiraPriority {
-    #[serde(deserialize_with = "deserialize_priority")]
-    id: i64,
-}
-fn deserialize_priority<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<i64, D::Error> {
-    let id = String::deserialize(deserializer)?;
-    id.parse().map_err(serde::de::Error::custom)
+    name: String,
 }
 #[derive(Deserialize)]
 struct JiraProject {
@@ -1429,6 +1650,15 @@ struct JiraAttachment {
     id: String,
     filename: String,
     content: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JiraUploadedFile {
+    filename: String,
+    content: String,
+    size: u64,
+    mime_type: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1607,4 +1837,4 @@ impl std::fmt::Display for AdfNode {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

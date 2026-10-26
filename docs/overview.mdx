@@ -1,82 +1,77 @@
-# Overview
+---
+title: "How Fugue works"
+description: "One persistent team and issue queue per repository, with explicit review and delivery evidence."
+---
 
-Meerkat Fugue is a small Rust service that turns a Linear project into a safe,
-observable coding-agent queue. It polls eligible Linear issues, prepares an
-isolated workspace for each issue, launches the configured native Meerkat mob,
-and keeps humans informed through a durable Linear Workpad, GitHub pull
-requests, and an optional local status API.
+# How Fugue works
 
-## When to use Fugue
+Fugue turns issues into reviewed code changes. It connects GitHub or GitHub
+Enterprise repositories to built-in tickets, Linear or Jira, and runs persistent
+Meerkat agent teams on a host you control.
 
-Use Fugue when you want a trusted automation host to process a Linear queue with
-clear handoff evidence:
+A repository is the unit of work. It owns its tracker/project, queue, checkout,
+credentials and native mob. Multiple repositories share one operator application
+and one native agent console.
 
-- Linear remains the intake and human coordination surface.
-- Each issue receives an isolated workspace under `workspace.root`.
-- Native Meerkat/Meta mobs perform planning, implementation, and review.
-- Operators can inspect status and recovery evidence without reading process
-  memory.
+## Setup creates the team
 
-Do not use Fugue as a sandbox boundary. Hooks, worker commands, repository
-code, Meerkat tools, and credentials run with the permissions available on the
-host.
+During preparation, Fugue maps the repository and proposes specialists based on
+its actual domains. An independent formation review checks the team, then the
+specialists study their code and retain their knowledge in native agent memory.
+They register file and folder subscriptions. Fugue polls the remote default
+branch and notifies the relevant specialists when those paths change.
 
-## Core concepts
+Preparation is separate from daily issue work. You do not repeat repository
+mapping for each ticket. Ticket leads and execution members join the existing
+repository mob, with prompts naming its specialists and requiring consultation
+and domain handoffs.
 
-### Linear issue lifecycle
+## Issues carry the work
 
-Native configs project the selected mob's state into coarse tracker lanes. The
-canonical planner/coder/reviewer projection looks like this:
+An eligible issue receives an isolated workspace. The repository coordinator
+and issue team plan, implement and review the work, recording durable evidence
+in native runtime state and a tracker comment headed `## Fugue Workpad`.
+
+The workpad is the human-readable record: scope, plan, test results, review and
+PR links. It does not replace typed review results or native lifecycle state.
+Tracker lanes project that lifecycle and expose configured operator actions.
+Jira retains its existing status names and transitions.
+
+The delivery path is:
 
 ```text
-Queue -> Active -> Done
-          ^
-          +-- planner/coder/reviewer phases live in labels, Workpad,
-              WorkGraph, and Meta runtime state
+Issue intake -> Planning and implementation -> Review -> PR gate -> Merge
+                         |                        |
+                         +---- blockers/rework ---+
 ```
 
-`Queue` is the default ready queue. `Active` means Fugue is working the issue;
-`fugue:phase:planning`, `fugue:phase:implementing`, and
-`fugue:phase:reviewing` carry detailed execution phase without additional
-tracker statuses. `Review` and `Deploy` are operator action lanes, and `Done` is
-terminal completion after required handoff evidence is coherent.
+A merge requires the configured review and check evidence for the actual PR
+head. A merge action does not deploy the application unless a deployment
+procedure is explicitly configured. No reported CI checks, failed tests and a
+successful check result are different outcomes.
 
-### Workpad
+## Three daily places
 
-Workers maintain exactly one persistent Linear comment headed
-`## Fugue Workpad`. The Workpad records the plan, acceptance criteria, progress,
-validation, and pull request or handoff evidence. It is the human-readable
-projection of the run, not the only source of truth.
+| Place | Use it for |
+| --- | --- |
+| Home | Issues in attention lanes, retries, active work and preparation problems. |
+| Board | The repository's actual tracker lanes, issue details and operator actions. |
+| Agents | Native conversations, members, topology, Memory, Work Graph, logs and health. |
 
-### Native execution mobs
+**Repositories** holds occasional setup and configuration. The repository
+selector retains context between pages. The shared console exposes all teams;
+its native Memory and Work Graph panels select an individual runtime.
 
-A native `fugue.yaml` with no backend override launches native Meerkat/Meta
-mobs. Mob templates define member profiles and flow shape, such as solo work or
-a bounded planner/coder/reviewer loop.
+## What you operate
 
-### Recovery evidence
+Fugue runs with the service user's permissions. Repository tools, hooks and build
+commands execute on that host. Use trusted repositories and credentials whose
+scope matches the work. Fugue is not an OS sandbox.
 
-Fugue reconciles Meta structural events, workspace state, Linear Workpad
-content, and GitHub PR state. A restarted process uses durable evidence to
-recover active work. Missing or contradictory facts set review requirements
-instead of silently completing an issue.
+Every admitted browser user is a full operator of the instance. Use separate
+instances for operators who must not share repository and credential authority.
+Keep remote access behind an authenticated HTTPS gateway, and preserve the
+service user's home and application state across upgrades.
 
-## Documentation map
-
-- [Getting started](./getting-started.mdx) for installation, first config, safe
-  validation, and first run.
-- [Configuration](./configuration.mdx) for typed `fugue.yaml` fields and
-  examples.
-- [Native mobs](./native-mobs.mdx) for projection profiles, member roles,
-  Workpad handoff, and typed transitions.
-- [Operations](./operations.mdx) for production setup, monitoring, incidents,
-  and rollback.
-- [Architecture](./architecture.mdx) for components, lifecycle, recovery, and
-  trust boundaries.
-- [Development](./development.mdx) for local checks, coding rules, and the real
-  E2E suite.
-
-## Related docs
-
-- [Getting Started](./getting-started.mdx)
-- [Architecture](./architecture.mdx)
+Start with [your first repository](./getting-started.mdx), then use
+[daily work](./daily-work.mdx) and [operations](./operations.mdx) as references.

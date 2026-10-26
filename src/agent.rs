@@ -77,7 +77,7 @@ async fn run_agent_worker_inner(
     tx: &mpsc::Sender<WorkerMessage>,
     cancel: CancellationToken,
 ) -> Result<LiveSession> {
-    let workspace_manager = WorkspaceManager::new(&config.workspace, &config.hooks);
+    let workspace_manager = WorkspaceManager::for_service(config);
     let tool_layer = FugueToolLayer::new(config);
     let workspace = match tool_layer.create_workspace_for_issue(issue).await {
         Ok(workspace) => workspace,
@@ -819,6 +819,14 @@ pub fn execute_github_fugue_tool(
     name: &str,
     arguments: &Value,
 ) -> (bool, String, Vec<KapellmeisterShadowSignal>) {
+    execute_github_fugue_tool_with_host(name, arguments, &GitHubToolHost::new())
+}
+
+pub(crate) fn execute_github_fugue_tool_with_host(
+    name: &str,
+    arguments: &Value,
+    host: &GitHubToolHost,
+) -> (bool, String, Vec<KapellmeisterShadowSignal>) {
     let operation = match name.parse::<FugueToolOperation>() {
         Ok(operation) => operation,
         Err(_) => {
@@ -826,7 +834,6 @@ pub fn execute_github_fugue_tool(
             return (is_error, content, Vec::new());
         }
     };
-    let host = GitHubToolHost::new();
     let mut source_signals = None;
     let result = match operation {
         FugueToolOperation::GitHubInspectRepo => serde_json::from_value(arguments.clone())
@@ -935,6 +942,19 @@ fn unsupported_tool_callback(name: &str) -> (bool, String) {
     )
 }
 
+fn reference_schema<T: schemars::JsonSchema>() -> Value {
+    // Derive the advertised shape from the same typed references that parse
+    // tool calls. Inline nested schemas because these live inside a tool schema.
+    schemars::generate::SchemaSettings::draft2020_12()
+        .with(|settings| {
+            settings.inline_subschemas = true;
+            settings.meta_schema = None;
+        })
+        .into_generator()
+        .into_root_schema_for::<T>()
+        .into()
+}
+
 pub fn external_tools_for_tracker(config: &crate::config::TrackerConfig) -> Option<Vec<Value>> {
     let linear_tool_surface_available = config.kind == "fugue-ims"
         || (matches!(config.kind.as_str(), "linear" | "jira") && config.api_key.is_some());
@@ -947,7 +967,7 @@ pub fn external_tools_for_tracker(config: &crate::config::TrackerConfig) -> Opti
             "description": "Inspect a Linear issue through Fugue's typed Linear tool layer, including the current Fugue Workpad comment body when present.",
             "input_schema": {
                 "type": "object",
-                "properties": { "issue": { "type": "object" } },
+                "properties": { "issue": reference_schema::<crate::tools::LinearIssueRef>() },
                 "required": ["issue"],
                 "additionalProperties": false
             }
@@ -958,9 +978,9 @@ pub fn external_tools_for_tracker(config: &crate::config::TrackerConfig) -> Opti
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "issue": { "type": "object" },
-                    "assignee": { "type": "object" },
-                    "target_state": { "type": ["object", "string", "null"] },
+                    "issue": reference_schema::<crate::tools::LinearIssueRef>(),
+                    "assignee": reference_schema::<crate::tools::LinearUserRef>(),
+                    "target_state": reference_schema::<Option<crate::tools::LinearStateRef>>(),
                     "idempotency_key": { "type": "string" }
                 },
                 "required": ["issue", "assignee", "idempotency_key"],
@@ -973,8 +993,8 @@ pub fn external_tools_for_tracker(config: &crate::config::TrackerConfig) -> Opti
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "issue": { "type": "object" },
-                    "state": { "type": ["object", "string"] },
+                    "issue": reference_schema::<crate::tools::LinearIssueRef>(),
+                    "state": reference_schema::<crate::tools::LinearStateRef>(),
                     "expected_updated_at": { "type": ["string", "null"], "format": "date-time" },
                     "idempotency_key": { "type": "string" }
                 },
@@ -988,7 +1008,7 @@ pub fn external_tools_for_tracker(config: &crate::config::TrackerConfig) -> Opti
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "issue": { "type": "object" },
+                    "issue": reference_schema::<crate::tools::LinearIssueRef>(),
                     "heading": { "type": "string" },
                     "body_markdown": { "type": "string" },
                     "create_if_missing": { "type": "boolean" },
@@ -1044,7 +1064,7 @@ pub fn external_tools_for_tracker(config: &crate::config::TrackerConfig) -> Opti
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "issue": { "type": ["object", "null"] },
+                    "issue": reference_schema::<Option<crate::tools::LinearIssueRef>>(),
                     "since": { "type": ["string", "null"], "format": "date-time" },
                     "cursor": { "type": ["string", "null"] },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
@@ -1058,7 +1078,7 @@ pub fn external_tools_for_tracker(config: &crate::config::TrackerConfig) -> Opti
             "description": "Inspect a GitHub repository through Fugue's typed GitHub tool layer.",
             "input_schema": {
                 "type": "object",
-                "properties": { "repo": { "type": "object" } },
+                "properties": { "repo": reference_schema::<crate::tools::GitHubRepoRef>() },
                 "required": ["repo"],
                 "additionalProperties": false
             }
@@ -1069,8 +1089,8 @@ pub fn external_tools_for_tracker(config: &crate::config::TrackerConfig) -> Opti
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "repo": { "type": "object" },
-                    "pull_request": { "type": "object" }
+                    "repo": reference_schema::<crate::tools::GitHubRepoRef>(),
+                    "pull_request": reference_schema::<crate::tools::GitHubPullRequestRef>()
                 },
                 "required": ["repo", "pull_request"],
                 "additionalProperties": false
@@ -1082,7 +1102,7 @@ pub fn external_tools_for_tracker(config: &crate::config::TrackerConfig) -> Opti
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "repo": { "type": "object" },
+                    "repo": reference_schema::<crate::tools::GitHubRepoRef>(),
                     "title": { "type": "string" },
                     "body_markdown": { "type": "string" },
                     "head_branch": { "type": "string" },
@@ -1097,17 +1117,17 @@ pub fn external_tools_for_tracker(config: &crate::config::TrackerConfig) -> Opti
         }),
         json!({
             "name": FugueToolOperation::GitHubMergePr.provider_callback_name(),
-            "description": "Merge a GitHub pull request through Fugue's typed GitHub tool layer after validating the current PR state and optional expected head SHA.",
+            "description": "Merge an open, non-draft GitHub pull request at the explicit expected head SHA. Success requires GitHub to confirm the merged state and merge commit.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "repo": { "type": "object" },
-                    "pull_request": { "type": "object" },
+                    "repo": reference_schema::<crate::tools::GitHubRepoRef>(),
+                    "pull_request": reference_schema::<crate::tools::GitHubPullRequestRef>(),
                     "method": { "type": "string", "enum": ["merge", "squash", "rebase"] },
-                    "expected_head_sha": { "type": ["string", "null"] },
+                    "expected_head_sha": { "type": "string", "minLength": 1 },
                     "idempotency_key": { "type": "string" }
                 },
-                "required": ["repo", "pull_request", "method", "idempotency_key"],
+                "required": ["repo", "pull_request", "method", "expected_head_sha", "idempotency_key"],
                 "additionalProperties": false
             }
         }),
@@ -1117,7 +1137,7 @@ pub fn external_tools_for_tracker(config: &crate::config::TrackerConfig) -> Opti
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "repo": { "type": "object" },
+                    "repo": reference_schema::<crate::tools::GitHubRepoRef>(),
                     "git_ref": { "type": "string" }
                 },
                 "required": ["repo", "git_ref"],
@@ -1336,6 +1356,68 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[test]
+    fn advertised_reference_schemas_reject_cloud_observed_guesses() {
+        let tools = external_tools_for_tracker(&TrackerConfig {
+            jira: None,
+            kind: "jira".to_string(),
+            endpoint: "https://example.atlassian.net".to_string(),
+            api_key: Some("test-token".to_string()),
+            project_slug: Some("TEST".to_string()),
+            intake_states: vec![],
+            in_flight_states: vec![],
+            active_states: vec![],
+            attachment_root: None,
+            max_attachment_files: 20,
+            max_attachment_bytes: 25 * 1024 * 1024,
+            max_attachment_total_bytes: 100 * 1024 * 1024,
+            terminal_states: vec![],
+        })
+        .unwrap();
+        for tool in &tools {
+            let properties = tool["input_schema"]["properties"].as_object().unwrap();
+            for (field, schema) in properties {
+                let (valid, invalid) = match field.as_str() {
+                    "issue" => (
+                        json!({"kind":"identifier","identifier":"TEST-8"}),
+                        vec![
+                            json!({"key":"TEST-8"}),
+                            json!({"kind":"issue_key","key":"TEST-8"}),
+                            json!({"kind":"identifier","value":"TEST-8"}),
+                        ],
+                    ),
+                    "assignee" => (json!({"kind":"me"}), vec![json!({"name":"me"})]),
+                    "state" | "target_state" => (
+                        json!({"kind":"name","name":"In Progress"}),
+                        vec![json!({"kind":"name","value":"In Progress"})],
+                    ),
+                    "repo" => (
+                        json!({"owner":"example","name":"service","host":"git.example.com"}),
+                        vec![json!({"owner":"example","repo":"service"})],
+                    ),
+                    "pull_request" => (
+                        json!({"kind":"number","number":42}),
+                        vec![json!({"number":42}), json!({"kind":"number","number":"42"})],
+                    ),
+                    _ => continue,
+                };
+                let validator = jsonschema::validator_for(schema).unwrap();
+                assert!(
+                    validator.is_valid(&valid),
+                    "{} {field}: canonical reference rejected",
+                    tool["name"]
+                );
+                for guess in invalid {
+                    assert!(
+                        !validator.is_valid(&guess),
+                        "{} {field}: malformed reference accepted: {guess}",
+                        tool["name"]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn advertised_linear_tools_are_provider_safe() {
         let tools = external_tools_for_tracker(&TrackerConfig {
             jira: None,
@@ -1346,6 +1428,7 @@ mod tests {
             intake_states: vec![],
             in_flight_states: vec![],
             active_states: vec![],
+            attachment_root: None,
             max_attachment_files: 20,
             max_attachment_bytes: 25 * 1024 * 1024,
             max_attachment_total_bytes: 100 * 1024 * 1024,
@@ -1374,6 +1457,7 @@ mod tests {
             intake_states: vec![],
             in_flight_states: vec![],
             active_states: vec![],
+            attachment_root: None,
             max_attachment_files: 20,
             max_attachment_bytes: 25 * 1024 * 1024,
             max_attachment_total_bytes: 100 * 1024 * 1024,
@@ -1405,6 +1489,7 @@ mod tests {
             intake_states: vec![],
             in_flight_states: vec![],
             active_states: vec![],
+            attachment_root: None,
             max_attachment_files: 20,
             max_attachment_bytes: 25 * 1024 * 1024,
             max_attachment_total_bytes: 100 * 1024 * 1024,
@@ -1432,6 +1517,7 @@ mod tests {
             intake_states: vec![],
             in_flight_states: vec![],
             active_states: vec![],
+            attachment_root: None,
             max_attachment_files: 20,
             max_attachment_bytes: 25 * 1024 * 1024,
             max_attachment_total_bytes: 100 * 1024 * 1024,

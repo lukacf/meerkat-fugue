@@ -218,7 +218,7 @@ fn resolve(
     Ok(path)
 }
 
-fn protected_path(path: &Path) -> bool {
+pub(super) fn protected_path(path: &Path) -> bool {
     let mut components = path.components().filter_map(|part| match part {
         Component::Normal(name) => Some(name.to_string_lossy().to_ascii_lowercase()),
         _ => None,

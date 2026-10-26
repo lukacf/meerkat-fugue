@@ -6,6 +6,7 @@ on:
     branches:
       - main
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -20,11 +21,17 @@ env:
 jobs:
   delivery:
     name: Delivery
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install publication scan dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ripgrep
+          rg --version
 
       - name: Install Node
         uses: actions/setup-node@v4
@@ -35,21 +42,27 @@ jobs:
       - name: Test release safeguards
         run: |
           command -v lsof
-          python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
+          npm run test:delivery
 
       - name: Install browser dependencies
         run: npm ci && npx playwright install --with-deps chromium
 
       - name: Test Ensemble browser behavior
-        run: npm run test:ensemble-search
+        run: npm run test:ui
 
   rust:
     name: Rust
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install publication scan dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ripgrep
+          rg --version
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.97.0
@@ -70,7 +83,31 @@ jobs:
 
       - name: Test offline contracts and runtime
         timeout-minutes: 45
-        run: cargo test --all-targets --locked
+        env:
+          FUGUE_TEST_EVIDENCE_DIR: ${{ runner.temp }}/fugue-full-suite
+        run: |
+          mkdir -p "$FUGUE_TEST_EVIDENCE_DIR"
+          cargo test --all-targets --locked
+
+      - name: Locate the compiled native test executable
+        timeout-minutes: 5
+        run: cargo test --locked --lib --no-run --message-format=json-render-diagnostics > "$RUNNER_TEMP/fugue-native-tests.jsonl"
+
+      - name: Repeat native handoff and restart contracts
+        # Internal bounds total 22 minutes including cleanup; leave room for
+        # cancellation, evidence finalization and artifact upload.
+        timeout-minutes: 25
+        run: python3 scripts/ci/repeat-native-tests.py "$RUNNER_TEMP/fugue-native-tests.jsonl" "$RUNNER_TEMP/fugue-retirement"
+
+      - name: Retain native retirement evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-retirement-evidence
+          path: |
+            ${{ runner.temp }}/fugue-retirement/
+            ${{ runner.temp }}/fugue-full-suite/
+          if-no-files-found: ignore
 
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings

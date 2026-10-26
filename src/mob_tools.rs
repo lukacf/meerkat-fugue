@@ -269,7 +269,10 @@ impl NativeMobExecutionHost for InMemoryNativeMobExecutionHost {
             }
             let run = run.clone();
             FugueToolResult::Ok {
-                output: FugueToolOutput::MobInspectRun(crate::tools::InspectRunOutput { run }),
+                output: FugueToolOutput::MobInspectRun(crate::tools::InspectRunOutput {
+                    run,
+                    launch_failure: None,
+                }),
                 metadata: ToolExecutionMetadata::default(),
             }
         })

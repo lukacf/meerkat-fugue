@@ -239,7 +239,9 @@ class DetachedDeploymentTests(unittest.TestCase):
                     'repository': 'owner/repo', 'merged_commit': MERGED, 'tree': TREE})
                 release.write(root / 'service.json', {'repository': 'owner/repo', 'url': url,
                     'cwd': temp, 'args': [str(port), str(callback)], 'state_dir': str(root / 'state'),
-                    'initial_binary': str(old), 'health_timeout_seconds': 2, 'notify_timeout_seconds': 5,
+                    # One lsof call can exceed two seconds on macOS. Allow a
+                    # second probe if the first races with listener startup.
+                    'initial_binary': str(old), 'health_timeout_seconds': 10, 'notify_timeout_seconds': 5,
                     'cutover_delay_seconds': 1, 'notify': {'path': '/api/repos/repo/meta/console/send',
                                                          'identity': 'repo:representative'}})
                 # The launcher exits before cutover. Child stdout/stderr cannot
@@ -255,9 +257,10 @@ class DetachedDeploymentTests(unittest.TestCase):
                 def finished():
                     status = release.read(status_path)
                     return status if status.get('notification') == 'accepted' else None
-                final = release.wait_for(finished, 20, 'detached deploy + callback')
+                final = release.wait_for(finished, 45, 'detached deploy + callback')
+                self.assertEqual(final['status'], 'rolled_back' if wrong_identity else 'deployed',
+                                 json.dumps(final, indent=2))
                 deployment_pid = final['pid']
-                self.assertEqual(final['status'], 'rolled_back' if wrong_identity else 'deployed')
                 self.assertEqual(final['preserved_sessions'], 1)
                 self.assertEqual(os.getpgid(deployment_pid), deployment_pid)
                 payloads = release.read(callback)

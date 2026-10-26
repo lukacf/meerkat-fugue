@@ -1,0 +1,51 @@
+<dialog class="fugue-welcome" id="fugueWelcome" aria-labelledby="welcomeTitle" aria-describedby="welcomeDescription">
+  <div class="welcome-top"><span>WELCOME TO MEERKAT FUGUE</span><button class="fugue-button quiet" id="welcomeClose" autofocus>Close guide</button></div>
+  <div class="welcome-instrument">
+    <div class="welcome-screen">
+      <svg class="welcome-scene" data-welcome-step="0" viewBox="0 0 600 230" role="img" aria-label="A repository, issue tracker and AI provider connect to one workspace">
+        <path class="welcome-wire" d="M44 86v84h384V86M236 86v84m64 0v18"/>
+        <g class="welcome-unit" style="--entry:0s"><path class="welcome-plate" d="m44 58 64-32 64 32-64 32z"/><path class="welcome-face" d="m44 58 64 32v28L44 86zm64 32 64-32v28l-64 32z"/><path class="welcome-detail" d="m78 60 30-15 30 15-30 15z"/><text x="108" y="142">Repository</text></g>
+        <g class="welcome-unit" style="--entry:.4s"><path class="welcome-plate" d="m236 58 64-32 64 32-64 32z"/><path class="welcome-face" d="m236 58 64 32v28l-64-32zm64 32 64-32v28l-64 32z"/><path class="welcome-detail" d="m273 52 35 18m-47-11 35 18m-23-30 12-6"/><text x="300" y="142">Issue tracker</text></g>
+        <g class="welcome-unit" style="--entry:.8s"><path class="welcome-plate" d="m428 58 64-32 64 32-64 32z"/><path class="welcome-face" d="m428 58 64 32v28l-64-32zm64 32 64-32v28l-64 32z"/><path class="welcome-detail" d="m470 59 14 7 23-12m-5-10 16 8"/><text x="492" y="142">AI provider</text></g>
+        <circle class="welcome-packet" style="--route:path('M44 86 V170 H300 V188');--entry:.5s" r="4"/>
+        <circle class="welcome-packet" style="--route:path('M428 86 V170 H300 V188');--entry:1s" r="4"/>
+        <rect class="welcome-destination" x="238" y="188" width="124" height="28" rx="4"/><text class="welcome-accent-label" x="300" y="207">Your workspace</text>
+      </svg>
+      <svg class="welcome-scene" data-welcome-step="1" hidden viewBox="0 0 600 230" role="img" aria-label="Repository mapping creates domain specialists alongside a coordinator, coder and reviewer in one team">
+        <path class="welcome-wire" d="M172 112h23"/>
+        <g class="welcome-unit" style="--entry:0s"><path class="welcome-plate" d="m36 83 68-34 68 34-68 34z"/><path class="welcome-face" d="m36 83 68 34v28l-68-34zm68 34 68-34v28l-68 34z"/><path class="welcome-detail" d="m74 82 30-15 30 15-30 15z"/><text x="104" y="175">Map the code</text></g>
+        <rect class="welcome-boundary" x="195" y="16" width="374" height="195" rx="8"/><text class="welcome-small" x="382" y="40">ONE REPOSITORY, ONE TEAM</text>
+        <g class="welcome-unit" style="--entry:.5s"><rect class="welcome-node" x="225" y="58" width="138" height="46" rx="4"/><text x="294" y="86">Coordinator</text><rect class="welcome-node" x="385" y="58" width="74" height="46" rx="4"/><text x="422" y="86">Coder</text><rect class="welcome-node" x="474" y="58" width="74" height="46" rx="4"/><text x="511" y="86">Review</text></g>
+        <path class="welcome-wire" d="M294 104v23h217v-23m-89 0v23m-128 0v21m128-21v21m89-21v21"/>
+        <g class="welcome-unit" style="--entry:1s"><rect class="welcome-specialist" x="225" y="148" width="97" height="35" rx="4"/><rect class="welcome-specialist" x="336" y="148" width="97" height="35" rx="4"/><rect class="welcome-specialist" x="447" y="148" width="101" height="35" rx="4"/><text class="welcome-accent-label" x="274" y="170">Specialist</text><text class="welcome-accent-label" x="385" y="170">Specialist</text><text class="welcome-accent-label" x="498" y="170">Specialist</text></g>
+        <circle class="welcome-packet" style="--route:path('M172 111 H211 V127 H385 V148');--entry:.5s" r="4"/>
+      </svg>
+      <svg class="welcome-scene" data-welcome-step="2" hidden viewBox="0 0 600 230" role="img" aria-label="An issue moves from ready to working to review on the board, with its team available in Agents">
+        <g class="welcome-unit" style="--entry:0s"><rect class="welcome-boundary" x="30" y="24" width="360" height="180" rx="7"/><path class="welcome-wire" d="M150 24v180m120-180v180M30 63h360"/><text x="90" y="49">Ready</text><text x="210" y="49">Working</text><text x="330" y="49">Review</text><rect class="welcome-card" x="48" y="83" width="84" height="52" rx="4"/><path class="welcome-detail" d="M62 99h44m-44 10h30"/><rect class="welcome-node" x="288" y="147" width="84" height="36" rx="4"/><path class="welcome-detail" d="M302 160h44m-44 10h30"/></g>
+        <path class="welcome-wire" d="M390 115h53m43-38v76"/>
+        <g class="welcome-unit" style="--entry:.5s"><rect class="welcome-specialist" x="445" y="57" width="115" height="42" rx="4"/><text class="welcome-accent-label" x="502" y="83">Your team</text><rect class="welcome-node" x="425" y="145" width="150" height="48" rx="4"/><text x="500" y="174">Ask in Agents</text></g>
+        <circle class="welcome-packet" style="--route:path('M132 110 H210 V115 H444 V78');--entry:.4s" r="4"/>
+        <text class="welcome-small" x="210" y="225">ILLUSTRATIVE BOARD</text>
+      </svg>
+      <svg class="welcome-scene" data-welcome-step="3" hidden viewBox="0 0 600 230" role="img" aria-label="A pull request passes review and checks before an explicit merge decision">
+        <path class="welcome-wire" d="M141 112h84m125 0h74"/>
+        <g class="welcome-unit" style="--entry:0s"><path class="welcome-plate" d="m29 78 66-33 66 33-66 33z"/><path class="welcome-face" d="m29 78 66 33v35l-66-33zm66 33 66-33v35l-66 33z"/><path class="welcome-detail" d="m74 76 21-10 21 10m-42 8 21 10 21-10"/><text x="95" y="178">Pull request</text></g>
+        <g class="welcome-unit" style="--entry:.5s"><rect class="welcome-boundary" x="218" y="43" width="142" height="132" rx="7"/><text x="289" y="69">Evidence</text><path class="welcome-detail" d="m237 94 5 5 9-11m-14 38 5 5 9-11M266 96h65m-65 31h65"/><text class="welcome-small" x="289" y="159">REVIEW + CHECKS</text></g>
+        <g class="welcome-unit" style="--entry:1s"><rect class="welcome-specialist" x="421" y="79" width="142" height="65" rx="5"/><path class="welcome-detail" d="M449 101v20m0-14c23 0 23 14 43 14m-8-23v23"/><text class="welcome-accent-label" x="524" y="117">Merge</text><text x="492" y="178">With your policy</text></g>
+        <circle class="welcome-packet" style="--route:path('M161 112 H218');--entry:.5s" r="4"/>
+        <circle class="welcome-packet" style="--route:path('M360 112 H421');--entry:1.7s" r="4"/>
+      </svg>
+    </div>
+    <div class="welcome-playback"><span id="welcomeStage">01 / CONNECT</span><button id="welcomeReplay" class="welcome-replay">Replay animation</button></div>
+  </div>
+  <div class="welcome-copy" aria-live="polite" aria-atomic="true">
+    <p class="welcome-eyebrow" id="welcomeEyebrow">Start with one repository</p>
+    <h2 id="welcomeTitle">Connect your tools.</h2>
+    <p id="welcomeDescription">Add a GitHub or GitHub Enterprise repository, choose its issue tracker, then connect your AI provider through Meerkat auth.</p>
+    <p class="welcome-tip" id="welcomeTip">Each repository has its own tracker, board and team. Manage connections in Repositories.</p>
+  </div>
+  <div class="welcome-footer">
+    <div class="welcome-progress" aria-label="Guide progress"><span class="current"></span><span></span><span></span><span></span><span id="welcomePosition">1 of 4</span></div>
+    <div class="fugue-actions"><button class="fugue-button quiet" id="welcomeBack" hidden>Back</button><a class="fugue-button" id="welcomeAdd" href="/ensemble#add" hidden>Add repository</a><button class="fugue-button primary" id="welcomeNext">Next</button></div>
+  </div>
+</dialog>

@@ -94,6 +94,7 @@ pub struct RepositoryStatus {
     pub members: Vec<MemberStatus>,
     pub preparation: PreparationState,
     pub discovery: super::team::DiscoveryProvenance,
+    pub notifications: super::notifications::NotificationStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,6 +108,7 @@ pub struct MemberStatus {
     /// study admission. This does not claim that the member is currently busy.
     pub memory_enabled: bool,
     pub ownership_paths: Vec<PathBuf>,
+    pub subscriptions: Vec<PathBuf>,
     pub identity: String,
     pub runtime_alias: Option<String>,
     pub session_id: Option<String>,
@@ -128,6 +130,8 @@ struct RepositoryRuntime {
     studies: Arc<tokio::sync::Mutex<StudyJournal>>,
     study_path: PathBuf,
     grants: BTreeMap<String, MemberGrant>,
+    events: Arc<super::notifications::RepositoryEvents>,
+    event_notifications: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     event_drain: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     handoff_notifications: tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
     handoff_failure: std::sync::OnceLock<String>,
@@ -194,17 +198,35 @@ fn save_studies(path: &Path, journal: &StudyJournal) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+enum ShutdownState {
+    #[default]
+    Running,
+    Closing,
+    Complete,
+    Failed(String),
+}
+
 pub struct EnsembleRuntime {
     config: EnsembleConfig,
     repositories: BTreeMap<RepoId, RepositoryRuntime>,
-    lifecycle: tokio::sync::RwLock<bool>,
+    lifecycle: tokio::sync::RwLock<ShutdownState>,
     peer_coordinators: Vec<SameProcessTopologyCoordinator>,
     _state_guard: EnsembleStateGuard,
+    queue: Option<crate::meta_runtime::MetaRuntimeRegistry>,
 }
 
 impl EnsembleRuntime {
     pub async fn build(config: EnsembleConfig) -> Result<Self> {
-        Box::pin(Self::build_inner(config, None)).await
+        Box::pin(Self::build_inner(config, None, None)).await
+    }
+
+    #[cfg(not(test))]
+    pub(crate) async fn build_for_queue(
+        config: EnsembleConfig,
+        queue: crate::meta_runtime::MetaRuntimeRegistry,
+    ) -> Result<Self> {
+        Box::pin(Self::build_inner(config, None, Some(queue))).await
     }
 
     #[cfg(test)]
@@ -212,36 +234,54 @@ impl EnsembleRuntime {
         config: EnsembleConfig,
         client: Arc<dyn meerkat::LlmClient>,
     ) -> Result<Self> {
-        Box::pin(Self::build_inner(config, Some(client))).await
+        Box::pin(Self::build_inner(config, Some(client), None)).await
     }
 
-    async fn build_inner(
+    pub(crate) async fn build_inner(
         mut config: EnsembleConfig,
         client: Option<Arc<dyn meerkat::LlmClient>>,
+        queue: Option<crate::meta_runtime::MetaRuntimeRegistry>,
     ) -> Result<Self> {
         config.resolve_and_validate(&std::env::current_dir()?)?;
+        if let Some(queue) = &queue {
+            config.auth_binding = queue.auth_binding();
+            let binding = queue
+                .repository_binding()
+                .context("queue repository binding is required")?;
+            if config.repositories.len() != 1
+                || !config.repositories.contains_key(&binding.repository)
+                || binding.state_path != config.state_root.join(binding.repository.as_str())
+            {
+                bail!("queue must bind the same repository and native state directory as its team");
+            }
+        }
         let state_guard = config.claim_state()?;
+        if let Some(queue) = &queue {
+            queue.ensure_tracker_binding().map_err(anyhow::Error::msg)?;
+        }
         let mut this = Self {
             config,
             repositories: BTreeMap::new(),
-            lifecycle: tokio::sync::RwLock::new(false),
+            lifecycle: tokio::sync::RwLock::new(ShutdownState::Running),
             peer_coordinators: Vec::new(),
             _state_guard: state_guard,
+            queue,
         };
         let result = Box::pin(this.initialize(client)).await;
         if let Err(error) = result {
             return match this.shutdown().await {
                 Ok(()) => Err(error),
-                Err(cleanup) => {
-                    Err(error.context(format!("partial build cleanup failed: {cleanup:#}")))
-                }
+                Err(cleanup) => Err(anyhow::Error::new(crate::error::NativeCleanupIncomplete(
+                    cleanup,
+                ))
+                .context(format!("repository initialization failed: {error:#}"))),
             };
         }
         Ok(this)
     }
 
     async fn initialize(&mut self, client: Option<Arc<dyn meerkat::LlmClient>>) -> Result<()> {
-        let connection_config = if client.is_some() {
+        let mut connection_config = if client.is_some() {
             meerkat::Config::default()
         } else {
             super::team_discovery::isolated_connection_config(
@@ -249,6 +289,9 @@ impl EnsembleRuntime {
             )
             .await?
         };
+        if let Some(queue) = &self.queue {
+            queue.configure_model(&mut connection_config)?;
+        }
         for (id, repository) in &self.config.repositories {
             let brief = discover_repository(&repository.path)?;
             let state = self.config.state_root.join(id.as_str());
@@ -265,6 +308,7 @@ impl EnsembleRuntime {
                         &brief,
                         &self.config.model,
                         self.config.auth_binding.clone(),
+                        Some(&connection_config),
                     )
                     .await?;
                     self.config.validate_team_capacity(id, &team)?;
@@ -273,6 +317,14 @@ impl EnsembleRuntime {
                 }
             };
             self.config.validate_team_capacity(id, &team)?;
+            let events = super::notifications::RepositoryEvents::open(
+                id.clone(),
+                repository.path.clone(),
+                &state,
+                self.queue
+                    .as_ref()
+                    .and_then(|queue| queue.connections().cloned()),
+            )?;
             let study_path = state.join("studies.json");
             let mut studies: StudyJournal = match std::fs::read(&study_path) {
                 Ok(bytes) => serde_json::from_slice(&bytes).context("read study journal")?,
@@ -313,7 +365,27 @@ impl EnsembleRuntime {
                 meerkat_meta::mob_composition_manifest::persistent_mob_storage(
                     state.join("mob.sqlite3"),
                 )?;
-            let desired_definition = definition(id, &self.config.model, &grants);
+            let mut desired_definition = definition(id, &self.config.model, &grants);
+            let queue_definition = self
+                .queue
+                .as_ref()
+                .map(|queue| queue.repository_definition().map_err(anyhow::Error::msg))
+                .transpose()?;
+            if let Some(queue_definition) = &queue_definition {
+                for (name, profile) in &queue_definition.profiles {
+                    if desired_definition
+                        .profiles
+                        .insert(name.clone(), profile.clone())
+                        .is_some()
+                    {
+                        bail!("ticket profile {name} conflicts with a repository specialist");
+                    }
+                }
+                desired_definition.limits = queue_definition.limits.clone();
+            }
+            // Native admission applies these rules to later spawns and forks,
+            // including two members using the same execution profile.
+            desired_definition.wiring = repository_wiring(&desired_definition);
             let handoff_runtime: super::handoff::RuntimeSlot = Arc::new(std::sync::OnceLock::new());
             if let Some(previous) = storage.created_definition_snapshot().await? {
                 let canonical = previous.definition();
@@ -332,23 +404,54 @@ impl EnsembleRuntime {
                             migrated.flows.remove(&flow_id);
                         }
                     }
+                    for name in legacy_profiles
+                        .into_iter()
+                        .filter(|name| *name != REPRESENTATIVE)
+                    {
+                        let role = name.into();
+                        let id = crate::native_review::flow_id(&role);
+                        if migrated.flows.get(&id) == Some(&crate::native_review::flow(&role)) {
+                            migrated.flows.remove(&id);
+                        }
+                    }
                 } else {
                     // Earlier Ensemble definitions omitted native memory. Only
                     // this host-owned capability changes for an existing team;
                     // model, roster and other policy drift still fail closed.
-                    for binding in migrated.profiles.values_mut() {
-                        if let ProfileBinding::Inline(profile) = binding {
+                    for (name, binding) in &mut migrated.profiles {
+                        if grants.contains_key(name.as_str())
+                            && let ProfileBinding::Inline(profile) = binding
+                        {
                             profile.tools.memory = true;
                         }
                     }
                 }
-                // Add only our missing native handoff flows. Existing flow drift
+                // Add only our missing native flows. Existing flow drift
                 // remains visible and fails definition validation.
                 for (flow_id, flow) in &desired_definition.flows {
                     migrated
                         .flows
                         .entry(flow_id.clone())
                         .or_insert_with(|| flow.clone());
+                }
+                if let Some(queue_definition) = &queue_definition {
+                    for (name, profile) in &queue_definition.profiles {
+                        migrated
+                            .profiles
+                            .entry(name.clone())
+                            .or_insert_with(|| profile.clone());
+                    }
+                    if migrated.limits.is_none() {
+                        migrated.limits = queue_definition.limits.clone();
+                    }
+                }
+                // Upgrade the old empty policy or our exact generated policy.
+                // A supported profile migration must also replace its generated
+                // edges; customized wiring still fails definition validation.
+                if canonical.wiring == Default::default()
+                    || canonical.wiring == repository_wiring(canonical)
+                {
+                    migrated.wiring = desired_definition.wiring.clone();
                 }
                 if canonical != &desired_definition && migrated == desired_definition {
                     // The native epoch CAS preserves history and makes the new profile
@@ -446,6 +549,26 @@ impl EnsembleRuntime {
                     concurrency: 1,
                 })
                 .session_hook(Arc::new(RepositorySessionHook {
+                    events: Arc::clone(&events),
+                    connections: self
+                        .queue
+                        .as_ref()
+                        .and_then(|queue| queue.connections().cloned()),
+                    queue_hook: self
+                        .queue
+                        .as_ref()
+                        .map(|queue| queue.repository_session_hook().map_err(anyhow::Error::msg))
+                        .transpose()?,
+                    queue_profiles: queue_definition
+                        .as_ref()
+                        .map(|definition| {
+                            definition
+                                .profiles
+                                .keys()
+                                .map(ToString::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     root: repository.path.clone(),
                     state_root: self.config.state_root.clone(),
                     auth_binding: self.config.auth_binding.clone(),
@@ -484,6 +607,8 @@ impl EnsembleRuntime {
                     studies,
                     study_path,
                     grants,
+                    events,
+                    event_notifications: tokio::sync::Mutex::new(None),
                     event_drain: tokio::sync::Mutex::new(Some(event_drain)),
                     handoff_notifications: tokio::sync::Mutex::new(None),
                     handoff_failure: std::sync::OnceLock::new(),
@@ -498,9 +623,25 @@ impl EnsembleRuntime {
         // Persisted native rosters retain historical assignments. Retire any
         // former live worker absent from the authoritative saved team before
         // wiring or admitting study work; history remains available.
+        let queue_profiles: std::collections::BTreeSet<String> = self
+            .queue
+            .as_ref()
+            .map(|queue| {
+                queue.repository_definition().map(|definition| {
+                    definition
+                        .profiles
+                        .keys()
+                        .map(ToString::to_string)
+                        .collect()
+                })
+            })
+            .transpose()
+            .map_err(anyhow::Error::msg)?
+            .unwrap_or_default();
         for (repo, entry) in &self.repositories {
             for member in entry.runtime.mob_handle().list_members().await {
-                if !entry.grants.contains_key(member.role.as_str()) {
+                let queue_member = queue_profiles.contains(member.role.as_str());
+                if !entry.grants.contains_key(member.role.as_str()) && !queue_member {
                     // The new identity registry intentionally omits this old
                     // assignment. Its surviving native mob row remains owned
                     // by the mob lifecycle, which can retire it by exact ID.
@@ -689,6 +830,20 @@ impl EnsembleRuntime {
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
         }
+        if self.config.notifications.enabled && client.is_none() {
+            for entry in self.repositories.values() {
+                for member in entry.team.specialists.keys() {
+                    entry
+                        .events
+                        .request_subscription(&entry.runtime, member)
+                        .await?;
+                }
+                *entry.event_notifications.lock().await = Some(entry.events.start(
+                    &entry.runtime,
+                    Duration::from_secs(self.config.notifications.poll_interval_secs.max(1)),
+                ));
+            }
+        }
         // Do not advertise a partially hydrated team as ready.
         for (repo, entry) in &self.repositories {
             if entry.runtime.workgraph_service().is_none() {
@@ -717,6 +872,33 @@ impl EnsembleRuntime {
             )
             .await?;
             *entry.handoff_notifications.lock().await = Some(task);
+        }
+        if let Some(queue) = &self.queue {
+            let binding = queue
+                .repository_binding()
+                .context("repository binding missing")?;
+            let runtime = self
+                .repository(&binding.repository)
+                .context("repository mob missing")?;
+            let entry = self
+                .repositories
+                .get(&binding.repository)
+                .context("repository team missing")?;
+            let specialists = entry
+                .team
+                .specialists
+                .iter()
+                .map(|(id, spec)| crate::meta_runtime::RepositorySpecialist {
+                    identity: format!("{}:{id}", binding.repository),
+                    label: spec.label.clone(),
+                    focus: spec.focus.clone(),
+                    paths: spec.ownership_paths.clone(),
+                })
+                .collect();
+            queue
+                .attach_repository_runtime(Arc::clone(runtime), specialists)
+                .await
+                .map_err(anyhow::Error::msg)?;
         }
         Ok(())
     }
@@ -918,6 +1100,7 @@ impl EnsembleRuntime {
                             .and_then(ProfileBinding::as_inline)
                             .is_some_and(|profile| profile.tools.memory),
                     ownership_paths: spec.map(|s| s.ownership_paths.clone()).unwrap_or_default(),
+                    subscriptions: entry.events.subscriptions(name).await,
                     identity: identity.to_string(),
                     runtime_alias: status.agent_runtime_id.map(|id| id.to_string()),
                     session_id: status.session_id.map(|id| id.to_string()),
@@ -930,6 +1113,7 @@ impl EnsembleRuntime {
                 brief: entry.brief.clone(),
                 members,
                 discovery: entry.team.discovery.clone(),
+                notifications: entry.events.status(&self.config.notifications).await,
                 preparation: if entry
                     .grants
                     .values()
@@ -947,10 +1131,40 @@ impl EnsembleRuntime {
         })
     }
 
+    /// Enrollment reconnects native teams. Refuse while native execution is
+    /// active or cannot be observed, rather than interrupting someone's work.
+    pub async fn ensure_idle_for_configuration(&self) -> Result<()> {
+        for (repo, entry) in &self.repositories {
+            let members = entry.runtime.mob_handle().list_members().await;
+            if members.len() < entry.grants.len() {
+                bail!(
+                    "Team {repo} is not fully observable yet. Wait for setup before adding a repository."
+                );
+            }
+            for member in members {
+                let snapshot = entry
+                    .runtime
+                    .mob_handle()
+                    .member_status(&member.agent_identity)
+                    .await?;
+                let idle = snapshot.progress.as_ref().is_some_and(|progress| {
+                    progress.run_state == meerkat_mob::MemberRunState::Idle
+                        && progress.in_flight_work == 0
+                });
+                if !idle {
+                    bail!(
+                        "Team {repo} still has active or unobserved work. Wait for its conversation to finish before adding a repository."
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn ask(&self, repo: &RepoId, text: &str) -> Result<EnsembleAccepted> {
         self.ensure_notification_health().await?;
         let stopping = self.lifecycle.read().await;
-        if *stopping {
+        if !matches!(*stopping, ShutdownState::Running) {
             bail!("Ensemble is shutting down");
         }
         if text.trim().is_empty() || text.len() > 64 * 1024 {
@@ -985,12 +1199,25 @@ impl EnsembleRuntime {
 
     pub async fn shutdown(&self) -> Result<()> {
         let mut stopping = self.lifecycle.write().await;
-        if *stopping {
-            return Ok(());
+        match &*stopping {
+            ShutdownState::Complete => return Ok(()),
+            ShutdownState::Failed(detail) => return Err(crate::error::NativeCleanupIncomplete(anyhow::anyhow!("{detail}")).into()),
+            ShutdownState::Closing => return Err(crate::error::NativeCleanupIncomplete(anyhow::anyhow!(
+                "Ensemble shutdown was interrupted; restart the host process before reopening its repositories"
+            )).into()),
+            ShutdownState::Running => {}
         }
-        *stopping = true;
+        *stopping = ShutdownState::Closing;
         let mut errors = Vec::new();
         for (repo, entry) in &self.repositories {
+            if let Some(task) = entry.event_notifications.lock().await.take() {
+                task.abort();
+                if let Err(error) = task.await
+                    && !error.is_cancelled()
+                {
+                    errors.push(format!("{repo} repository notifications: {error}"));
+                }
+            }
             if let Some(task) = entry.handoff_notifications.lock().await.take() {
                 task.abort();
                 match task.await {
@@ -1003,7 +1230,7 @@ impl EnsembleRuntime {
                     _ => {}
                 }
             }
-            let report = entry.runtime.shutdown().await;
+            let mut report = entry.runtime.shutdown().await;
             if let Some(task) = entry.event_drain.lock().await.take() {
                 task.abort();
                 if let Err(error) = task.await
@@ -1012,13 +1239,29 @@ impl EnsembleRuntime {
                     errors.push(format!("{repo} event drain: {error}"));
                 }
             }
-            if !report.cleanup_completed() && !report.cleanup_retained_until_process_exit() {
+            // A process-exit retention receipt does not permit this host to
+            // reopen the layout. After our drain owner has joined, ask the
+            // native child owner to settle its retained work once more.
+            if report.cleanup_retained_until_process_exit() {
+                tracing::warn!(repository = %repo, ?report, "retrying retained native child cleanup before repository replacement");
+                report.child_mob_stand_down = entry
+                    .runtime
+                    .mob_runtime()
+                    .stand_down_child_mobs(std::time::Instant::now() + Duration::from_secs(30))
+                    .await;
+            }
+            if !report.cleanup_completed() {
                 errors.push(format!("{repo}: {report:?}"));
             }
         }
         if !errors.is_empty() {
-            bail!("Ensemble shutdown failed: {errors:?}");
+            let detail = format!(
+                "Ensemble shutdown failed; restart the host process before reopening its repositories: {errors:?}"
+            );
+            *stopping = ShutdownState::Failed(detail.clone());
+            return Err(crate::error::NativeCleanupIncomplete(anyhow::anyhow!(detail)).into());
         }
+        *stopping = ShutdownState::Complete;
         Ok(())
     }
 }
@@ -1044,7 +1287,11 @@ For those ordinary peer requests, explicitly require the recipient to return its
 verification results, or blocker evidence through the matching native reply path. Retain the \
 requesting peer and correlation while work is pending. Send substantive completion or failure \
 evidence; do not create acknowledgement loops or reply to a terminal result merely to acknowledge \
-it. A delivery receipt is not task completion.\n\n\
+it. A delivery receipt is not task completion. For informational messages, peer lifecycle \
+introductions, or messages saying no reply is needed, do not send a peer acknowledgement. \
+Still finish your own turn with a short, nonempty final-text record of what you learned or \
+that no action is needed. Every activated turn must have a visible outcome, even when no \
+tool use or peer response is appropriate.\n\n\
 Exception: during an explicit initial read-only domain study, only inspect repository files and \
 return the Domain Brief as final text. That study is host-initiated, requires no peer reply, and \
 must not send messages or delegate.";
@@ -1151,11 +1398,11 @@ async fn restore_member_transports(repo: &RepoId, entry: &RepositoryRuntime) -> 
             .with_context(|| {
                 let bootstrap = authority.identity_bootstrap_status();
                 format!(
-                    "member runtime alias missing for {identity}: state={:?}, session={:?}, bootstrap={:?}, continuity_unrecoverable={:?}, session_repair_required={:?}, customizer_tools_pending={:?}",
+                    "member runtime alias missing for {identity}: state={:?}, session={:?}, bootstrap={:?}, wake_refusal={:?}, session_repair_required={:?}, customizer_tools_pending={:?}",
                     before.state,
                     before.session_id,
                     bootstrap.identities.get(&identity),
-                    before.continuity_unrecoverable,
+                    before.wake_refusal,
                     before.session_repair_required,
                     before.customizer_tools_pending,
                 )
@@ -1199,6 +1446,21 @@ fn mob_id(repo: &RepoId) -> String {
     format!("ensemble-{repo}")
 }
 
+fn repository_wiring(definition: &MobDefinition) -> meerkat_mob::definition::WiringRules {
+    let mut wiring = meerkat_mob::definition::WiringRules::default();
+    for (index, a) in definition.profiles.keys().enumerate() {
+        for b in definition.profiles.keys().skip(index) {
+            wiring
+                .role_wiring
+                .push(meerkat_mob::definition::RoleWiringRule {
+                    a: a.clone(),
+                    b: b.clone(),
+                });
+        }
+    }
+    wiring
+}
+
 struct TeamTopology(Vec<ManagedPeerEdge>);
 
 #[async_trait]
@@ -1232,9 +1494,19 @@ fn definition(repo: &RepoId, model: &str, grants: &BTreeMap<String, MemberGrant>
         source_identity: None,
     };
     for name in grants.keys() {
+        if name != REPRESENTATIVE {
+            let role = name.clone().into();
+            definition.flows.insert(
+                crate::native_review::flow_id(&role),
+                crate::native_review::flow(&role),
+            );
+        }
         definition.profiles.insert(
             name.clone().into(),
             ProfileBinding::Inline(Box::new(Profile {
+                // The repository mob and Meta continuity own persistence.
+                // This optional flag is for separate durable-worker discovery.
+                durable: false,
                 model: model.to_owned(),
                 model_fallback: None,
                 provider: None,
@@ -1498,6 +1770,10 @@ impl meerkat_core::tool_execution_policy::ToolDispatchAdmission for StudyAdmissi
 }
 
 struct RepositorySessionHook {
+    connections: Option<Arc<crate::setup::connections::Connections>>,
+    events: Arc<super::notifications::RepositoryEvents>,
+    queue_hook: Option<Arc<dyn SessionHook>>,
+    queue_profiles: BTreeSet<String>,
     handoff_runtime: super::handoff::RuntimeSlot,
     studies: Arc<tokio::sync::Mutex<StudyJournal>>,
     study_path: PathBuf,
@@ -1513,6 +1789,21 @@ impl SessionHook for RepositorySessionHook {
         &self,
         request: &mut CreateSessionRequest,
     ) -> std::result::Result<(), SessionError> {
+        let queue_member = request
+            .build
+            .as_ref()
+            .and_then(|build| build.mob_member_binding.as_ref())
+            .is_some_and(|binding| self.queue_profiles.contains(&binding.role));
+        if queue_member {
+            return self
+                .queue_hook
+                .as_ref()
+                .ok_or_else(|| {
+                    SessionError::Unsupported("ticket profile has no repository queue hook".into())
+                })?
+                .before_create(request)
+                .await;
+        }
         let build = request
             .build
             .get_or_insert_with(SessionBuildOptions::default);
@@ -1552,7 +1843,13 @@ impl SessionHook for RepositorySessionHook {
                         Arc::new(MemoryTaskStore::new()),
                         &config,
                         Some(self.root.clone()),
-                        Some(ShellConfig::with_project_root(self.root.clone())),
+                        Some({
+                            let mut shell = ShellConfig::with_project_root(self.root.clone());
+                            if let Some(connections) = &self.connections {
+                                shell.env_vars.extend(connections.github_environment());
+                            }
+                            shell
+                        }),
                         Some(files),
                         None,
                     )
@@ -1578,6 +1875,27 @@ impl SessionHook for RepositorySessionHook {
                 Arc::new(super::handoff::HandoffTools::new(
                     self.handoff_runtime.clone(),
                 )),
+                Some(owned),
+            )
+        } else {
+            owned
+        };
+        let owned = if let Some(grant) = grant
+            && let Some(member) = build
+                .mob_member_binding
+                .as_ref()
+                .filter(|binding| binding.role != REPRESENTATIVE)
+                .and_then(|binding| MemberId::try_from(binding.role.clone()).ok())
+        {
+            meerkat_meta::tool_compose::ComposedExternalTools::over(
+                Arc::new(
+                    super::notifications::SubscriptionTools::new(
+                        self.events.clone(),
+                        member,
+                        grant.studied.clone(),
+                    )
+                    .with_excluded_state_root(self.state_root.clone()),
+                ),
                 Some(owned),
             )
         } else {
@@ -1660,6 +1978,10 @@ pub(crate) fn write_fixture_teams(config: &EnsembleConfig) {
 
 #[cfg(test)]
 mod tests {
+    mod cold_restart_tests;
+    mod fork_tests;
+    mod review_context_tests;
+
     use super::*;
     use meerkat_core::{Message, Provider, StopReason, TurnUsage, Usage};
     use meerkat_llm_core::{LlmClient, LlmDoneOutcome, LlmError, LlmEvent, LlmRequest, LlmStream};
@@ -1776,7 +2098,7 @@ mod tests {
                 usage: TurnUsage::host_declared(Provider::OpenAI, &request.model, Usage::default()),
             });
             events.push(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success { stop_reason },
+                outcome: LlmDoneOutcome::success(stop_reason),
             });
             Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
         }
@@ -1835,6 +2157,7 @@ mod tests {
             );
         }
         let config = EnsembleConfig {
+            notifications: Default::default(),
             version: 1,
             name: "Test ensemble".into(),
             state_root: root.join("state"),
@@ -1849,6 +2172,357 @@ mod tests {
         };
         write_fixture_teams(&config);
         config
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repository_mob_preserves_specialists_and_ticket_members_together_on_restart() {
+        if !isolated("repository_mob_preserves_specialists_and_ticket_members_together_on_restart")
+        {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = fixture_config(temp.path());
+        config.repositories.retain(|id, _| id.as_str() == "alpha");
+        config.peers.clear();
+        let repo = RepoId::try_from("alpha".to_string()).unwrap();
+        let mut queue_config =
+            crate::meta_runtime::tests::test_meerkat_config(temp.path().join("queue"));
+        queue_config.repository_runtime = Some(crate::config::RepositoryRuntimeBinding {
+            repository: repo.clone(),
+            state_path: config.state_root.join("alpha"),
+        });
+        let mut previous = BTreeMap::new();
+        for iteration in 0..2 {
+            let queue = crate::meta_runtime::MetaRuntimeRegistry::new(queue_config.clone());
+            let ensemble = EnsembleRuntime::build_inner(
+                config.clone(),
+                Some(Arc::new(meerkat_llm_core::TestClient::default())),
+                Some(queue.clone()),
+            )
+            .await
+            .unwrap();
+            queue.bootstrap_repo_kapellmeister().await.unwrap();
+            let runtime = ensemble.repository(&repo).unwrap();
+            let identity = meerkat_mob::AgentIdentity::from("issue_DEMO-1__issue_5Flead");
+            runtime
+                .mob_handle()
+                .ensure_member(meerkat_mob::SpawnMemberSpec::new(
+                    "issue_lead",
+                    identity.clone(),
+                ))
+                .await
+                .unwrap();
+            queue.wire_repository_members(runtime).await.unwrap();
+            // Members admitted after ticket startup must join the same team
+            // through native wiring rules, without another host repair pass.
+            runtime
+                .mob_handle()
+                .ensure_member(meerkat_mob::SpawnMemberSpec::new(
+                    "issue_lead",
+                    "late-ticket-helper",
+                ))
+                .await
+                .unwrap();
+            if iteration == 0 {
+                let fork = runtime
+                    .mob_handle()
+                    .fork_member_at_turn_boundary(
+                        &identity,
+                        meerkat_mob::SpawnMemberSpec::new("issue_lead", "late-ticket-fork"),
+                        Some(0),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    fork,
+                    meerkat_mob::ForkMemberAtTurnBoundary::Forked(_)
+                ));
+            }
+            let console =
+                crate::console::ConsoleHub::open(&temp.path().join("console.sqlite3")).unwrap();
+            console.register("alpha".into(), runtime.clone());
+            let records = console.aggregator.list_identities().await.unwrap();
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record.identity.contains("alpha:coder")),
+                "specialist must be visible: {records:?}"
+            );
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record.runtime_member_id == "kapellmeister"),
+                "queue coordinator must be visible: {records:?}"
+            );
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record.runtime_member_id == identity.as_str()),
+                "ticket lead must be visible: {records:?}"
+            );
+            let visible: BTreeSet<_> = records.iter().map(|record| &record.identity).collect();
+            let unresolved_peers: Vec<_> = records
+                .iter()
+                .flat_map(|record| {
+                    record
+                        .topology_peers
+                        .iter()
+                        .filter(|peer| !visible.contains(peer))
+                        .map(|peer| (record.identity.clone(), peer.clone()))
+                })
+                .collect();
+            console.unregister("alpha");
+            drop(console);
+            let members = runtime.mob_handle().list_all_members().await;
+            assert!(
+                members
+                    .iter()
+                    .any(|member| member.agent_identity.as_str() == "kapellmeister")
+            );
+            let coder = members
+                .iter()
+                .find(|member| member.role.as_str() == "coder")
+                .unwrap();
+            let lead = members
+                .iter()
+                .find(|member| member.agent_identity == identity)
+                .unwrap();
+            assert!(lead.wired_to.contains(&coder.agent_identity));
+            for member in &members {
+                for peer in &members {
+                    if member.agent_identity != peer.agent_identity {
+                        assert!(
+                            member.wired_to.contains(&peer.agent_identity),
+                            "repository members must have direct peer access: {} -> {}",
+                            member.agent_identity,
+                            peer.agent_identity,
+                        );
+                    }
+                }
+            }
+            for member in members {
+                if iteration == 0 {
+                    previous.insert(
+                        member.agent_identity.clone(),
+                        member.bridge_session_id().cloned(),
+                    );
+                } else {
+                    assert_eq!(
+                        previous.get(&member.agent_identity),
+                        Some(&member.bridge_session_id().cloned())
+                    );
+                }
+            }
+            queue.shutdown().await.unwrap();
+            assert!(
+                runtime.mob_handle().list_members().await.len() >= 6,
+                "borrower shutdown must not stop the native owner"
+            );
+            ensemble.shutdown().await.unwrap();
+            drop(ensemble);
+            if iteration == 0 {
+                // Simulate the exact persisted policy from an older Fugue
+                // deployment while retaining its members and session history.
+                let (storage, _) = meerkat_meta::mob_composition_manifest::persistent_mob_storage(
+                    config.state_root.join("alpha/mob.sqlite3"),
+                )
+                .unwrap();
+                let snapshot = storage
+                    .created_definition_snapshot()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut legacy = snapshot.definition().clone();
+                legacy.wiring = Default::default();
+                storage
+                    .update_definition(snapshot.epoch(), legacy)
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                unresolved_peers.is_empty(),
+                "console topology endpoints must resolve to visible identities: {unresolved_peers:?}"
+            );
+        }
+    }
+
+    #[derive(Default)]
+    struct NotificationScript {
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl LlmClient for NotificationScript {
+        fn project_replay_messages(
+            &self,
+            messages: &[Message],
+        ) -> std::result::Result<Vec<Message>, LlmError> {
+            Ok(messages.to_vec())
+        }
+        fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
+            assert!(
+                serde_json::to_string(&request.messages)
+                    .unwrap()
+                    .contains("[REPOSITORY CHANGE]")
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(futures::stream::iter(vec![
+                Ok(LlmEvent::TextDelta {
+                    delta: "Domain update assessed.".into(),
+                    meta: None,
+                }),
+                Ok(LlmEvent::UsageUpdate {
+                    usage: TurnUsage::host_declared(
+                        Provider::OpenAI,
+                        &request.model,
+                        Usage::default(),
+                    ),
+                }),
+                Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::success(StopReason::EndTurn),
+                }),
+            ]))
+        }
+        fn provider(&self) -> Provider {
+            Provider::OpenAI
+        }
+        async fn health_check(&self) -> std::result::Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repository_changes_notify_only_subscribers_and_do_not_repeat_after_restart() {
+        if !isolated("repository_changes_notify_only_subscribers_and_do_not_repeat_after_restart") {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = fixture_config(temp.path());
+        config.repositories.retain(|id, _| id.as_str() == "alpha");
+        config.peers.clear();
+        let root = &config.repositories.values().next().unwrap().path;
+        let git = |path: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args([
+                    "-c",
+                    "user.name=Fugue Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "initial"]);
+        let remote = temp.path().join("origin.git");
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "--bare",
+                root.to_str().unwrap(),
+                remote.to_str().unwrap(),
+            ],
+        );
+        git(root, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        let client = Arc::new(NotificationScript::default());
+        let ensemble = EnsembleRuntime::build_with_client(config.clone(), client.clone())
+            .await
+            .unwrap();
+        let repo = RepoId::try_from("alpha".to_string()).unwrap();
+        let entry = &ensemble.repositories[&repo];
+        entry
+            .events
+            .subscribe(
+                &MemberId::try_from("coder".to_string()).unwrap(),
+                vec!["README.md".into()],
+            )
+            .await
+            .unwrap();
+        entry
+            .events
+            .subscribe(
+                &MemberId::try_from("reviewer".to_string()).unwrap(),
+                vec!["tests".into()],
+            )
+            .await
+            .unwrap();
+        entry.events.poll(&entry.runtime).await.unwrap();
+        assert_eq!(client.calls.load(Ordering::SeqCst), 0);
+        std::fs::write(root.join("README.md"), "# alpha\nChanged API contract.\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "change domain"]);
+        git(root, &["push", "origin", "HEAD"]);
+        entry.events.poll(&entry.runtime).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while client.calls.load(Ordering::SeqCst) != 1 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        entry.events.poll(&entry.runtime).await.unwrap();
+        assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+        ensemble.shutdown().await.unwrap();
+        drop(ensemble);
+        let next = Arc::new(NotificationScript::default());
+        let ensemble = EnsembleRuntime::build_with_client(config, next.clone())
+            .await
+            .unwrap();
+        let entry = &ensemble.repositories[&repo];
+        entry.events.poll(&entry.runtime).await.unwrap();
+        assert_eq!(
+            next.calls.load(Ordering::SeqCst),
+            0,
+            "unchanged revision must stay idle after restart"
+        );
+        // A default branch can revisit an earlier commit. Each newly observed
+        // transition must notify subscribers, even when the SHA pair repeats.
+        let root = &ensemble.config.repositories[&repo].path;
+        let branch_output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["symbolic-ref", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(branch_output.status.success());
+        let branch = String::from_utf8(branch_output.stdout).unwrap();
+        let branch = branch.trim();
+        git(
+            root,
+            &["push", "--force", "origin", &format!("HEAD~1:{branch}")],
+        );
+        entry.events.poll(&entry.runtime).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while next.calls.load(Ordering::SeqCst) != 1 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("rewinding the default branch must notify its subscriber");
+        git(
+            root,
+            &["push", "--force", "origin", &format!("HEAD:{branch}")],
+        );
+        entry.events.poll(&entry.runtime).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while next.calls.load(Ordering::SeqCst) != 2 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("repeating an earlier SHA transition must notify again");
+        entry.events.poll(&entry.runtime).await.unwrap();
+        assert_eq!(next.calls.load(Ordering::SeqCst), 2);
+        ensemble.shutdown().await.unwrap();
     }
 
     #[derive(Default)]
@@ -1954,7 +2628,7 @@ mod tests {
                 usage: TurnUsage::host_declared(Provider::OpenAI, &request.model, Usage::default()),
             });
             events.push(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success { stop_reason },
+                outcome: LlmDoneOutcome::success(stop_reason),
             });
             Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
         }
@@ -2296,7 +2970,7 @@ mod tests {
                 usage: TurnUsage::host_declared(Provider::OpenAI, &request.model, Usage::default()),
             });
             events.push(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success { stop_reason },
+                outcome: LlmDoneOutcome::success(stop_reason),
             });
             Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
         }
@@ -2327,9 +3001,7 @@ mod tests {
                         ),
                     }),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                     }),
                 ]
             } else {
@@ -2601,6 +3273,59 @@ mod tests {
         );
         let before = ensemble.status().await.expect("status");
         assert_eq!(before.repositories.len(), 2);
+        let console =
+            crate::console::ConsoleHub::open(&temp.path().join("console.sqlite3")).unwrap();
+        for repo in config.repositories.keys() {
+            console.register(repo.to_string(), ensemble.repository(repo).unwrap().clone());
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let identities = console.aggregator.list_identities().await.unwrap();
+                if ["alpha", "beta"].iter().all(|repo| {
+                    identities.iter().any(|record| {
+                        record.runtime_key == *repo
+                            && record.identity.contains(&format!("{repo}:coder"))
+                    })
+                }) && identities.iter().any(|record| {
+                    record.identity == "alpha/alpha:representative"
+                        && record
+                            .topology_peers
+                            .contains(&"beta/beta:representative".to_owned())
+                }) {
+                    let visible: BTreeSet<_> =
+                        identities.iter().map(|record| &record.identity).collect();
+                    for record in &identities {
+                        assert!(
+                            record
+                                .topology_peers
+                                .iter()
+                                .all(|peer| visible.contains(peer)),
+                            "all registered repository peers resolve in the console: {record:?}"
+                        );
+                    }
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("both repository mobs appear in the shared native console");
+        console.unregister("alpha");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let identities = console.aggregator.list_identities().await.unwrap();
+                if !identities.is_empty()
+                    && identities.iter().all(|record| record.runtime_key == "beta")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("stopping one mob removes its live roster without removing the other mob");
+        console.unregister("beta");
+        drop(console);
         assert!(before.repositories.iter().all(|repo| {
             repo.members.len() == 4
                 && repo
@@ -2819,6 +3544,988 @@ mod tests {
         );
         recovered.shutdown().await.expect("shutdown");
     }
+    #[derive(Default)]
+    struct NativeReviewScript {
+        reviews: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmClient for NativeReviewScript {
+        async fn health_check(&self) -> std::result::Result<(), LlmError> {
+            Ok(())
+        }
+
+        fn project_replay_messages(
+            &self,
+            messages: &[Message],
+        ) -> std::result::Result<Vec<Message>, LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
+            let latest_user = request
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    Message::User(user) => Some(serde_json::to_string(&user.content).unwrap()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if latest_user.contains("[HOLD REVIEW]") {
+                return Box::pin(futures::stream::pending());
+            }
+            let text = if latest_user.contains("[INDEPENDENT REVIEW]") {
+                let role = ["planner", "coder", "reviewer"]
+                    .into_iter()
+                    .find(|role| latest_user.contains(&format!("Review role: {role}")))
+                    .expect("native assignment preserves the selected role");
+                self.reviews.fetch_add(1, Ordering::SeqCst);
+                json!({
+                    "schema_version":"fugue.review.v1", "reviewer_id":format!("alpha:{role}"),
+                    "focus":role, "verdict":"green", "summary":"Fixture checks pass",
+                    "findings":[], "evidence":{"base":"main", "head_sha":"a".repeat(40),
+                    "commands":["fixture check"], "checked_paths":["README.md"]}
+                })
+                .to_string()
+            } else {
+                "Ready.".into()
+            };
+            Box::pin(futures::stream::iter(vec![
+                Ok(LlmEvent::TextDelta {
+                    delta: text,
+                    meta: None,
+                }),
+                Ok(LlmEvent::UsageUpdate {
+                    usage: TurnUsage::host_declared(
+                        Provider::OpenAI,
+                        &request.model,
+                        Usage::default(),
+                    ),
+                }),
+                Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::success(StopReason::EndTurn),
+                }),
+            ]))
+        }
+
+        fn provider(&self) -> Provider {
+            Provider::OpenAI
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_review_proof_uses_selected_specialists_and_survives_restart() {
+        if !isolated("native_review_proof_uses_selected_specialists_and_survives_restart") {
+            return;
+        }
+        exercise_native_review_completion(false).await;
+        exercise_native_review_completion(true).await;
+    }
+
+    async fn exercise_native_review_completion(final_only: bool) {
+        use crate::native_review::{ReviewCandidate, ReviewIntent};
+        use crate::tools::{
+            GitHubOwner, GitHubPullRequestNumber, GitHubRepoName, GitHubRepoRef, GitSha,
+            LinearIssueId,
+        };
+        use meerkat_mob::{FlowRoleTargets, MobRunStatus};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = fixture_config(temp.path());
+        config.repositories.retain(|id, _| id.as_str() == "alpha");
+        config.peers.clear();
+        let repo = RepoId::try_from("alpha".to_owned()).unwrap();
+        let client = Arc::new(NativeReviewScript::default());
+        let mut queue_config =
+            crate::meta_runtime::tests::test_meerkat_config(temp.path().join("queue"));
+        queue_config.repository_runtime = Some(crate::config::RepositoryRuntimeBinding {
+            repository: repo.clone(),
+            state_path: config.state_root.join("alpha"),
+        });
+        let mut service = crate::config::ServiceConfig::from_definition(temp.path().join("fugue.yaml"),
+            &crate::config::WorkflowDefinition {
+                config: json!({
+                    "tracker":{"kind":"fugue-ims", "endpoint":temp.path().join("issues.sqlite"), "project_slug":"example/app"},
+                    "kapellmeister":{"authority_mode":"guarded_labeled", "safe_selectors":{"repositories":[{"owner":"example","name":"app"}]}},
+                    "deploy":{"enabled":true, "procedure":"merge-only", "require_ota_update":false,
+                        "allow_no_ci_checks":true, "allowed_repositories":[{"owner":"example", "name":"app"}]}
+                }).as_object().unwrap().clone(), prompt_template:"test".into(),
+            }).unwrap();
+        service.meerkat = queue_config.clone();
+        let tracker_issue = crate::fugue_ims::create_issue_for_config(
+            &service.tracker,
+            crate::fugue_ims::CreateFugueIssue {
+                key: crate::ims::ImsIssueKey("TEST-1".into()),
+                repo: "example/app".into(),
+                title: "Native merge gate".into(),
+                description: None,
+                stage: crate::ims::ImsStageName("Todo".into()),
+                labels: vec![],
+            },
+        )
+        .unwrap();
+        let review_config = crate::config::IndependentReviewConfig {
+            enabled: !final_only,
+            ..Default::default()
+        };
+        service.independent_review = review_config.clone();
+        service.final_review = crate::config::FinalReviewConfig {
+            enabled: true,
+            reviewers: ["planner", "coder", "reviewer"]
+                .map(|profile| crate::config::FinalReviewReviewerConfig {
+                    id: profile.into(),
+                    profile: profile.into(),
+                    required: true,
+                })
+                .to_vec(),
+            ..Default::default()
+        };
+        let queue = crate::meta_runtime::MetaRuntimeRegistry::new(queue_config.clone())
+            .with_independent_review_config(review_config.clone())
+            .with_final_review_config(service.final_review.clone());
+        let ensemble =
+            EnsembleRuntime::build_inner(config.clone(), Some(client.clone()), Some(queue.clone()))
+                .await
+                .unwrap();
+        let handle = ensemble.repository(&repo).unwrap().mob_handle();
+        let before: BTreeSet<_> = handle
+            .list_all_members()
+            .await
+            .into_iter()
+            .map(|member| member.agent_identity)
+            .collect();
+        let intent = ReviewIntent {
+            schema_version: "fugue.native-review.v1".into(),
+            round: "review-round-1".into(),
+            candidate: ReviewCandidate {
+                tracker_context: service.tracker_context_id(),
+                issue_id: LinearIssueId(tracker_issue.id.0),
+                issue_identifier: "TEST-1".into(),
+                repo: GitHubRepoRef {
+                    host: None,
+                    owner: GitHubOwner("example".into()),
+                    name: GitHubRepoName("app".into()),
+                },
+                pull_request: GitHubPullRequestNumber(1),
+                base_branch: crate::tools::BranchName("main".into()),
+                head_sha: GitSha("a".repeat(40)),
+            },
+            reviewers: FlowRoleTargets::new(["planner", "coder", "reviewer"].map(|role| {
+                (
+                    role,
+                    [
+                        meerkat_meta::member_comms_id::roster_member_id_for_identity(
+                            member_identity(&repo, role).unwrap().as_str(),
+                        ),
+                    ],
+                )
+            }))
+            .unwrap(),
+            task: "Inspect the immutable fixture candidate".into(),
+        };
+        let draft = crate::review_requests::ReviewRequestDraft {
+            candidate: intent.candidate,
+            reviewers: intent.reviewers,
+            task: intent.task,
+            idempotency_key: crate::tools::IdempotencyKey("request-1".into()),
+            supersedes: None,
+        };
+        let (first, concurrent) = tokio::join!(
+            queue.admit_native_review(draft.clone()),
+            queue.admit_native_review(draft.clone()),
+        );
+        let (intent, reference) = first.unwrap();
+        assert_eq!(
+            concurrent.unwrap(),
+            (intent.clone(), reference.clone()),
+            "concurrent retries reuse admission"
+        );
+        for change in ["task", "candidate", "targets"] {
+            let mut different = intent.clone();
+            match change {
+                "task" => different.task = "Different instructions".into(),
+                "candidate" => different.candidate.head_sha = GitSha("b".repeat(40)),
+                _ => {
+                    different.reviewers =
+                        FlowRoleTargets::new(
+                            [
+                                ("planner", vec!["alpha:reviewer"]),
+                                ("coder", vec!["alpha:coder"]),
+                                ("reviewer", vec!["alpha:planner"]),
+                            ]
+                            .map(|(role, members)| {
+                                (role, members.into_iter().map(
+                        meerkat_meta::member_comms_id::roster_member_id_for_identity,
+                    ))
+                            }),
+                        )
+                        .unwrap();
+                }
+            }
+            assert!(
+                matches!(
+                    crate::native_review::admit(&handle, &different, 3).await,
+                    Err(crate::native_review::ReviewAdmissionError::Conflict { .. })
+                ),
+                "same round must reject changed {change}"
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(40), async {
+            for id in &reference.runs {
+                loop {
+                    let run = handle.flow_status(id.clone()).await.unwrap().unwrap();
+                    if matches!(
+                        run.status,
+                        MobRunStatus::Completed | MobRunStatus::Failed | MobRunStatus::Canceled
+                    ) {
+                        assert_eq!(run.status, MobRunStatus::Completed, "{run:?}");
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        })
+        .await
+        .expect("bounded native reviews");
+        let verified = queue
+            .read_native_review(&intent.candidate, &reference)
+            .await
+            .unwrap();
+        verified.require_approval().unwrap();
+        assert_eq!(
+            crate::native_review::admit(&handle, &intent, 3)
+                .await
+                .unwrap(),
+            reference,
+            "terminal replay does not launch another review"
+        );
+        assert_eq!(verified.verdicts().count(), 3);
+        assert_eq!(client.reviews.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            before,
+            handle
+                .list_all_members()
+                .await
+                .into_iter()
+                .map(|member| member.agent_identity)
+                .collect()
+        );
+        // Exercise the production merge gate with real native proof and tracker
+        // state. Only forge responses are fixtures; no external PR is mutated.
+        let graph_path = crate::meta_runtime::meta_runtime_state_path(&service.meerkat)
+            .join("workgraph.sqlite3");
+        let graph_store = meerkat::SqliteWorkGraphStore::open(&graph_path).unwrap();
+        drop(graph_store);
+        let merge_input = crate::tools::MergePrInput {
+            repo: intent.candidate.repo.clone(),
+            pull_request: crate::tools::GitHubPullRequestRef::Number {
+                number: intent.candidate.pull_request,
+            },
+            method: crate::tools::MergeMethod::Squash,
+            expected_head_sha: Some(intent.candidate.head_sha.clone()),
+            idempotency_key: crate::tools::IdempotencyKey("fixture-merge".into()),
+        };
+        let issue_ref = crate::tools::LinearIssueRef::Id {
+            id: intent.candidate.issue_id.clone(),
+        };
+        let forge_pr = |state: &str| {
+            json!({"number":1,"title":"Candidate", "url":"https://github.com/example/app/pull/1",
+            "state":state, "isDraft":false, "headRefName":"feature", "baseRefName":"main", "headRefOid":"a".repeat(40)}).to_string()
+        };
+        let ci = |state: &str| {
+            json!({"data":{"repository":{"pullRequest":{
+            "headRefOid":"a".repeat(40), "commits":{"nodes":[{"commit":{"oid":"a".repeat(40),
+            "statusCheckRollup":{"contexts":{"nodes":[{"__typename":"StatusContext", "context":"test", "state":state, "targetUrl":null}],
+            "pageInfo":{"hasNextPage":false,"endCursor":null}}}}}]}
+        }}}}).to_string()
+        };
+        let completion = crate::independent_review::IndependentReviewCompletionRequest {
+            issue: issue_ref.clone(),
+            pull_request: crate::tools::GitHubPullRequestSnapshot {
+                repo: intent.candidate.repo.clone(),
+                number: intent.candidate.pull_request,
+                title: "Candidate".into(),
+                url: "https://github.com/example/app/pull/1".into(),
+                state: crate::tools::PullRequestState::Open,
+                draft: false,
+                head_branch: crate::tools::BranchName("feature".into()),
+                base_branch: crate::tools::BranchName("main".into()),
+                head_sha: intent.candidate.head_sha.clone(),
+            },
+            head_sha: intent.candidate.head_sha.clone(),
+            workgraph_scope: crate::independent_review::IndependentReviewWorkGraphScope {
+                realm_id: meerkat_core::mob_realm_id(&service.meerkat.mob_id())
+                    .unwrap()
+                    .to_string(),
+                namespace: meerkat::WorkNamespace::default().as_str().into(),
+            },
+            native_review: reference.clone(),
+            idempotency_key: crate::tools::IdempotencyKey("final-completion".into()),
+        };
+        let final_kind = crate::review_completion::ReviewCompletionKind::Final;
+        let mut wrong_profiles = service.clone();
+        wrong_profiles
+            .final_review
+            .reviewers
+            .push(crate::config::FinalReviewReviewerConfig {
+                id: "second-planner".into(),
+                profile: "planner".into(),
+                required: true,
+            });
+        let (host, calls) = crate::github_tools::scripted_host(vec![forge_pr("OPEN")]);
+        let error = crate::review_completion::complete(
+            &wrong_profiles,
+            &queue,
+            completion.clone(),
+            final_kind,
+            host,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "final_review_profiles_not_satisfied");
+        assert_eq!(
+            calls().len(),
+            1,
+            "missing profile coverage cannot reach merge"
+        );
+        // The common merge gate independently enforces the same profile policy.
+        let (host, calls) = crate::github_tools::scripted_host(vec![forge_pr("OPEN")]);
+        let result = crate::merge_gate::merge_with_host(
+            &wrong_profiles,
+            &queue,
+            issue_ref.clone(),
+            merge_input.clone(),
+            crate::merge_gate::MergePurpose::FinalReview,
+            host,
+        )
+        .await;
+        assert!(matches!(result, crate::tools::FugueToolResult::Err { .. }));
+        assert_eq!(calls().len(), 1);
+        let mut shadow_only = service.clone();
+        shadow_only.kapellmeister.shadow_mode.authority = Default::default();
+        let (host, calls) = crate::github_tools::scripted_host(vec![forge_pr("OPEN")]);
+        let error = crate::review_completion::complete(
+            &shadow_only,
+            &queue,
+            completion.clone(),
+            final_kind,
+            host,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "final_review_not_authorized");
+        assert_eq!(calls().len(), 1);
+        let mut disabled = service.clone();
+        disabled.final_review.enabled = false;
+        let (host, calls) = crate::github_tools::scripted_host(vec![]);
+        let error = crate::review_completion::complete(
+            &disabled,
+            &queue,
+            completion.clone(),
+            final_kind,
+            host,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "review_disabled");
+        assert!(calls().is_empty());
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            ci("FAILURE"),
+        ]);
+        let blocked = crate::review_completion::complete(
+            &service,
+            &queue,
+            completion.clone(),
+            final_kind,
+            host,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            blocked.plan.decision,
+            crate::independent_review::IndependentReviewDecision::Blocked
+        );
+        assert_eq!(
+            blocked.projection.target_lane,
+            service.final_review.blocked_lane
+        );
+        assert!(blocked.merge.is_none());
+        assert_eq!(calls().len(), 4);
+        let adapter = crate::linear_adapter::IssueAdapter::from_config(&service.tracker).unwrap();
+        let state = adapter
+            .inspect_issue(crate::tools::InspectIssueInput {
+                issue: issue_ref.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(state.issue.state.name, service.final_review.blocked_lane);
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            ci("SUCCESS"),
+            forge_pr("OPEN"),
+            String::new(),
+            forge_pr("MERGED"),
+            json!({"mergeCommit":{"oid":"b".repeat(40)}}).to_string(),
+        ]);
+        let completed = crate::review_completion::complete(
+            &service,
+            &queue,
+            completion.clone(),
+            final_kind,
+            host,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            completed.plan.decision,
+            crate::independent_review::IndependentReviewDecision::Success
+        );
+        assert_eq!(
+            completed.projection.target_lane,
+            service.final_review.success_lane
+        );
+        assert_eq!(
+            completed.merge.unwrap().merge_commit_sha,
+            Some(GitSha("b".repeat(40)))
+        );
+        assert_eq!(
+            calls()
+                .iter()
+                .filter(|args| args.get(1).is_some_and(|arg| arg == "merge"))
+                .count(),
+            1
+        );
+        let state = adapter
+            .inspect_issue(crate::tools::InspectIssueInput {
+                issue: issue_ref.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(state.issue.state.name, service.final_review.success_lane);
+        let workpad = adapter.issue_comments(&issue_ref).await.unwrap();
+        assert!(
+            workpad
+                .iter()
+                .any(|comment| comment.body_markdown.contains(&"b".repeat(40)))
+        );
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("MERGED"),
+            forge_pr("MERGED"),
+            forge_pr("MERGED"),
+            ci("SUCCESS"),
+            forge_pr("MERGED"),
+            json!({"mergeCommit":{"oid":"b".repeat(40)}}).to_string(),
+        ]);
+        let replay = crate::review_completion::complete(
+            &service,
+            &queue,
+            completion.clone(),
+            final_kind,
+            host,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay.plan.decision,
+            crate::independent_review::IndependentReviewDecision::Success
+        );
+        assert!(
+            !replay.merge.unwrap().merged,
+            "retry records the existing merge"
+        );
+        assert!(
+            !calls()
+                .iter()
+                .any(|args| args.get(1).is_some_and(|arg| arg == "merge"))
+        );
+        let mut old_intent = intent.clone();
+        old_intent.round = "an-older-request".into();
+        let (host, calls) = crate::github_tools::scripted_host(vec![forge_pr("OPEN")]);
+        let result = crate::merge_gate::merge_review_with_host(
+            &service,
+            &queue,
+            issue_ref.clone(),
+            merge_input.clone(),
+            crate::merge_gate::MergePurpose::FinalReview,
+            host,
+            Some(&old_intent),
+        )
+        .await;
+        assert!(matches!(result, crate::tools::FugueToolResult::Err { .. }));
+        assert_eq!(
+            calls().len(),
+            1,
+            "an old completion cannot merge using a newer green request"
+        );
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            ci("FAILURE"),
+        ]);
+        let result = crate::merge_gate::merge_with_host(
+            &service,
+            &queue,
+            issue_ref.clone(),
+            merge_input.clone(),
+            crate::merge_gate::MergePurpose::Deploy,
+            host,
+        )
+        .await;
+        assert!(
+            matches!(result, crate::tools::FugueToolResult::Err { .. }),
+            "{result:?}"
+        );
+        assert_eq!(calls().len(), 3);
+        assert!(
+            !calls()
+                .iter()
+                .any(|args| args.get(1).is_some_and(|arg| arg == "merge"))
+        );
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            ci("SUCCESS"),
+        ]);
+        let mut unavailable_graph = service.clone();
+        unavailable_graph
+            .meerkat
+            .repository_runtime
+            .as_mut()
+            .unwrap()
+            .state_path = temp.path().join("missing-runtime");
+        let result = crate::merge_gate::merge_with_host(
+            &unavailable_graph,
+            &queue,
+            issue_ref.clone(),
+            merge_input.clone(),
+            crate::merge_gate::MergePurpose::Deploy,
+            host,
+        )
+        .await;
+        assert!(
+            matches!(result, crate::tools::FugueToolResult::Err { error, .. }
+            if error.message.contains("WorkGraph database is unavailable"))
+        );
+        assert_eq!(calls().len(), 3);
+        assert!(!temp.path().join("missing-runtime").exists());
+
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            ci("SUCCESS"),
+            forge_pr("OPEN"),
+            String::new(),
+            forge_pr("MERGED"),
+            json!({"mergeCommit":{"oid":"b".repeat(40)}}).to_string(),
+        ]);
+        let mut deploy_config = service.clone();
+        deploy_config.deploy.require_ota_update = false;
+        deploy_config.deploy.procedure = "merge-only".into();
+        let deploy_request = crate::deploy_gate::DeployStartRequest {
+            issue: issue_ref.clone(),
+            pull_request: completion.pull_request.clone(),
+            recorded_head_sha: Some(completion.head_sha.clone()),
+            ci_status: Some(crate::tools::CiStatus::Success),
+            unresolved_workgraph_blockers: 0,
+            idempotency_key: crate::tools::IdempotencyKey("native-merge-transaction".into()),
+            retry_deployment: None,
+        };
+        let result = crate::http::execute_deploy_transaction_with_host(
+            deploy_config.clone(),
+            queue.clone(),
+            deploy_request.clone(),
+            host,
+        )
+        .await;
+        assert!(result.accepted, "{result:?}");
+        assert_eq!(
+            result.outcome.unwrap().status,
+            crate::deploy_gate::DeployOutcomeStatus::Merged
+        );
+        assert_eq!(calls().len(), 7);
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("MERGED"),
+            forge_pr("MERGED"),
+            ci("SUCCESS"),
+            forge_pr("MERGED"),
+            json!({"mergeCommit":{"oid":"b".repeat(40)}}).to_string(),
+        ]);
+        let result = crate::merge_gate::merge_with_host(
+            &service,
+            &queue,
+            issue_ref.clone(),
+            merge_input.clone(),
+            crate::merge_gate::MergePurpose::Deploy,
+            host,
+        )
+        .await;
+        assert!(
+            matches!(result,crate::tools::FugueToolResult::Ok { output:crate::tools::FugueToolOutput::GitHubMergePr(output),.. } if !output.merged)
+        );
+        assert_eq!(calls().len(), 5);
+        assert!(
+            !calls()
+                .iter()
+                .any(|args| args.get(1).is_some_and(|arg| arg == "merge"))
+        );
+        let graph = meerkat::WorkGraphService::with_scope(
+            Arc::new(meerkat::SqliteWorkGraphStore::open(&graph_path).unwrap()),
+            meerkat_core::mob_realm_id(service.meerkat.mob_id().as_ref())
+                .unwrap()
+                .as_str(),
+            meerkat::WorkNamespace::default(),
+        );
+        let blocker = graph
+            .create(meerkat::CreateWorkItemRequest {
+                realm_id: None,
+                namespace: None,
+                title: "Unresolved review finding".into(),
+                description: None,
+                priority: meerkat::WorkPriority::High,
+                completion_policy: meerkat::WorkCompletionPolicy::SelfAttest,
+                failed_child_join_policy: Default::default(),
+                cancelled_child_join_policy: Default::default(),
+                labels: BTreeSet::from(["fugue".into(), "blocking".into(), "issue:TEST-1".into()]),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: Some(meerkat::WorkStatus::Open),
+            })
+            .await
+            .unwrap();
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            ci("SUCCESS"),
+        ]);
+        let result = crate::merge_gate::merge_with_host(
+            &service,
+            &queue,
+            issue_ref.clone(),
+            merge_input.clone(),
+            crate::merge_gate::MergePurpose::Deploy,
+            host,
+        )
+        .await;
+        assert!(
+            matches!(result, crate::tools::FugueToolResult::Err { error, .. }
+            if error.message.contains("unresolved blocking WorkGraph"))
+        );
+        assert_eq!(
+            calls().len(),
+            3,
+            "native obligations stop the actual merge gate before mutation"
+        );
+        // The exact transaction can be retried after a new native blocker.
+        // A precondition failure must not erase the earlier observed merge.
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("MERGED"),
+            forge_pr("MERGED"),
+            ci("SUCCESS"),
+        ]);
+        let replay = crate::http::execute_deploy_transaction_with_host(
+            deploy_config.clone(),
+            queue.clone(),
+            deploy_request.clone(),
+            host,
+        )
+        .await;
+        assert!(!replay.accepted, "{replay:?}");
+        assert!(replay.message.contains("unresolved blocking WorkGraph"));
+        assert_eq!(calls().len(), 3);
+        assert!(
+            !calls()
+                .iter()
+                .any(|args| args.get(1).is_some_and(|arg| arg == "merge"))
+        );
+        let workpad = adapter
+            .inspect_issue(crate::tools::InspectIssueInput {
+                issue: issue_ref.clone(),
+            })
+            .await
+            .unwrap()
+            .workpad
+            .unwrap()
+            .body_markdown;
+        assert!(workpad.contains("### Deployment\n"));
+        assert!(workpad.contains(&format!("\"merged_sha\": \"{}\"", "b".repeat(40))));
+        assert!(workpad.contains("### Deployment attempt\n"));
+        assert!(workpad.contains("\"status\": \"failed\""));
+        fn confirmed_deployment(body: &str) -> &str {
+            body.split_once("### Deployment\n")
+                .unwrap()
+                .1
+                .split("\n### ")
+                .next()
+                .unwrap()
+                .trim()
+        }
+        let confirmed_before_restart = confirmed_deployment(&workpad).to_owned();
+
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            forge_pr("OPEN"),
+            ci("SUCCESS"),
+        ]);
+        let blocked = crate::review_completion::complete(
+            &service,
+            &queue,
+            completion.clone(),
+            final_kind,
+            host,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            blocked.plan.decision,
+            crate::independent_review::IndependentReviewDecision::Blocked
+        );
+        assert!(blocked.merge.is_none());
+        assert_eq!(calls().len(), 4);
+        assert_eq!(
+            client.reviews.load(Ordering::SeqCst),
+            3,
+            "completion never asks specialists to review again"
+        );
+        let verdicts: Vec<_> = verified.verdicts().cloned().collect();
+        let projection = crate::review_completion::record_review_projection(
+            &service,
+            &completion,
+            "TEST-1",
+            &completed.plan,
+            &verdicts,
+            None,
+            final_kind,
+        )
+        .await;
+        assert!(
+            projection.is_err(),
+            "a newly arrived blocker prevents terminal projection after merge"
+        );
+        let state = adapter
+            .inspect_issue(crate::tools::InspectIssueInput {
+                issue: issue_ref.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(state.issue.state.name, service.final_review.blocked_lane);
+        drop(adapter);
+        drop(graph);
+        ensemble.shutdown().await.unwrap();
+        drop(handle);
+        drop(ensemble);
+
+        drop(queue);
+        let queue = crate::meta_runtime::MetaRuntimeRegistry::new(queue_config)
+            .with_independent_review_config(review_config)
+            .with_final_review_config(service.final_review.clone());
+        let restarted =
+            EnsembleRuntime::build_inner(config, Some(client.clone()), Some(queue.clone()))
+                .await
+                .unwrap();
+        let handle = restarted.repository(&repo).unwrap().mob_handle();
+        assert_eq!(
+            crate::native_review::admit(&handle, &intent, 3)
+                .await
+                .unwrap(),
+            reference,
+            "restart replay returns the same durable run identities"
+        );
+        let verified = queue
+            .read_native_review(&intent.candidate, &reference)
+            .await
+            .unwrap();
+        verified.require_approval().unwrap();
+        assert_eq!(verified.verdicts().count(), 3);
+        assert_eq!(
+            client.reviews.load(Ordering::SeqCst),
+            3,
+            "restart reads durable results without asking agents again"
+        );
+        // Reopen every authority and retry the full transaction, not only the
+        // native proof reader. The persisted blocker still gates the retry.
+        let adapter = crate::linear_adapter::IssueAdapter::from_config(&service.tracker).unwrap();
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("MERGED"),
+            forge_pr("MERGED"),
+            ci("SUCCESS"),
+        ]);
+        let replay = crate::http::execute_deploy_transaction_with_host(
+            deploy_config.clone(),
+            queue.clone(),
+            deploy_request.clone(),
+            host,
+        )
+        .await;
+        assert!(!replay.accepted, "{replay:?}");
+        assert!(replay.message.contains("unresolved blocking WorkGraph"));
+        assert_eq!(calls().len(), 3);
+        assert!(
+            !calls()
+                .iter()
+                .any(|args| args.get(1).is_some_and(|arg| arg == "merge"))
+        );
+        let state = adapter
+            .inspect_issue(crate::tools::InspectIssueInput {
+                issue: issue_ref.clone(),
+            })
+            .await
+            .unwrap();
+        let workpad = state.workpad.unwrap().body_markdown;
+        assert_eq!(confirmed_deployment(&workpad), confirmed_before_restart);
+        assert!(workpad.contains("### Deployment attempt\n"));
+
+        // An explicit native resolution permits the same request to confirm
+        // the existing forge result without another merge or another review.
+        let graph = meerkat::WorkGraphService::with_scope(
+            Arc::new(meerkat::SqliteWorkGraphStore::open(&graph_path).unwrap()),
+            meerkat_core::mob_realm_id(service.meerkat.mob_id().as_ref())
+                .unwrap()
+                .as_str(),
+            meerkat::WorkNamespace::default(),
+        );
+        graph
+            .close(meerkat::CloseWorkItemRequest {
+                id: blocker.id,
+                realm_id: None,
+                namespace: None,
+                expected_revision: blocker.revision,
+                status: meerkat::WorkStatus::Completed,
+            })
+            .await
+            .unwrap();
+        let (host, calls) = crate::github_tools::scripted_host(vec![
+            forge_pr("MERGED"),
+            forge_pr("MERGED"),
+            ci("SUCCESS"),
+            forge_pr("MERGED"),
+            json!({"mergeCommit":{"oid":"b".repeat(40)}}).to_string(),
+        ]);
+        let replay = crate::http::execute_deploy_transaction_with_host(
+            deploy_config,
+            queue.clone(),
+            deploy_request,
+            host,
+        )
+        .await;
+        assert!(replay.accepted, "{replay:?}");
+        let outcome = replay.outcome.unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::deploy_gate::DeployOutcomeStatus::Merged
+        );
+        assert_eq!(outcome.merge.unwrap().merged_sha, GitSha("b".repeat(40)));
+        assert_eq!(calls().len(), 5);
+        assert!(
+            !calls()
+                .iter()
+                .any(|args| args.get(1).is_some_and(|arg| arg == "merge"))
+        );
+        assert_eq!(client.reviews.load(Ordering::SeqCst), 3);
+        let state = adapter
+            .inspect_issue(crate::tools::InspectIssueInput {
+                issue: issue_ref.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(state.issue.state.name, service.deploy.success_lane);
+        assert!(
+            confirmed_deployment(&state.workpad.unwrap().body_markdown).contains(&"b".repeat(40))
+        );
+        drop(graph);
+        let mut changed = intent.candidate.clone();
+        changed.head_sha = GitSha("b".repeat(40));
+        assert!(
+            crate::native_review::read(&handle, &changed, 3, &reference)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            queue.admit_native_review(draft.clone()).await.unwrap(),
+            (intent.clone(), reference.clone())
+        );
+        let mut replacement = draft.clone();
+        replacement.idempotency_key.0 = "request-2".into();
+        replacement.supersedes = Some(intent.round.clone());
+        replacement.task = "[HOLD REVIEW] Exercise cancellation before completion".into();
+        let (another_round, canceled) = queue
+            .admit_native_review(replacement.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            queue.admit_native_review(draft).await,
+            Err(crate::review_requests::ReviewRequestError::Superseded)
+        ));
+        assert!(matches!(
+            queue
+                .read_native_review(&intent.candidate, &reference)
+                .await,
+            Err(crate::native_review::ReviewProofError::Superseded)
+        ));
+        let (host, calls) = crate::github_tools::scripted_host(vec![forge_pr("OPEN")]);
+        let result = crate::merge_gate::merge_with_host(
+            &service,
+            &queue,
+            issue_ref,
+            merge_input,
+            crate::merge_gate::MergePurpose::Deploy,
+            host,
+        )
+        .await;
+        assert!(matches!(result, crate::tools::FugueToolResult::Err { .. }));
+        assert_eq!(
+            calls().len(),
+            1,
+            "replacement invalidates old approval before forge mutation"
+        );
+        let (host, calls) = crate::github_tools::scripted_host(vec![forge_pr("OPEN")]);
+        let stale =
+            crate::review_completion::complete(&service, &queue, completion, final_kind, host)
+                .await
+                .unwrap_err();
+        assert_eq!(stale.code, "native_review_not_verified");
+        assert_eq!(calls().len(), 1);
+        assert!(canceled.runs.iter().all(|id| !reference.runs.contains(id)));
+        for id in &canceled.runs {
+            handle.cancel_flow(id.clone()).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            for id in &canceled.runs {
+                loop {
+                    let run = handle.flow_status(id.clone()).await.unwrap().unwrap();
+                    if run.status == MobRunStatus::Canceled {
+                        break;
+                    }
+                    assert_ne!(run.status, MobRunStatus::Completed);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        })
+        .await
+        .expect("native cancellation is bounded");
+        assert_eq!(
+            queue.admit_native_review(replacement).await.unwrap(),
+            (another_round.clone(), canceled.clone()),
+            "a canceled round is returned, never relaunched"
+        );
+        assert!(matches!(
+            queue
+                .read_native_review(&another_round.candidate, &canceled)
+                .await,
+            Err(crate::native_review::ReviewProofError::NotCompleted)
+        ));
+        restarted.shutdown().await.unwrap();
+    }
+
     struct HandoffScript {
         fail_worker: bool,
         pause_worker: bool,
@@ -2891,9 +4598,7 @@ mod tests {
                     ),
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ]))
         }

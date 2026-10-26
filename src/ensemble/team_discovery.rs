@@ -69,6 +69,7 @@ pub async fn discover_team(
     brief: &RepoBrief,
     model: &str,
     auth_binding: Option<meerkat_core::AuthBindingRef>,
+    connection_config: Option<&meerkat::Config>,
 ) -> Result<TeamManifest> {
     let formation = state_dir.join("formation");
     std::fs::create_dir_all(&formation)?;
@@ -88,32 +89,44 @@ pub async fn discover_team(
         .memory(false)
         .schedule(false)
         .workgraph(false);
-    let mut build = meerkat::AgentBuildConfig::new(model);
-    build.system_prompt = meerkat::SystemPromptOverride::Set(FORMATION_PROMPT.to_owned());
-    build.auth_binding = auth_binding.clone();
-    build.external_tools = Some(dispatcher.clone());
-    build.budget_limits = Some(meerkat_core::budget::BudgetLimits {
-        max_tokens: Some(SCOUT_TOKEN_BUDGET),
-        max_tool_calls: Some(SCOUT_TOOL_BUDGET),
-        max_duration: None,
-        max_turn_duration: Some(Duration::from_secs(600)),
-    });
-    let config =
-        isolated_connection_config(meerkat::Config::global_config_path().as_deref()).await?;
-    let mut agent = factory.build_agent(build, &config).await?;
+    let build = meerkat_core::service::SessionBuildOptions {
+        auth_binding: auth_binding.clone(),
+        external_tools: Some(dispatcher.clone()),
+        budget_limits: Some(meerkat_core::budget::BudgetLimits {
+            max_tokens: Some(SCOUT_TOKEN_BUDGET),
+            max_tool_calls: Some(SCOUT_TOOL_BUDGET),
+            max_duration: None,
+            max_turn_duration: Some(Duration::from_secs(600)),
+        }),
+        ..Default::default()
+    };
+    let config = match connection_config {
+        Some(config) => config.clone(),
+        None => {
+            isolated_connection_config(meerkat::Config::global_config_path().as_deref()).await?
+        }
+    };
+    let mut agent = super::formation_session::FormationSession::new(
+        factory,
+        config.clone(),
+        model,
+        FORMATION_PROMPT,
+        build,
+    )
+    .await?;
     let mut prompt = format!(
         "Discover the specialist team for {}.\n\n{}",
         root.display(),
         brief.prompt_context()
     );
     for round in 1..=MAX_REVIEWED_ATTEMPTS {
-        let result = tokio::time::timeout(Duration::from_secs(600), agent.run(prompt.into()))
+        let result = tokio::time::timeout(Duration::from_secs(600), agent.run(prompt))
             .await
             .context("repository team discovery timed out")?
             .context("repository team discovery failed")?;
         std::fs::write(
             formation.join(format!("scout-{round}.json")),
-            serde_json::to_vec_pretty(agent.session())?,
+            serde_json::to_vec_pretty(&agent.snapshot().await?)?,
         )?;
         std::fs::write(
             formation.join(format!("scout-{round}-result.json")),
@@ -139,6 +152,7 @@ pub async fn discover_team(
             model,
             auth_binding.clone(),
             &team,
+            Some(&config),
         )
         .await?;
         std::fs::write(
@@ -146,6 +160,7 @@ pub async fn discover_team(
             serde_json::to_vec_pretty(&review)?,
         )?;
         if review.approved {
+            agent.close().await?;
             eprintln!(
                 "Formed {} repository specialists for {}",
                 team.specialists.len(),
@@ -158,6 +173,7 @@ pub async fn discover_team(
             review.feedback,
         );
     }
+    agent.close().await?;
     anyhow::bail!(
         "repository team did not pass automatic formation review after three revisions; see {}",
         formation.display()
