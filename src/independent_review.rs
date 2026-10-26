@@ -261,9 +261,25 @@ pub struct IndependentReviewEvidence {
     pub base: String,
     pub head_sha: GitSha,
     #[serde(default)]
-    pub commands: Vec<String>,
+    pub commands: Vec<IndependentReviewCommand>,
     #[serde(default)]
     pub checked_paths: Vec<String>,
+}
+
+/// Native reviewers can retain a command alone or its observed result. These
+/// are supporting evidence, not an alternative verdict or approval source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IndependentReviewCommand {
+    Command(String),
+    Observation(IndependentReviewCommandObservation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndependentReviewCommandObservation {
+    pub command: String,
+    pub result: String,
 }
 
 impl IndependentReviewVerdict {
@@ -666,7 +682,9 @@ mod tests {
             evidence: IndependentReviewEvidence {
                 base: "main".to_string(),
                 head_sha: GitSha("abc123".to_string()),
-                commands: vec!["git diff origin/main...HEAD".to_string()],
+                commands: vec![IndependentReviewCommand::Command(
+                    "git diff origin/main...HEAD".into(),
+                )],
                 checked_paths: vec!["src/meta_runtime.rs".to_string()],
             },
         }

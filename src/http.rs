@@ -9534,7 +9534,11 @@ mod tests {
             evidence: crate::independent_review::IndependentReviewEvidence {
                 base: "main".to_string(),
                 head_sha: GitSha("abc123".to_string()),
-                commands: vec!["git diff origin/main...HEAD".to_string()],
+                commands: vec![
+                    crate::independent_review::IndependentReviewCommand::Command(
+                        "git diff origin/main...HEAD".into(),
+                    ),
+                ],
                 checked_paths: vec!["src/http.rs".to_string()],
             },
         }
