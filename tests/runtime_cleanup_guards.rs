@@ -55,17 +55,17 @@ fn meerkat_dependency_train_is_exact_and_unmixed() {
             continue;
         }
         assert!(
-            !trimmed.contains("path ="),
-            "published Fugue builds must not use path/dev Meerkat dependencies: {trimmed}"
+            !trimmed.contains("path =") && !trimmed.contains("git ="),
+            "published Fugue builds must use released registry Meerkat dependencies: {trimmed}"
         );
         if trimmed.starts_with("meerkat-meta") {
             assert!(
-                trimmed.contains("=0.9.5"),
+                trimmed.contains("=0.9.14"),
                 "meerkat-meta must be pinned to the companion train: {trimmed}"
             );
         } else if trimmed.starts_with("meerkat") {
             assert!(
-                trimmed.contains("=0.9.5"),
+                trimmed.contains("=0.9.14"),
                 "Meerkat crates must be pinned to one train: {trimmed}"
             );
             meerkat_versions.push(trimmed.to_string());
@@ -78,7 +78,7 @@ fn meerkat_dependency_train_is_exact_and_unmixed() {
 }
 
 #[test]
-fn locked_native_graph_uses_the_selected_recovery_commits() {
+fn locked_native_graph_uses_the_released_train() {
     #[derive(serde::Deserialize)]
     struct Lock {
         package: Vec<Package>,
@@ -88,43 +88,54 @@ fn locked_native_graph_uses_the_selected_recovery_commits() {
         name: String,
         version: String,
         source: Option<String>,
+        checksum: Option<String>,
     }
-    #[derive(serde::Deserialize)]
-    struct Manifest {
-        patch: Patches,
-    }
-    #[derive(serde::Deserialize)]
-    struct Patches {
-        #[serde(rename = "crates-io")]
-        crates: std::collections::BTreeMap<String, Pin>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Pin {
-        git: String,
-        rev: String,
-    }
-    let manifest: Manifest = toml::from_str(include_str!("../Cargo.toml")).expect("valid manifest");
     let lock: Lock = toml::from_str(include_str!("../Cargo.lock")).expect("valid lockfile");
-    let core = &manifest.patch.crates["meerkat"];
-    let meta = &manifest.patch.crates["meerkat-meta"];
+    let mut count = 0;
     for package in lock.package.iter().filter(|p| {
         (p.name.starts_with("meerkat") || p.name.starts_with("meta-")) && p.name != "meerkat-fugue"
     }) {
-        let pin = if package.name == "meerkat-meta" || package.name.starts_with("meta-") {
-            meta
-        } else {
-            core
-        };
+        count += 1;
         assert_eq!(
-            package.version, "0.9.5",
+            package.version, "0.9.14",
             "mixed native train: {}",
             package.name
         );
         assert_eq!(
             package.source.as_deref(),
-            Some(format!("git+{}?rev={}#{}", pin.git, pin.rev, pin.rev).as_str()),
-            "{} must use the selected commit, including transitive Meta dependencies",
+            Some("registry+https://github.com/rust-lang/crates.io-index"),
+            "{} must use the published registry release",
             package.name
         );
+        assert!(
+            package.checksum.is_some(),
+            "{} has no registry checksum",
+            package.name
+        );
+    }
+    assert!(count > 0, "native dependency graph must not be empty");
+
+    #[derive(serde::Deserialize)]
+    struct CliPin {
+        version: String,
+        assets: std::collections::BTreeMap<String, String>,
+    }
+    let cli: CliPin = serde_json::from_str(include_str!("../scripts/distribution/rkat.json"))
+        .expect("valid CLI release pin");
+    assert_eq!(
+        cli.version, "0.9.14",
+        "bundled CLI must match the native train"
+    );
+    assert!(
+        cli.assets.contains_key(&format!(
+            "rkat-{}-x86_64-unknown-linux-gnu.tar.gz",
+            cli.version
+        )),
+        "the release target must have a pinned CLI archive"
+    );
+    for (asset, checksum) in &cli.assets {
+        assert!(asset.starts_with(&format!("rkat-{}-", cli.version)));
+        assert_eq!(checksum.len(), 64, "invalid CLI checksum: {asset}");
+        assert!(checksum.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 }

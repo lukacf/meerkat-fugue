@@ -69,17 +69,22 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Select isolated Cargo paths
+        run: scripts/repo-cargo --print-env | sed -n '/^CARGO_/p' >> "$GITHUB_ENV"
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: ${{ env.CARGO_HOME }}
+          workspaces: . -> ${{ env.CARGO_TARGET_DIR }}
 
       - name: Check tracked publication hygiene
         run: scripts/public-readiness/scan.sh --current-only
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: scripts/repo-cargo fmt --check
 
       - name: Check
-        run: cargo check --all-targets --locked
+        run: scripts/repo-cargo check --all-targets --locked
 
       - name: Test offline contracts and runtime
         timeout-minutes: 45
@@ -87,11 +92,11 @@ jobs:
           FUGUE_TEST_EVIDENCE_DIR: ${{ runner.temp }}/fugue-full-suite
         run: |
           mkdir -p "$FUGUE_TEST_EVIDENCE_DIR"
-          cargo test --all-targets --locked
+          scripts/repo-cargo test --all-targets --locked
 
       - name: Locate the compiled native test executable
         timeout-minutes: 5
-        run: cargo test --locked --lib --no-run --message-format=json-render-diagnostics > "$RUNNER_TEMP/fugue-native-tests.jsonl"
+        run: scripts/repo-cargo test --locked --lib --no-run --message-format=json-render-diagnostics > "$RUNNER_TEMP/fugue-native-tests.jsonl"
 
       - name: Repeat native handoff and restart contracts
         # Internal bounds total 22 minutes including cleanup; leave room for
@@ -110,4 +115,4 @@ jobs:
           if-no-files-found: ignore
 
       - name: Lint
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: scripts/repo-cargo clippy --all-targets --locked -- -D warnings

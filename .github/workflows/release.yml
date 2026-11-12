@@ -28,13 +28,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
+      - name: Select isolated Cargo paths
+        run: scripts/repo-cargo --print-env | sed -n '/^CARGO_/p' >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: ${{ env.CARGO_HOME }}
+          workspaces: . -> ${{ env.CARGO_TARGET_DIR }}
       - name: Verify installer failure and upgrade behavior
         run: python3 -m unittest discover -s scripts/distribution -p 'test_*.py' -v
       - name: Build all cooperating binaries from the locked source
-        run: cargo build --release --bins --locked
+        run: scripts/repo-cargo build --release --bins --locked
       - name: Package with pinned rkat and file checksums
-        run: python3 scripts/distribution/package.py --bin-dir target/release --target x86_64-unknown-linux-gnu --output /tmp/fugue-dist
+        run: python3 scripts/distribution/package.py --bin-dir "$CARGO_TARGET_DIR/release" --target x86_64-unknown-linux-gnu --output /tmp/fugue-dist
       - name: Exercise the exact package on a fresh installation path
         run: |
           archive=$(find /tmp/fugue-dist -name '*.tar.gz')

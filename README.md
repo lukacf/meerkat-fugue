@@ -92,10 +92,10 @@ operator has access to the instance's repositories and controls. Keep deployment
 configuration, credentials, databases and transcripts outside this public repo.
 See [SECURITY.md](SECURITY.md).
 
-This branch uses exact public Meerkat and Meta source revisions. The
-[dependency declarations](Cargo.toml) and [lockfile](Cargo.lock) identify the
-versions and commits used by this checkout; the bundled rkat CLI has its own
-[release pin](scripts/distribution/rkat.json).
+Fugue 0.1.1 uses the released Meerkat and Meta 0.9.14 crates. The
+[dependency declarations](Cargo.toml) and [lockfile](Cargo.lock) pin the complete
+native dependency graph. Bundles also include rkat 0.9.14, verified against its
+[release checksums](scripts/distribution/rkat.json).
 The first release targets fresh installations and still requires crash-recovery
 and hosted acceptance. Legacy migration is a separate, unqualified upgrade path;
 it is not a prerequisite for a fresh installation. Follow the
@@ -117,10 +117,10 @@ Start at the [documentation home](docs/index.mdx).
 ## Development
 
 ```sh
-cargo fmt --check
-cargo check --all-targets --locked
-cargo test --all-targets --locked
-cargo clippy --all-targets --locked -- -D warnings
+scripts/repo-cargo fmt --check
+scripts/repo-cargo check --all-targets --locked
+scripts/repo-cargo test --all-targets --locked
+scripts/repo-cargo clippy --all-targets --locked -- -D warnings
 ```
 
 The normal suite uses local fixtures. Ignored live E2E tests require an explicitly

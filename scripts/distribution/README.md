@@ -9,8 +9,9 @@ part of the archive. The executable set is `meerkat-fugue`, `fugue-linear-mcp`,
 Build from a clean checkout on the target platform:
 
 ```sh
-cargo build --release --bins --locked
-python3 scripts/distribution/package.py --bin-dir target/release \
+scripts/repo-cargo build --release --bins --locked
+bin_dir="$(scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')/release"
+python3 scripts/distribution/package.py --bin-dir "$bin_dir" \
   --target x86_64-unknown-linux-gnu --output /tmp/fugue-dist
 ```
 

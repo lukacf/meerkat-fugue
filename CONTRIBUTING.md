@@ -10,10 +10,10 @@ Install Git and Rust through rustup. The repository's `rust-toolchain.toml` pins
 the development toolchain. Clone the repository, create a branch, then run:
 
 ```bash
-cargo fmt --check
-cargo check --all-targets --locked
-cargo test --all-targets --locked
-cargo clippy --all-targets --locked -- -D warnings
+scripts/repo-cargo fmt --check
+scripts/repo-cargo check --all-targets --locked
+scripts/repo-cargo test --all-targets --locked
+scripts/repo-cargo clippy --all-targets --locked -- -D warnings
 ```
 
 Add a focused regression test when it demonstrates a behavior change. Include
