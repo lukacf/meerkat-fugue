@@ -42,14 +42,19 @@ by the post-merge tree check, not an atomic base guard. Protected-branch strict
 up-to-date checks can close this server-side race. Repeating
 a successful merge after a lost response safely reconstructs its receipt.
 
-Next update the checkout to the **merged commit from the receipt**, build from that
-clean tree (`cargo build --locked --bin meerkat-fugue`, or `--release`), and deploy:
+Next update the checkout to the **merged commit from the receipt**, then build
+and deploy from that clean tree:
 
 ```sh
+scripts/repo-cargo build --locked --bin meerkat-fugue
+fugue_target_dir=$(scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')
 python3 scripts/release/release.py deploy --receipt /tmp/release-merge.json \
-  --service /absolute/operator/service.json --binary target/debug/meerkat-fugue \
+  --service /absolute/operator/service.json --binary "$fugue_target_dir/debug/meerkat-fugue" \
   --work-item work_REPLACE_WITH_NATIVE_WORK_ID
 ```
+
+For a release build, add `--release` to the build command and use
+`$fugue_target_dir/release/meerkat-fugue` as the binary.
 
 The operator's stable service file is configured once; subsequent releases reuse it:
 

@@ -546,7 +546,7 @@ impl EnsembleRuntime {
                 // member's partially initialized domain. The native readiness
                 // barrier below still admits the whole team before serving.
                 .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
-                    concurrency: 1,
+                    concurrency: Some(1),
                 })
                 .session_hook(Arc::new(RepositorySessionHook {
                     events: Arc::clone(&events),
@@ -1508,6 +1508,7 @@ fn definition(repo: &RepoId, model: &str, grants: &BTreeMap<String, MemberGrant>
                 // The repository mob and Meta continuity own persistence.
                 // This optional flag is for separate durable-worker discovery.
                 durable: false,
+                auth_binding: None,
                 model: model.to_owned(),
                 model_fallback: None,
                 provider: None,

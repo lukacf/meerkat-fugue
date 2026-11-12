@@ -54,17 +54,18 @@ npx playwright test tests/welcome.spec.mjs --project=chromium
 ### Rust checks
 
 ```sh
-cargo fmt --check
-cargo check --all-targets --locked
-cargo test --all-targets --locked
-cargo clippy --all-targets --locked -- -D warnings
-cargo run --locked -- --help
+scripts/repo-cargo fmt --check
+scripts/repo-cargo check --all-targets --locked
+scripts/repo-cargo test --all-targets --locked
+scripts/repo-cargo clippy --all-targets --locked -- -D warnings
+scripts/repo-cargo run --locked -- --help
 ```
 
 The normal suite uses temporary local state and fixtures. The destructive live
-test remains ignored. When working alongside another Rust build, give your
-checkout a separate `CARGO_TARGET_DIR`; do not delete another build's target or
-lock files to resolve contention.
+test remains ignored. The wrapper gives each checkout its own build directory
+and shares downloaded dependencies across this repository's worktrees. Use
+`scripts/repo-cargo --print-env` to locate the cache and build output. Do not
+delete another build's target or lock files to resolve contention.
 
 ### Native qualification evidence
 

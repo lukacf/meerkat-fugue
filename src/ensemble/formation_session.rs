@@ -172,7 +172,24 @@ auth_profile = "default_openai"
             &transition,
         )
         .unwrap();
-        persistence.token_store().save(&key, &marked).await.unwrap();
+        let store = persistence.token_store();
+        persistence
+            .refresh_coordinator()
+            .with_exclusive_mutation(
+                key.clone(),
+                Box::new(move |guard| {
+                    Box::pin(async move {
+                        store.save(&guard, &key, &marked).await.map_err(
+                            meerkat_core::auth::CredentialMutationError::from_token_store,
+                        )?;
+                        Ok(meerkat_core::auth::CredentialMutationOutcome::Persisted(
+                            marked,
+                        ))
+                    })
+                }),
+            )
+            .await
+            .unwrap();
         let mut standalone = meerkat::AgentBuildConfig::new("gpt-6-astra");
         standalone.auth_binding = Some(binding.clone());
         let error = factory()

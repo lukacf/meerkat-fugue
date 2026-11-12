@@ -9493,6 +9493,7 @@ mod tests {
                 ],
                 include_terminal: false,
                 limit: None,
+                cursor: None,
             })
             .await
             .expect("workgraph items");
