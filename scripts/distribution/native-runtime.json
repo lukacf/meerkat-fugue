@@ -2,7 +2,7 @@
   "upstream_version": "0.9.14",
   "upstream_commit": "abdabeb8e97805385e71d66da7e78136c4b0e68c",
   "repository": "https://github.com/lukacf/meerkat",
-  "revision": "dc64d48ebe2f8f34290115fa87707aa4f58f77b5",
+  "revision": "26d6cca32f1c9376187fcbcea5f9d375704f19d6",
   "patch": "native-flow-run-observers",
   "patch_origin": "a3db0ef2bc6d4787878b5e6a7e0057323eb42d80",
   "mob_schema": 13,
