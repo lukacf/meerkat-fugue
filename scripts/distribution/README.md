@@ -107,12 +107,20 @@ on the intended gateway before treating a deployment as accepted.
 
 ## Temporary dependency follow-up
 
-The candidate uses exact public Core and Meta source revisions. Read
-[Cargo.toml](../../Cargo.toml) for the selected revisions and
+The candidate uses a custom Core build based on Meerkat 0.9.14 and the
+published Meta 0.9.14 crate. Core carries the native flow observer and
+terminal-wake feature used by independent review. This also preserves mob
+schema 13 from Fugue's previous custom runtime. Read
+[native-runtime.json](native-runtime.json) for the upstream base and carried
+feature provenance (also included in each bundle's `manifest.json`),
+[Cargo.toml](../../Cargo.toml) for the selected revision and
 [Cargo.lock](../../Cargo.lock) for the resolved versions and commits. Every
 Core package, including Meta's transitive dependencies, must resolve to the same
 Core commit. The separately packaged rkat CLI uses [rkat.json](rkat.json); its
-version can differ from the embedded runtime.
+version can differ from the embedded runtime. In this candidate it is the
+published rkat 0.9.14, used for model authentication. Do not use that stock
+CLI to open Fugue's schema 13 mob stores: the unpatched runtime supports
+only schema 12 and refuses them.
 
 For an installed bundle, run `meerkat-fugue build-info` and compare its commit
 and tree with `manifest.json`. Inspect the dependency files at that source

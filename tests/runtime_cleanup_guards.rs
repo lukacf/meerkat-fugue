@@ -48,15 +48,29 @@ fn runtime_edge_calls_are_bounded() {
 #[test]
 fn meerkat_dependency_train_is_exact_and_unmixed() {
     let cargo_toml = include_str!("../Cargo.toml");
+    let pin = native_runtime_pin();
     let mut meerkat_versions = Vec::new();
+    let mut in_patch = false;
+    let mut patched = 0;
     for line in cargo_toml.lines() {
         let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_patch = trimmed == "[patch.crates-io]";
+        }
         if !trimmed.starts_with("meerkat") {
+            continue;
+        }
+        if in_patch {
+            assert!(!trimmed.starts_with("meerkat-meta"));
+            assert!(trimmed.contains(&format!("git = {:?}", pin.repository)));
+            assert!(trimmed.contains(&format!("rev = {:?}", pin.revision)));
+            assert!(!trimmed.contains("path ="));
+            patched += 1;
             continue;
         }
         assert!(
             !trimmed.contains("path =") && !trimmed.contains("git ="),
-            "published Fugue builds must use released registry Meerkat dependencies: {trimmed}"
+            "native dependencies must declare the exact release train before the explicit Core patch: {trimmed}"
         );
         if trimmed.starts_with("meerkat-meta") {
             assert!(
@@ -75,10 +89,33 @@ fn meerkat_dependency_train_is_exact_and_unmixed() {
         !meerkat_versions.is_empty(),
         "metadata guard should see at least one Meerkat dependency"
     );
+    assert!(patched > 0, "the native observer carry must be explicit");
+}
+
+#[derive(serde::Deserialize)]
+struct NativeRuntimePin {
+    upstream_version: String,
+    repository: String,
+    revision: String,
+    mob_schema: u32,
+    meta_version: String,
+}
+
+fn native_runtime_pin() -> NativeRuntimePin {
+    let pin: NativeRuntimePin =
+        serde_json::from_str(include_str!("../scripts/distribution/native-runtime.json"))
+            .expect("valid custom native runtime pin");
+    assert_eq!(pin.upstream_version, "0.9.14");
+    assert_eq!(pin.meta_version, "0.9.14");
+    assert_eq!(pin.mob_schema, 13);
+    assert_eq!(pin.repository, "https://github.com/lukacf/meerkat");
+    assert_eq!(pin.revision.len(), 40);
+    assert!(pin.revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    pin
 }
 
 #[test]
-fn locked_native_graph_uses_the_released_train() {
+fn locked_native_graph_uses_the_exact_custom_core_and_released_meta() {
     #[derive(serde::Deserialize)]
     struct Lock {
         package: Vec<Package>,
@@ -91,6 +128,11 @@ fn locked_native_graph_uses_the_released_train() {
         checksum: Option<String>,
     }
     let lock: Lock = toml::from_str(include_str!("../Cargo.lock")).expect("valid lockfile");
+    let pin = native_runtime_pin();
+    let core_source = format!(
+        "git+{}?rev={}#{}",
+        pin.repository, pin.revision, pin.revision
+    );
     let mut count = 0;
     for package in lock.package.iter().filter(|p| {
         (p.name.starts_with("meerkat") || p.name.starts_with("meta-")) && p.name != "meerkat-fugue"
@@ -101,17 +143,23 @@ fn locked_native_graph_uses_the_released_train() {
             "mixed native train: {}",
             package.name
         );
-        assert_eq!(
-            package.source.as_deref(),
-            Some("registry+https://github.com/rust-lang/crates.io-index"),
-            "{} must use the published registry release",
-            package.name
-        );
-        assert!(
-            package.checksum.is_some(),
-            "{} has no registry checksum",
-            package.name
-        );
+        if package.name.starts_with("meerkat") && package.name != "meerkat-meta" {
+            assert_eq!(
+                package.source.as_deref(),
+                Some(core_source.as_str()),
+                "{} must use the exact custom Core revision",
+                package.name
+            );
+            assert!(package.checksum.is_none());
+        } else {
+            assert_eq!(
+                package.source.as_deref(),
+                Some("registry+https://github.com/rust-lang/crates.io-index"),
+                "{} must use the published Meta release",
+                package.name
+            );
+            assert!(package.checksum.is_some());
+        }
     }
     assert!(count > 0, "native dependency graph must not be empty");
 

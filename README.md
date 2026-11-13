@@ -92,7 +92,8 @@ operator has access to the instance's repositories and controls. Keep deployment
 configuration, credentials, databases and transcripts outside this public repo.
 See [SECURITY.md](SECURITY.md).
 
-Fugue 0.1.1 uses the released Meerkat and Meta 0.9.14 crates. The
+Fugue 0.1.1 uses Meerkat 0.9.14 with its native flow observer patch and the
+released Meta 0.9.14 crate. The
 [dependency declarations](Cargo.toml) and [lockfile](Cargo.lock) pin the complete
 native dependency graph. Bundles also include rkat 0.9.14, verified against its
 [release checksums](scripts/distribution/rkat.json).
