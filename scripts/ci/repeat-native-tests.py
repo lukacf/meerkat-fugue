@@ -11,9 +11,24 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 
 
 RETIREMENT_TEST = 'meta_runtime::tests::runtime_members_emit_canonical_structural_events'
+
+
+def native_test_environment():
+    # Direct executable launches do not receive Cargo's configured test stack.
+    # Use the repository policy while preserving an explicit caller override.
+    env = dict(os.environ)
+    if 'RUST_MIN_STACK' not in env:
+        config_path = Path(__file__).resolve().parents[2] / '.cargo' / 'config.toml'
+        with config_path.open('rb') as config:
+            stack = tomllib.load(config)['env']['RUST_MIN_STACK']
+        if not isinstance(stack, str) or not stack.isdecimal() or int(stack) <= 0:
+            raise ValueError('Cargo RUST_MIN_STACK must be a positive byte-count string')
+        env['RUST_MIN_STACK'] = stack
+    return env
 
 
 class Cancellation:
@@ -92,7 +107,9 @@ def run_phase(command, report_dir, name, timeout, cancelled, env=None):
     with (report_dir / f'{name}.log').open('wb', buffering=0) as output:
         try:
             if not cancelled.is_set():
-                process = subprocess.Popen(command, env=env, stdout=output,
+                child_env = native_test_environment() if env is None else env
+                row['rust_min_stack'] = child_env.get('RUST_MIN_STACK')
+                process = subprocess.Popen(command, env=child_env, stdout=output,
                                            stderr=subprocess.STDOUT, start_new_session=True)
                 row['pid'] = process.pid
                 record(path, row)
@@ -126,7 +143,8 @@ def qualify_retirement(executable, report_dir, attempt, cancelled=None, timeout=
     name = f'attempt-{attempt:02}'
     state_dir = report_dir / f'{name}-state'
     state_dir.mkdir()
-    env = dict(os.environ, FUGUE_ISOLATED_RUNTIME_TEST='runtime_members_emit_canonical_structural_events',
+    env = native_test_environment()
+    env.update(FUGUE_ISOLATED_RUNTIME_TEST='runtime_members_emit_canonical_structural_events',
                FUGUE_TEST_EVIDENCE_DIR=str(state_dir.resolve()))
     row = run_phase([executable, RETIREMENT_TEST, '--exact', '--nocapture'], report_dir,
                     name, timeout, cancelled if cancelled is not None else Cancellation(), env)
