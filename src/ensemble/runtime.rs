@@ -1561,20 +1561,15 @@ async fn recover_study_work(
     identity: &AgentIdentity,
     interaction: &str,
 ) -> Result<meerkat_mob::DurableBoundedWorkRecovery> {
-    let authority = entry
-        .runtime
-        .identity_runtime()
-        .context("identity authority missing")?;
-    let alias = authority
-        .status(identity)
-        .await?
-        .agent_runtime_id
-        .context("study runtime alias missing")?;
+    // Core's roster is keyed by the encoded durable identity. A runtime
+    // alias names an incarnation, not a roster row; using it here makes a
+    // committed failed study appear absent and prevents the next attempt.
+    let member = meerkat_meta::member_comms_id::roster_member_id_for_identity(identity.as_str());
     let recovery = entry
         .runtime
         .mob_handle()
         .recover_bounded_work_for_identity_with_delivery_identity(
-            &alias.to_string().into(),
+            &member,
             &meerkat_mob::MobDeliveryIdentity::new(
                 format!("ensemble-study-{interaction}"),
                 interaction,

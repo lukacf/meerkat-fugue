@@ -119,8 +119,10 @@ Core package, including Meta's transitive dependencies, must resolve to the same
 Core commit. The separately packaged rkat CLI uses [rkat.json](rkat.json); its
 version can differ from the embedded runtime. In this candidate it is the
 published rkat 0.9.14, used for model authentication. Do not use that stock
-CLI to open Fugue's schema 13 mob stores: the unpatched runtime supports
-only schema 12 and refuses them.
+CLI to open Fugue's schema 13 mob stores. Stock Core 0.9.14 and 0.9.15
+cannot open this custom state or resume its pending `MobFlowRun` observer
+continuations. Roll back with a compatible custom Fugue bundle and its complete
+matching state backup; changing only the executable is not a supported rollback.
 
 For an installed bundle, run `meerkat-fugue build-info` and compare its commit
 and tree with `manifest.json`. Inspect the dependency files at that source
