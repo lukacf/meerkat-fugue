@@ -70,6 +70,7 @@ def main():
         for name in ('LICENSE-MIT', 'LICENSE-APACHE'):
             shutil.copy2(ROOT / name, stage / name)
         manifest = {'schema': 1, 'fugue': identity, 'target': args.target,
+                    'native_runtime': json.loads(Path(__file__).with_name('native-runtime.json').read_text()),
                     'rkat': {'version': pins['version'], 'archive_sha256': expected},
                     'files': {str(path.relative_to(stage)): digest(path) for path in sorted(stage.rglob('*')) if path.is_file()}}
         (stage / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

@@ -546,7 +546,7 @@ impl EnsembleRuntime {
                 // member's partially initialized domain. The native readiness
                 // barrier below still admits the whole team before serving.
                 .identity_bootstrap_mode(IdentityBootstrapMode::LazyWithBackgroundWarm {
-                    concurrency: 1,
+                    concurrency: Some(1),
                 })
                 .session_hook(Arc::new(RepositorySessionHook {
                     events: Arc::clone(&events),
@@ -1508,6 +1508,7 @@ fn definition(repo: &RepoId, model: &str, grants: &BTreeMap<String, MemberGrant>
                 // The repository mob and Meta continuity own persistence.
                 // This optional flag is for separate durable-worker discovery.
                 durable: false,
+                auth_binding: None,
                 model: model.to_owned(),
                 model_fallback: None,
                 provider: None,
@@ -1560,20 +1561,15 @@ async fn recover_study_work(
     identity: &AgentIdentity,
     interaction: &str,
 ) -> Result<meerkat_mob::DurableBoundedWorkRecovery> {
-    let authority = entry
-        .runtime
-        .identity_runtime()
-        .context("identity authority missing")?;
-    let alias = authority
-        .status(identity)
-        .await?
-        .agent_runtime_id
-        .context("study runtime alias missing")?;
+    // Core's roster is keyed by the encoded durable identity. A runtime
+    // alias names an incarnation, not a roster row; using it here makes a
+    // committed failed study appear absent and prevents the next attempt.
+    let member = meerkat_meta::member_comms_id::roster_member_id_for_identity(identity.as_str());
     let recovery = entry
         .runtime
         .mob_handle()
         .recover_bounded_work_for_identity_with_delivery_identity(
-            &alias.to_string().into(),
+            &member,
             &meerkat_mob::MobDeliveryIdentity::new(
                 format!("ensemble-study-{interaction}"),
                 interaction,

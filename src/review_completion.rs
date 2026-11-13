@@ -404,8 +404,9 @@ async fn create_independent_review_workgraph_items(
     let mut created_any = false;
     for item in &plan.workgraph_items {
         let labels = item.labels.iter().cloned().collect::<BTreeSet<_>>();
-        let existing = service
-            .list(WorkItemFilter {
+        let existing = crate::workgraph_gate::list_all_items(
+            &service,
+            WorkItemFilter {
                 realm_id: Some(scope.realm_id.clone()),
                 namespace: Some(namespace.clone()),
                 all_namespaces: false,
@@ -413,13 +414,15 @@ async fn create_independent_review_workgraph_items(
                 labels: item.labels.clone(),
                 include_terminal: false,
                 limit: None,
-            })
-            .await?
-            .into_iter()
-            .find(|existing| {
-                existing.title == item.title
-                    && existing.description.as_deref() == Some(item.detail.as_str())
-            });
+                cursor: None,
+            },
+        )
+        .await?
+        .into_iter()
+        .find(|existing| {
+            existing.title == item.title
+                && existing.description.as_deref() == Some(item.detail.as_str())
+        });
         let work_item = match existing {
             Some(existing) => existing,
             None => {

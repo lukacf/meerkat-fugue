@@ -3680,6 +3680,7 @@ fn control_profile(
         // Persisted mob membership supplies restart continuity; do not opt
         // into a second durable-worker discovery contract for these profiles.
         durable: false,
+        auth_binding: None,
         model_fallback: None,
         provider: None,
         self_hosted_server_id: None,
@@ -3712,6 +3713,7 @@ fn agent_profile(
 ) -> Result<Profile, String> {
     Ok(Profile {
         durable: false,
+        auth_binding: None,
         model_fallback: None,
         provider: agent
             .provider
@@ -3800,6 +3802,7 @@ fn independent_review_orchestrator_profile(
 ) -> Profile {
     Profile {
         durable: false,
+        auth_binding: None,
         model_fallback: None,
         provider: None,
         self_hosted_server_id: None,

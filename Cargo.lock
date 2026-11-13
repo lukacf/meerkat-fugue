@@ -677,7 +677,7 @@ version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71958f69fb2de856c5dd51ac9377e986ca1aa5919f931bf5395a807277f889a0"
 dependencies = [
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -949,6 +949,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1206,7 +1212,7 @@ checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash",
+ "foldhash 0.1.5",
 ]
 
 [[package]]
@@ -1214,14 +1220,17 @@ name = "hashbrown"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
+dependencies = [
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "hashlink"
-version = "0.10.0"
+version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"
+checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
 dependencies = [
- "hashbrown 0.15.5",
+ "hashbrown 0.17.0",
 ]
 
 [[package]]
@@ -1737,9 +1746,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.35.0"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "133c182a6a2c87864fe97778797e46c7e999672690dc9fa3ee8e241aa4a9c13f"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -1811,8 +1820,8 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "meerkat"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1848,10 +1857,11 @@ dependencies = [
  "meerkat-workgraph",
  "nix 0.29.0",
  "parking_lot",
- "reqwest 0.12.28",
+ "reqwest",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "sha2",
+ "thiserror 2.0.21",
  "tokio",
  "tokio_with_wasm",
  "toml 0.9.12+spec-1.1.0",
@@ -1861,8 +1871,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-anthropic"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1874,10 +1884,10 @@ dependencies = [
  "meerkat-core",
  "meerkat-llm-core",
  "meerkat-models",
- "reqwest 0.12.28",
+ "reqwest",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio_with_wasm",
  "tracing",
@@ -1885,8 +1895,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-auth-core"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "axum",
@@ -1902,11 +1912,11 @@ dependencies = [
  "meerkat-llm-core",
  "oauth2",
  "parking_lot",
- "reqwest 0.12.28",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio_with_wasm",
  "tracing",
@@ -1916,8 +1926,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-authorization"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "indexmap",
  "meerkat-authorization-contracts",
@@ -1926,27 +1936,27 @@ dependencies = [
  "meerkat-machine-schema",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "uuid",
 ]
 
 [[package]]
 name = "meerkat-authorization-contracts"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "meerkat-core",
  "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "uuid",
 ]
 
 [[package]]
 name = "meerkat-capabilities"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "inventory",
  "meerkat-core",
@@ -1957,8 +1967,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-client"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "meerkat-anthropic",
  "meerkat-core",
@@ -1969,8 +1979,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-comms"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1992,7 +2002,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "tokio_with_wasm",
@@ -2004,8 +2014,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-contracts"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2019,14 +2029,14 @@ dependencies = [
  "serde_json",
  "sha2",
  "strum",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "uuid",
 ]
 
 [[package]]
 name = "meerkat-copilot"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2036,10 +2046,10 @@ dependencies = [
  "meerkat-core",
  "meerkat-llm-core",
  "parking_lot",
- "reqwest 0.12.28",
+ "reqwest",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "url",
@@ -2047,8 +2057,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-core"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2063,12 +2073,13 @@ dependencies = [
  "js-sys",
  "jsonschema",
  "parking_lot",
+ "rustix 1.1.4",
  "schemars 1.2.1",
  "serde",
  "serde_json",
  "sha2",
  "strum",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio_with_wasm",
  "toml 0.9.12+spec-1.1.0",
@@ -2081,7 +2092,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-fugue"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2105,7 +2116,7 @@ dependencies = [
  "meerkat-tools",
  "minijinja",
  "nix 0.29.0",
- "reqwest 0.12.28",
+ "reqwest",
  "rusqlite",
  "schemars 1.2.1",
  "serde",
@@ -2114,7 +2125,7 @@ dependencies = [
  "sha2",
  "subtle",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "toml 0.9.12+spec-1.1.0",
@@ -2126,8 +2137,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-gemini"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2141,18 +2152,18 @@ dependencies = [
  "meerkat-core",
  "meerkat-llm-core",
  "meerkat-models",
- "reqwest 0.12.28",
+ "reqwest",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio_with_wasm",
 ]
 
 [[package]]
 name = "meerkat-hooks"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2164,7 +2175,7 @@ dependencies = [
  "meerkat-sandbox",
  "meerkat-skills",
  "nix 0.29.0",
- "reqwest 0.12.28",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
@@ -2174,8 +2185,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-jobs"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2185,7 +2196,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio_with_wasm",
  "uuid",
@@ -2193,8 +2204,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-live"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "axum",
@@ -2204,7 +2215,7 @@ dependencies = [
  "meerkat-core",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "uuid",
@@ -2212,8 +2223,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-llm-core"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2225,11 +2236,11 @@ dependencies = [
  "meerkat-contracts",
  "meerkat-core",
  "parking_lot",
- "reqwest 0.12.28",
+ "reqwest",
  "serde",
  "serde_json",
  "slab",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio_with_wasm",
  "tracing",
@@ -2237,8 +2248,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-machine-derive"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "quote",
  "syn 2.0.117",
@@ -2246,16 +2257,16 @@ dependencies = [
 
 [[package]]
 name = "meerkat-machine-dsl"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "meerkat-machine-dsl-core",
 ]
 
 [[package]]
 name = "meerkat-machine-dsl-core"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2264,35 +2275,35 @@ dependencies = [
 
 [[package]]
 name = "meerkat-machine-kernels"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "indexmap",
  "meerkat-authorization-contracts",
  "meerkat-core",
  "meerkat-machine-schema",
  "serde",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "meerkat-machine-schema"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "indexmap",
  "meerkat-authorization-contracts",
  "meerkat-core",
  "meerkat-machine-dsl",
  "serde",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "uuid",
 ]
 
 [[package]]
 name = "meerkat-mcp"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "futures",
@@ -2305,12 +2316,12 @@ dependencies = [
  "meerkat-sandbox",
  "meerkat-skills",
  "nix 0.29.0",
- "reqwest 0.12.28",
+ "reqwest",
  "rmcp",
  "serde",
  "serde_json",
  "sse-stream",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2319,8 +2330,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-memory"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "hnsw_rs",
@@ -2341,8 +2352,9 @@ dependencies = [
 
 [[package]]
 name = "meerkat-meta"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat-meta.git?rev=ce4f3587bf0b6fc2596974b80e8962cc13500b99#ce4f3587bf0b6fc2596974b80e8962cc13500b99"
+version = "0.9.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c118a27670a5be4a4bfff0af3eee1cc01e972a0e2ec10e31f0c1ce793191789e"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2378,7 +2390,7 @@ dependencies = [
  "meerkat-tools",
  "object_store",
  "rand_core 0.6.4",
- "reqwest 0.12.28",
+ "reqwest",
  "ring",
  "rusqlite",
  "rustix 1.1.4",
@@ -2399,8 +2411,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-mob"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2426,7 +2438,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "tokio_with_wasm",
@@ -2438,8 +2450,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-mob-mcp"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2458,7 +2470,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "tokio_with_wasm",
@@ -2468,16 +2480,16 @@ dependencies = [
 
 [[package]]
 name = "meerkat-models"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "meerkat-core",
 ]
 
 [[package]]
 name = "meerkat-openai"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2493,11 +2505,11 @@ dependencies = [
  "meerkat-llm-core",
  "meerkat-models",
  "oai-rt-rs",
- "reqwest 0.12.28",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tokio_with_wasm",
@@ -2506,8 +2518,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-providers"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "meerkat-auth-core",
  "meerkat-llm-core",
@@ -2515,8 +2527,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-runtime"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2540,7 +2552,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio_with_wasm",
  "tracing",
@@ -2550,8 +2562,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-sandbox"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "meerkat-core",
  "nix 0.29.0",
@@ -2560,8 +2572,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-schedule"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2576,7 +2588,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio_with_wasm",
  "tracing",
@@ -2585,8 +2597,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-session"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "futures",
@@ -2602,7 +2614,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio_with_wasm",
  "tracing",
@@ -2610,8 +2622,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-skills"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "indexmap",
@@ -2619,7 +2631,7 @@ dependencies = [
  "meerkat-capabilities",
  "meerkat-core",
  "regex",
- "reqwest 0.12.28",
+ "reqwest",
  "serde",
  "serde-saphyr",
  "serde_json",
@@ -2632,19 +2644,19 @@ dependencies = [
 
 [[package]]
 name = "meerkat-sqlite"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "notify",
  "rusqlite",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
 [[package]]
 name = "meerkat-store"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2657,7 +2669,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio_with_wasm",
  "toml 0.9.12+spec-1.1.0",
@@ -2667,8 +2679,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-tools"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2697,7 +2709,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shlex",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio_with_wasm",
  "toml 0.9.12+spec-1.1.0",
@@ -2708,8 +2720,8 @@ dependencies = [
 
 [[package]]
 name = "meerkat-workgraph"
-version = "0.9.5"
-source = "git+https://github.com/lukacf/meerkat.git?rev=74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838#74e62b9c7c46b2b8fc0b3b8ace576fd3f9a28838"
+version = "0.9.14"
+source = "git+https://github.com/lukacf/meerkat?rev=02cd5628fbd2a681292f3d3ec5b62bdac605642b#02cd5628fbd2a681292f3d3ec5b62bdac605642b"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2726,7 +2738,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "strum",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio_with_wasm",
  "tracing",
@@ -2806,7 +2818,7 @@ dependencies = [
  "mach2",
  "nix 0.30.1",
  "sysctl",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "widestring",
  "windows 0.48.0",
 ]
@@ -3010,11 +3022,11 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "futures",
- "reqwest 0.12.28",
+ "reqwest",
  "schemars 0.8.22",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tracing",
@@ -3032,7 +3044,7 @@ dependencies = [
  "getrandom 0.2.17",
  "http",
  "rand 0.8.6",
- "reqwest 0.12.28",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -3058,7 +3070,7 @@ dependencies = [
  "itertools",
  "parking_lot",
  "percent-encoding",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "url",
@@ -3268,7 +3280,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "socket2",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "web-time",
@@ -3289,7 +3301,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tinyvec",
  "tracing",
  "web-time",
@@ -3549,43 +3561,9 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams 0.4.2",
+ "wasm-streams",
  "web-sys",
  "webpki-roots",
-]
-
-[[package]]
-name = "reqwest"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
-dependencies = [
- "base64 0.23.1",
- "bytes",
- "futures-core",
- "futures-util",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-util",
- "js-sys",
- "log",
- "percent-encoding",
- "pin-project-lite",
- "serde",
- "serde_json",
- "sync_wrapper",
- "tokio",
- "tokio-util",
- "tower",
- "tower-http",
- "tower-service",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-streams 0.5.0",
- "web-sys",
 ]
 
 [[package]]
@@ -3616,13 +3594,12 @@ dependencies = [
  "pastey",
  "pin-project-lite",
  "process-wrap",
- "reqwest 0.13.5",
  "rmcp-macros",
  "schemars 1.2.1",
  "serde",
  "serde_json",
  "sse-stream",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -3643,10 +3620,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "rusqlite"
-version = "0.37.0"
+name = "rsqlite-vfs"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "165ca6e57b20e1351573e3729b958bc62f0e48025386970b6e4d29e7a7e71f3f"
+checksum = "353b74f9810d5b085b6c42c9d86a5f0fdb795553235cdd48753b32e3809d18a7"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "rusqlite"
+version = "0.41.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags 2.11.1",
  "fallible-iterator",
@@ -3654,6 +3640,7 @@ dependencies = [
  "hashlink",
  "libsqlite3-sys",
  "smallvec",
+ "sqlite-wasm-rs",
 ]
 
 [[package]]
@@ -4070,7 +4057,7 @@ checksum = "0d585997b0ac10be3c5ee635f1bab02d512760d14b7c468801ac8a01d9ae5f1d"
 dependencies = [
  "num-bigint",
  "num-traits",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "time",
 ]
 
@@ -4116,6 +4103,16 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "sqlite-wasm-rs"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6cd504cecbfe7eef649988840f9a6cb768d11085efec138f8e99f160632d867"
+dependencies = [
+ "cc",
+ "rsqlite-vfs",
 ]
 
 [[package]]
@@ -4282,11 +4279,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.18"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.18",
+ "thiserror-impl 2.0.21",
 ]
 
 [[package]]
@@ -4302,13 +4299,13 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.18"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -4735,7 +4732,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "sha1",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
  "utf-8",
 ]
 
@@ -4752,7 +4749,7 @@ dependencies = [
  "log",
  "rand 0.9.4",
  "sha1",
- "thiserror 2.0.18",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -5007,19 +5004,6 @@ name = "wasm-streams"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
-dependencies = [
- "futures-util",
- "js-sys",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
-name = "wasm-streams"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
 dependencies = [
  "futures-util",
  "js-sys",

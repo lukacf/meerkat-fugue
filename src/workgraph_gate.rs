@@ -296,8 +296,9 @@ impl WorkGraphTerminalGate {
 
     pub async fn unresolved_blocking_items(&self, issue: &str) -> Result<Vec<WorkItem>, String> {
         let service = workgraph_service_for_mob(&self.state_path, &self.mob_id)?;
-        service
-            .list(WorkItemFilter {
+        list_all_items(
+            &service,
+            WorkItemFilter {
                 statuses: vec![
                     WorkStatus::Open,
                     WorkStatus::InProgress,
@@ -310,9 +311,39 @@ impl WorkGraphTerminalGate {
                 ],
                 include_terminal: false,
                 ..WorkItemFilter::default()
-            })
-            .await
-            .map_err(|error| format!("query WorkGraph review obligations: {error}"))
+            },
+        )
+        .await
+        .map_err(|error| format!("query WorkGraph review obligations: {error}"))
+    }
+}
+
+/// Read every native page without treating a truncated or changing collection
+/// as a complete review-obligation census.
+pub(crate) async fn list_all_items(
+    service: &WorkGraphService,
+    mut filter: WorkItemFilter,
+) -> Result<Vec<WorkItem>, meerkat::WorkGraphError> {
+    let mut items = Vec::new();
+    loop {
+        let page = service.list_page(filter.clone()).await?;
+        if page.changed_since_anchor != Some(false) {
+            return Err(meerkat::WorkGraphError::Conflict(
+                "WorkGraph changed during review-obligation inspection; retry the read".into(),
+            ));
+        }
+        items.extend(page.items);
+        match (page.truncated, page.next_cursor) {
+            (Some(false), None) => return Ok(items),
+            (Some(true), Some(cursor)) if filter.cursor.as_ref() != Some(&cursor) => {
+                filter.cursor = Some(cursor);
+            }
+            _ => {
+                return Err(meerkat::WorkGraphError::InvalidInput(
+                    "WorkGraph returned an incomplete review-obligation page".into(),
+                ));
+            }
+        }
     }
 }
 
@@ -438,6 +469,55 @@ mod tests {
                 id: crate::tools::LinearIssueId(issue.id.0),
             },
         )
+    }
+
+    #[tokio::test]
+    async fn workgraph_review_obligations_cross_collection_pages() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workgraph.sqlite3");
+        let store = SqliteWorkGraphStore::open(&path).unwrap();
+        let service = WorkGraphService::with_scope(
+            Arc::new(store),
+            meerkat_core::mob_realm_id("ensemble-paged")
+                .unwrap()
+                .as_str(),
+            meerkat::WorkNamespace::default(),
+        );
+        for index in 0..101 {
+            service
+                .create(CreateWorkItemRequest {
+                    realm_id: None,
+                    namespace: None,
+                    title: format!("Review obligation {index}"),
+                    description: None,
+                    priority: WorkPriority::High,
+                    completion_policy: WorkCompletionPolicy::SelfAttest,
+                    failed_child_join_policy: Default::default(),
+                    cancelled_child_join_policy: Default::default(),
+                    labels: BTreeSet::from([
+                        FUGUE_WORKGRAPH_LABEL.into(),
+                        issue_workgraph_label("PAGE-1"),
+                        FUGUE_WORKGRAPH_BLOCKING_LABEL.into(),
+                    ]),
+                    due_at: None,
+                    not_before: None,
+                    snoozed_until: None,
+                    external_refs: Vec::new(),
+                    evidence_refs: Vec::new(),
+                    status: Some(WorkStatus::Open),
+                })
+                .await
+                .unwrap();
+        }
+        let gate = WorkGraphTerminalGate::new(&path, vec!["Done".into()], Vec::new())
+            .for_mob("ensemble-paged");
+        let items = gate.unresolved_blocking_items("PAGE-1").await.unwrap();
+        assert_eq!(
+            items.len(),
+            101,
+            "review obligations must not stop at the first native page"
+        );
+        assert!(items.iter().any(|item| item.title == "Review obligation 0"));
     }
 
     #[tokio::test]

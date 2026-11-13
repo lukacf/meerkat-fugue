@@ -54,17 +54,18 @@ npx playwright test tests/welcome.spec.mjs --project=chromium
 ### Rust checks
 
 ```sh
-cargo fmt --check
-cargo check --all-targets --locked
-cargo test --all-targets --locked
-cargo clippy --all-targets --locked -- -D warnings
-cargo run --locked -- --help
+scripts/repo-cargo fmt --check
+scripts/repo-cargo check --all-targets --locked
+scripts/repo-cargo test --all-targets --locked
+scripts/repo-cargo clippy --all-targets --locked -- -D warnings
+scripts/repo-cargo run --locked -- --help
 ```
 
 The normal suite uses temporary local state and fixtures. The destructive live
-test remains ignored. When working alongside another Rust build, give your
-checkout a separate `CARGO_TARGET_DIR`; do not delete another build's target or
-lock files to resolve contention.
+test remains ignored. The wrapper gives each checkout its own build directory
+and shares downloaded dependencies across this repository's worktrees. Use
+`scripts/repo-cargo --print-env` to locate the cache and build output. Do not
+delete another build's target or lock files to resolve contention.
 
 ### Native qualification evidence
 
@@ -195,6 +196,17 @@ request ID before calling native flows. An unchanged idempotency key reuses that
 request after a lost response or restart. Different assignments under the same key
 conflict. Replacing a request requires a new key and the current ID in `supersedes`.
 A retry of an older request must never make it current again.
+
+The admission response's `intent.round` is the server-issued request ID used by
+`supersedes`; it is not a native flow run ID. When another request has become
+current, the rejection's `current_request` identifies that request. Replacement
+compares this ID atomically, so a stale caller cannot overwrite a newer request.
+After a confirmed cancellation, the review coordinator may explicitly replace
+the canceled request with a new idempotency key and its current request ID in
+`supersedes`. The replacement still requires eligible specialists, the configured
+quorum and a freshly checked PR head. Preserve the canceled attempt and use only
+the replacement's actual native runs for completion. An uncertain admission
+response instead requires an unchanged retry; it is not evidence of cancellation.
 
 Verify both native run identity and immutable activation parameters. Copying an
 assignment into an unrelated run must not establish review evidence. Completion

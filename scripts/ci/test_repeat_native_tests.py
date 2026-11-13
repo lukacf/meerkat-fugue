@@ -21,6 +21,8 @@ FIXTURE = '''import json, os, signal, subprocess, sys, time
 from pathlib import Path
 signal.alarm(20)
 selection = sys.argv[1]
+if 'FIXTURE_EXPECT_STACK' in os.environ:
+    assert os.environ.get('RUST_MIN_STACK') == os.environ['FIXTURE_EXPECT_STACK'], 'test stack configuration was not inherited'
 hang = os.environ.get('FIXTURE_HANG', '')
 if (hang == 'list' and '--list' in sys.argv) or (hang == 'retirement' and '--list' not in sys.argv and 'runtime_members' in selection):
     child_code = 'import signal, time; signal.alarm(20); signal.signal(signal.SIGTERM, signal.SIG_IGN); print("ready", flush=True); time.sleep(120)' if os.environ.get('FIXTURE_IGNORE_TERM') else 'import signal, time; signal.alarm(20); print("ready", flush=True); time.sleep(120)'
@@ -169,8 +171,13 @@ class NativeTrialEvidenceTests(unittest.TestCase):
         manifest.write_text(json.dumps({'reason': 'compiler-artifact',
             'target': {'name': 'meerkat_fugue'}, 'profile': {'test': True},
             'executable': str(self.executable)}) + '\n')
-        result = subprocess.run([sys.executable, str(SCRIPT), str(manifest), str(report)],
-                                capture_output=True, text=True, timeout=60)
+        # Cargo supplies this setting to cargo-test children. This entry point
+        # runs outside Cargo and must carry the same policy into every phase.
+        with patch.dict(os.environ):
+            os.environ.pop('RUST_MIN_STACK', None)
+            os.environ['FIXTURE_EXPECT_STACK'] = '8388608'
+            result = subprocess.run([sys.executable, str(SCRIPT), str(manifest), str(report)],
+                                    capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         summary = json.loads((report / 'summary.json').read_text())
         self.assertTrue(summary['qualified'])
@@ -180,6 +187,15 @@ class NativeTrialEvidenceTests(unittest.TestCase):
         self.assertEqual(len(summary['trials']), 20)
         self.assertEqual(len(summary['phases']), 7)
         self.assertEqual(len(list(report.glob('*.log'))), 27)
+        self.assertTrue(all(row['rust_min_stack'] == '8388608'
+                            for row in summary['phases'] + summary['trials']))
+
+    def test_direct_phase_preserves_an_explicit_test_stack_override(self):
+        with patch.dict(os.environ, RUST_MIN_STACK='16777216', FIXTURE_EXPECT_STACK='16777216'):
+            row = trials.run_phase([str(self.executable), 'normal'], self.root,
+                                   'explicit-stack', 5, trials.Cancellation())
+        self.assertTrue(row['qualified'], row)
+        self.assertEqual(row['rust_min_stack'], '16777216')
 
     def test_outer_cancellation_retains_inflight_logs_and_stops_descendants(self):
         for phase in ('list', 'retirement'):

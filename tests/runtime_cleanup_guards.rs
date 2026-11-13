@@ -48,24 +48,38 @@ fn runtime_edge_calls_are_bounded() {
 #[test]
 fn meerkat_dependency_train_is_exact_and_unmixed() {
     let cargo_toml = include_str!("../Cargo.toml");
+    let pin = native_runtime_pin();
     let mut meerkat_versions = Vec::new();
+    let mut in_patch = false;
+    let mut patched = 0;
     for line in cargo_toml.lines() {
         let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_patch = trimmed == "[patch.crates-io]";
+        }
         if !trimmed.starts_with("meerkat") {
             continue;
         }
+        if in_patch {
+            assert!(!trimmed.starts_with("meerkat-meta"));
+            assert!(trimmed.contains(&format!("git = {:?}", pin.repository)));
+            assert!(trimmed.contains(&format!("rev = {:?}", pin.revision)));
+            assert!(!trimmed.contains("path ="));
+            patched += 1;
+            continue;
+        }
         assert!(
-            !trimmed.contains("path ="),
-            "published Fugue builds must not use path/dev Meerkat dependencies: {trimmed}"
+            !trimmed.contains("path =") && !trimmed.contains("git ="),
+            "native dependencies must declare the exact release train before the explicit Core patch: {trimmed}"
         );
         if trimmed.starts_with("meerkat-meta") {
             assert!(
-                trimmed.contains("=0.9.5"),
+                trimmed.contains("=0.9.14"),
                 "meerkat-meta must be pinned to the companion train: {trimmed}"
             );
         } else if trimmed.starts_with("meerkat") {
             assert!(
-                trimmed.contains("=0.9.5"),
+                trimmed.contains("=0.9.14"),
                 "Meerkat crates must be pinned to one train: {trimmed}"
             );
             meerkat_versions.push(trimmed.to_string());
@@ -75,10 +89,33 @@ fn meerkat_dependency_train_is_exact_and_unmixed() {
         !meerkat_versions.is_empty(),
         "metadata guard should see at least one Meerkat dependency"
     );
+    assert!(patched > 0, "the native observer carry must be explicit");
+}
+
+#[derive(serde::Deserialize)]
+struct NativeRuntimePin {
+    upstream_version: String,
+    repository: String,
+    revision: String,
+    mob_schema: u32,
+    meta_version: String,
+}
+
+fn native_runtime_pin() -> NativeRuntimePin {
+    let pin: NativeRuntimePin =
+        serde_json::from_str(include_str!("../scripts/distribution/native-runtime.json"))
+            .expect("valid custom native runtime pin");
+    assert_eq!(pin.upstream_version, "0.9.14");
+    assert_eq!(pin.meta_version, "0.9.14");
+    assert_eq!(pin.mob_schema, 13);
+    assert_eq!(pin.repository, "https://github.com/lukacf/meerkat");
+    assert_eq!(pin.revision.len(), 40);
+    assert!(pin.revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    pin
 }
 
 #[test]
-fn locked_native_graph_uses_the_selected_recovery_commits() {
+fn locked_native_graph_uses_the_exact_custom_core_and_released_meta() {
     #[derive(serde::Deserialize)]
     struct Lock {
         package: Vec<Package>,
@@ -88,43 +125,65 @@ fn locked_native_graph_uses_the_selected_recovery_commits() {
         name: String,
         version: String,
         source: Option<String>,
+        checksum: Option<String>,
     }
-    #[derive(serde::Deserialize)]
-    struct Manifest {
-        patch: Patches,
-    }
-    #[derive(serde::Deserialize)]
-    struct Patches {
-        #[serde(rename = "crates-io")]
-        crates: std::collections::BTreeMap<String, Pin>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Pin {
-        git: String,
-        rev: String,
-    }
-    let manifest: Manifest = toml::from_str(include_str!("../Cargo.toml")).expect("valid manifest");
     let lock: Lock = toml::from_str(include_str!("../Cargo.lock")).expect("valid lockfile");
-    let core = &manifest.patch.crates["meerkat"];
-    let meta = &manifest.patch.crates["meerkat-meta"];
+    let pin = native_runtime_pin();
+    let core_source = format!(
+        "git+{}?rev={}#{}",
+        pin.repository, pin.revision, pin.revision
+    );
+    let mut count = 0;
     for package in lock.package.iter().filter(|p| {
         (p.name.starts_with("meerkat") || p.name.starts_with("meta-")) && p.name != "meerkat-fugue"
     }) {
-        let pin = if package.name == "meerkat-meta" || package.name.starts_with("meta-") {
-            meta
-        } else {
-            core
-        };
+        count += 1;
         assert_eq!(
-            package.version, "0.9.5",
+            package.version, "0.9.14",
             "mixed native train: {}",
             package.name
         );
-        assert_eq!(
-            package.source.as_deref(),
-            Some(format!("git+{}?rev={}#{}", pin.git, pin.rev, pin.rev).as_str()),
-            "{} must use the selected commit, including transitive Meta dependencies",
-            package.name
-        );
+        if package.name.starts_with("meerkat") && package.name != "meerkat-meta" {
+            assert_eq!(
+                package.source.as_deref(),
+                Some(core_source.as_str()),
+                "{} must use the exact custom Core revision",
+                package.name
+            );
+            assert!(package.checksum.is_none());
+        } else {
+            assert_eq!(
+                package.source.as_deref(),
+                Some("registry+https://github.com/rust-lang/crates.io-index"),
+                "{} must use the published Meta release",
+                package.name
+            );
+            assert!(package.checksum.is_some());
+        }
+    }
+    assert!(count > 0, "native dependency graph must not be empty");
+
+    #[derive(serde::Deserialize)]
+    struct CliPin {
+        version: String,
+        assets: std::collections::BTreeMap<String, String>,
+    }
+    let cli: CliPin = serde_json::from_str(include_str!("../scripts/distribution/rkat.json"))
+        .expect("valid CLI release pin");
+    assert_eq!(
+        cli.version, "0.9.14",
+        "bundled CLI must match the native train"
+    );
+    assert!(
+        cli.assets.contains_key(&format!(
+            "rkat-{}-x86_64-unknown-linux-gnu.tar.gz",
+            cli.version
+        )),
+        "the release target must have a pinned CLI archive"
+    );
+    for (asset, checksum) in &cli.assets {
+        assert!(asset.starts_with(&format!("rkat-{}-", cli.version)));
+        assert_eq!(checksum.len(), 64, "invalid CLI checksum: {asset}");
+        assert!(checksum.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 }
