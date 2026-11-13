@@ -197,6 +197,17 @@ request after a lost response or restart. Different assignments under the same k
 conflict. Replacing a request requires a new key and the current ID in `supersedes`.
 A retry of an older request must never make it current again.
 
+The admission response's `intent.round` is the server-issued request ID used by
+`supersedes`; it is not a native flow run ID. When another request has become
+current, the rejection's `current_request` identifies that request. Replacement
+compares this ID atomically, so a stale caller cannot overwrite a newer request.
+After a confirmed cancellation, the review coordinator may explicitly replace
+the canceled request with a new idempotency key and its current request ID in
+`supersedes`. The replacement still requires eligible specialists, the configured
+quorum and a freshly checked PR head. Preserve the canceled attempt and use only
+the replacement's actual native runs for completion. An uncertain admission
+response instead requires an unchanged retry; it is not evidence of cancellation.
+
 Verify both native run identity and immutable activation parameters. Copying an
 assignment into an unrelated run must not establish review evidence. Completion
 must use every selected profile's run from the current request, with native
