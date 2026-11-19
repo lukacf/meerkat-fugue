@@ -493,6 +493,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn literal_bracket_read_does_not_poison_submission_with_other_ownership() {
+        let (directory, tools) = fixture();
+        let path = Path::new("[PLAN] Example notes.md");
+        fs::write(directory.path().join(path), "Example planning notes.\n").unwrap();
+        for limit in [7, 64] {
+            let read = call(
+                &tools,
+                "repo_read_file",
+                &json!({"path": path, "limit": limit}).to_string(),
+            )
+            .await
+            .unwrap();
+            assert!(!read.result.is_error, "{}", read.result.text_content());
+        }
+        inspect_domains(&tools).await;
+        let result = call(&tools, "submit_repository_team", &proposal_json(proposal()))
+            .await
+            .unwrap();
+        assert!(!result.result.is_error, "{}", result.result.text_content());
+        let accepted = tools.accepted.lock().await;
+        let team = accepted.as_ref().unwrap();
+        assert!(team.specialists.values().all(|specialist| {
+            !specialist
+                .ownership_paths
+                .iter()
+                .any(|scope| path.starts_with(scope))
+        }));
+        assert_eq!(team.discovery.inspected_files.len(), DOMAINS.len() + 1);
+        let evidence = team
+            .discovery
+            .inspected_files
+            .iter()
+            .find(|evidence| evidence.path == path)
+            .unwrap();
+        assert_eq!(evidence.sha256, format!("{:x}", Sha256::digest(b"Example")));
+    }
+
+    #[tokio::test]
     async fn invalid_proposals_can_be_corrected_without_repeating_inspection() {
         let (_directory, tools) = fixture();
         inspect_domains(&tools).await;

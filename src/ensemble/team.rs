@@ -339,9 +339,11 @@ fn checked_path(root: &Path, relative: &Path, require_exists: bool) -> Result<Pa
     let Some(text) = relative.to_str() else {
         bail!("specialist paths must be UTF-8");
     };
+    // Filesystem resolution below is literal, so square brackets are ordinary
+    // filename characters, not glob syntax.
     if text.is_empty()
         || text.chars().count() > 120
-        || text.contains(['*', '?', '[', ']', '\\', '\0'])
+        || text.contains(['*', '?', '\\', '\0'])
         || relative.is_absolute()
         || relative.components().any(|component| {
             matches!(
@@ -453,6 +455,65 @@ mod tests {
         fs::remove_file(repo.path().join("schema.sql")).unwrap();
         assert!(team.validate(repo.path()).is_err());
         assert_eq!(TeamManifest::load(&file, repo.path()).unwrap(), Some(team));
+    }
+
+    #[test]
+    fn literal_bracket_paths_roundtrip_and_preserve_deleted_history() {
+        let relative = Path::new("[notes]/[PLAN] Example notes.md");
+        for scope in [relative, relative.parent().unwrap()] {
+            let repo = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let mut team = fixture(repo.path());
+            fs::create_dir(repo.path().join("[notes]")).unwrap();
+            fs::rename(repo.path().join("account.rs"), repo.path().join(relative)).unwrap();
+            team.discovery.inspected_files[0].path = relative.into();
+            team.specialists
+                .values_mut()
+                .next()
+                .unwrap()
+                .ownership_paths = vec![scope.into()];
+            let file = state.path().join("team.json");
+            team.save(&file, repo.path()).unwrap();
+            assert_eq!(
+                TeamManifest::load(&file, repo.path()).unwrap(),
+                Some(team.clone())
+            );
+            fs::remove_file(repo.path().join(relative)).unwrap();
+            fs::remove_dir(repo.path().join("[notes]")).unwrap();
+            assert!(team.validate(repo.path()).is_err());
+            assert_eq!(TeamManifest::load(&file, repo.path()).unwrap(), Some(team));
+        }
+    }
+
+    #[test]
+    fn bracket_paths_are_literal_and_require_exact_evidence() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let mut team = fixture(repo.path());
+        fs::write(root.join("a.rs"), "inspected source").unwrap();
+        let literal = Path::new("[ab].rs");
+        assert!(checked_path(&root, literal, true).is_err());
+        assert_eq!(
+            checked_path(&root, literal, false).unwrap(),
+            root.join(literal)
+        );
+
+        fs::write(root.join(literal), "uninspected source").unwrap();
+        assert_eq!(
+            checked_path(&root, literal, true).unwrap(),
+            root.join(literal)
+        );
+        team.discovery.inspected_files[0].path = "a.rs".into();
+        team.specialists
+            .values_mut()
+            .next()
+            .unwrap()
+            .ownership_paths = vec![literal.into()];
+        let error = team.validate(repo.path()).unwrap_err().to_string();
+        assert!(error.contains("has no inspected file evidence"), "{error}");
+
+        team.discovery.inspected_files[0].path = literal.into();
+        team.validate(repo.path()).unwrap();
     }
 
     #[test]
@@ -579,10 +640,29 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let root = repo.path().canonicalize().unwrap();
-        for path in ["/etc/passwd", "../escape", "src/*.rs", "src\\file"] {
+        for path in [
+            "/etc/passwd",
+            "../escape",
+            "src/*.rs",
+            "src/?.rs",
+            "src/[ab]*.rs",
+            "src\\file",
+            "src/\0file",
+            "[notes]/../escape",
+        ] {
             assert!(checked_path(&root, Path::new(path), false).is_err());
         }
         std::os::unix::fs::symlink(outside.path(), repo.path().join("redirect")).unwrap();
         assert!(checked_path(&root, Path::new("redirect/missing.rs"), false).is_err());
+        fs::write(outside.path().join("sample.rs"), "outside source").unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("[redirect]")).unwrap();
+        for require_exists in [true, false] {
+            assert!(
+                checked_path(&root, Path::new("[redirect]/sample.rs"), require_exists).is_err()
+            );
+            assert!(
+                checked_path(&root, Path::new("[redirect]/missing.rs"), require_exists).is_err()
+            );
+        }
     }
 }
