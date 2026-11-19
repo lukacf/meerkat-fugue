@@ -4,9 +4,50 @@
 //! Fugue never treats client-provided identity headers as authentication.
 use anyhow::{Context, Result, bail};
 use axum::http::{HeaderMap, Method, header};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::{path::Path, sync::OnceLock};
 use subtle::ConstantTimeEq;
+
+static ORGANIZATION: OnceLock<Option<OrganizationBrand>> = OnceLock::new();
+
+pub(crate) struct OrganizationBrand {
+    pub(crate) name: String,
+    pub(crate) logo: String,
+}
+
+fn organization_brand(name: &str, path: &Path) -> Result<OrganizationBrand> {
+    if name.trim() != name
+        || name.is_empty()
+        || name.len() > 80
+        || name.chars().any(char::is_control)
+    {
+        bail!("FUGUE_ORGANIZATION_NAME must contain 1-80 bytes of plain text");
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(262_145)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 262_144 {
+        bail!("Organization logo must be at most 256 KiB");
+    }
+    let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        "image/webp"
+    } else {
+        bail!("Organization logo must be a PNG or WebP image");
+    };
+    Ok(OrganizationBrand {
+        name: name.to_owned(),
+        logo: format!("data:{mime};base64,{}", STANDARD.encode(bytes)),
+    })
+}
+
+pub(crate) fn organization() -> Option<&'static OrganizationBrand> {
+    ORGANIZATION.get().and_then(Option::as_ref)
+}
 
 static PROXY: OnceLock<Option<ProxyAccess>> = OnceLock::new();
 
@@ -77,6 +118,14 @@ impl ProxyAccess {
 }
 
 pub fn configure_from_environment() -> Result<()> {
+    let organization = match (
+        std::env::var("FUGUE_ORGANIZATION_NAME").ok(),
+        std::env::var_os("FUGUE_ORGANIZATION_LOGO_FILE"),
+    ) {
+        (None, None) => None,
+        (Some(name), Some(path)) => Some(organization_brand(&name, Path::new(&path))?),
+        _ => bail!("Set both FUGUE_ORGANIZATION_NAME and FUGUE_ORGANIZATION_LOGO_FILE"),
+    };
     let origin = std::env::var("FUGUE_PUBLIC_ORIGIN").ok();
     let file = std::env::var_os("FUGUE_PROXY_TOKEN_FILE");
     let proxy = match (origin, file) {
@@ -101,6 +150,9 @@ pub fn configure_from_environment() -> Result<()> {
             "Set both FUGUE_PUBLIC_ORIGIN and FUGUE_PROXY_TOKEN_FILE for authenticated proxy access"
         ),
     };
+    ORGANIZATION
+        .set(organization)
+        .map_err(|_| anyhow::anyhow!("Organization branding was already configured"))?;
     PROXY
         .set(proxy)
         .map_err(|_| anyhow::anyhow!("Browser access was already configured"))
@@ -133,6 +185,22 @@ pub(crate) fn allows_proxy(method: &Method, headers: &HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn organization_logo_is_bounded_raster_data_not_markup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("logo");
+        std::fs::write(&path, b"<svg onload=alert(1) />").unwrap();
+        assert!(organization_brand("Example", &path).is_err());
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        let brand = organization_brand("Example & Partners", &path).unwrap();
+        assert_eq!(brand.name, "Example & Partners");
+        assert!(brand.logo.starts_with("data:image/png;base64,"));
+        assert!(organization_brand(" Example", &path).is_err());
+        assert!(organization_brand("Example\n", &path).is_err());
+        std::fs::write(&path, vec![0_u8; 262_145]).unwrap();
+        assert!(organization_brand("Example", &path).is_err());
+    }
+
     #[test]
     fn public_operator_access_requires_proxy_token_and_exact_browser_origin() {
         let token = "test-proxy-token-that-is-long-enough";

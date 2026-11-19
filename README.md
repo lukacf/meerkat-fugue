@@ -133,3 +133,7 @@ configured disposable environment. Read [CONTRIBUTING.md](CONTRIBUTING.md),
 Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
 option. Contributions intentionally submitted for inclusion use those same terms
 unless explicitly stated otherwise.
+
+### Organization branding
+
+Deployments can add their organization logo to the shared web navigation by setting both `FUGUE_ORGANIZATION_NAME` and `FUGUE_ORGANIZATION_LOGO_FILE` before starting Fugue. The logo must be a local PNG or WebP file, at most 256 KiB, readable by the Fugue service. It is embedded in the page, so browsers make no external image requests. Without these settings the standard Fugue branding is unchanged. Restart Fugue after changing the image or settings.

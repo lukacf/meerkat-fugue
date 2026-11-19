@@ -417,8 +417,17 @@ pub(crate) fn inject_app_chrome(
         ""
     };
     let brand = include_str!("ui/brand.svg");
+    let organization = crate::browser_access::organization()
+        .map(|brand| {
+            format!(
+                r#"<img class="fugue-organization-logo" src="{}" alt="{}" />"#,
+                brand.logo,
+                html_escape(&brand.name)
+            )
+        })
+        .unwrap_or_default();
     let chrome = format!(
-        r#"<div class="fugue-console-rail" data-fugue-console-chrome data-area="{area}"><a class="fugue-console-brand" href="/overview" aria-label="Meerkat Fugue home"><span class="fugue-console-mark">{brand}</span><span class="fugue-wordmark"><small>Meerkat</small><span>Fugue</span></span></a><div class="fugue-scope"><label for="fugueScope">Repository</label><select id="fugueScope" aria-label="Repository scope"><option value="">All repositories</option></select></div><nav class="fugue-console-tabs" aria-label="Primary app navigation">{nav}</nav><div class="fugue-console-spacer"></div><a id="fugueRepositories" href="/ensemble"{repositories_selected}>Repositories</a><details class="fugue-account"><summary>Session</summary><div class="fugue-account-menu"><strong>Browser session</strong><p>Signing out leaves your teams running. Repository and AI credentials are managed in Repositories.</p><button class="fugue-button quiet" data-fugue-welcome>Getting started</button>{account}</div></details></div><div class="fugue-breadcrumb"><a id="fugueScopeCrumb" href="/overview">All repositories</a><span aria-hidden="true">/</span><span>{title}</span><a id="fugueRepoSettings" href="./settings" hidden>Repository settings</a></div>"#
+        r#"<div class="fugue-console-rail" data-fugue-console-chrome data-area="{area}"><a class="fugue-console-brand" href="/overview" aria-label="Meerkat Fugue home">{organization}<span class="fugue-console-mark">{brand}</span><span class="fugue-wordmark"><small>Meerkat</small><span>Fugue</span></span></a><div class="fugue-scope"><label for="fugueScope">Repository</label><select id="fugueScope" aria-label="Repository scope"><option value="">All repositories</option></select></div><nav class="fugue-console-tabs" aria-label="Primary app navigation">{nav}</nav><div class="fugue-console-spacer"></div><a id="fugueRepositories" href="/ensemble"{repositories_selected}>Repositories</a><details class="fugue-account"><summary>Session</summary><div class="fugue-account-menu"><strong>Browser session</strong><p>Signing out leaves your teams running. Repository and AI credentials are managed in Repositories.</p><button class="fugue-button quiet" data-fugue-welcome>Getting started</button>{account}</div></details></div><div class="fugue-breadcrumb"><a id="fugueScopeCrumb" href="/overview">All repositories</a><span aria-hidden="true">/</span><span>{title}</span><a id="fugueRepoSettings" href="./settings" hidden>Repository settings</a></div>"#
     );
 
     if html.contains(MARKER) {
