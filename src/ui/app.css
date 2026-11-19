@@ -365,3 +365,7 @@ body.fugue-console-embedded { padding-top:104px; }
   .welcome-footer .fugue-button { padding:7px 10px; font-size:12px; }
   .welcome-footer .primary { min-width:60px; }
 }
+
+/* Optional deployment branding uses a local embedded image, never a third-party request. */
+.fugue-organization-logo { width:58px; height:38px; object-fit:contain; flex-shrink:0; }
+.fugue-console-brand:has(.fugue-organization-logo) .fugue-console-mark { display:none; }
