@@ -4,7 +4,7 @@ use super::{HostConnections, LoginStatus};
 use anyhow::{Context, Result, bail};
 use meerkat_core::{
     AuthConstraints, AuthProfileConfig, BackendProfileConfig, BindingId, Config, ConfigDelta,
-    ConfigStore, CredentialAccountId, CredentialSourceSpec, FileConfigStore, OAuthProviderIdentity,
+    CredentialAccountId, CredentialSourceSpec, FileConfigStore, OAuthProviderIdentity,
     ProviderBindingConfig, RealmConfigSection, RealmId,
 };
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
