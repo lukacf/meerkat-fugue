@@ -16,6 +16,7 @@ async function setup(page, initial={}, prefix='', initialWorkflow=null) {
     if(prefix && !url.pathname.startsWith(prefix+'/')) return route.fulfill({status:404});
     url.pathname=url.pathname.slice(prefix.length);
     if(url.pathname==='/setup')return route.fulfill({contentType:'text/html',body:browserDocument(html)});
+    if(url.pathname==='/api/setup/auth/login')return route.fulfill({json:{phase:'idle'}});
     if(url.pathname==='/api/setup/auth/accounts') return route.fulfill({json:[{provider:'openai',name:'rkat-openai',method:'api_key',auth_binding:{realm:'global',binding:'default_openai'}}]});
     if(url.pathname==='/api/setup/connections') {
       if(route.request().method()==='POST') {
@@ -477,7 +478,7 @@ for(const width of [390,1024,1440])test(`first-run setup fits ${width}px`,async(
 test('choosing a native account saves a binding without an AI secret',async({page})=>{
   const {writes}=await setup(page,connected);
   await page.getByLabel('AI authentication',{exact:true}).selectOption('binding');
-  await page.getByLabel('rkat account',{exact:true}).selectOption('0');
+  await page.getByLabel('Connected AI account',{exact:true}).selectOption('0');
   await page.getByLabel('Model',{exact:true}).fill('replacement-model');
   await page.getByRole('button',{name:'Save AI selection'}).click();
   await expect(page.locator('#modelResult')).toHaveText('AI account selected.');
@@ -588,4 +589,82 @@ test('commit identity is explicit, saved per repository and invalidates preparat
   await page.reload();
   await expect(page.getByLabel('Commit author name',{exact:true})).toHaveValue('Example Automation');
   await expect(page.getByLabel('Commit author email',{exact:true})).toHaveValue('automation@example.com');
+});
+
+test('hosted Copilot sign-in shows device challenge and supports expiry and retry',async({page})=>{
+  await setup(page,{environment_providers:[]});
+  let phase='idle';
+  let starts=0;
+  await page.route('**/api/setup/auth/login',async route=>{
+    if(route.request().method()==='POST'){
+      expect(route.request().postDataJSON()).toEqual({provider:'copilot'});
+      starts++;
+      phase='device';
+    }
+    await route.fulfill({json:phase==='device'?{phase,user_code:'ABCD-EFGH',verification_uri:'https://github.com/login/device'}:phase==='idle'?{phase}:{phase:'failed',error:'GitHub sign-in expired. Start sign-in again.'}});
+  });
+  await page.getByRole('button',{name:'Connect GitHub Copilot'}).click();
+  await expect(page.locator('#deviceCode')).toHaveText('ABCD-EFGH');
+  await expect(page.getByRole('link',{name:'Open GitHub sign-in'})).toHaveAttribute('href','https://github.com/login/device');
+  await expect(page.getByRole('button',{name:'Connect GitHub Copilot'})).toBeDisabled();
+  phase='expired';
+  await expect(page.locator('#loginResult')).toContainText('expired');
+  await expect(page.locator('#deviceCode')).toBeEmpty();
+  await page.getByRole('button',{name:'Connect GitHub Copilot'}).click();
+  await expect(page.locator('#deviceCode')).toHaveText('ABCD-EFGH');
+  expect(starts).toBe(2);
+});
+
+test('hosted device code is cleared on cancellation and never interpreted as markup',async({page})=>{
+  await setup(page,{environment_providers:[]});
+  let phase='idle';
+  await page.route('**/api/setup/auth/login',route=>{if(route.request().method()==='POST')phase='device';return route.fulfill({json:phase==='device'?{phase,user_code:'<img src=x onerror=alert(1)>',verification_uri:'https://github.com/login/device'}:{phase}});});
+  await page.route('**/api/setup/auth/cancel',route=>{phase='cancelled';return route.fulfill({json:{phase}});});
+  await page.getByRole('button',{name:'Connect GitHub Copilot'}).click();
+  await expect(page.locator('#deviceCode')).toHaveText('<img src=x onerror=alert(1)>');
+  await expect(page.locator('#deviceCode img')).toHaveCount(0);
+  await page.getByRole('button',{name:'Cancel sign-in'}).click();
+  await expect(page.locator('#deviceCode')).toBeEmpty();
+  await expect(page.locator('#deviceLink')).not.toHaveAttribute('href');
+  await expect(page.getByRole('button',{name:'Connect GitHub Copilot'})).toBeEnabled();
+});
+
+test('Copilot completion selects its native binding without sending credentials to connection storage',async({page})=>{
+  const errors=[];page.on('pageerror',error=>errors.push(error.message));
+  const {writes}=await setup(page,{environment_providers:[]});
+  let phase='idle';
+  await page.route('**/api/setup/auth/accounts',route=>route.fulfill({json:[
+    {provider:'openai',name:'existing',method:'api_key',auth_binding:{realm:'global',binding:'default_openai'}},
+    {provider:'openai',name:'copilot',method:'github_copilot_oauth',auth_binding:{realm:'global',binding:'copilot_openai'}}
+  ]}));
+  await page.route('**/api/setup/auth/login',route=>{if(route.request().method()==='POST')phase='copilot_complete';return route.fulfill({json:{phase}});});
+  await page.getByRole('button',{name:'Connect GitHub Copilot'}).click();
+  await expect(page.locator('#authAccount')).toHaveValue('1');
+  await page.getByRole('button',{name:'Save AI selection'}).click();
+  await expect(page.locator('#modelResult')).toHaveText('AI account selected.');
+  expect(writes.at(-1).value.credential).toEqual({method:'binding',auth_binding:{realm:'global',binding:'copilot_openai'}});
+  await expect(page.locator('#authAccount')).toHaveValue('1');
+  expect(errors).toEqual([]);
+});
+
+test('restoring a pending login shows its code but an old completion preserves saved model choice',async({page})=>{
+  await setup(page,connected);
+  let phase='device';
+  await page.route('**/api/setup/auth/login',route=>route.fulfill({json:{phase,user_code:'ABCD-EFGH',verification_uri:'https://github.com/login/device'}}));
+  await page.reload();
+  await expect(page.locator('#deviceCode')).toHaveText('ABCD-EFGH');
+  phase='copilot_complete';
+  await page.reload();
+  await expect(page.locator('#modelMethod')).toHaveValue('environment');
+  await expect(page.locator('#model')).toHaveValue('example-model');
+});
+
+test('device sign-in refuses unexpected authorization destinations',async({page})=>{
+  await setup(page,{environment_providers:[]});
+  let phase='idle';
+  await page.route('**/api/setup/auth/login',route=>{if(route.request().method()==='POST')phase='device';return route.fulfill({json:{phase,user_code:'SECRET',verification_uri:'https://attacker.invalid/'}});});
+  await page.getByRole('button',{name:'Connect GitHub Copilot'}).click();
+  await expect(page.locator('#loginResult')).toContainText('Unexpected sign-in destination');
+  await expect(page.locator('#deviceCode')).toBeEmpty();
+  await expect(page.locator('#deviceLink')).not.toHaveAttribute('href');
 });

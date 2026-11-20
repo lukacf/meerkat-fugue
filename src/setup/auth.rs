@@ -1,4 +1,5 @@
 //! Native rkat account discovery and login transport. Fugue never persists AI secrets.
+mod copilot;
 use super::connections::{ModelProvider, Secret};
 use anyhow::{Context, Result, bail};
 use meerkat_core::{AuthBindingRef, BindingId, BindingOrigin, Config, Provider, RealmId};
@@ -251,28 +252,65 @@ pub enum LoginStatus {
     #[default]
     Idle,
     Waiting,
+    Device {
+        verification_uri: String,
+        user_code: String,
+    },
     Complete,
+    CopilotComplete,
     Failed {
         error: &'static str,
     },
     Cancelled,
 }
 
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginProvider {
+    Openai,
+    Anthropic,
+    Gemini,
+    Copilot,
+}
+
 #[derive(Default)]
 pub struct Login {
     status: Arc<Mutex<LoginStatus>>,
     operation: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    cancel: Mutex<Option<tokio_util::sync::CancellationToken>>,
 }
 
 impl Login {
     pub async fn status(&self) -> LoginStatus {
         self.status.lock().await.clone()
     }
-    pub async fn start(&self, provider: ModelProvider, directory: &Path) -> Result<()> {
+    pub async fn start(&self, provider: LoginProvider, directory: &Path) -> Result<()> {
         let mut operation = self.operation.lock().await;
         if operation.as_ref().is_some_and(|task| !task.is_finished()) {
             bail!("An rkat sign-in is already waiting. Complete or cancel it first.");
         }
+        if matches!(provider, LoginProvider::Copilot) {
+            *self.status.lock().await = LoginStatus::Waiting;
+            let status = Arc::clone(&self.status);
+            let directory = directory.to_path_buf();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            *self.cancel.lock().await = Some(cancel.clone());
+            *operation = Some(tokio::spawn(async move {
+                if copilot::login(&directory, &status, &cancel).await.is_err() {
+                    *status.lock().await = LoginStatus::Failed {
+                        error: "GitHub Copilot sign-in could not complete. Retry sign-in; existing accounts have been preserved.",
+                    };
+                }
+            }));
+            return Ok(());
+        }
+        *self.cancel.lock().await = None;
+        let provider = match provider {
+            LoginProvider::Openai => ModelProvider::Openai,
+            LoginProvider::Anthropic => ModelProvider::Anthropic,
+            LoginProvider::Gemini => ModelProvider::Gemini,
+            LoginProvider::Copilot => bail!("Copilot sign-in must use device authorization"),
+        };
         let mut child = tokio::process::Command::new("rkat")
             .args(["auth", "login", provider.name(), "--realm", "global"])
             .current_dir(directory)
@@ -296,15 +334,23 @@ impl Login {
         Ok(())
     }
     pub async fn cancel(&self) -> Result<()> {
-        if let Some(operation) = self.operation.lock().await.take() {
-            operation.abort();
-            if let Err(error) = operation.await
-                && !error.is_cancelled()
-            {
-                return Err(error.into());
+        let mut operation = self.operation.lock().await;
+        if let Some(task) = operation.take() {
+            if let Some(cancel) = self.cancel.lock().await.take() {
+                // Native credential commits settle on owned tasks. Never abort
+                // the observer or report cancellation ahead of that outcome.
+                cancel.cancel();
+                task.await?;
+            } else {
+                task.abort();
+                if let Err(error) = task.await
+                    && !error.is_cancelled()
+                {
+                    return Err(error.into());
+                }
+                *self.status.lock().await = LoginStatus::Cancelled;
             }
         }
-        *self.status.lock().await = LoginStatus::Cancelled;
         Ok(())
     }
 }
@@ -312,6 +358,34 @@ impl Login {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cancellation_waits_for_native_commit_and_preserves_its_success() {
+        let login = Arc::new(Login::default());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        *login.cancel.lock().await = Some(cancel.clone());
+        *login.status.lock().await = LoginStatus::Device {
+            verification_uri: "https://github.com/login/device".into(),
+            user_code: "TEST-CODE".into(),
+        };
+        let (finish, waiting) = tokio::sync::oneshot::channel();
+        let status = login.status.clone();
+        *login.operation.lock().await = Some(tokio::spawn(async move {
+            waiting.await.unwrap();
+            *status.lock().await = LoginStatus::CopilotComplete;
+        }));
+        let cancelling = tokio::spawn({
+            let login = login.clone();
+            async move { login.cancel().await }
+        });
+        cancel.cancelled().await;
+        assert!(!cancelling.is_finished());
+        finish.send(()).unwrap();
+        cancelling.await.unwrap().unwrap();
+        assert!(matches!(login.status().await, LoginStatus::CopilotComplete));
+        login.cancel().await.unwrap();
+        assert!(matches!(login.status().await, LoginStatus::CopilotComplete));
+    }
+
     #[tokio::test]
     async fn api_key_setup_creates_discoverable_native_bindings_and_preserves_other_config() {
         let dir = tempfile::tempdir().unwrap();
