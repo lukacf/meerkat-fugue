@@ -21,6 +21,8 @@ chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
 indexmap = { version = "2", features = ["serde"] }
+meerkat-copilot = "=0.9.14"
+meerkat-providers = { version = "=0.9.14", default-features = false }
 meerkat-contracts = "=0.9.14"
 meerkat-core = "=0.9.14"
 meerkat-models = "=0.9.14"

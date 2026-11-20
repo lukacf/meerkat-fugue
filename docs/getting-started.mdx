@@ -116,10 +116,23 @@ Connecting an API key sends it to native rkat authentication through stdin;
 Fugue stores the resulting binding reference. This updates rkat's default API-key
 account for that provider. Review the selected account before saving.
 
-Browser OAuth support depends on the provider and native rkat. For Copilot or
-remote-host sign-in, complete `rkat auth login` in a terminal on the execution
-host, then refresh the account list. Your Fugue browser login grants operator
-access; it is separate from the model account used by agents.
+For GitHub Copilot, choose **Connect GitHub Copilot**. Open the GitHub sign-in
+link, enter the one-time code shown by Fugue, and approve access using your own
+GitHub account with Copilot access. Keep the Fugue page open until it confirms
+that the account is connected. Choose the model and **Save AI selection**.
+This works when Fugue runs on a remote server; no terminal or server browser is
+needed. If the code expires, start sign-in again. You can cancel a pending
+attempt without deleting an existing account.
+
+Meerkat stores the credentials on the Fugue host. The repository saves only the
+account reference. On a shared instance, that account can be used by the
+instance's configured agents; this is not a private per-browser credential.
+Your Fugue browser login grants operator access and is separate from the model
+account used by agents.
+
+The separate **Desktop provider sign-in** action is for providers that open a
+browser on the machine running Fugue. Use it only for a local desktop instance.
+On a remote host, use Copilot device sign-in or connect an API key.
 
 ## 4. Prepare and start
 

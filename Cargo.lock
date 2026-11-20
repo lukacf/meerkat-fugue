@@ -2106,6 +2106,7 @@ dependencies = [
  "jsonschema",
  "meerkat",
  "meerkat-contracts",
+ "meerkat-copilot",
  "meerkat-core",
  "meerkat-llm-core",
  "meerkat-meta",

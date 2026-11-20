@@ -306,7 +306,7 @@ async fn jira_states(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LoginRequest {
-    provider: super::connections::ModelProvider,
+    provider: super::auth::LoginProvider,
 }
 
 async fn login_start(
@@ -323,14 +323,23 @@ async fn login_start(
         );
     }
     match setup.login.start(request.provider, &setup.root).await {
-        Ok(()) => (StatusCode::ACCEPTED, Json(setup.login.status().await)).into_response(),
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            [("cache-control", "no-store")],
+            Json(setup.login.status().await),
+        )
+            .into_response(),
         Err(cause) => error(StatusCode::BAD_REQUEST, cause),
     }
 }
 
 async fn login_cancel(State(setup): State<Arc<Setup>>) -> Response {
     match setup.login.cancel().await {
-        Ok(()) => Json(setup.login.status().await).into_response(),
+        Ok(()) => (
+            [("cache-control", "no-store")],
+            Json(setup.login.status().await),
+        )
+            .into_response(),
         Err(_) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Could not cancel rkat sign-in",
@@ -391,8 +400,13 @@ pub fn router(setup: Arc<Setup>) -> Router {
         .route("/api/setup/auth/accounts", get(accounts))
         .route(
             "/api/setup/auth/login",
-            get(|State(setup): State<Arc<Setup>>| async move { Json(setup.login.status().await) })
-                .post(login_start),
+            get(|State(setup): State<Arc<Setup>>| async move {
+                (
+                    [("cache-control", "no-store")],
+                    Json(setup.login.status().await),
+                )
+            })
+            .post(login_start),
         )
         .route("/api/setup/auth/cancel", post(login_cancel))
         .route("/api/setup/check/github", post(check_github))
